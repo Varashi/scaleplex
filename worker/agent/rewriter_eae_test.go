@@ -73,9 +73,9 @@ func TestRewriter_StripsPlexEnv(t *testing.T) {
 			t.Errorf("missing env:strip:%s change: %v", k, out.Changes)
 		}
 	}
-	// X_PLEX_TOKEN is intentionally KEPT — needed by the worker's
-	// progress URL rewrite (auth query param) so the relay's POST→PUT
-	// translation succeeds at PMS.
+	// X_PLEX_TOKEN is intentionally KEPT — the worker-side progress
+	// reporter appends it as ?X-Plex-Token=... so PMS authorises the
+	// per-session PUT to /video/:/transcode/session/<token>/<uuid>/progress.
 	if out.Env["X_PLEX_TOKEN"] != "secret" {
 		t.Fatalf("X_PLEX_TOKEN should be preserved, got %q", out.Env["X_PLEX_TOKEN"])
 	}

@@ -22,6 +22,16 @@ type RewriteResult struct {
 	Env     map[string]string
 	Applied bool
 	Changes []string
+	// ProgressURL — when non-empty, the agent must run a worker-side
+	// progress reporter against this URL instead of letting ffmpeg
+	// drive `-progress`. Captured from Plex's `-progressurl` arg with
+	// the loopback rewritten to a worker-reachable address and the
+	// per-session X-Plex-Token appended as a query param. Plex's PUT
+	// handler parses each request body as a discrete payload — stock
+	// ffmpeg's chunked-stream `-progress` confuses it and stalls
+	// `/header` for ~120s. The reporter sends one PUT per ffmpeg
+	// progress block instead.
+	ProgressURL string
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -545,24 +555,28 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	// Plex's `-progressurl <url>` points at 127.0.0.1:32400 — PMS's own
-	// loopback, unreachable from the worker. Translate to ffmpeg's
-	// stock `-progress <url>` AND substitute the loopback for an
-	// address the worker can dial. Source the substitution from the
-	// SCALEPLEX_PMS_BASE_URL env var (set by the shim, e.g.
-	// "http://clusterplex-pms.clusterplex.svc.cluster.local:32400").
-	// If the env var is empty we drop the flag — playback works but
-	// PMS holds /header requests open ~120s waiting for progress.
+	// loopback, unreachable from the worker. Earlier we translated to
+	// stock `-progress <url>` (ffmpeg's HTTP progress sink). That fails
+	// because ffmpeg streams updates over a single chunked-encoded PUT
+	// body and Plex's progress handler parses each PUT body as a
+	// complete discrete payload — `/header` then waits ~120s for a
+	// "first" report it never sees. So we strip `-progressurl` from the
+	// argv entirely and surface the rewritten URL on RewriteResult so
+	// the agent can run its own reporter (one PUT per progress block).
+	progressURL := ""
 	if i := indexOfArg(args, "-progressurl", 0); i >= 0 && i+1 < len(args) {
 		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
 		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
 			base = envBase
 		}
+		origURL := args[i+1]
+		args = removeArgs(args, i, 2)
 		if base != "" {
-			rewritten := strings.Replace(args[i+1], "http://127.0.0.1:32400", base, 1)
+			rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
 			// Plex's progress endpoint is auth-gated by the per-session
-			// X_PLEX_TOKEN that PMS pipes into the spawn env. ffmpeg's
-			// stock `-progress` doesn't add headers, so embed the token
-			// in the URL query.
+			// X_PLEX_TOKEN that PMS pipes into the spawn env. The PUT
+			// has no headers we control on this side, so embed the
+			// token in the URL query.
 			if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
 				if strings.Contains(rewritten, "?") {
 					rewritten += "&X-Plex-Token=" + tok
@@ -571,11 +585,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 				changes = append(changes, "progress:append-X-Plex-Token")
 			}
-			args[i] = "-progress"
-			args[i+1] = rewritten
-			changes = append(changes, "progressurl->progress(rewrote-loopback)")
+			progressURL = rewritten
+			changes = append(changes, "progressurl:captured-for-reporter")
 		} else {
-			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:-progressurl(no-pms-base)")
 		}
 	}
@@ -612,7 +624,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	changes = append(changes, "env:LIBVA")
 
-	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes}
+	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL}
 }
 
 func containsString(slice []string, s string) bool {
