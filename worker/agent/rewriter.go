@@ -508,9 +508,16 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	// Drop Plex-Transcoder-only flags that stock ffmpeg rejects with
-	// "Unrecognized option".
-	//   -loglevel_plex <level> — custom Plex log verbosity, no analog
-	for _, flag := range []string{"-loglevel_plex"} {
+	// "Unrecognized option". Each is two-token (`flag value`).
+	//   -loglevel_plex <level>   — custom Plex log verbosity, no analog
+	//   -delete_removed <bool>   — Plex DASH muxer extension; stock
+	//                              ffmpeg keeps segments by default so
+	//                              the false case is the implicit behaviour
+	//   -skip_to_segment <N>     — Plex DASH muxer extension to start
+	//                              segment numbering at N; stock ffmpeg
+	//                              starts at 1, which is what Plex sends
+	//                              anyway in the cases we've seen
+	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-skip_to_segment"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
