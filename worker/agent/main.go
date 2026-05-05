@@ -335,21 +335,30 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 
-	// Stream both pipes to the response so the orchestrator/shim can see
-	// what's happening. Multiplex by prefixing.
+	// All response writes (stdout pipe, stderr pipe, segwatch) go through
+	// this lock — http.ResponseWriter.Write is not safe for concurrent use.
+	resp := newLockedWriter(w)
+
+	// Watch ffmpeg's output dir for the first segment file. If req.Cwd
+	// isn't set we skip the watcher silently; the orchestrator/shim sets
+	// cwd to the per-session transcode dir.
+	if req.Cwd != "" {
+		go watchFirstSegment(ctx, req.Cwd, req.SessionID, resp)
+	}
+
 	streamDone := make(chan struct{}, 2)
-	go streamPrefixed(stdout, w, "[stdout] ", streamDone)
-	go streamPrefixed(stderr, w, "[stderr] ", streamDone)
+	go streamPrefixed(stdout, resp, "[stdout] ", streamDone)
+	go streamPrefixed(stderr, resp, "[stderr] ", streamDone)
 
 	waitErr := cmd.Wait()
 	<-streamDone
 	<-streamDone
 
 	if waitErr != nil {
-		fmt.Fprintf(w, "[scaleplex] ffmpeg exit: %v\n", waitErr)
+		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: %v\n", waitErr)
 		log.Printf("session %s: ffmpeg exit: %v", req.SessionID, waitErr)
 	} else {
-		fmt.Fprintf(w, "[scaleplex] ffmpeg exit: success\n")
+		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: success\n")
 		log.Printf("session %s: ffmpeg ok", req.SessionID)
 	}
 }
@@ -380,19 +389,14 @@ func handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func streamPrefixed(rc io.ReadCloser, w io.Writer, prefix string, done chan<- struct{}) {
+func streamPrefixed(rc io.ReadCloser, w *lockedWriter, prefix string, done chan<- struct{}) {
 	defer rc.Close()
 	defer func() { done <- struct{}{} }()
 	buf := make([]byte, 4096)
-	flusher, _ := w.(http.Flusher)
 	for {
 		n, err := rc.Read(buf)
 		if n > 0 {
-			fmt.Fprint(w, prefix)
-			w.Write(buf[:n])
-			if flusher != nil {
-				flusher.Flush()
-			}
+			_, _ = w.writePrefixed(prefix, buf[:n])
 		}
 		if err != nil {
 			return
