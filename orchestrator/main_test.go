@@ -175,6 +175,23 @@ func TestSessionTracker_KillRouting(t *testing.T) {
 	}
 }
 
+func TestPickOrder_InFlightBreaksTie(t *testing.T) {
+	resetGlobals()
+	a := addWorker(t, "http://a", 0, 0, true)
+	b := addWorker(t, "http://b", 0, 0, true)
+	// Stale registry says both have load=0. Mark a as in-flight; b
+	// should now rank first.
+	a.dispatchBegin()
+	defer a.dispatchEnd()
+	got := pl.pickOrder()
+	if got[0] != b {
+		t.Fatalf("expected b first (a is in-flight), got %v", got[0].url)
+	}
+	if got[1] != a {
+		t.Fatalf("expected a second, got %v", got[1].url)
+	}
+}
+
 func TestProbeWorker_ParsesCapability(t *testing.T) {
 	resetGlobals()
 	stub := &stubWorker{capability: capabilityResponse{FFmpegOK: true, ActiveSessions: 2, MaxSessions: 0}}
