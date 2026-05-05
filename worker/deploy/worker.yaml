@@ -53,6 +53,16 @@ spec:
         runAsUser: 1000
         runAsGroup: 100
         supplementalGroups: [44, 568]
+      volumes:
+        - name: media
+          nfs:
+            server: skw-truenas-nfs.boeye.net
+            path: /mnt/DATA/mediapool/media
+            readOnly: true
+        - name: transcode
+          nfs:
+            server: skw-truenas-nfs.boeye.net
+            path: /mnt/SSD/mediapool/clusterplextranscode
       containers:
         - name: agent
           image: ghcr.io/varashi/scaleplex_worker:latest
@@ -60,6 +70,12 @@ spec:
           ports:
             - name: http
               containerPort: 3501
+          volumeMounts:
+            - name: media
+              mountPath: /media
+              readOnly: true
+            - name: transcode
+              mountPath: /transcode
           resources:
             requests:
               cpu: 200m
