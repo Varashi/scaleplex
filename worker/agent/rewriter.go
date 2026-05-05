@@ -35,6 +35,36 @@ var decoderMap = map[string]string{
 	"libx264":  "h264",
 }
 
+// x264PresetToVAAPI maps Plex's libx264 -preset names onto iHD's VAAPI
+// TargetUsage scale (compression_level 1..7, where 7 = fastest /
+// "ultrafast" and 1 = highest quality / "veryslow"). The bucketing is
+// approximate — VAAPI has 7 levels vs x264's 9 named presets.
+//
+// Source: Intel iHD driver TargetUsage docs + on-cluster benchmark
+// (3× Arc A310, 2026-05-05): cl=7 yielded +30-70% throughput over cl=2
+// on no-sub workloads, with no quality difference visible at QP=22.
+var x264PresetToVAAPI = map[string]string{
+	"ultrafast": "7",
+	"superfast": "7",
+	"veryfast":  "6",
+	"faster":    "5",
+	"fast":      "4",
+	"medium":    "4",
+	"slow":      "3",
+	"slower":    "2",
+	"veryslow":  "1",
+	"placebo":   "1",
+}
+
+func mapX264PresetToVAAPI(preset string) string {
+	if v, ok := x264PresetToVAAPI[strings.ToLower(preset)]; ok {
+		return v
+	}
+	// Unknown preset → fastest. Worker only runs when called by orch;
+	// playback latency wins over an unfamiliar quality knob.
+	return "7"
+}
+
 func encoderMap(preferHEVC bool) map[string]string {
 	if preferHEVC {
 		return map[string]string{"libx264": "hevc_vaapi", "libx265": "hevc_vaapi"}
@@ -390,8 +420,25 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		changes = append(changes, "crf->qp")
 	}
 
-	// 7. Drop SW-encoder-specific flags
-	for _, flag := range []string{"-preset:0", "-x264opts:0", "-x265-params:0"} {
+	// 7. Translate -preset:0 <x264-name> → -compression_level:v <N>
+	// (Plex emits x264 preset names; iHD VAAPI uses a 1-7 TargetUsage
+	// scale where 7 = fastest, 1 = highest quality.)
+	if i := indexOfArg(args, "-preset:0", encCodecIdx+1); i >= 0 && i+1 < len(args) {
+		preset := args[i+1]
+		cl := mapX264PresetToVAAPI(preset)
+		args = removeArgs(args, i, 2)
+		// Inject right after the encoder so the encoder context picks it up.
+		args = spliceArgs(args, encCodecIdx+2, "-compression_level:v", cl)
+		changes = append(changes, "preset:"+preset+"->compression_level:"+cl)
+	} else {
+		// No preset emitted (e.g. an x265 path with -x265-params instead);
+		// default to fastest. Worker GPU wants throughput, not max quality.
+		args = spliceArgs(args, encCodecIdx+2, "-compression_level:v", "7")
+		changes = append(changes, "inject:compression_level=7")
+	}
+
+	// Drop the remaining SW-encoder-specific flags.
+	for _, flag := range []string{"-x264opts:0", "-x265-params:0"} {
 		if i := indexOfArg(args, flag, encCodecIdx+1); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)

@@ -106,7 +106,7 @@ out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 		"map-label-update",
 		"encode:libx264->h264_vaapi",
 		"crf->qp",
-		"drop:-preset:0",
+		"preset:veryfast->compression_level:6",
 		"drop:-x264opts:0",
 		"inject:sei+a53_cc",
 		"env:LIBVA",
@@ -171,7 +171,7 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
 out := Rewrite(swArgsAV1H264, nil, nil)
 	if containsString(out.Args, "-preset:0") {
-		t.Error("preset:0 not dropped")
+		t.Error("preset:0 not consumed (should translate to -compression_level:v)")
 	}
 	if containsString(out.Args, "-x264opts:0") {
 		t.Error("x264opts:0 not dropped")
@@ -184,6 +184,14 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 	encIdx := indexOfArg(out.Args, "-codec:0", inputIdx+1)
 	if out.Args[encIdx+1] != "h264_vaapi" {
 		t.Fatalf("encoder=%q want h264_vaapi", out.Args[encIdx+1])
+	}
+	// veryfast → compression_level 6
+	clIdx := indexOfArg(out.Args, "-compression_level:v", encIdx)
+	if clIdx <= 0 {
+		t.Fatal("missing -compression_level:v")
+	}
+	if out.Args[clIdx+1] != "6" {
+		t.Fatalf("compression_level=%q want 6 (veryfast)", out.Args[clIdx+1])
 	}
 	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
 	if qpIdx <= 0 {
@@ -455,6 +463,76 @@ args := []string{
 // HDR PMS-shape filter — synthetic mirror of Plex's SW HDR→SDR chain.
 // Real captures may differ in label numbering and filter args; the
 // matcher is intentionally flexible (zscale + tonemap + final nv12 label).
+func TestRewriter_PresetMapping(t *testing.T) {
+	cases := []struct {
+		x264   string
+		vaapi  string
+	}{
+		{"ultrafast", "7"},
+		{"superfast", "7"},
+		{"veryfast", "6"},
+		{"faster", "5"},
+		{"fast", "4"},
+		{"medium", "4"},
+		{"slow", "3"},
+		{"slower", "2"},
+		{"veryslow", "1"},
+		{"placebo", "1"},
+		{"VeryFast", "6"}, // case-insensitive
+		{"unknownish", "7"}, // unknown → fastest
+	}
+	for _, c := range cases {
+		got := mapX264PresetToVAAPI(c.x264)
+		if got != c.vaapi {
+			t.Errorf("preset %q → cl=%q, want %q", c.x264, got, c.vaapi)
+		}
+	}
+}
+
+func TestRewriter_PresetMapping_FullArgRewrite(t *testing.T) {
+	args := []string{
+		"-codec:0", "libdav1d", "-i", "m.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264", "-crf:0", "16", "-preset:0", "ultrafast",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "preset:ultrafast->compression_level:7") {
+		t.Fatalf("missing preset translation change: %v", out.Changes)
+	}
+	encIdx := indexOfArg(out.Args, "-codec:0", indexOfArg(out.Args, "-i", 0))
+	if out.Args[encIdx+2] != "-compression_level:v" || out.Args[encIdx+3] != "7" {
+		t.Fatalf("expected -compression_level:v 7 right after encoder swap, got %q %q",
+			out.Args[encIdx+2], out.Args[encIdx+3])
+	}
+	if containsString(out.Args, "-preset:0") {
+		t.Fatal("-preset:0 should be consumed")
+	}
+}
+
+func TestRewriter_NoPresetEmitted_DefaultsFastest(t *testing.T) {
+	// libx265 path: PMS emits -x265-params instead of -preset:0. Worker
+	// has nothing to translate, so we inject compression_level=7.
+	args := []string{
+		"-codec:0", "libdav1d", "-i", "m.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx265", "-crf:0", "20", "-x265-params", "no-info=1",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "inject:compression_level=7") {
+		t.Fatalf("missing default-fastest injection: %v", out.Changes)
+	}
+}
+
 func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
 args := []string{
 		"-codec:0", "libdav1d",
