@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,7 +51,8 @@ type worker struct {
 
 	mu             sync.Mutex
 	healthy        bool
-	activeSessions int
+	activeSessions int   // last reported by /capability poll (5s stale)
+	inFlight       int32 // dispatched-here-but-not-yet-finished count
 	maxSessions    int
 	lastErr        string
 	lastUpdated    time.Time
@@ -62,18 +64,24 @@ func (w *worker) snapshot() (active, max int, healthy bool) {
 	return w.activeSessions, w.maxSessions, w.healthy
 }
 
+// load is the ranking score. Combines the worker's last-reported
+// active_sessions with the orchestrator's local in-flight count so two
+// concurrent requests don't both pick the same worker just because the
+// /capability cache is 5s stale.
 func (w *worker) load() float64 {
 	active, max, healthy := w.snapshot()
 	if !healthy {
 		return float64(1 << 30)
 	}
+	combined := float64(active) + float64(atomic.LoadInt32(&w.inFlight))
 	if max <= 0 {
-		// Unlimited capacity: prefer this worker over capped ones with
-		// any sessions, but rank ties by raw active count.
-		return float64(active)
+		return combined
 	}
-	return float64(active) / float64(max)
+	return combined / float64(max)
 }
+
+func (w *worker) dispatchBegin() { atomic.AddInt32(&w.inFlight, 1) }
+func (w *worker) dispatchEnd()   { atomic.AddInt32(&w.inFlight, -1) }
 
 type pool struct {
 	mu      sync.RWMutex
@@ -297,21 +305,26 @@ func handleReady(w http.ResponseWriter, r *http.Request) {
 // and for the eventual /status dashboard.
 func handleWorkers(w http.ResponseWriter, r *http.Request) {
 	type entry struct {
-		URL            string `json:"url"`
-		Healthy        bool   `json:"healthy"`
-		ActiveSessions int    `json:"active_sessions"`
-		MaxSessions    int    `json:"max_sessions"`
-		LastErr        string `json:"last_err,omitempty"`
-		LastUpdatedAgo string `json:"last_updated_ago,omitempty"`
+		URL            string  `json:"url"`
+		Healthy        bool    `json:"healthy"`
+		ActiveSessions int     `json:"active_sessions"`
+		InFlight       int32   `json:"in_flight"`
+		MaxSessions    int     `json:"max_sessions"`
+		Load           float64 `json:"load"`
+		LastErr        string  `json:"last_err,omitempty"`
+		LastUpdatedAgo string  `json:"last_updated_ago,omitempty"`
 	}
 	out := []entry{}
 	for _, wk := range pl.list() {
+		load := wk.load()
 		wk.mu.Lock()
 		e := entry{
 			URL:            wk.url,
 			Healthy:        wk.healthy,
 			ActiveSessions: wk.activeSessions,
+			InFlight:       atomic.LoadInt32(&wk.inFlight),
 			MaxSessions:    wk.maxSessions,
+			Load:           load,
 			LastErr:        wk.lastErr,
 		}
 		if !wk.lastUpdated.IsZero() {
@@ -344,15 +357,26 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	candidates := pl.pickOrder()
-	if len(candidates) == 0 {
-		http.Error(w, "no healthy workers", http.StatusServiceUnavailable)
-		return
-	}
-
-	for i, wk := range candidates {
-		log.Printf("session %s: try worker %s (load=%.3f, attempt=%d/%d)", req.SessionID, wk.url, wk.load(), i+1, len(candidates))
+	// Re-pick before each try so the in-flight count from earlier
+	// dispatches is reflected — sequential candidates after a 503 should
+	// also be ranked freshly.
+	tried := make(map[*worker]bool)
+	for {
+		var wk *worker
+		for _, c := range pl.pickOrder() {
+			if !tried[c] {
+				wk = c
+				break
+			}
+		}
+		if wk == nil {
+			break
+		}
+		tried[wk] = true
+		log.Printf("session %s: try worker %s (load=%.3f, attempt=%d)", req.SessionID, wk.url, wk.load(), len(tried))
+		wk.dispatchBegin()
 		ok := proxyToWorker(w, r, wk.url, body, req.SessionID)
+		wk.dispatchEnd()
 		if ok {
 			return
 		}
