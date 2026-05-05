@@ -15,6 +15,7 @@ VAAPI HW filters, unlocking:
 - Full HW subtitle burn (`overlay_vaapi`)
 - HDR Main10 passthrough (no tonemap loss for HDR clients)
 - Direct NFS segment writes (no `LOCAL_RELAY` HTTP hop)
+- **First-frame latency as a first-class design goal** (see docs/LATENCY.md)
 - Independent of Plex version internals
 
 PMS still sees a normal local transcoder via a thin shim. Plex session
