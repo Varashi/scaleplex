@@ -229,7 +229,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		fsExists = opts.FSExists
 	}
 
-	enabled := envBool("HW_ARG_REWRITE_ENABLED")
 	preferHEVC := envBool("HW_PREFER_HEVC")
 	overlayEnabled := envBool("HW_OVERLAY_VAAPI_ENABLED")
 	renderDevice := envOr("HW_RENDER_DEVICE", "/dev/dri/renderD128")
@@ -248,10 +247,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			Applied: false,
 			Changes: append(changes, "skip:"+reason),
 		}
-	}
-
-	if !enabled {
-		return bail("rewriter-disabled")
 	}
 
 	args := cloneArgs(inputArgs)
