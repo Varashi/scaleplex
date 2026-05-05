@@ -7,3 +7,7 @@ node_modules/
 dist/
 build/
 target/
+
+# Go build artifacts
+worker/agent/agent
+worker/agent/scaleplex-agent
