@@ -56,4 +56,7 @@ RUN chmod +x /mod/etc/cont-init.d/99-scaleplex-shim
 # lsio mods convention: empty `FROM scratch` final stage holding only
 # the layout files; lsio's mod loader copies everything from /.
 FROM scratch
+LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
+LABEL org.opencontainers.image.description="scaleplex PMS DOCKER_MOD — installs the Plex Transcoder shim that forwards transcodes to scaleplex-orchestrator"
+LABEL org.opencontainers.image.licenses=MIT
 COPY --from=layout /mod/ /

@@ -463,7 +463,60 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// 9. VAAPI driver discovery env. Only override if explicitly set;
+	// 9. Audio: Plex emits `-codec:1 eac3_eae -eae_prefix:1 <token>`
+	// (eac3_eae is Plex's custom encoder backed by EasyAudioEncoder over
+	// a localhost socket — only present in Plex Transcoder, not in
+	// stock/jellyfin ffmpeg). Walk the whole arg list and replace every
+	// `<codec-flag> eac3_eae` with `<codec-flag> eac3`. PMS sometimes
+	// repeats the codec flag (early near-input and again after video
+	// codec block).
+	{
+		audioCodecFlag := func(s string) bool {
+			switch s {
+			case "-codec:0", "-codec:1", "-c:a", "-c:a:0", "-c:a:1":
+				return true
+			}
+			return false
+		}
+		swapped := false
+		for i := 0; i < len(args); i++ {
+			if audioCodecFlag(args[i]) && i+1 < len(args) && args[i+1] == "eac3_eae" {
+				args[i+1] = "eac3"
+				swapped = true
+			}
+		}
+		if swapped {
+			changes = append(changes, "audio:eac3_eae->eac3")
+		}
+	}
+	// Drop -eae_prefix:N (any stream spec). Walk because there may be
+	// multiple, and removeArgs shifts indexes.
+	for {
+		removed := false
+		for i := 0; i < len(args); i++ {
+			if strings.HasPrefix(args[i], "-eae_prefix") {
+				dropped := args[i]
+				args = removeArgs(args, i, 2)
+				changes = append(changes, "drop:"+dropped)
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			break
+		}
+	}
+
+	// 10. Strip env vars that point at Plex-Transcoder-only paths
+	// (won't exist on the worker pod and confuse libavcodec init).
+	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "X_PLEX_TOKEN"} {
+		if _, ok := env[k]; ok {
+			delete(env, k)
+			changes = append(changes, "env:strip:"+k)
+		}
+	}
+
+	// 11. VAAPI driver discovery env. Only override if explicitly set;
 	// libva otherwise auto-discovers iHD on the worker image.
 	env["LIBVA_DRIVER_NAME"] = vaapiDriver
 	if libvaDriversPath != "" {
