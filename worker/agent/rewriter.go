@@ -516,6 +516,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
+	// PMS sets `-loglevel quiet`, which silences errors too. Upgrade to
+	// `error` so a transcode failure actually leaves a stderr trail
+	// (worker captures and logs the tail; orchestrator streams it back
+	// to the shim → PMS log). Idempotent if already at error or above.
+	if i := indexOfArg(args, "-loglevel", 0); i >= 0 && i+1 < len(args) {
+		if args[i+1] == "quiet" || args[i+1] == "panic" || args[i+1] == "fatal" {
+			args[i+1] = "error"
+			changes = append(changes, "loglevel:->error")
+		}
+	}
+
 	// 10. Strip env vars that point at Plex-Transcoder-only paths
 	// (won't exist on the worker pod and confuse libavcodec init).
 	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "X_PLEX_TOKEN"} {
