@@ -186,7 +186,9 @@ func sendPrelude(ctx context.Context, c *http.Client, rc reportContext) {
 	}
 	if rc.DurationS > 0 {
 		q := url.Values{}
-		q.Set("duration", fmt.Sprintf("%.6f", rc.DurationS*1000))
+		// Plex Transcoder capture (2026-05-05): "duration=6461.876000"
+		// for a 108-min film → SECONDS, not ms. Send seconds.
+		q.Set("duration", fmt.Sprintf("%.6f", rc.DurationS))
 		doPlexPUT(ctx, c, rc, "duration", joinQuery(rc.URL, q))
 	}
 	var firstVideo *outputStream
@@ -231,7 +233,7 @@ func sendPrelude(ctx context.Context, c *http.Client, rc reportContext) {
 			}
 			q.Set("disp_default", "1")
 		}
-		doPlexPUT(ctx, c, rc, "streamDetail", joinQuery(rc.URL+"/streamDetail", q))
+		doPlexPUT(ctx, c, rc, "streamDetail", joinQueryWithSuffix(rc.URL, "/streamDetail", q))
 	}
 	if firstVideo != nil && firstVideo.Width > 0 && firstVideo.Height > 0 {
 		q := url.Values{}
@@ -249,6 +251,26 @@ func joinQuery(rawURL string, extra url.Values) string {
 	if err != nil {
 		return rawURL // best-effort; caller handles non-200
 	}
+	q := u.Query()
+	for k, v := range extra {
+		for _, vv := range v {
+			q.Add(k, vv)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// joinQueryWithSuffix appends pathSuffix to the URL's path (preserving
+// the existing query) and merges extra params. String concatenation
+// breaks because rc.URL ends with `?X-Plex-Token=…`; the suffix would
+// land inside the query string.
+func joinQueryWithSuffix(rawURL, pathSuffix string, extra url.Values) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.Path += pathSuffix
 	q := u.Query()
 	for k, v := range extra {
 		for _, vv := range v {
