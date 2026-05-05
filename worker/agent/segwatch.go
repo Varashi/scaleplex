@@ -101,15 +101,21 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
 	if dir == "" {
 		return
 	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("session %s: chunk-renumber mkdir %s: %v", sessionID, dir, err)
+		return
+	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Printf("session %s: chunk-renumber init: %v", sessionID, err)
 		return
 	}
 	defer watcher.Close()
-	if err := os.MkdirAll(dir, 0o755); err == nil {
-		_ = watcher.Add(dir)
+	if err := watcher.Add(dir); err != nil {
+		log.Printf("session %s: chunk-renumber add %s: %v", sessionID, dir, err)
+		return
 	}
+	log.Printf("session %s: chunk-renumber watching %s", sessionID, dir)
 	streamSeq := map[string]int{} // streamID → next sequence to assign
 	for {
 		select {
