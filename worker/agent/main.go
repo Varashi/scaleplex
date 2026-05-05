@@ -444,6 +444,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	// cwd to the per-session transcode dir.
 	if req.Cwd != "" {
 		go watchFirstSegment(ctx, req.Cwd, req.SessionID, resp, spawnedAt)
+		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID)
 	}
 
 	streamDone := make(chan struct{}, 2)
