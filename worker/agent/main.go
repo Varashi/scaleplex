@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,12 @@ type capabilityResponse struct {
 	HWAccels    []string `json:"hwaccels,omitempty"`
 	HWFilters   []string `json:"hw_filters,omitempty"`
 	RenderNodes []string `json:"render_nodes,omitempty"`
+	// Active session count. Used by the orchestrator for least-loaded
+	// worker selection.
+	ActiveSessions int `json:"active_sessions"`
+	// MaxSessions is a soft cap; 0 means unlimited (default until we
+	// have real Arc A310 capacity numbers from phase 6 testing).
+	MaxSessions int `json:"max_sessions"`
 }
 
 type taskRegistry struct {
@@ -74,6 +81,12 @@ func (r *taskRegistry) unregister(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.tasks, id)
+}
+
+func (r *taskRegistry) activeCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.tasks)
 }
 
 func (r *taskRegistry) kill(id string) bool {
@@ -190,8 +203,25 @@ func handleCapability(w http.ResponseWriter, r *http.Request) {
 	resp.HWAccels = collectFFmpegList("-hwaccels")
 	resp.HWFilters = filterVAAPIFilters(collectFFmpegList("-filters"))
 	resp.RenderNodes = listRenderNodes()
+	resp.ActiveSessions = registry.activeCount()
+	resp.MaxSessions = maxSessions()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// maxSessions returns the soft cap on concurrent ffmpeg spawns. 0 means
+// unlimited — the default until we have real concurrency numbers from
+// the Arc A310 in production.
+func maxSessions() int {
+	v := os.Getenv("WORKER_MAX_SESSIONS")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func collectFFmpegList(flag string) []string {
@@ -274,6 +304,15 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Args) == 0 {
 		http.Error(w, "args required", http.StatusBadRequest)
+		return
+	}
+
+	// Soft cap: when WORKER_MAX_SESSIONS is set and we're at it, refuse
+	// with 503 so the orchestrator falls through to the next-best worker.
+	// 0 = unlimited (default).
+	if cap := maxSessions(); cap > 0 && registry.activeCount() >= cap {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "worker at capacity", http.StatusServiceUnavailable)
 		return
 	}
 
