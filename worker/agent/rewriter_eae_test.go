@@ -65,13 +65,19 @@ func TestRewriter_StripsPlexEnv(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "X_PLEX_TOKEN"} {
+	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
 		if _, ok := out.Env[k]; ok {
 			t.Errorf("%s should be stripped from env (still present: %q)", k, out.Env[k])
 		}
 		if !containsString(out.Changes, "env:strip:"+k) {
 			t.Errorf("missing env:strip:%s change: %v", k, out.Changes)
 		}
+	}
+	// X_PLEX_TOKEN is intentionally KEPT — needed by the worker's
+	// progress URL rewrite (auth query param) so the relay's POST→PUT
+	// translation succeeds at PMS.
+	if out.Env["X_PLEX_TOKEN"] != "secret" {
+		t.Fatalf("X_PLEX_TOKEN should be preserved, got %q", out.Env["X_PLEX_TOKEN"])
 	}
 	if out.Env["TZ"] != "Europe/Brussels" {
 		t.Fatalf("TZ should be preserved, got %q", out.Env["TZ"])
