@@ -581,7 +581,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	// 10. Strip env vars that point at Plex-Transcoder-only paths
 	// (won't exist on the worker pod and confuse libavcodec init).
-	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "X_PLEX_TOKEN"} {
+	// X_PLEX_TOKEN is INTENTIONALLY kept — it's the per-session auth
+	// the progress endpoint expects (PMS routes PUT
+	// /video/:/transcode/session/<token>/<uuid>/progress with that
+	// token as X-Plex-Token); a future POST→PUT relay can use it.
+	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
 		if _, ok := env[k]; ok {
 			delete(env, k)
 			changes = append(changes, "env:strip:"+k)
