@@ -467,11 +467,27 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 
 	progressDone := make(chan struct{}, 1)
 	if progressReader != nil {
+		inputPath := extractInputPath(finalArgs)
+		streams := probeInputStreams(ctx, inputPath)
+		if len(streams) == 0 {
+			// ffprobe failed — fall back to argv-derived output stream
+			// info. Less accurate (codec is the output encoder, not the
+			// source) but better than empty.
+			streams = extractOutputStreams(finalArgs)
+		} else {
+			// Plex Transcoder hardcodes level=5 for h264 and emits the
+			// codec name without "-vaapi" / "-nvenc" suffixes.
+			for i := range streams {
+				if streams[i].Type == "video" && streams[i].Level == 0 {
+					streams[i].Level = 5
+				}
+			}
+		}
 		rc := reportContext{
 			URL:       progressURL,
 			SessionID: req.SessionID,
-			Streams:   extractOutputStreams(finalArgs),
-			DurationS: probeDurationSeconds(ctx, extractInputPath(finalArgs)),
+			Streams:   streams,
+			DurationS: probeDurationSeconds(ctx, inputPath),
 		}
 		// Fire the one-shot prelude PUTs (duration + streamDetail +
 		// dimensions) before starting the periodic reporter. PMS uses
