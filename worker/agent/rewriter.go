@@ -507,6 +507,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
+	// Drop other Plex-Transcoder-only flags that stock ffmpeg rejects
+	// with "Unrecognized option". Add as-discovered.
+	for _, flag := range []string{"-loglevel_plex"} {
+		if i := indexOfArg(args, flag, 0); i >= 0 {
+			args = removeArgs(args, i, 2)
+			changes = append(changes, "drop:"+flag)
+		}
+	}
+
 	// 10. Strip env vars that point at Plex-Transcoder-only paths
 	// (won't exist on the worker pod and confuse libavcodec init).
 	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "X_PLEX_TOKEN"} {
