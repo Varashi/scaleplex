@@ -50,6 +50,13 @@ var (
 	reFilterPlain = regexp.MustCompile(
 		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
 			`\[0\]format=pix_fmts=[^\[]*nv12\[1\]$`)
+	// HDR→SDR PMS pattern: scale → zscale(linear) → format(gbrpf32le) →
+	// zscale(primaries=bt709) → tonemap → zscale(bt709) → format(nv12).
+	// Capture leading w/h and the final output label number; the middle is
+	// flexible because Plex tweaks the chain across versions.
+	reFilterHDR = regexp.MustCompile(
+		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[\d+\];` +
+			`.*zscale.*tonemap.*format=pix_fmts=[^\[]*nv12\[(\d+)\]$`)
 	reLanguage = regexp.MustCompile(`(?:^|:)language=([a-zA-Z]{2,3})`)
 	reInitHW   = regexp.MustCompile(`^vaapi=vaapi:?$`)
 )
@@ -127,7 +134,7 @@ func rewriteVideoFilter(filterStr, mediaPath string, fsExists func(string) bool,
 
 		if sidecar != "" && overlayEnabled {
 			subPath := escapeFilterPath(sidecar)
-			fontsDir := envOr("HW_FONTS_DIR", "/usr/lib/plexmediaserver/Resources/Fonts")
+			fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];[10]scale_vaapi=w=%s:h=%s:format=nv12[main];"+
@@ -153,6 +160,21 @@ func rewriteVideoFilter(filterStr, mediaPath string, fsExists func(string) bool,
 			OldLabel: "[2]",
 			NewLabel: "[15]",
 			Mode:     "hybrid-inlineass",
+		}
+	}
+
+	if m := reFilterHDR.FindStringSubmatch(filterStr); m != nil {
+		w, h, finalIdx := m[1], m[2], m[3]
+		return &filterRewrite{
+			Filter: fmt.Sprintf(
+				"[0:0]hwupload[0];"+
+					"[0]scale_vaapi=w=%s:h=%s:format=p010,"+
+					"tonemap_vaapi=transfer=bt709:format=nv12[1];"+
+					"[1]hwupload[2]",
+				w, h),
+			OldLabel: "[" + finalIdx + "]",
+			NewLabel: "[2]",
+			Mode:     "hdr-tonemap-vaapi",
 		}
 	}
 
@@ -212,8 +234,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	overlayEnabled := envBool("HW_OVERLAY_VAAPI_ENABLED")
 	renderDevice := envOr("HW_RENDER_DEVICE", "/dev/dri/renderD128")
 	vaapiDriver := envOr("HW_VAAPI_DRIVER", "iHD")
-	libvaDriversPath := envOr("HW_LIBVA_DRIVERS_PATH",
-		"/config/Library/Application Support/Plex Media Server/Cache/va-dri-linux-x86_64")
+	// Image-resident defaults: Ubuntu's intel-media-va-driver-non-free
+	// installs iHD_drv_video.so under /usr/lib/x86_64-linux-gnu/dri and
+	// libva auto-discovers it. HW_LIBVA_DRIVERS_PATH only needs to be
+	// non-empty when overriding (e.g. talking to a Plex-bundled cache).
+	libvaDriversPath := os.Getenv("HW_LIBVA_DRIVERS_PATH")
 
 	changes := []string{}
 	bail := func(reason string) RewriteResult {
@@ -243,9 +268,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if strings.Contains(f, "subtitles=") {
 			return bail("subtitles-burn-in")
 		}
-		if strings.Contains(f, "zscale") || strings.Contains(f, "tonemap") {
-			return bail("hdr-tonemap")
-		}
+		// HDR (zscale/tonemap) is rewritten to tonemap_vaapi by
+		// rewriteVideoFilter; only video chains starting with [0:0] are
+		// in-scope. Bail kept off — phase 1 smoke proved tonemap_vaapi
+		// works on real HDR10.
 	}
 
 	inputIdx := indexOfArg(args, "-i", 0)
@@ -337,10 +363,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			args = removeArgs(args, miaIdx, 2)
 			changes = append(changes, "drop:-map_inlineass")
 		}
-		env["FONTCONFIG_FILE"] = envOr("HW_FONTCONFIG_FILE",
-			"/usr/lib/plexmediaserver/Resources/fonts.conf")
-		env["FONTCONFIG_PATH"] = envOr("HW_FONTCONFIG_PATH",
-			"/usr/lib/plexmediaserver/Resources")
+		// Fontconfig is opt-in; the worker image ships a system-wide
+		// fontconfig (fc-cache built at image-build time) that libass
+		// finds without any env nudging.
+		if v := os.Getenv("HW_FONTCONFIG_FILE"); v != "" {
+			env["FONTCONFIG_FILE"] = v
+		}
+		if v := os.Getenv("HW_FONTCONFIG_PATH"); v != "" {
+			env["FONTCONFIG_PATH"] = v
+		}
 		changes = append(changes, "sidecar:"+rewritten.Sidecar)
 	}
 
@@ -380,9 +411,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// 9. VAAPI driver discovery env
-	env["LIBVA_DRIVERS_PATH"] = libvaDriversPath
+	// 9. VAAPI driver discovery env. Only override if explicitly set;
+	// libva otherwise auto-discovers iHD on the worker image.
 	env["LIBVA_DRIVER_NAME"] = vaapiDriver
+	if libvaDriversPath != "" {
+		env["LIBVA_DRIVERS_PATH"] = libvaDriversPath
+	}
 	changes = append(changes, "env:LIBVA")
 
 	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes}

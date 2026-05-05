@@ -291,6 +291,14 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("session %s: rewriter NOT applied (%s) — running original args", req.SessionID, strings.Join(res.Changes, ","))
 		}
+		// Adaptive probesize runs whether the HW rewrite applied or not —
+		// it's a pure latency win on any ffmpeg invocation that has
+		// -probesize / -analyzeduration set conservatively.
+		var psChanges []string
+		finalArgs, psChanges = applyAdaptiveProbesize(finalArgs)
+		if len(psChanges) > 0 {
+			log.Printf("session %s: probesize: %s", req.SessionID, strings.Join(psChanges, ","))
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, ffmpegBin, finalArgs...)
