@@ -544,16 +544,28 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Plex's `-progressurl <url>` points at 127.0.0.1:32400 — PMS's
-	// own loopback. Worker can't reach it without an orchestrator-side
-	// proxy. For now: DROP the flag entirely. Cost: PMS loses the
-	// "transcoder N seconds ahead" telemetry; Plex still serves
-	// segments off NFS as the worker writes them.
-	// TODO: orchestrator-side progress proxy that rewrites 127.0.0.1
-	// to the PMS Service DNS and forwards POSTs.
-	if i := indexOfArg(args, "-progressurl", 0); i >= 0 {
-		args = removeArgs(args, i, 2)
-		changes = append(changes, "drop:-progressurl")
+	// Plex's `-progressurl <url>` points at 127.0.0.1:32400 — PMS's own
+	// loopback, unreachable from the worker. Translate to ffmpeg's
+	// stock `-progress <url>` AND substitute the loopback for an
+	// address the worker can dial. Source the substitution from the
+	// SCALEPLEX_PMS_BASE_URL env var (set by the shim, e.g.
+	// "http://clusterplex-pms.clusterplex.svc.cluster.local:32400").
+	// If the env var is empty we drop the flag — playback works but
+	// PMS holds /header requests open ~120s waiting for progress.
+	if i := indexOfArg(args, "-progressurl", 0); i >= 0 && i+1 < len(args) {
+		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+			base = envBase
+		}
+		if base != "" {
+			rewritten := strings.Replace(args[i+1], "http://127.0.0.1:32400", base, 1)
+			args[i] = "-progress"
+			args[i+1] = rewritten
+			changes = append(changes, "progressurl->progress(rewrote-loopback)")
+		} else {
+			args = removeArgs(args, i, 2)
+			changes = append(changes, "drop:-progressurl(no-pms-base)")
+		}
 	}
 
 	// PMS sets `-loglevel quiet`, which silences errors too. Upgrade to
