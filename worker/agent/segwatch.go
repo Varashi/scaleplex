@@ -117,6 +117,7 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
 	}
 	log.Printf("session %s: chunk-renumber watching %s", sessionID, dir)
 	streamSeq := map[string]int{} // streamID → next sequence to assign
+	debugCount := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -124,6 +125,10 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
 		case ev, ok := <-watcher.Events:
 			if !ok {
 				return
+			}
+			if debugCount < 8 {
+				log.Printf("session %s: chunk-renumber raw event op=%v name=%s", sessionID, ev.Op, ev.Name)
+				debugCount++
 			}
 			if ev.Op&fsnotify.Create == 0 {
 				continue
