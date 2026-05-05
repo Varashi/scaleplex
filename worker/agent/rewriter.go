@@ -530,6 +530,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
+	// Plex's `-skip_to_segment N` extension overrides DASH segment
+	// numbering to start at N. Stock ffmpeg has no equivalent and
+	// numbers segments by output_pts / seg_duration. With Plex's
+	// `-copyts -start_at_zero` combo source PTS leaks into output PTS,
+	// pushing segment numbers far past what PMS expects (e.g. 381).
+	// Strip both single-token flags so output PTS starts at 0 and
+	// segments number from 1.
+	for _, flag := range []string{"-copyts", "-start_at_zero"} {
+		if i := indexOfArg(args, flag, 0); i >= 0 {
+			args = removeArgs(args, i, 1)
+			changes = append(changes, "drop:"+flag)
+		}
+	}
+
 	// Plex's `-progressurl <url>` points at 127.0.0.1:32400 — PMS's
 	// own loopback. Worker can't reach it without an orchestrator-side
 	// proxy. For now: DROP the flag entirely. Cost: PMS loses the
