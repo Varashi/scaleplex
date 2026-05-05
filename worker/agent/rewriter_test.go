@@ -85,10 +85,6 @@ var swArgsWithSubsSidecar = []string{
 	"-map", "0:3", "-f", "null", "-codec", "ass", "nullfile",
 }
 
-func enableRewriter(t *testing.T) {
-	t.Setenv("HW_ARG_REWRITE_ENABLED", "true")
-}
-
 func findFilterComplex(args []string, prefix string) int {
 	for i := 0; i < len(args); i++ {
 		if args[i] == "-filter_complex" && i+1 < len(args) && strings.HasPrefix(args[i+1], prefix) {
@@ -98,20 +94,8 @@ func findFilterComplex(args []string, prefix string) int {
 	return -1
 }
 
-func TestRewriter_DisabledByDefault(t *testing.T) {
-	t.Setenv("HW_ARG_REWRITE_ENABLED", "")
-	out := Rewrite([]string{"-i", "foo"}, map[string]string{"A": "1"}, nil)
-	if out.Applied {
-		t.Fatal("expected applied=false when flag off")
-	}
-	if !containsString(out.Changes, "skip:rewriter-disabled") {
-		t.Fatalf("expected skip:rewriter-disabled, got %v", out.Changes)
-	}
-}
-
 func TestRewriter_AV1H264_AppliedAndChanges(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
+out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
 		t.Fatalf("expected applied=true, changes=%v", out.Changes)
 	}
@@ -135,8 +119,7 @@ func TestRewriter_AV1H264_AppliedAndChanges(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_DecoderFollowedByHwaccel(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsAV1H264, nil, nil)
+out := Rewrite(swArgsAV1H264, nil, nil)
 	decIdx := indexOfArg(out.Args, "-codec:0", 0)
 	if out.Args[decIdx+1] != "av1" {
 		t.Fatalf("decoder=%s want av1", out.Args[decIdx+1])
@@ -155,8 +138,7 @@ func TestRewriter_AV1H264_DecoderFollowedByHwaccel(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_InitHwDeviceGetsRenderDeviceAndDriver(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsAV1H264, nil, nil)
+out := Rewrite(swArgsAV1H264, nil, nil)
 	i := indexOfArg(out.Args, "-init_hw_device", 0)
 	if got := out.Args[i+1]; got != "vaapi=vaapi:/dev/dri/renderD128,driver=iHD" {
 		t.Fatalf("init_hw_device=%q", got)
@@ -164,8 +146,7 @@ func TestRewriter_AV1H264_InitHwDeviceGetsRenderDeviceAndDriver(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_FilterIsVaapiPlain(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsAV1H264, nil, nil)
+out := Rewrite(swArgsAV1H264, nil, nil)
 	idx := findFilterComplex(out.Args, "[0:0]")
 	want := "[0:0]hwupload[0];[0]scale_vaapi=w=2276:h=1280:format=nv12[1];[1]hwupload[2]"
 	if out.Args[idx] != want {
@@ -174,8 +155,7 @@ func TestRewriter_AV1H264_FilterIsVaapiPlain(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_MapLabelUpdated(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsAV1H264, nil, nil)
+out := Rewrite(swArgsAV1H264, nil, nil)
 	idx := findFilterComplex(out.Args, "[0:0]")
 	for i := idx + 1; i < len(out.Args); i++ {
 		if out.Args[i] == "-map" {
@@ -189,8 +169,7 @@ func TestRewriter_AV1H264_MapLabelUpdated(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsAV1H264, nil, nil)
+out := Rewrite(swArgsAV1H264, nil, nil)
 	if containsString(out.Args, "-preset:0") {
 		t.Error("preset:0 not dropped")
 	}
@@ -216,8 +195,7 @@ func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_EnvLIBVA_DefaultsAreImageResident(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsAV1H264, map[string]string{"TZ": "Europe/Brussels"}, nil)
+out := Rewrite(swArgsAV1H264, map[string]string{"TZ": "Europe/Brussels"}, nil)
 	// Default scaleplex worker doesn't override LIBVA_DRIVERS_PATH —
 	// libva auto-discovers iHD under /usr/lib/x86_64-linux-gnu/dri.
 	if _, ok := out.Env["LIBVA_DRIVERS_PATH"]; ok {
@@ -232,8 +210,7 @@ func TestRewriter_AV1H264_EnvLIBVA_DefaultsAreImageResident(t *testing.T) {
 }
 
 func TestRewriter_LIBVADriversPath_OverrideHonored(t *testing.T) {
-	enableRewriter(t)
-	t.Setenv("HW_LIBVA_DRIVERS_PATH", "/opt/some/cache/dri")
+t.Setenv("HW_LIBVA_DRIVERS_PATH", "/opt/some/cache/dri")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	if out.Env["LIBVA_DRIVERS_PATH"] != "/opt/some/cache/dri" {
 		t.Fatalf("LIBVA_DRIVERS_PATH=%q", out.Env["LIBVA_DRIVERS_PATH"])
@@ -241,8 +218,7 @@ func TestRewriter_LIBVADriversPath_OverrideHonored(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_ReturnsCopy(t *testing.T) {
-	enableRewriter(t)
-	before := strings.Join(swArgsAV1H264, "\x00")
+before := strings.Join(swArgsAV1H264, "\x00")
 	Rewrite(swArgsAV1H264, nil, nil)
 	after := strings.Join(swArgsAV1H264, "\x00")
 	if before != after {
@@ -251,8 +227,7 @@ func TestRewriter_AV1H264_ReturnsCopy(t *testing.T) {
 }
 
 func TestRewriter_InitHwDevice_Inject(t *testing.T) {
-	enableRewriter(t)
-	args := []string{
+args := []string{
 		"-codec:0", "libdav1d",
 		"-i", "/media/m.mkv",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
@@ -280,8 +255,7 @@ func TestRewriter_InitHwDevice_Inject(t *testing.T) {
 }
 
 func TestRewriter_HybridInlineAss(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsWithSubs, nil, nil)
+out := Rewrite(swArgsWithSubs, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
@@ -308,8 +282,7 @@ func TestRewriter_HybridInlineAss(t *testing.T) {
 }
 
 func TestRewriter_HybridInlineAss_MapLabel15(t *testing.T) {
-	enableRewriter(t)
-	out := Rewrite(swArgsWithSubs, nil, nil)
+out := Rewrite(swArgsWithSubs, nil, nil)
 	idx := findFilterComplex(out.Args, "[0:0]")
 	for i := idx + 1; i < len(out.Args); i++ {
 		if out.Args[i] == "-map" {
@@ -323,8 +296,7 @@ func TestRewriter_HybridInlineAss_MapLabel15(t *testing.T) {
 }
 
 func TestRewriter_PreferHEVC(t *testing.T) {
-	enableRewriter(t)
-	t.Setenv("HW_PREFER_HEVC", "true")
+t.Setenv("HW_PREFER_HEVC", "true")
 	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -347,8 +319,7 @@ func TestRewriter_PreferHEVC(t *testing.T) {
 }
 
 func TestRewriter_PreferHEVCOff(t *testing.T) {
-	enableRewriter(t)
-	t.Setenv("HW_PREFER_HEVC", "")
+t.Setenv("HW_PREFER_HEVC", "")
 	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -363,8 +334,7 @@ func TestRewriter_PreferHEVCOff(t *testing.T) {
 }
 
 func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
-	enableRewriter(t)
-	t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
+t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 	expected := "/media/Movies/Superman (2025)/Superman (2025).en.srt"
 	fsMock := func(p string) bool { return p == expected }
 	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{FSExists: fsMock})
@@ -413,8 +383,7 @@ func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
 }
 
 func TestRewriter_OverlayVAAPI_FallsBackWhenNoSidecar(t *testing.T) {
-	enableRewriter(t)
-	t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
+t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{FSExists: func(string) bool { return false }})
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
@@ -428,8 +397,7 @@ func TestRewriter_OverlayVAAPI_FallsBackWhenNoSidecar(t *testing.T) {
 }
 
 func TestRewriter_OverlayVAAPI_SidecarSpecialChars(t *testing.T) {
-	enableRewriter(t)
-	t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
+t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 	// Real-world filenames: apostrophe, brackets, braces, parentheses.
 	// All should make it into the filter without breaking ffmpeg's parser
 	// because ' is escaped by escapeFilterPath and the rest are filename-
@@ -469,8 +437,7 @@ func TestRewriter_OverlayVAAPI_SidecarSpecialChars(t *testing.T) {
 }
 
 func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
-	enableRewriter(t)
-	args := []string{
+args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[v];[v]subtitles=f.srt[0]",
@@ -489,8 +456,7 @@ func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
 // Real captures may differ in label numbering and filter args; the
 // matcher is intentionally flexible (zscale + tonemap + final nv12 label).
 func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
-	enableRewriter(t)
-	args := []string{
+args := []string{
 		"-codec:0", "libdav1d",
 		"-i", "/media/m.mkv",
 		"-filter_complex",
@@ -530,8 +496,7 @@ func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
 }
 
 func TestRewriter_Bail_UnknownDecoder(t *testing.T) {
-	enableRewriter(t)
-	args := []string{
+args := []string{
 		"-codec:0", "librav1e", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
@@ -547,8 +512,7 @@ func TestRewriter_Bail_UnknownDecoder(t *testing.T) {
 }
 
 func TestRewriter_Bail_FilterMismatch_NoCorruption(t *testing.T) {
-	enableRewriter(t)
-	args := []string{
+args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]some_unsupported_filter[1]",
