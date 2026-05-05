@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.env
+.envrc
+*.swp
+.DS_Store
+dist/
+build/
+target/
