@@ -559,6 +559,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 		if base != "" {
 			rewritten := strings.Replace(args[i+1], "http://127.0.0.1:32400", base, 1)
+			// Plex's progress endpoint is auth-gated by the per-session
+			// X_PLEX_TOKEN that PMS pipes into the spawn env. ffmpeg's
+			// stock `-progress` doesn't add headers, so embed the token
+			// in the URL query.
+			if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+				if strings.Contains(rewritten, "?") {
+					rewritten += "&X-Plex-Token=" + tok
+				} else {
+					rewritten += "?X-Plex-Token=" + tok
+				}
+				changes = append(changes, "progress:append-X-Plex-Token")
+			}
 			args[i] = "-progress"
 			args[i+1] = rewritten
 			changes = append(changes, "progressurl->progress(rewrote-loopback)")
