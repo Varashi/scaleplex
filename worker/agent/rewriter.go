@@ -541,16 +541,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	// Plex's `-skip_to_segment N` extension overrides DASH segment
-	// numbering to start at N. Stock ffmpeg has no equivalent — segments
-	// number by `output_pts / seg_duration + 1`. PMS gates /header on
+	// numbering to start at N. Stock ffmpeg numbers segments by
+	// `output_pts / seg_duration + 1`. PMS gates /header on
 	// chunk-stream0-00001.m4s (its manifest hardcodes startNumber=1)
-	// and times out at ~124s if it doesn't see it. Strip the Plex argv
-	// that pushes PTS off zero so segments start at 1:
-	//   -copyts            : preserve source PTS (pushes output past 0)
-	//   -start_at_zero     : pairs with copyts; without copyts, redundant
-	//   -avoid_negative_ts disabled : Plex disables ffmpeg's PTS rebasing;
-	//                                 we want ffmpeg's default `auto` so
-	//                                 it remaps to output_pts=0.
+	// and times out at ~124s if it doesn't see it.
+	//
+	// Plex's argv keeps `-copyts -start_at_zero -avoid_negative_ts
+	// disabled` so source PTS pass through to output PTS, then
+	// `-skip_to_segment 1` renumbers anyway. Without that extension we
+	// must reset output PTS ourselves. Stripping `-copyts` and
+	// `-start_at_zero` was insufficient — segments still landed at 100+
+	// numbers — so we now also force the DASH muxer to start at 0 with
+	// `-output_ts_offset 0` and (if not already set) drop the negative
+	// `-avoid_negative_ts disabled` so ffmpeg's default `auto` rebase
+	// kicks in.
 	for _, flag := range []string{"-copyts", "-start_at_zero"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 1)
@@ -561,6 +565,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if args[i+1] == "disabled" {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:-avoid_negative_ts=disabled")
+		}
+	}
+	// Inject `-output_ts_offset 0` immediately before `-f dash` so it
+	// applies to the DASH muxer specifically. Idempotent: skip if
+	// already present. If `-f dash` isn't found we silently skip.
+	if indexOfArg(args, "-output_ts_offset", 0) < 0 {
+		for k := 0; k+1 < len(args); k++ {
+			if args[k] == "-f" && args[k+1] == "dash" {
+				args = spliceArgs(args, k, "-output_ts_offset", "0")
+				changes = append(changes, "inject:-output_ts_offset=0")
+				break
+			}
 		}
 	}
 
