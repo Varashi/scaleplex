@@ -61,6 +61,16 @@ ffmpeg -hwaccel vaapi -hwaccel_output_format vaapi \
 - Session cleanup:
   - On new task receipt with same session_id, kill prior ffmpeg first
     (avoids stale-orphan problem we hit in clusterplex)
+- **Latency-reduction features (see `docs/LATENCY.md`):**
+  - Pre-warm at startup: hold `/dev/dri` fd, mmap codec libs, init libass +
+    fontconfig, JIT the iHD VPP/encoder programs via a 1s dummy transcode
+  - Adaptive probesize: ffprobe source once with progressive sizes (1MB →
+    20MB), pick minimum that yields a full stream listing, cache by
+    inode+mtime, replace Plex's `-probesize 20MB / -analyzeduration 20MB`
+  - GOP-aligned segments: rewrite `-force_key_frames` to align with
+    `-segment_time`
+  - inotify watch on `/transcode` session dir; push "segment 0 ready" the
+    moment it lands
 
 ## Phase 3 — Orchestrator (1 day)
 
