@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -80,7 +81,9 @@ var segmentExts = map[string]struct{}{
 // emitting. The caller should run this in its own goroutine.
 //
 // `dir` is created if missing so we don't race ffmpeg's mkdir.
-func watchFirstSegment(ctx context.Context, dir, sessionID string, w *lockedWriter) {
+// `spawnedAt` is used to observe the spawn-to-first-segment latency
+// histogram for status.boeye.net.
+func watchFirstSegment(ctx context.Context, dir, sessionID string, w *lockedWriter, spawnedAt time.Time) {
 	if dir == "" {
 		return
 	}
@@ -117,6 +120,9 @@ func watchFirstSegment(ctx context.Context, dir, sessionID string, w *lockedWrit
 			name := filepath.Base(ev.Name)
 			line := fmt.Sprintf("[scaleplex] segment-ready: %s\n", name)
 			_, _ = w.Write([]byte(line))
+			if !spawnedAt.IsZero() {
+				metricFirstSegmentSeconds.Observe(time.Since(spawnedAt).Seconds())
+			}
 			log.Printf("session %s: first segment ready: %s", sessionID, name)
 			return
 		case err, ok := <-watcher.Errors:

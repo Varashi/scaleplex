@@ -33,6 +33,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: scaleplex-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3501"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: scaleplex-worker
       # Phase-1 fast-startup posture:
