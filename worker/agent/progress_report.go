@@ -539,6 +539,20 @@ func extractOutputStreams(args []string) []outputStream {
 		if typ == "video" {
 			s.Width = w
 			s.Height = h
+			s.Profile = "Main" // matches Plex Transcoder's per-encoder default
+			// Pull frame rate from `-r:N <fps>` if present.
+			rNeedle := "-r:" + strconv.Itoa(idx)
+			for j := 0; j+1 < len(args); j++ {
+				if args[j] == rNeedle {
+					if f, err := strconv.ParseFloat(args[j+1], 64); err == nil {
+						s.FrameRate = f
+					}
+					break
+				}
+			}
+			if s.FrameRate <= 0 {
+				s.FrameRate = 23.976 // film default; better than nothing
+			}
 		}
 		if typ == "audio" {
 			s.Channels = 2
