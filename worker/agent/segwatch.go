@@ -16,6 +16,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,85 @@ var segmentExts = map[string]struct{}{
 	".m4s": {},
 	".ts":  {},
 	".mp4": {},
+}
+
+// chunkRE captures stream id and sequence number from ffmpeg's DASH
+// muxer output, e.g. "chunk-stream0-00130.m4s" → ("0", "00130").
+var chunkRE = regexp.MustCompile(`^chunk-stream(\d+)-0*(\d+)\.m4s$`)
+
+// watchAndRenumberChunks runs alongside watchFirstSegment. ffmpeg's
+// stock DASH muxer numbers chunks based on accumulated PTS / seg
+// duration, which our scaleplex argv (no Plex `-skip_to_segment 1`
+// extension) emits as chunk-stream<N>-00130.m4s and similar — far past
+// the startNumber=1 that PMS's manifest hardcodes. PMS waits ~124s
+// for chunk-stream0-00001.m4s before falling back to a disk-probe of
+// init-stream0.m4s, blocking /header for two minutes.
+//
+// Workaround: hardlink each new chunk to chunk-stream<N>-<seq>.m4s
+// where seq is a per-stream counter that starts at 1 and increments
+// in the order ffmpeg emits the file. PMS opens the file by the
+// sequential name and reads the original chunk's bytes.
+//
+// Hardlinks survive ffmpeg's window_size cleanup (we strip
+// -delete_removed so the source filename also stays around). Any
+// failure here is best-effort: log and keep going.
+func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
+	if dir == "" {
+		return
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("session %s: chunk-renumber init: %v", sessionID, err)
+		return
+	}
+	defer watcher.Close()
+	if err := os.MkdirAll(dir, 0o755); err == nil {
+		_ = watcher.Add(dir)
+	}
+	streamSeq := map[string]int{} // streamID → next sequence to assign
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if ev.Op&fsnotify.Create == 0 {
+				continue
+			}
+			name := filepath.Base(ev.Name)
+			m := chunkRE.FindStringSubmatch(name)
+			if m == nil {
+				continue
+			}
+			streamID := m[1]
+			streamSeq[streamID]++
+			seq := streamSeq[streamID]
+			target := filepath.Join(dir, fmt.Sprintf("chunk-stream%s-%05d.m4s", streamID, seq))
+			if name == filepath.Base(target) {
+				// ffmpeg already wrote at the right number — nothing to do.
+				continue
+			}
+			// Best-effort hardlink. If we collide (target exists from a
+			// prior session crash / restart), drop the existing one
+			// first so PMS sees the freshest content.
+			_ = os.Remove(target)
+			if err := os.Link(ev.Name, target); err != nil {
+				log.Printf("session %s: chunk-renumber link %s→%s: %v", sessionID, name, filepath.Base(target), err)
+				continue
+			}
+			if seq <= 3 {
+				log.Printf("session %s: chunk-renumber stream%s: %s → %s", sessionID, streamID, name, filepath.Base(target))
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("session %s: chunk-renumber err: %v", sessionID, err)
+			return
+		}
+	}
 }
 
 // watchFirstSegment fires once when the first segment file appears in
