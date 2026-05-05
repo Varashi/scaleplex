@@ -333,11 +333,13 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 
 	finalArgs := req.Args
 	finalEnv := req.Env
+	progressURL := ""
 	if req.Rewrite {
 		res := Rewrite(req.Args, req.Env, nil)
 		if res.Applied {
 			finalArgs = res.Args
 			finalEnv = res.Env
+			progressURL = res.ProgressURL
 			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 		} else {
@@ -368,6 +370,24 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM, Setpgid: true}
 
+	// Wire `-progress pipe:N` for the worker-side reporter when the
+	// rewriter captured a Plex progress URL. Stock ffmpeg's chunked
+	// `-progress <http>` confuses Plex's PUT handler; the reporter
+	// reissues each block as its own PUT.
+	var progressReader, progressWriter *os.File
+	if progressURL != "" {
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			http.Error(w, "progress pipe: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		extraIdx := len(cmd.ExtraFiles)
+		cmd.ExtraFiles = append(cmd.ExtraFiles, pw)
+		cmd.Args = append(cmd.Args, progressPipeArg(extraIdx)...)
+		progressReader = pr
+		progressWriter = pw
+	}
+
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		http.Error(w, "stderr pipe: "+err.Error(), http.StatusInternalServerError)
@@ -380,8 +400,18 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := cmd.Start(); err != nil {
+		if progressReader != nil {
+			progressReader.Close()
+			progressWriter.Close()
+		}
 		http.Error(w, "spawn: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// After Start, the child holds its own copy of pw. Close ours so
+	// the reader gets EOF when ffmpeg exits.
+	if progressWriter != nil {
+		progressWriter.Close()
+		progressWriter = nil
 	}
 	log.Printf("session %s: spawned ffmpeg pid=%d", req.SessionID, cmd.Process.Pid)
 	spawnedAt := time.Now()
@@ -420,9 +450,21 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	go streamPrefixed(stdout, resp, "[stdout] ", streamDone, nil)
 	go streamPrefixed(stderr, resp, "[stderr] ", streamDone, stderrTail.Append)
 
+	progressDone := make(chan struct{}, 1)
+	if progressReader != nil {
+		go func() {
+			defer close(progressDone)
+			defer progressReader.Close()
+			runProgressReporter(ctx, progressReader, progressURL, req.SessionID)
+		}()
+	} else {
+		close(progressDone)
+	}
+
 	waitErr := cmd.Wait()
 	<-streamDone
 	<-streamDone
+	<-progressDone
 
 	recordSpeedFromOutput(stderrTail.String())
 

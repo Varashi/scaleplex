@@ -618,3 +618,52 @@ args := []string{
 		t.Fatal("args returned not equal to input")
 	}
 }
+
+// -progressurl must be stripped entirely (not translated to -progress)
+// and the worker-reachable URL surfaced on RewriteResult.ProgressURL,
+// with the per-session X-Plex-Token appended as a query param.
+func TestRewriter_ProgressURL_CapturedAndStripped(t *testing.T) {
+	in := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "secret",
+	}
+	out := Rewrite(swArgsAV1H264, in, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if containsString(out.Args, "-progressurl") {
+		t.Fatal("-progressurl must be stripped from argv")
+	}
+	if containsString(out.Args, "-progress") {
+		t.Fatal("-progress must NOT be inserted; reporter handles HTTP")
+	}
+	wantURL := "http://relay.svc:32499/.../progress?X-Plex-Token=secret"
+	if out.ProgressURL != wantURL {
+		t.Fatalf("ProgressURL=%q want %q", out.ProgressURL, wantURL)
+	}
+	if !containsString(out.Changes, "progressurl:captured-for-reporter") {
+		t.Fatalf("missing capture change: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "progress:append-X-Plex-Token") {
+		t.Fatalf("missing token-append change: %v", out.Changes)
+	}
+}
+
+// Without a base URL we drop -progressurl entirely and ProgressURL is
+// empty (reporter no-ops). Avoids workers POSTing to PMS's internal
+// 127.0.0.1:32400 — which they can't reach anyway.
+func TestRewriter_ProgressURL_NoBase_Drops(t *testing.T) {
+	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if containsString(out.Args, "-progressurl") {
+		t.Fatal("-progressurl must be stripped from argv")
+	}
+	if out.ProgressURL != "" {
+		t.Fatalf("ProgressURL=%q want empty when no base", out.ProgressURL)
+	}
+	if !containsString(out.Changes, "drop:-progressurl(no-pms-base)") {
+		t.Fatalf("missing drop change: %v", out.Changes)
+	}
+}
