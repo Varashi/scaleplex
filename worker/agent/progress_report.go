@@ -241,6 +241,16 @@ func sendPrelude(ctx context.Context, c *http.Client, rc reportContext) {
 			q.Set("disp_default", "1")
 		}
 		doPlexPUT(ctx, c, rc, "streamDetail", joinQueryWithSuffix(rc.URL, "/streamDetail", q))
+		// /stream (singular) registers the output stream's existence —
+		// Plex Transcoder fires this once per stream alongside
+		// streamDetail. We observed in offline capture that PMS keeps
+		// /header pending until both have arrived.
+		streamQ := url.Values{}
+		streamQ.Set("index", strconv.Itoa(s.Index))
+		streamQ.Set("id", strconv.Itoa(s.ID))
+		streamQ.Set("codec", s.Codec)
+		streamQ.Set("type", s.Type)
+		doPlexPUT(ctx, c, rc, "stream", joinQueryWithSuffix(rc.URL, "/stream", streamQ))
 	}
 	if firstVideo != nil && firstVideo.Width > 0 && firstVideo.Height > 0 {
 		q := url.Values{}

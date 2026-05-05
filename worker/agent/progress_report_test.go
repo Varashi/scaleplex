@@ -159,8 +159,9 @@ func TestSendPrelude_FullSet(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(*reqs) != 4 {
-		t.Fatalf("want 4 PUTs (duration + 2× streamDetail + dimensions), got %d: %+v", len(*reqs), *reqs)
+	// 1 duration + 2× streamDetail + 2× stream + 1 dimensions = 6
+	if len(*reqs) != 6 {
+		t.Fatalf("want 6 PUTs (duration + 2× streamDetail + 2× stream + dimensions), got %d: %+v", len(*reqs), *reqs)
 	}
 	// duration first
 	if got := (*reqs)[0].query.Get("duration"); got == "" {
