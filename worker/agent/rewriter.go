@@ -507,18 +507,24 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Drop other Plex-Transcoder-only flags that stock ffmpeg rejects
-	// with "Unrecognized option". Add as-discovered.
-	//   -loglevel_plex <level>  → custom Plex log verbosity
-	//   -progressurl <url>      → Plex's HTTP-POST-progress channel
-	//                             (stock ffmpeg uses -progress; PMS
-	//                             tracks segments via NFS writes
-	//                             instead, no need to forward)
-	for _, flag := range []string{"-loglevel_plex", "-progressurl"} {
+	// Drop Plex-Transcoder-only flags that stock ffmpeg rejects with
+	// "Unrecognized option".
+	//   -loglevel_plex <level> — custom Plex log verbosity, no analog
+	for _, flag := range []string{"-loglevel_plex"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
 		}
+	}
+
+	// Translate `-progressurl <url>` → `-progress <url>`. Stock ffmpeg
+	// emits the same key=value progress payload to a destination URL
+	// (Plex Transcoder is an ffmpeg fork; the format matches), so PMS
+	// keeps tracking transcoder-vs-playback offset and Tautulli's
+	// "X seconds ahead" indicator stays accurate.
+	if i := indexOfArg(args, "-progressurl", 0); i >= 0 && i+1 < len(args) {
+		args[i] = "-progress"
+		changes = append(changes, "progressurl->progress")
 	}
 
 	// PMS sets `-loglevel quiet`, which silences errors too. Upgrade to
