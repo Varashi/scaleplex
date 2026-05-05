@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -36,6 +37,9 @@ type taskRequest struct {
 	Args      []string          `json:"args"`
 	Env       map[string]string `json:"env,omitempty"`
 	Cwd       string            `json:"cwd,omitempty"`
+	// Rewrite=true → run the args through argRewriter (Plex SW → VAAPI HW)
+	// before spawning ffmpeg. Off by default for raw smoke-test calls.
+	Rewrite bool `json:"rewrite,omitempty"`
 }
 
 type capabilityResponse struct {
@@ -276,8 +280,21 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, ffmpegBin, req.Args...)
-	cmd.Env = buildEnv(req.Env)
+	finalArgs := req.Args
+	finalEnv := req.Env
+	if req.Rewrite {
+		res := Rewrite(req.Args, req.Env, nil)
+		if res.Applied {
+			finalArgs = res.Args
+			finalEnv = res.Env
+			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
+		} else {
+			log.Printf("session %s: rewriter NOT applied (%s) — running original args", req.SessionID, strings.Join(res.Changes, ","))
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, ffmpegBin, finalArgs...)
+	cmd.Env = buildEnv(finalEnv)
 	if req.Cwd != "" {
 		cmd.Dir = req.Cwd
 	}
