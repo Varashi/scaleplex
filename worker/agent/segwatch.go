@@ -126,8 +126,8 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
 			if !ok {
 				return
 			}
-			if debugCount < 8 {
-				log.Printf("session %s: chunk-renumber raw event op=%v name=%s", sessionID, ev.Op, ev.Name)
+			if debugCount < 25 {
+				log.Printf("session %s: chunk-renumber raw event op=%v name=%s", sessionID, ev.Op, filepath.Base(ev.Name))
 				debugCount++
 			}
 			if ev.Op&fsnotify.Create == 0 {

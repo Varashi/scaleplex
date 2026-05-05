@@ -37,6 +37,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -346,6 +347,94 @@ func httpClass(code int) string {
 // extraIdx in cmd.ExtraFiles (0-based).
 func progressPipeArg(extraIdx int) []string {
 	return []string{"-progress", "pipe:" + strconv.Itoa(3+extraIdx)}
+}
+
+// logForwarder buffers ffmpeg stderr bytes, splits on newlines, and
+// POSTs each line as a Plex Transcoder-style /progress/log message.
+// PMS appears to gate /header on a "transcoder is alive and producing"
+// signal fed by these POSTs in production; without them /header sits
+// at SegmentedTranscoderTimeout (~125s) before falling back to a disk
+// probe of init-stream0.m4s.
+//
+// Append() is called from the existing stderr peek callback in
+// streamPrefixed, so we don't need an extra pipe. POSTs are
+// fire-and-forget on a dedicated http.Client.
+type logForwarder struct {
+	ctx       context.Context
+	baseURL   string
+	sessionID string
+	mu        sync.Mutex
+	buf       []byte
+	client    *http.Client
+}
+
+func newLogForwarder(ctx context.Context, baseURL, sessionID string) *logForwarder {
+	return &logForwarder{
+		ctx:       ctx,
+		baseURL:   baseURL,
+		sessionID: sessionID,
+		client:    &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+func (l *logForwarder) Append(p []byte) {
+	if l == nil || l.baseURL == "" {
+		return
+	}
+	l.mu.Lock()
+	l.buf = append(l.buf, p...)
+	// Split on \n or \r — ffmpeg uses \r for the periodic
+	// "size= time= speed=" stats line, \n for everything else.
+	for {
+		idx := -1
+		for i, c := range l.buf {
+			if c == '\n' || c == '\r' {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			break
+		}
+		line := strings.TrimRight(string(l.buf[:idx]), "\r\n ")
+		l.buf = l.buf[idx+1:]
+		if line == "" {
+			continue
+		}
+		if len(line) > 8192 {
+			line = line[:8192]
+		}
+		// Plex Transcoder uses level=2 for info-ish, level=3 for debug.
+		// Coarse classifier: bracketed component logs + the periodic
+		// stats line are 2; everything else 3.
+		level := "3"
+		if strings.HasPrefix(line, "[") || strings.HasPrefix(line, "frame=") || strings.HasPrefix(line, "size=") {
+			level = "2"
+		}
+		q := url.Values{}
+		q.Set("level", level)
+		q.Set("message", line)
+		full := joinQueryWithSuffix(l.baseURL, "/log", q)
+		go l.post(full)
+	}
+	l.mu.Unlock()
+}
+
+func (l *logForwarder) post(fullURL string) {
+	pctx, cancel := context.WithTimeout(l.ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodPost, fullURL, http.NoBody)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Range", "bytes=0-")
+	req.ContentLength = 0
+	resp, err := l.client.Do(req)
+	if err != nil {
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 }
 
 // extractInputPath returns the value passed after the first -i flag.
