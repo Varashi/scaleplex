@@ -215,17 +215,28 @@ func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
 	}
 }
 
-func TestRewriter_AV1H264_EnvLIBVA(t *testing.T) {
+func TestRewriter_AV1H264_EnvLIBVA_DefaultsAreImageResident(t *testing.T) {
 	enableRewriter(t)
 	out := Rewrite(swArgsAV1H264, map[string]string{"TZ": "Europe/Brussels"}, nil)
-	if !strings.HasSuffix(out.Env["LIBVA_DRIVERS_PATH"], "va-dri-linux-x86_64") {
-		t.Fatalf("LIBVA_DRIVERS_PATH=%q", out.Env["LIBVA_DRIVERS_PATH"])
+	// Default scaleplex worker doesn't override LIBVA_DRIVERS_PATH —
+	// libva auto-discovers iHD under /usr/lib/x86_64-linux-gnu/dri.
+	if _, ok := out.Env["LIBVA_DRIVERS_PATH"]; ok {
+		t.Fatalf("default should not set LIBVA_DRIVERS_PATH, got %q", out.Env["LIBVA_DRIVERS_PATH"])
 	}
 	if out.Env["LIBVA_DRIVER_NAME"] != "iHD" {
 		t.Fatalf("LIBVA_DRIVER_NAME=%q", out.Env["LIBVA_DRIVER_NAME"])
 	}
 	if out.Env["TZ"] != "Europe/Brussels" {
 		t.Fatalf("TZ stripped: %q", out.Env["TZ"])
+	}
+}
+
+func TestRewriter_LIBVADriversPath_OverrideHonored(t *testing.T) {
+	enableRewriter(t)
+	t.Setenv("HW_LIBVA_DRIVERS_PATH", "/opt/some/cache/dri")
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	if out.Env["LIBVA_DRIVERS_PATH"] != "/opt/some/cache/dri" {
+		t.Fatalf("LIBVA_DRIVERS_PATH=%q", out.Env["LIBVA_DRIVERS_PATH"])
 	}
 }
 
@@ -377,7 +388,7 @@ func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
 	for _, must := range []string{
 		"scale_vaapi=w=3840:h=2160:format=nv12[main]",
 		"subtitles=filename='/media/Movies/Superman (2025)/Superman (2025).en.srt'",
-		"fontsdir=/usr/lib/plexmediaserver/Resources/Fonts",
+		"fontsdir=/usr/share/fonts/truetype/dejavu",
 		"overlay_vaapi=eof_action=pass:repeatlast=0[15]",
 	} {
 		if !strings.Contains(f, must) {
@@ -392,8 +403,9 @@ func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
 			break
 		}
 	}
-	if !strings.HasSuffix(out.Env["FONTCONFIG_FILE"], "fonts.conf") {
-		t.Fatalf("FONTCONFIG_FILE=%q", out.Env["FONTCONFIG_FILE"])
+	// Default: FONTCONFIG_* not injected (image's system fontconfig is used).
+	if v, ok := out.Env["FONTCONFIG_FILE"]; ok {
+		t.Fatalf("FONTCONFIG_FILE should be unset by default, got %q", v)
 	}
 	if !containsString(out.Args, "nullfile") {
 		t.Fatal("nullfile output mapping must be retained for HLS bookkeeping")
@@ -415,6 +427,47 @@ func TestRewriter_OverlayVAAPI_FallsBackWhenNoSidecar(t *testing.T) {
 	}
 }
 
+func TestRewriter_OverlayVAAPI_SidecarSpecialChars(t *testing.T) {
+	enableRewriter(t)
+	t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
+	// Real-world filenames: apostrophe, brackets, braces, parentheses.
+	// All should make it into the filter without breaking ffmpeg's parser
+	// because ' is escaped by escapeFilterPath and the rest are filename-
+	// legal inside a single-quoted filename= argument.
+	src := "/media/Movies/Pirates of the Caribbean: At World's End (2007)/Pirates {tmdb-285} [Hybrid][Remux-2160p][HDR][AV1].mkv"
+	expectedSub := "/media/Movies/Pirates of the Caribbean: At World's End (2007)/Pirates {tmdb-285} [Hybrid][Remux-2160p][HDR][AV1].en.srt"
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-i", src,
+		"-map_inlineass", "0:3",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1];[1]inlineass=language=en:font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+		"-crf:0", "16",
+	}
+	fsMock := func(p string) bool { return p == expectedSub }
+	out := Rewrite(args, nil, &RewriteOpts{FSExists: fsMock})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "filter:overlay-vaapi") {
+		t.Fatalf("expected overlay-vaapi: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "sidecar:"+expectedSub) {
+		t.Fatalf("sidecar change missing: %v", out.Changes)
+	}
+	idx := findFilterComplex(out.Args, "[0:0]")
+	f := out.Args[idx]
+	// `:` must be backslash-escaped inside subtitles=filename='...'
+	// so the filter-graph parser doesn't split on it; `'` likewise.
+	if !strings.Contains(f, `subtitles=filename='/media/Movies/Pirates of the Caribbean\:`) {
+		t.Errorf("`:` in path not escaped:\n%s", f)
+	}
+	if !strings.Contains(f, `World\'s End`) {
+		t.Errorf("`'` in path not escaped:\n%s", f)
+	}
+}
+
 func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
 	enableRewriter(t)
 	args := []string{
@@ -432,21 +485,48 @@ func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
 	}
 }
 
-func TestRewriter_Bail_HDR(t *testing.T) {
+// HDR PMS-shape filter — synthetic mirror of Plex's SW HDR→SDR chain.
+// Real captures may differ in label numbering and filter args; the
+// matcher is intentionally flexible (zscale + tonemap + final nv12 label).
+func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
 	enableRewriter(t)
 	args := []string{
-		"-codec:0", "libdav1d", "-i", "m.mkv",
-		"-init_hw_device", "vaapi=vaapi:",
-		"-filter_complex", "[0:0]zscale=t=linear,tonemap=hable[0]",
-		"-map", "[0]", "-codec:0", "libx264",
+		"-codec:0", "libdav1d",
+		"-i", "/media/m.mkv",
+		"-filter_complex",
+		"[0:0]scale=w=1920:h=1080:force_divisible_by=4[0];" +
+			"[0]zscale=t=linear:npl=100[1];" +
+			"[1]format=gbrpf32le[2];" +
+			"[2]zscale=primaries=bt709[3];" +
+			"[3]tonemap=tonemap=hable:desat=0[4];" +
+			"[4]zscale=t=bt709:m=bt709:r=tv[5];" +
+			"[5]format=pix_fmts=yuv420p|nv12[6]",
+		"-map", "[6]",
+		"-codec:0", "libx264",
+		"-crf:0", "16",
+		"-preset:0", "veryfast",
 	}
 	out := Rewrite(args, nil, nil)
-	if out.Applied {
-		t.Fatal("should bail")
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "skip:hdr-tonemap") {
-		t.Fatalf("changes=%v", out.Changes)
+	if !containsString(out.Changes, "filter:hdr-tonemap-vaapi") {
+		t.Fatalf("missing hdr-tonemap-vaapi: %v", out.Changes)
 	}
+	idx := findFilterComplex(out.Args, "[0:0]")
+	want := "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=p010,tonemap_vaapi=transfer=bt709:format=nv12[1];[1]hwupload[2]"
+	if out.Args[idx] != want {
+		t.Fatalf("filter=%q\nwant   %q", out.Args[idx], want)
+	}
+	for i := idx + 1; i < len(out.Args); i++ {
+		if out.Args[i] == "-map" {
+			if out.Args[i+1] != "[2]" {
+				t.Fatalf("map=%q want [2]", out.Args[i+1])
+			}
+			return
+		}
+	}
+	t.Fatal("no -map found after filter")
 }
 
 func TestRewriter_Bail_UnknownDecoder(t *testing.T) {
