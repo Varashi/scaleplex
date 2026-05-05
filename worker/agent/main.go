@@ -434,8 +434,15 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		} else {
 			metricSessionsTotal.WithLabelValues("error").Inc()
 		}
+		// Log stderr tail so failures don't need manual replay to debug.
+		tail := stderrTail.String()
+		const maxTail = 1024
+		if len(tail) > maxTail {
+			tail = "..." + tail[len(tail)-maxTail:]
+		}
+		tail = strings.ReplaceAll(strings.ReplaceAll(tail, "\r", "\\r"), "\n", "\\n")
 		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: %v\n", waitErr)
-		log.Printf("session %s: ffmpeg exit: %v", req.SessionID, waitErr)
+		log.Printf("session %s: ffmpeg exit: %v stderr_tail=%s", req.SessionID, waitErr, tail)
 	} else {
 		metricSessionsTotal.WithLabelValues("success").Inc()
 		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: success\n")
