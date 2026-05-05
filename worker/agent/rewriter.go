@@ -163,20 +163,27 @@ func rewriteVideoFilter(filterStr, mediaPath string, fsExists func(string) bool,
 		sidecar := findSidecarSubtitle(mediaPath, lang, fsExists)
 
 		if sidecar != "" && overlayEnabled {
-			// jellyfin-ffmpeg's `subtitles=...:sub2video=1` renders subs
-			// to a transparent video stream (no per-frame canvas alloc),
-			// then hwupload + overlay_vaapi merges on the GPU. Main video
-			// stays in vaapi memory the whole way → no 4K hwdownload tax.
+			// hwdownload + libass + hwupload on jellyfin-ffmpeg.
+			// Bench 2026-05-05 (3× Arc A310): vs stock-ffmpeg same shape
+			// gained +25-50% per stream, mostly from jellyfin's tonemapx
+			// SIMD CPU tonemap and scale_vaapi=fast default.
+			//
+			// TODO(scaleplex): sub2video=1 + hwmap zero-copy chain to
+			// skip the 12 MB nv12 main-stream hwdownload. Needs a
+			// `[0:v]split=2[main_in][timing]; [timing]hwmap=mode=read...`
+			// wiring; first attempt failed because subtitles=...:sub2video=1
+			// requires an unlabeled video input pad for timing.
 			subPath := escapeFilterPath(sidecar)
 			fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];"+
-						"[10]scale_vaapi=w=%s:h=%s:format=nv12[main];"+
-						"subtitles=filename='%s':fontsdir=%s:sub2video=1:original_size=%sx%s,"+
-						"format=bgra,hwupload=extra_hw_frames=64[sub];"+
-						"[main][sub]overlay_vaapi=eof_action=pass:repeatlast=0[15]",
-					w, h, subPath, fontsDir, w, h),
+						"[10]scale_vaapi=w=%s:h=%s:format=nv12[11];"+
+						"[11]hwdownload[12];"+
+						"[12]format=pix_fmts=nv12[13];"+
+						"[13]subtitles=filename='%s':fontsdir=%s[14];"+
+						"[14]hwupload[15]",
+					w, h, subPath, fontsDir),
 				OldLabel: "[2]",
 				NewLabel: "[15]",
 				Mode:     "overlay-vaapi",
