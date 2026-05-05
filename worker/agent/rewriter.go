@@ -1,0 +1,398 @@
+package main
+
+// argRewriter — rewrite Plex SW transcode argv into a stock-ffmpeg VAAPI
+// invocation. Ported from clusterplex/orchestrator/argRewriter.js. The Go
+// port runs on the worker (where /media is locally mounted) instead of on
+// the orchestrator, so sidecar SRT/ASS lookups happen here.
+//
+// Conservative: only rewrites a known argv shape. Anything unfamiliar is
+// returned untouched with applied=false. The caller decides whether to
+// spawn ffmpeg with the rewritten or the original arg list.
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+type RewriteResult struct {
+	Args    []string
+	Env     map[string]string
+	Applied bool
+	Changes []string
+}
+
+// RewriteOpts is for testability; production callers pass nil.
+type RewriteOpts struct {
+	FSExists func(string) bool
+}
+
+var decoderMap = map[string]string{
+	"libdav1d": "av1",
+	"libhevc":  "hevc",
+	"libx264":  "h264",
+}
+
+func encoderMap(preferHEVC bool) map[string]string {
+	if preferHEVC {
+		return map[string]string{"libx264": "hevc_vaapi", "libx265": "hevc_vaapi"}
+	}
+	return map[string]string{"libx264": "h264_vaapi", "libx265": "hevc_vaapi"}
+}
+
+var (
+	reFilterAss = regexp.MustCompile(
+		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
+			`\[0\]format=pix_fmts=[^\[]*nv12\[1\];` +
+			`\[1\]inlineass=([^\[]*)\[2\]$`)
+	reFilterPlain = regexp.MustCompile(
+		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
+			`\[0\]format=pix_fmts=[^\[]*nv12\[1\]$`)
+	reLanguage = regexp.MustCompile(`(?:^|:)language=([a-zA-Z]{2,3})`)
+	reInitHW   = regexp.MustCompile(`^vaapi=vaapi:?$`)
+)
+
+func envBool(k string) bool { return os.Getenv(k) == "true" }
+
+func envOr(k, dflt string) string {
+	if v, ok := os.LookupEnv(k); ok && v != "" {
+		return v
+	}
+	return dflt
+}
+
+func indexOfArg(args []string, key string, from int) int {
+	for i := from; i < len(args); i++ {
+		if args[i] == key {
+			return i
+		}
+	}
+	return -1
+}
+
+// findSidecarSubtitle probes the source media's directory for a sibling
+// SRT/ASS subtitle file. Probe order:
+//   <base>.<lang>.srt, <base>.<lang>.ass, <base>.srt, <base>.ass
+func findSidecarSubtitle(mediaPath, lang string, fsExists func(string) bool) string {
+	if mediaPath == "" {
+		return ""
+	}
+	dir := filepath.Dir(mediaPath)
+	ext := filepath.Ext(mediaPath)
+	base := strings.TrimSuffix(filepath.Base(mediaPath), ext)
+	var cands []string
+	if lang != "" {
+		cands = append(cands,
+			filepath.Join(dir, base+"."+lang+".srt"),
+			filepath.Join(dir, base+"."+lang+".ass"),
+		)
+	}
+	cands = append(cands,
+		filepath.Join(dir, base+".srt"),
+		filepath.Join(dir, base+".ass"),
+	)
+	for _, c := range cands {
+		if fsExists(c) {
+			return c
+		}
+	}
+	return ""
+}
+
+func escapeFilterPath(p string) string {
+	p = strings.ReplaceAll(p, `\`, `\\`)
+	p = strings.ReplaceAll(p, `:`, `\:`)
+	p = strings.ReplaceAll(p, `'`, `\'`)
+	return p
+}
+
+type filterRewrite struct {
+	Filter   string
+	OldLabel string
+	NewLabel string
+	Mode     string
+	Sidecar  string
+}
+
+func rewriteVideoFilter(filterStr, mediaPath string, fsExists func(string) bool, overlayEnabled bool) *filterRewrite {
+	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
+		w, h, assParams := m[1], m[2], m[3]
+		var lang string
+		if lm := reLanguage.FindStringSubmatch(assParams); lm != nil {
+			lang = strings.ToLower(lm[1])
+		}
+		sidecar := findSidecarSubtitle(mediaPath, lang, fsExists)
+
+		if sidecar != "" && overlayEnabled {
+			subPath := escapeFilterPath(sidecar)
+			fontsDir := envOr("HW_FONTS_DIR", "/usr/lib/plexmediaserver/Resources/Fonts")
+			return &filterRewrite{
+				Filter: fmt.Sprintf(
+					"[0:0]hwupload[10];[10]scale_vaapi=w=%s:h=%s:format=nv12[main];"+
+						"color=c=black@0.0:s=%sx%s:r=24/1,"+
+						"subtitles=filename='%s':fontsdir=%s:alpha=1,"+
+						"format=bgra[sub_cpu];"+
+						"[sub_cpu]hwupload=extra_hw_frames=64[sub_hw];"+
+						"[main][sub_hw]overlay_vaapi=eof_action=pass:repeatlast=0[15]",
+					w, h, w, h, subPath, fontsDir),
+				OldLabel: "[2]",
+				NewLabel: "[15]",
+				Mode:     "overlay-vaapi",
+				Sidecar:  sidecar,
+			}
+		}
+
+		return &filterRewrite{
+			Filter: fmt.Sprintf(
+				"[0:0]hwupload[10];[10]scale_vaapi=w=%s:h=%s:format=nv12[11];"+
+					"[11]hwdownload[12];[12]format=pix_fmts=nv12[13];"+
+					"[13]inlineass=%s[14];[14]hwupload[15]",
+				w, h, assParams),
+			OldLabel: "[2]",
+			NewLabel: "[15]",
+			Mode:     "hybrid-inlineass",
+		}
+	}
+
+	if m := reFilterPlain.FindStringSubmatch(filterStr); m != nil {
+		w, h := m[1], m[2]
+		return &filterRewrite{
+			Filter: fmt.Sprintf(
+				"[0:0]hwupload[0];[0]scale_vaapi=w=%s:h=%s:format=nv12[1];[1]hwupload[2]",
+				w, h),
+			OldLabel: "[1]",
+			NewLabel: "[2]",
+			Mode:     "plain",
+		}
+	}
+	return nil
+}
+
+func cloneArgs(in []string) []string {
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneEnv(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// spliceArgs inserts `ins` at position `at` and returns the new slice.
+func spliceArgs(s []string, at int, ins ...string) []string {
+	out := make([]string, 0, len(s)+len(ins))
+	out = append(out, s[:at]...)
+	out = append(out, ins...)
+	out = append(out, s[at:]...)
+	return out
+}
+
+// removeArgs removes `n` items starting at `at`.
+func removeArgs(s []string, at, n int) []string {
+	out := make([]string, 0, len(s)-n)
+	out = append(out, s[:at]...)
+	out = append(out, s[at+n:]...)
+	return out
+}
+
+func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) RewriteResult {
+	fsExists := func(p string) bool { _, err := os.Stat(p); return err == nil }
+	if opts != nil && opts.FSExists != nil {
+		fsExists = opts.FSExists
+	}
+
+	enabled := envBool("HW_ARG_REWRITE_ENABLED")
+	preferHEVC := envBool("HW_PREFER_HEVC")
+	overlayEnabled := envBool("HW_OVERLAY_VAAPI_ENABLED")
+	renderDevice := envOr("HW_RENDER_DEVICE", "/dev/dri/renderD128")
+	vaapiDriver := envOr("HW_VAAPI_DRIVER", "iHD")
+	libvaDriversPath := envOr("HW_LIBVA_DRIVERS_PATH",
+		"/config/Library/Application Support/Plex Media Server/Cache/va-dri-linux-x86_64")
+
+	changes := []string{}
+	bail := func(reason string) RewriteResult {
+		return RewriteResult{
+			Args:    cloneArgs(inputArgs),
+			Env:     cloneEnv(inputEnv),
+			Applied: false,
+			Changes: append(changes, "skip:"+reason),
+		}
+	}
+
+	if !enabled {
+		return bail("rewriter-disabled")
+	}
+
+	args := cloneArgs(inputArgs)
+	env := cloneEnv(inputEnv)
+
+	for i := 0; i < len(args); i++ {
+		if args[i] != "-filter_complex" {
+			continue
+		}
+		f := ""
+		if i+1 < len(args) {
+			f = args[i+1]
+		}
+		if strings.Contains(f, "subtitles=") {
+			return bail("subtitles-burn-in")
+		}
+		if strings.Contains(f, "zscale") || strings.Contains(f, "tonemap") {
+			return bail("hdr-tonemap")
+		}
+	}
+
+	inputIdx := indexOfArg(args, "-i", 0)
+	if inputIdx < 0 {
+		return bail("no-input")
+	}
+
+	// 1. Decoder swap (FIRST -codec:0 must precede -i)
+	decCodecIdx := indexOfArg(args, "-codec:0", 0)
+	if decCodecIdx < 0 || decCodecIdx >= inputIdx {
+		return bail("no-decoder")
+	}
+	swDecoder := args[decCodecIdx+1]
+	hwDecoder, ok := decoderMap[swDecoder]
+	if !ok {
+		return bail("unknown-decoder:" + swDecoder)
+	}
+	args[decCodecIdx+1] = hwDecoder
+	args = spliceArgs(args, decCodecIdx+2,
+		"-hwaccel:0", "vaapi",
+		"-hwaccel_output_format:0", "vaapi",
+		"-hwaccel_device:0", "vaapi",
+	)
+	changes = append(changes, "decode:"+swDecoder+"->"+hwDecoder)
+
+	// 2. -init_hw_device patch or inject
+	initIdx := indexOfArg(args, "-init_hw_device", 0)
+	if initIdx >= 0 {
+		if !reInitHW.MatchString(args[initIdx+1]) {
+			return bail("init_hw_device-pattern:" + args[initIdx+1])
+		}
+		args[initIdx+1] = "vaapi=vaapi:" + renderDevice + ",driver=" + vaapiDriver
+		if indexOfArg(args, "-filter_hw_device", 0) < 0 {
+			args = spliceArgs(args, initIdx+2, "-filter_hw_device", "vaapi")
+			changes = append(changes, "inject:filter_hw_device")
+		}
+		changes = append(changes, "init_hw_device")
+	} else {
+		newInputIdx := indexOfArg(args, "-i", 0)
+		injectAt := newInputIdx + 2
+		args = spliceArgs(args, injectAt,
+			"-init_hw_device", "vaapi=vaapi:"+renderDevice+",driver="+vaapiDriver,
+			"-filter_hw_device", "vaapi",
+		)
+		changes = append(changes, "inject:init_hw_device+filter_hw_device")
+	}
+
+	// 3. Video -filter_complex rewrite
+	vfIdx := -1
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-filter_complex" && i+1 < len(args) && strings.HasPrefix(args[i+1], "[0:0]") {
+			vfIdx = i + 1
+			break
+		}
+	}
+	if vfIdx < 0 {
+		return bail("no-video-filter")
+	}
+	mediaPath := ""
+	if i := indexOfArg(args, "-i", 0); i >= 0 && i+1 < len(args) {
+		mediaPath = args[i+1]
+	}
+	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, fsExists, overlayEnabled)
+	if rewritten == nil {
+		return bail("filter-pattern:" + args[vfIdx])
+	}
+	args[vfIdx] = rewritten.Filter
+	changes = append(changes, "filter:"+rewritten.Mode)
+
+	// 4. Update -map output label following the video filter
+	for i := vfIdx + 1; i < len(args); i++ {
+		if args[i] != "-map" {
+			continue
+		}
+		v := args[i+1]
+		if v == rewritten.OldLabel || v == `"`+rewritten.OldLabel+`"` {
+			if strings.HasPrefix(v, `"`) {
+				args[i+1] = `"` + rewritten.NewLabel + `"`
+			} else {
+				args[i+1] = rewritten.NewLabel
+			}
+			changes = append(changes, "map-label-update")
+			break
+		}
+	}
+
+	if rewritten.Mode == "overlay-vaapi" {
+		if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
+			args = removeArgs(args, miaIdx, 2)
+			changes = append(changes, "drop:-map_inlineass")
+		}
+		env["FONTCONFIG_FILE"] = envOr("HW_FONTCONFIG_FILE",
+			"/usr/lib/plexmediaserver/Resources/fonts.conf")
+		env["FONTCONFIG_PATH"] = envOr("HW_FONTCONFIG_PATH",
+			"/usr/lib/plexmediaserver/Resources")
+		changes = append(changes, "sidecar:"+rewritten.Sidecar)
+	}
+
+	// 5. Encoder swap (next -codec:0 after -i)
+	newInputIdx := indexOfArg(args, "-i", 0)
+	encCodecIdx := indexOfArg(args, "-codec:0", newInputIdx+1)
+	if encCodecIdx < 0 {
+		return bail("no-encoder")
+	}
+	swEncoder := args[encCodecIdx+1]
+	hwEncoder, ok := encoderMap(preferHEVC)[swEncoder]
+	if !ok {
+		return bail("unknown-encoder:" + swEncoder)
+	}
+	args[encCodecIdx+1] = hwEncoder
+	changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
+
+	// 6. -crf:0 → -qp:0
+	if crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1); crfIdx >= 0 {
+		args[crfIdx] = "-qp:0"
+		changes = append(changes, "crf->qp")
+	}
+
+	// 7. Drop SW-encoder-specific flags
+	for _, flag := range []string{"-preset:0", "-x264opts:0", "-x265-params:0"} {
+		if i := indexOfArg(args, flag, encCodecIdx+1); i >= 0 {
+			args = removeArgs(args, i, 2)
+			changes = append(changes, "drop:"+flag)
+		}
+	}
+
+	// 8. -sei:0 -a53_cc before -force_key_frames:0
+	if indexOfArg(args, "-sei:0", 0) < 0 {
+		if fkfIdx := indexOfArg(args, "-force_key_frames:0", encCodecIdx+1); fkfIdx >= 0 {
+			args = spliceArgs(args, fkfIdx, "-sei:0", "-a53_cc")
+			changes = append(changes, "inject:sei+a53_cc")
+		}
+	}
+
+	// 9. VAAPI driver discovery env
+	env["LIBVA_DRIVERS_PATH"] = libvaDriversPath
+	env["LIBVA_DRIVER_NAME"] = vaapiDriver
+	changes = append(changes, "env:LIBVA")
+
+	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes}
+}
+
+func containsString(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
