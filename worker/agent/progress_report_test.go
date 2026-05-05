@@ -227,6 +227,46 @@ func TestExtractOutputStreams(t *testing.T) {
 	}
 }
 
+// rc.URL ends with `?X-Plex-Token=…` in production. The streamDetail
+// PUT must append /streamDetail to the PATH, not after the query
+// string, AND the token must survive — otherwise PMS 401s.
+func TestSendPrelude_TokenPreserved(t *testing.T) {
+	srv, reqs, mu := newCaptureServer(t)
+	defer srv.Close()
+
+	rc := reportContext{
+		URL:       srv.URL + "/sess/uuid/progress?X-Plex-Token=secret",
+		SessionID: "test",
+		DurationS: 100,
+		Streams:   []outputStream{{Index: 0, Codec: "h264", Type: "video", Width: 1280, Height: 720}},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sendPrelude(ctx, &http.Client{Timeout: 2 * time.Second}, rc)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*reqs) == 0 {
+		t.Fatal("no PUTs captured")
+	}
+	for _, r := range *reqs {
+		if r.query.Get("X-Plex-Token") != "secret" {
+			t.Errorf("PUT %s lost token; query=%v", r.path, r.query)
+		}
+	}
+	// streamDetail must be at /sess/uuid/progress/streamDetail, not
+	// jammed inside the query string.
+	sawStreamDetail := false
+	for _, r := range *reqs {
+		if strings.HasSuffix(r.path, "/progress/streamDetail") {
+			sawStreamDetail = true
+		}
+	}
+	if !sawStreamDetail {
+		t.Errorf("streamDetail PUT missing from %v", *reqs)
+	}
+}
+
 func TestExtractInputPath(t *testing.T) {
 	args := []string{"-x", "y", "-i", "/m.mkv", "-c", "copy"}
 	if got := extractInputPath(args); got != "/m.mkv" {
