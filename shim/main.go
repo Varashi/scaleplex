@@ -278,6 +278,11 @@ func sanitize(s string) string {
 // collectEnv copies the calling process's environment into the task
 // envelope. The worker uses these to spawn ffmpeg with PMS-equivalent
 // state (LIBVA_*, FONTCONFIG_*, plex-specific paths, etc).
+//
+// Adds SCALEPLEX_PMS_BASE_URL — a worker-reachable address for this
+// PMS pod — so the rewriter can substitute Plex's hardcoded
+// 127.0.0.1:32400 in -progressurl. Without this, PMS holds segment
+// HTTP requests open for ~120s waiting on progress reports.
 func collectEnv() map[string]string {
 	out := make(map[string]string)
 	for _, kv := range os.Environ() {
@@ -286,6 +291,20 @@ func collectEnv() map[string]string {
 			continue
 		}
 		out[kv[:eq]] = kv[eq+1:]
+	}
+	// PMS_SERVICE is set by the lsio plex helmrelease (clusterplex
+	// already sets it to clusterplex-pms.clusterplex.svc); fall back
+	// to localhost which is correct for non-cluster setups.
+	if _, has := out["SCALEPLEX_PMS_BASE_URL"]; !has {
+		host := out["PMS_SERVICE"]
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		port := out["PMS_PORT"]
+		if port == "" {
+			port = "32400"
+		}
+		out["SCALEPLEX_PMS_BASE_URL"] = "http://" + host + ":" + port
 	}
 	return out
 }
