@@ -163,17 +163,24 @@ func rewriteVideoFilter(filterStr, mediaPath string, fsExists func(string) bool,
 		sidecar := findSidecarSubtitle(mediaPath, lang, fsExists)
 
 		if sidecar != "" && overlayEnabled {
+			// hwdownload + libass + hwupload — bench 2026-05-05 on 3× Arc
+			// A310 found this shape +40-75% over the canvas/overlay_vaapi
+			// chain at 4K (CPU canvas + 32 MB BGRA hwupload was the wall).
+			// At 1080p the two are within ±10%; we always use this shape
+			// for simplicity. ffmpeg dispatches subtitles= timestamps off
+			// each video frame, so passing through libass on a CPU nv12
+			// frame is cheap.
 			subPath := escapeFilterPath(sidecar)
 			fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
-					"[0:0]hwupload[10];[10]scale_vaapi=w=%s:h=%s:format=nv12[main];"+
-						"color=c=black@0.0:s=%sx%s:r=24/1,"+
-						"subtitles=filename='%s':fontsdir=%s:alpha=1,"+
-						"format=bgra[sub_cpu];"+
-						"[sub_cpu]hwupload=extra_hw_frames=64[sub_hw];"+
-						"[main][sub_hw]overlay_vaapi=eof_action=pass:repeatlast=0[15]",
-					w, h, w, h, subPath, fontsDir),
+					"[0:0]hwupload[10];"+
+						"[10]scale_vaapi=w=%s:h=%s:format=nv12[11];"+
+						"[11]hwdownload[12];"+
+						"[12]format=pix_fmts=nv12[13];"+
+						"[13]subtitles=filename='%s':fontsdir=%s[14];"+
+						"[14]hwupload[15]",
+					w, h, subPath, fontsDir),
 				OldLabel: "[2]",
 				NewLabel: "[15]",
 				Mode:     "overlay-vaapi",
