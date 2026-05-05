@@ -3,6 +3,26 @@
 **Goal:** play within **2-3 seconds** of click on LAN clients. Stretch
 target: <1.5s for sessions where the worker is warm.
 
+**Companion goal — fast pod startup for every scaleplex pod.** Worker,
+orchestrator, and shim images all aim for a 2-second `Pending → Ready`
+budget on a node that has the image cached. Levers used everywhere:
+
+- **All deps baked into the image.** No initContainer downloads (the
+  clusterplex iHD-driver init container was a 3-8s startup tax we will not
+  reintroduce). This includes ffmpeg, iHD VAAPI driver, libass, fonts.
+- **Spegel mirrors images cluster-wide.** First pull on a node hits ghcr,
+  every subsequent pod pulls from a peer node — sub-second pulls cluster-
+  wide once one node has the layer.
+- **Tagged by digest / sha-XXX, never `:latest`.** Mutable tags + Spegel
+  is a footgun (see `feedback_spegel_stale_tag_digest_pin.md`).
+- **Liveness vs readiness split.** `/healthz` is up the moment HTTP binds;
+  pre-warm runs in the background and `/readyz` only flips green after it
+  finishes. The kubelet won't kill us mid-warm and Service endpoints don't
+  receive traffic until we're truly hot.
+- **Static Go binary, no CGO.** `scaleplex-agent` is `CGO_ENABLED=0` so
+  process startup is single-syscall ELF load, no glibc/musl version dance.
+- **`tini` as PID 1** to reap zombies cleanly without a full init system.
+
 ## Where latency comes from in the current clusterplex stack
 
 Measured during the 2026-05-05 sessions:

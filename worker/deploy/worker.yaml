@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scaleplex-worker
+  namespace: scaleplex
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scaleplex-worker
+  namespace: scaleplex
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: scaleplex-worker
+  ports:
+    - name: http
+      port: 3501
+      targetPort: 3501
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: scaleplex-worker
+  namespace: scaleplex
+  labels:
+    app.kubernetes.io/name: scaleplex-worker
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scaleplex-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scaleplex-worker
+    spec:
+      serviceAccountName: scaleplex-worker
+      # Phase-1 fast-startup posture:
+      # - Image baked with all deps (no init download).
+      # - Spegel pre-distributes the image cluster-wide; first pod on a node
+      #   pulls once, the rest hit Spegel.
+      # - Liveness probe is /healthz (returns 200 immediately).
+      # - Readiness probe is /readyz (flips after pre-warm finishes).
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        intel.feature.node.kubernetes.io/gpu: "true"
+      tolerations:
+        - key: intel.feature.node.kubernetes.io/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        supplementalGroups: [44, 568]
+      containers:
+        - name: agent
+          image: ghcr.io/varashi/scaleplex_worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3501
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+              gpu.intel.com/i915: 1
+            limits:
+              gpu.intel.com/i915: 1
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 2
+            failureThreshold: 60
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 1
+            failureThreshold: 30
