@@ -23,6 +23,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
       -o /out/scaleplex-agent ./...
 
 FROM ubuntu:24.04
+LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
+LABEL org.opencontainers.image.description="scaleplex worker — jellyfin-ffmpeg + Intel iHD VAAPI + Go agent"
+LABEL org.opencontainers.image.licenses=MIT
 
 # multiverse for intel-media-va-driver-non-free; jellyfin-ffmpeg expects
 # libva to come from the system (it doesn't bundle the VAAPI userspace).
