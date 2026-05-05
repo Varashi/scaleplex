@@ -369,6 +369,7 @@ type logForwarder struct {
 }
 
 func newLogForwarder(ctx context.Context, baseURL, sessionID string) *logForwarder {
+	log.Printf("session %s: log-forwarder armed url=%s", sessionID, baseURL)
 	return &logForwarder{
 		ctx:       ctx,
 		baseURL:   baseURL,
@@ -431,10 +432,15 @@ func (l *logForwarder) post(fullURL string) {
 	req.ContentLength = 0
 	resp, err := l.client.Do(req)
 	if err != nil {
+		// Log first few errors so we can tell if POSTs are reaching the relay.
+		log.Printf("session %s: log POST err: %v", l.sessionID, err)
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		log.Printf("session %s: log POST status=%d url=%s", l.sessionID, resp.StatusCode, fullURL)
+	}
 }
 
 // extractInputPath returns the value passed after the first -i flag.
