@@ -517,7 +517,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	//                              segment numbering at N; stock ffmpeg
 	//                              starts at 1, which is what Plex sends
 	//                              anyway in the cases we've seen
-	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-skip_to_segment"} {
+	//   -manifest_name <url>     — Plex DASH muxer extension that stores
+	//                              a full URL in the .mpd; stock ffmpeg
+	//                              writes the manifest at the output
+	//                              filename and PMS doesn't read the
+	//                              file anyway (it serves its own DASH
+	//                              manifest derived from segments-on-disk)
+	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-skip_to_segment", "-manifest_name"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
