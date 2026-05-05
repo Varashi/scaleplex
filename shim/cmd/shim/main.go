@@ -292,17 +292,21 @@ func collectEnv() map[string]string {
 		}
 		out[kv[:eq]] = kv[eq+1:]
 	}
-	// PMS_SERVICE is set by the lsio plex helmrelease (clusterplex
-	// already sets it to clusterplex-pms.clusterplex.svc); fall back
-	// to localhost which is correct for non-cluster setups.
+	// Workers can't POST to PMS's progress endpoint directly — Plex
+	// validates request origin somewhere in its session-handling stack
+	// and rejects non-loopback POSTs with 404, even from inside the
+	// pod. So we route through the local-relay sidecar (clusterplex
+	// uses an nginx proxy for the same reason) on LOCAL_RELAY_PORT,
+	// which listens on the PMS pod and proxies to 127.0.0.1:PMS_PORT.
+	// The upstream sees 127.0.0.1 and accepts.
 	if _, has := out["SCALEPLEX_PMS_BASE_URL"]; !has {
 		host := out["PMS_SERVICE"]
 		if host == "" {
 			host = "127.0.0.1"
 		}
-		port := out["PMS_PORT"]
+		port := out["LOCAL_RELAY_PORT"]
 		if port == "" {
-			port = "32400"
+			port = "32499"
 		}
 		out["SCALEPLEX_PMS_BASE_URL"] = "http://" + host + ":" + port
 	}
