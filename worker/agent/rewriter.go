@@ -509,7 +509,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	// Drop other Plex-Transcoder-only flags that stock ffmpeg rejects
 	// with "Unrecognized option". Add as-discovered.
-	for _, flag := range []string{"-loglevel_plex"} {
+	//   -loglevel_plex <level>  → custom Plex log verbosity
+	//   -progressurl <url>      → Plex's HTTP-POST-progress channel
+	//                             (stock ffmpeg uses -progress; PMS
+	//                             tracks segments via NFS writes
+	//                             instead, no need to forward)
+	for _, flag := range []string{"-loglevel_plex", "-progressurl"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
