@@ -449,7 +449,21 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 
 	streamDone := make(chan struct{}, 2)
 	go streamPrefixed(stdout, resp, "[stdout] ", streamDone, nil)
-	go streamPrefixed(stderr, resp, "[stderr] ", streamDone, stderrTail.Append)
+
+	// Build a stderr peek callback that fans out to:
+	//   1. stderrTail (ring buffer for the speed=Xx scrape on exit)
+	//   2. logForwarder, when we have a Plex progress URL — POSTs each
+	//      stderr line to <progressURL>/log so PMS sees a transcoder-
+	//      alive signal without needing real Plex Transcoder.
+	var stderrPeek func([]byte) = stderrTail.Append
+	if progressURL != "" {
+		fwd := newLogForwarder(ctx, progressURL, req.SessionID)
+		stderrPeek = func(p []byte) {
+			stderrTail.Append(p)
+			fwd.Append(p)
+		}
+	}
+	go streamPrefixed(stderr, resp, "[stderr] ", streamDone, stderrPeek)
 
 	progressDone := make(chan struct{}, 1)
 	if progressReader != nil {
