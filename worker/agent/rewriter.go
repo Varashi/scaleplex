@@ -592,15 +592,26 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// PMS sets `-loglevel quiet`, which silences errors too. Upgrade to
-	// `error` so a transcode failure actually leaves a stderr trail
-	// (worker captures and logs the tail; orchestrator streams it back
-	// to the shim → PMS log). Idempotent if already at error or above.
+	// PMS sets `-loglevel quiet`, which silences everything ffmpeg
+	// would normally write to stderr. PMS's JobRunner reads the
+	// child's stderr to detect transcoder readiness — without
+	// "Stream mapping:" / "[dash @ ...] Representation N init segment
+	// will be written to" lines, /header sits ~125s waiting for a
+	// signal it never gets. Upgrade to `info` so those lines emit;
+	// they ride the worker→orchestrator→shim stream back to PMS via
+	// the shim's stderr.
 	if i := indexOfArg(args, "-loglevel", 0); i >= 0 && i+1 < len(args) {
 		if args[i+1] == "quiet" || args[i+1] == "panic" || args[i+1] == "fatal" {
-			args[i+1] = "error"
-			changes = append(changes, "loglevel:->error")
+			args[i+1] = "info"
+			changes = append(changes, "loglevel:->info")
 		}
+	}
+	// Also drop -nostats so ffmpeg emits its periodic
+	// "size= time= bitrate= speed=" stderr line that PMS's
+	// transcoder-statistics parser hooks into.
+	if i := indexOfArg(args, "-nostats", 0); i >= 0 {
+		args = removeArgs(args, i, 1)
+		changes = append(changes, "drop:-nostats")
 	}
 
 	// 10. Strip env vars that point at Plex-Transcoder-only paths
