@@ -29,6 +29,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -258,6 +260,7 @@ func main() {
 	mux.HandleFunc("/workers", handleWorkers)
 	mux.HandleFunc("/task", handleTask)
 	mux.HandleFunc("/task/", handleTaskByID)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	log.Printf("scaleplex-orchestrator listening on %s, workers=%s:%d", listen, workersDNS, workerPort)
 	srv := &http.Server{Addr: listen, Handler: mux}
@@ -274,12 +277,17 @@ func discoveryLoop(dns string, port, refreshSec, probeSec int) {
 	probeTick := time.NewTicker(time.Duration(probeSec) * time.Second)
 	defer refreshTick.Stop()
 	defer probeTick.Stop()
+	updateWorkerMetrics()
 	for {
 		select {
 		case <-refreshTick.C:
 			pl.refresh(dns, port)
+			updateWorkerMetrics()
 		case <-probeTick.C:
 			pl.probeAll(probeClient)
+			// Probes run concurrently in goroutines; give them a moment
+			// to settle before we re-snapshot the pool for metrics.
+			time.AfterFunc(time.Duration(defaultProbeTimeoutSec+1)*time.Second, updateWorkerMetrics)
 		}
 	}
 }
@@ -378,11 +386,17 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		ok := proxyToWorker(w, r, wk.url, body, req.SessionID)
 		wk.dispatchEnd()
 		if ok {
+			metricDispatchAttempts.Observe(float64(len(tried)))
+			metricDispatchTotal.WithLabelValues("success").Inc()
 			return
 		}
-		// proxyToWorker returns false ONLY for cap-503 (worker says
-		// "try someone else"). All other errors finish the response on
-		// our side.
+		metricDispatchTotal.WithLabelValues("fallthrough_503").Inc()
+	}
+	if len(tried) == 0 {
+		metricDispatchTotal.WithLabelValues("no_workers").Inc()
+	} else {
+		metricDispatchTotal.WithLabelValues("all_at_cap").Inc()
+		metricDispatchAttempts.Observe(float64(len(tried)))
 	}
 	http.Error(w, "all workers at capacity", http.StatusServiceUnavailable)
 }
@@ -460,16 +474,19 @@ func handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	}
 	workerURL := sessions.get(id)
 	if workerURL == "" {
+		metricKillTotal.WithLabelValues("not_found").Inc()
 		http.Error(w, "no such session", http.StatusNotFound)
 		return
 	}
 	preq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, workerURL+"/task/"+id+"/kill", nil)
 	resp, err := proxyClient.Do(preq)
 	if err != nil {
+		metricKillTotal.WithLabelValues("error").Inc()
 		http.Error(w, "kill forward: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	metricKillTotal.WithLabelValues("success").Inc()
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }

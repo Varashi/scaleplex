@@ -22,7 +22,7 @@ func TestWatchFirstSegment_FiresOnFirstM4S(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		watchFirstSegment(ctx, dir, "test-session", lw)
+		watchFirstSegment(ctx, dir, "test-session", lw, time.Now())
 	}()
 
 	// Give the watcher a moment to add the inotify hook.
@@ -60,7 +60,7 @@ func TestWatchFirstSegment_IgnoresUninterestingExtensions(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		watchFirstSegment(ctx, dir, "test-session", lw)
+		watchFirstSegment(ctx, dir, "test-session", lw, time.Now())
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -80,7 +80,7 @@ func TestWatchFirstSegment_BailsOnEmptyDir(t *testing.T) {
 	defer cancel()
 	var buf bytes.Buffer
 	lw := newLockedWriter(&buf)
-	watchFirstSegment(ctx, "", "test-session", lw)
+	watchFirstSegment(ctx, "", "test-session", lw, time.Time{})
 	if buf.Len() != 0 {
 		t.Fatalf("expected nothing written, got: %q", buf.String())
 	}

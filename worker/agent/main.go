@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -120,6 +122,13 @@ func main() {
 	mux.HandleFunc("/capability", handleCapability)
 	mux.HandleFunc("/task", handleTask)
 	mux.HandleFunc("/task/", handleTaskByID)
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Initialise static gauges so they show up in the first scrape.
+	metricMaxSessions.Set(float64(maxSessions()))
+	if _, err := os.Stat(ffmpegBin); err == nil {
+		metricFFmpegOK.Set(1)
+	}
 
 	go prewarm()
 
@@ -161,7 +170,10 @@ func prewarm() {
 	t0 := time.Now()
 	defer func() {
 		atomic.StoreInt32(&ready, 1)
-		log.Printf("pre-warm complete in %s", time.Since(t0))
+		dur := time.Since(t0)
+		metricPrewarmSeconds.Set(dur.Seconds())
+		metricReady.Set(1)
+		log.Printf("pre-warm complete in %s", dur)
 	}()
 
 	for _, dev := range listRenderNodes() {
@@ -326,8 +338,17 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		if res.Applied {
 			finalArgs = res.Args
 			finalEnv = res.Env
+			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 		} else {
+			reason := "unknown"
+			for _, c := range res.Changes {
+				if strings.HasPrefix(c, "skip:") {
+					reason = c
+					break
+				}
+			}
+			metricRewriteApplied.WithLabelValues(reason).Inc()
 			log.Printf("session %s: rewriter NOT applied (%s) — running original args", req.SessionID, strings.Join(res.Changes, ","))
 		}
 		// Adaptive probesize runs whether the HW rewrite applied or not —
@@ -363,9 +384,15 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("session %s: spawned ffmpeg pid=%d", req.SessionID, cmd.Process.Pid)
+	spawnedAt := time.Now()
 
 	registry.register(req.SessionID, &runningTask{cmd: cmd, cancel: cancel})
-	defer registry.unregister(req.SessionID)
+	metricActiveSessions.Set(float64(registry.activeCount()))
+	defer func() {
+		registry.unregister(req.SessionID)
+		metricActiveSessions.Set(float64(registry.activeCount()))
+		metricSessionDurationSeconds.Observe(time.Since(spawnedAt).Seconds())
+	}()
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Scaleplex-Pid", fmt.Sprintf("%d", cmd.Process.Pid))
@@ -378,28 +405,67 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	// this lock — http.ResponseWriter.Write is not safe for concurrent use.
 	resp := newLockedWriter(w)
 
+	// Sliding window over stderr so we can pull the final speed=Xx value
+	// once ffmpeg exits. 8KB easily covers the last ~100 progress lines.
+	stderrTail := newRingBuffer(8192)
+
 	// Watch ffmpeg's output dir for the first segment file. If req.Cwd
 	// isn't set we skip the watcher silently; the orchestrator/shim sets
 	// cwd to the per-session transcode dir.
 	if req.Cwd != "" {
-		go watchFirstSegment(ctx, req.Cwd, req.SessionID, resp)
+		go watchFirstSegment(ctx, req.Cwd, req.SessionID, resp, spawnedAt)
 	}
 
 	streamDone := make(chan struct{}, 2)
-	go streamPrefixed(stdout, resp, "[stdout] ", streamDone)
-	go streamPrefixed(stderr, resp, "[stderr] ", streamDone)
+	go streamPrefixed(stdout, resp, "[stdout] ", streamDone, nil)
+	go streamPrefixed(stderr, resp, "[stderr] ", streamDone, stderrTail.Append)
 
 	waitErr := cmd.Wait()
 	<-streamDone
 	<-streamDone
 
+	recordSpeedFromOutput(stderrTail.String())
+
 	if waitErr != nil {
+		// Was it killed via context (registry.kill or client disconnect)
+		// vs ffmpeg crash? Distinguish for the metric.
+		if ctx.Err() != nil {
+			metricSessionsTotal.WithLabelValues("killed").Inc()
+		} else {
+			metricSessionsTotal.WithLabelValues("error").Inc()
+		}
 		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: %v\n", waitErr)
 		log.Printf("session %s: ffmpeg exit: %v", req.SessionID, waitErr)
 	} else {
+		metricSessionsTotal.WithLabelValues("success").Inc()
 		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: success\n")
 		log.Printf("session %s: ffmpeg ok", req.SessionID)
 	}
+}
+
+// ringBuffer keeps the last N bytes appended to it. Cheap thread-safe
+// sliding-window for stderr scrubbing.
+type ringBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func newRingBuffer(max int) *ringBuffer { return &ringBuffer{max: max} }
+
+func (r *ringBuffer) Append(p []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	if len(r.buf) > r.max {
+		r.buf = r.buf[len(r.buf)-r.max:]
+	}
+}
+
+func (r *ringBuffer) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return string(r.buf)
 }
 
 func handleTaskByID(w http.ResponseWriter, r *http.Request) {
@@ -428,13 +494,19 @@ func handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func streamPrefixed(rc io.ReadCloser, w *lockedWriter, prefix string, done chan<- struct{}) {
+// streamPrefixed copies pipe → response writer with a prefix per chunk.
+// The optional `peek` callback receives every raw chunk before prefixing
+// — used to scrub stderr for `speed=` and the like without re-reading.
+func streamPrefixed(rc io.ReadCloser, w *lockedWriter, prefix string, done chan<- struct{}, peek func([]byte)) {
 	defer rc.Close()
 	defer func() { done <- struct{}{} }()
 	buf := make([]byte, 4096)
 	for {
 		n, err := rc.Read(buf)
 		if n > 0 {
+			if peek != nil {
+				peek(buf[:n])
+			}
 			_, _ = w.writePrefixed(prefix, buf[:n])
 		}
 		if err != nil {

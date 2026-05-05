@@ -39,6 +39,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: scaleplex-orchestrator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3500"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: scaleplex-orchestrator
       terminationGracePeriodSeconds: 10
