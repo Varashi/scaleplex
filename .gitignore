@@ -11,3 +11,5 @@ target/
 # Go build artifacts
 worker/agent/agent
 worker/agent/scaleplex-agent
+orchestrator/orchestrator
+orchestrator/scaleplex-orchestrator
