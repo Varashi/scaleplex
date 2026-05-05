@@ -364,10 +364,13 @@ t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
 	for _, must := range []string{
-		"scale_vaapi=w=3840:h=2160:format=nv12[main]",
+		"[0:0]hwupload[10]",
+		"[10]scale_vaapi=w=3840:h=2160:format=nv12[11]",
+		"[11]hwdownload[12]",
+		"[12]format=pix_fmts=nv12[13]",
 		"subtitles=filename='/media/Movies/Superman (2025)/Superman (2025).en.srt'",
 		"fontsdir=/usr/share/fonts/truetype/dejavu",
-		"overlay_vaapi=eof_action=pass:repeatlast=0[15]",
+		"[14]hwupload[15]",
 	} {
 		if !strings.Contains(f, must) {
 			t.Errorf("filter missing %q\n%s", must, f)
@@ -434,8 +437,9 @@ t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
-	// `:` must be backslash-escaped inside subtitles=filename='...'
-	// so the filter-graph parser doesn't split on it; `'` likewise.
+	// hwdl shape: subtitles= sits in [13] →[14], inside single quotes.
+	// `:` and `'` in the path must be backslash-escaped so the filter-
+	// graph parser doesn't split on them.
 	if !strings.Contains(f, `subtitles=filename='/media/Movies/Pirates of the Caribbean\:`) {
 		t.Errorf("`:` in path not escaped:\n%s", f)
 	}
