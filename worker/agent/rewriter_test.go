@@ -365,12 +365,13 @@ t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 	f := out.Args[idx]
 	for _, must := range []string{
 		"[0:0]hwupload[10]",
-		"[10]scale_vaapi=w=3840:h=2160:format=nv12[11]",
-		"[11]hwdownload[12]",
-		"[12]format=pix_fmts=nv12[13]",
+		"[10]scale_vaapi=w=3840:h=2160:format=nv12[main]",
 		"subtitles=filename='/media/Movies/Superman (2025)/Superman (2025).en.srt'",
+		"sub2video=1",
+		"original_size=3840x2160",
 		"fontsdir=/usr/share/fonts/truetype/dejavu",
-		"[14]hwupload[15]",
+		"format=bgra,hwupload=extra_hw_frames=64[sub]",
+		"overlay_vaapi=eof_action=pass:repeatlast=0[15]",
 	} {
 		if !strings.Contains(f, must) {
 			t.Errorf("filter missing %q\n%s", must, f)
