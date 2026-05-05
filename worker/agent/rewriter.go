@@ -530,14 +530,16 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Translate `-progressurl <url>` → `-progress <url>`. Stock ffmpeg
-	// emits the same key=value progress payload to a destination URL
-	// (Plex Transcoder is an ffmpeg fork; the format matches), so PMS
-	// keeps tracking transcoder-vs-playback offset and Tautulli's
-	// "X seconds ahead" indicator stays accurate.
-	if i := indexOfArg(args, "-progressurl", 0); i >= 0 && i+1 < len(args) {
-		args[i] = "-progress"
-		changes = append(changes, "progressurl->progress")
+	// Plex's `-progressurl <url>` points at 127.0.0.1:32400 — PMS's
+	// own loopback. Worker can't reach it without an orchestrator-side
+	// proxy. For now: DROP the flag entirely. Cost: PMS loses the
+	// "transcoder N seconds ahead" telemetry; Plex still serves
+	// segments off NFS as the worker writes them.
+	// TODO: orchestrator-side progress proxy that rewrites 127.0.0.1
+	// to the PMS Service DNS and forwards POSTs.
+	if i := indexOfArg(args, "-progressurl", 0); i >= 0 {
+		args = removeArgs(args, i, 2)
+		changes = append(changes, "drop:-progressurl")
 	}
 
 	// PMS sets `-loglevel quiet`, which silences errors too. Upgrade to
