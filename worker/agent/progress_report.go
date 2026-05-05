@@ -89,6 +89,7 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 
 	httpClient := &http.Client{Timeout: 4 * time.Second}
 	block := map[string]string{}
+	first := true
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
@@ -100,6 +101,10 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 		}
 		block[k] = v
 		if k == "progress" {
+			if first {
+				first = false
+				log.Printf("session %s: first progress block out_time_us=%s total_size=%s speed=%s base_url=%s", rc.SessionID, block["out_time_us"], block["total_size"], block["speed"], rc.URL)
+			}
 			putProgressTick(ctx, httpClient, rc, block)
 			block = map[string]string{}
 		}
@@ -108,6 +113,7 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 		log.Printf("session %s: progress reporter scan: %v", rc.SessionID, err)
 	}
 }
+
 
 // putProgressTick translates one ffmpeg progress block into the
 // Plex-shaped query-string PUT.
@@ -168,7 +174,8 @@ func putProgressTick(ctx context.Context, c *http.Client, rc reportContext, blk 
 		q.Set("speed", "inf")
 	}
 
-	doPlexPUT(ctx, c, rc, "progress", joinQuery(rc.URL, q))
+	fullURL := joinQuery(rc.URL, q)
+	doPlexPUT(ctx, c, rc, "progress", fullURL)
 }
 
 // sendPrelude fires the one-time PUTs Plex Transcoder sends at startup:
