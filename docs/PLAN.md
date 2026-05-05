@@ -1,5 +1,13 @@
 # scaleplex implementation plan
 
+## Pod-startup budget (applies to every phase)
+
+Worker / orchestrator / shim pods aim for **≤2s `Pending → Ready` on a
+node with the image cached**. Rules: all deps baked into the image (no
+init download), digest-pinned tags, Spegel pre-distribution, liveness
+(`/healthz`) up immediately and readiness (`/readyz`) gated on pre-warm.
+See `docs/LATENCY.md` for rationale.
+
 ## Phase 1 — Worker image (3 days)
 
 Build `ghcr.io/varashi/scaleplex_worker:<tag>`:
