@@ -2,24 +2,41 @@ package main
 
 // progress_report — drives Plex's /progress endpoint from the worker.
 //
-// Plex Transcoder PUTs one discrete payload per progress tick. Stock
-// ffmpeg's `-progress <url>` does HTTP differently: a single chunked
-// PUT for the whole transcode, with key=value blocks streamed inside
-// the body. Plex's PUT handler reads the body to EOF before parsing,
-// so it never sees a "first" report and stalls /header for ~120s
-// (until the internal timeout). Workaround: ffmpeg writes its progress
-// stream to a pipe we own, this reporter reissues each completed block
-// as its own PUT. Block boundary = the `progress=continue|end` line
-// ffmpeg always emits at the end of every tick (default tick = 1s).
+// Reverse-engineered from Plex Transcoder.real (musl ffmpeg fork in the
+// PMS image, run offline against /sess/uuid/progress on a netcat sink
+// 2026-05-05). Plex's progress wire format is NOT the same as stock
+// ffmpeg's `-progress <http>` — Plex Transcoder PUTs query-string-only,
+// empty-body messages of four shapes:
+//
+//   PUT <base>/streamDetail?index=N&id=M&codec=X&type=video|audio
+//                          &profile=...&width=W&height=H&...   (per output stream)
+//   PUT <base>?duration=<sec.frac>                              (once at start)
+//   PUT <base>?width=W&height=H                                 (once after probe)
+//   PUT <base>?progress=<pct>&size=<bytes>&remaining=<sec>&speed=<x>
+//                                                              (every ~1s)
+//
+// PMS reads only the query string; the body is ignored. Without these
+// PUTs PMS's /header handler sits ~125s waiting for codec/duration
+// metadata before it falls back to disk-probing the init segment, which
+// is exactly the stall scaleplex showed pre-fix.
+//
+// Wiring: ffmpeg writes its native `-progress` stream to a pipe we
+// own; we parse it block-by-block and translate each block into a
+// query-string PUT in Plex shape.
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"net/url"
+	"os/exec"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -28,58 +45,246 @@ import (
 
 var metricProgressPUT = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "scaleplex_worker_progress_put_total",
-	Help: "Per-block PUTs to Plex's /progress endpoint, labelled by HTTP class or err.",
-}, []string{"result"}) // 2xx | 3xx | 4xx | 5xx | err
+	Help: "PUTs to Plex's /progress endpoint, labelled by kind and HTTP class.",
+}, []string{"kind", "result"}) // kind: progress|streamDetail|duration|dimensions ; result: 2xx|3xx|4xx|5xx|err
+
+// outputStream describes one of the output streams scaleplex needs to
+// register with PMS via a streamDetail PUT.
+type outputStream struct {
+	Index    int    // -map index in the output (0, 1, ...)
+	ID       int    // libavformat stream id; Plex Transcoder always sends 0
+	Codec    string // av1 | h264 | hevc | aac | eac3 | ...
+	Type     string // video | audio
+	Width    int    // video only
+	Height   int    // video only
+	FrameRate float64 // video only (e.g. 23.976)
+	Profile  string // video: Main | High | ...
+	Channels int    // audio only
+	Layout   string // audio only, e.g. "stereo"
+	SampleRate int  // audio only (Hz)
+	Language string // ISO-639 code or empty
+}
+
+// reportContext holds the per-session state the reporter needs.
+type reportContext struct {
+	URL        string
+	Streams    []outputStream
+	DurationS  float64 // total source duration in seconds (0 = unknown)
+	SessionID  string
+}
 
 // runProgressReporter consumes ffmpeg -progress output from r and PUTs
-// each completed block to url. Returns when r reaches EOF or ctx done.
-func runProgressReporter(ctx context.Context, r io.Reader, url, sessionID string) {
-	if url == "" {
+// each completed block to ctx.URL in Plex Transcoder format.
+//
+// Caller must have already issued the prelude PUTs (streamDetail+
+// duration+dimensions) via sendPrelude before this is called — ffmpeg's
+// -progress doesn't carry codec/duration info, so the prelude is the
+// only source.
+func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
+	if rc.URL == "" {
 		return
 	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 4096), 1<<20)
 
 	httpClient := &http.Client{Timeout: 4 * time.Second}
-	var blk bytes.Buffer
+	block := map[string]string{}
 	for sc.Scan() {
-		line := sc.Bytes()
-		blk.Write(line)
-		blk.WriteByte('\n')
-		if bytes.HasPrefix(line, []byte("progress=")) {
-			putProgress(ctx, httpClient, url, blk.Bytes(), sessionID)
-			blk.Reset()
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		block[k] = v
+		if k == "progress" {
+			putProgressTick(ctx, httpClient, rc, block)
+			block = map[string]string{}
 		}
 	}
 	if err := sc.Err(); err != nil && ctx.Err() == nil {
-		log.Printf("session %s: progress reporter scan: %v", sessionID, err)
+		log.Printf("session %s: progress reporter scan: %v", rc.SessionID, err)
 	}
 }
 
-func putProgress(ctx context.Context, c *http.Client, url string, body []byte, sessionID string) {
-	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(pctx, http.MethodPut, url, bytes.NewReader(body))
-	if err != nil {
-		metricProgressPUT.WithLabelValues("err").Inc()
+// putProgressTick translates one ffmpeg progress block into the
+// Plex-shaped query-string PUT.
+//
+//	progress = clamp(out_time / duration * 100, 0, 100)
+//	size     = total_size (bytes; ffmpeg may emit "N/A" → -1)
+//	remaining= (duration - out_time) / speed
+//	speed    = ffmpeg "<x>" minus the trailing "x"
+func putProgressTick(ctx context.Context, c *http.Client, rc reportContext, blk map[string]string) {
+	outUs, _ := strconv.ParseInt(blk["out_time_us"], 10, 64)
+	outS := float64(outUs) / 1e6
+
+	var pct float64
+	if rc.DurationS > 0 {
+		pct = outS / rc.DurationS * 100
+		if pct < 0 {
+			pct = 0
+		}
+		if pct > 100 {
+			pct = 100
+		}
+	}
+
+	size := int64(-1)
+	if v := blk["total_size"]; v != "" && v != "N/A" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			size = n
+		}
+	}
+
+	speedF := math.NaN()
+	if v := blk["speed"]; v != "" && v != "N/A" {
+		v = strings.TrimSuffix(strings.TrimSpace(v), "x")
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			speedF = n
+		}
+	}
+
+	remaining := -1.0
+	if rc.DurationS > 0 && !math.IsNaN(speedF) && speedF > 0 {
+		remaining = (rc.DurationS - outS) / speedF
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+
+	q := url.Values{}
+	q.Set("progress", fmt.Sprintf("%.1f", pct))
+	q.Set("size", strconv.FormatInt(size, 10))
+	if remaining >= 0 {
+		q.Set("remaining", fmt.Sprintf("%.0f", remaining))
+	} else {
+		q.Set("remaining", "-1")
+	}
+	if !math.IsNaN(speedF) {
+		q.Set("speed", strconv.FormatFloat(speedF, 'f', -1, 64))
+	} else {
+		q.Set("speed", "inf")
+	}
+
+	doPlexPUT(ctx, c, rc, "progress", joinQuery(rc.URL, q))
+}
+
+// sendPrelude fires the one-time PUTs Plex Transcoder sends at startup:
+// duration, then a streamDetail per output stream, then a dimensions
+// PUT for the (first) video stream. PMS uses these to fill in codec
+// metadata so /header can return the init segment without falling back
+// to disk-probing.
+//
+// All PUTs are best-effort — a failure here only delays /header by a
+// few hundred ms (PMS retries) and the periodic progress PUTs continue
+// regardless.
+func sendPrelude(ctx context.Context, c *http.Client, rc reportContext) {
+	if rc.URL == "" {
 		return
 	}
-	req.Header.Set("Content-Type", "text/plain")
-	req.ContentLength = int64(len(body))
+	if rc.DurationS > 0 {
+		q := url.Values{}
+		q.Set("duration", fmt.Sprintf("%.6f", rc.DurationS*1000))
+		doPlexPUT(ctx, c, rc, "duration", joinQuery(rc.URL, q))
+	}
+	var firstVideo *outputStream
+	for i := range rc.Streams {
+		s := rc.Streams[i]
+		q := url.Values{}
+		q.Set("index", strconv.Itoa(s.Index))
+		q.Set("id", strconv.Itoa(s.ID))
+		q.Set("codec", s.Codec)
+		q.Set("type", s.Type)
+		switch s.Type {
+		case "video":
+			if s.Profile != "" {
+				q.Set("profile", s.Profile)
+			}
+			if s.Width > 0 {
+				q.Set("width", strconv.Itoa(s.Width))
+			}
+			if s.Height > 0 {
+				q.Set("height", strconv.Itoa(s.Height))
+			}
+			q.Set("interlaced", "0")
+			if s.FrameRate > 0 {
+				q.Set("frameRate", strconv.FormatFloat(s.FrameRate, 'f', 3, 64))
+			}
+			q.Set("disp_default", "1")
+			if firstVideo == nil {
+				firstVideo = &rc.Streams[i]
+			}
+		case "audio":
+			if s.Language != "" {
+				q.Set("language", s.Language)
+			}
+			if s.Channels > 0 {
+				q.Set("channels", strconv.Itoa(s.Channels))
+			}
+			if s.Layout != "" {
+				q.Set("layout", s.Layout)
+			}
+			if s.SampleRate > 0 {
+				q.Set("sampleRate", strconv.Itoa(s.SampleRate))
+			}
+			q.Set("disp_default", "1")
+		}
+		doPlexPUT(ctx, c, rc, "streamDetail", joinQuery(rc.URL+"/streamDetail", q))
+	}
+	if firstVideo != nil && firstVideo.Width > 0 && firstVideo.Height > 0 {
+		q := url.Values{}
+		q.Set("width", strconv.Itoa(firstVideo.Width))
+		q.Set("height", strconv.Itoa(firstVideo.Height))
+		doPlexPUT(ctx, c, rc, "dimensions", joinQuery(rc.URL, q))
+	}
+}
+
+// joinQuery merges existing URL query string with extra params and
+// returns the full URL. Plex's progress URL already carries
+// X-Plex-Token in the query; we keep it.
+func joinQuery(rawURL string, extra url.Values) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL // best-effort; caller handles non-200
+	}
+	q := u.Query()
+	for k, v := range extra {
+		for _, vv := range v {
+			q.Add(k, vv)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func doPlexPUT(ctx context.Context, c *http.Client, rc reportContext, kind, fullURL string) {
+	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodPut, fullURL, http.NoBody)
+	if err != nil {
+		metricProgressPUT.WithLabelValues(kind, "err").Inc()
+		return
+	}
+	// Plex Transcoder sends Range: bytes=0-, no body. Mimic that so PMS
+	// path matching matches Plex Transcoder's wire frame exactly.
+	req.Header.Set("Range", "bytes=0-")
+	req.ContentLength = 0
 
 	resp, err := c.Do(req)
 	if err != nil {
-		metricProgressPUT.WithLabelValues("err").Inc()
+		metricProgressPUT.WithLabelValues(kind, "err").Inc()
 		if ctx.Err() == nil {
-			log.Printf("session %s: progress PUT: %v", sessionID, err)
+			log.Printf("session %s: progress PUT (%s): %v", rc.SessionID, kind, err)
 		}
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	metricProgressPUT.WithLabelValues(httpClass(resp.StatusCode)).Inc()
+	metricProgressPUT.WithLabelValues(kind, httpClass(resp.StatusCode)).Inc()
 	if resp.StatusCode >= 400 {
-		log.Printf("session %s: progress PUT status=%d", sessionID, resp.StatusCode)
+		log.Printf("session %s: progress PUT (%s) status=%d", rc.SessionID, kind, resp.StatusCode)
 	}
 }
 
@@ -102,4 +307,165 @@ func httpClass(code int) string {
 // extraIdx in cmd.ExtraFiles (0-based).
 func progressPipeArg(extraIdx int) []string {
 	return []string{"-progress", "pipe:" + strconv.Itoa(3+extraIdx)}
+}
+
+// extractInputPath returns the value passed after the first -i flag.
+// Empty if -i isn't present or has no value.
+func extractInputPath(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-i" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// probeDurationSeconds runs ffprobe against `path` and returns the
+// container duration in seconds. Returns 0 on any failure (caller
+// treats 0 as "unknown" and skips the duration PUT).
+//
+// Bound the probe at 2s so a slow NFS mount doesn't stall ffmpeg
+// startup; first-segment latency is the design goal.
+func probeDurationSeconds(ctx context.Context, path string) float64 {
+	if path == "" {
+		return 0
+	}
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(pctx, "/usr/bin/ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		path,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	v := strings.TrimSpace(string(out))
+	d, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// extractOutputStreams parses the rewritten ffmpeg argv to derive the
+// list of output streams Plex Transcoder normally registers via
+// streamDetail. Best-effort: anything missing is left zero/empty and
+// the prelude PUT skips it.
+//
+// Pattern observed in PMS-emitted argv:
+//
+//	-map [N]    -codec:0 h264_vaapi  ... -metadata:s:0 language=eng
+//	-map 0:1    -codec:1 aac         -b:1 256k          ...
+//
+// Width/height for video come from the rewritten filter_complex
+// `scale_vaapi=w=W:h=H` (or `scale=w=W:h=H` if HW rewrite skipped).
+func extractOutputStreams(args []string) []outputStream {
+	var out []outputStream
+	w, h := extractScaleWH(args)
+	for i := 0; i < len(args)-1; i++ {
+		if !strings.HasPrefix(args[i], "-codec:") {
+			continue
+		}
+		idxPart := strings.TrimPrefix(args[i], "-codec:")
+		idx, err := strconv.Atoi(idxPart)
+		if err != nil {
+			continue
+		}
+		// Skip the input-side -codec (just before -i). The rule is:
+		// if the first -i appears AFTER this -codec, this is an input
+		// codec hint, not an output encoder.
+		inputIdx := -1
+		for j := i + 1; j < len(args); j++ {
+			if args[j] == "-i" {
+				inputIdx = j
+				break
+			}
+		}
+		if inputIdx > i {
+			continue
+		}
+		// Don't double-register the same -map index (Plex sometimes
+		// repeats `-codec:1 X ... -codec:1 X`).
+		dup := false
+		for _, s := range out {
+			if s.Index == idx {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		codec := args[i+1]
+		typ := codecType(codec)
+		s := outputStream{Index: idx, ID: 0, Codec: codecPlexName(codec), Type: typ}
+		if typ == "video" {
+			s.Width = w
+			s.Height = h
+		}
+		if typ == "audio" {
+			s.Channels = 2
+			s.Layout = "stereo"
+			s.SampleRate = 48000
+		}
+		// language metadata
+		needle := "-metadata:s:" + strconv.Itoa(idx)
+		for j := 0; j < len(args)-1; j++ {
+			if args[j] == needle && strings.HasPrefix(args[j+1], "language=") {
+				s.Language = strings.TrimPrefix(args[j+1], "language=")
+				break
+			}
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+var reScaleWH = regexp.MustCompile(`scale(?:_vaapi)?=w=(\d+):h=(\d+)`)
+
+func extractScaleWH(args []string) (int, int) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-filter_complex" {
+			continue
+		}
+		if m := reScaleWH.FindStringSubmatch(args[i+1]); m != nil {
+			w, _ := strconv.Atoi(m[1])
+			h, _ := strconv.Atoi(m[2])
+			return w, h
+		}
+	}
+	return 0, 0
+}
+
+// codecType classifies an ffmpeg codec/encoder into Plex's video|audio
+// bucket. Anything unfamiliar returns "" so the caller can skip the
+// streamDetail PUT for it (subtitles, attachments, etc.).
+func codecType(codec string) string {
+	switch codec {
+	case "h264_vaapi", "hevc_vaapi", "h264_nvenc", "hevc_nvenc",
+		"libx264", "libx265", "av1", "h264", "hevc", "vp9":
+		return "video"
+	case "aac", "eac3", "ac3", "mp3", "opus", "flac", "libopus", "libvorbis":
+		return "audio"
+	}
+	return ""
+}
+
+// codecPlexName collapses ffmpeg's encoder names back into the codec
+// name Plex uses in streamDetail (`h264_vaapi` → `h264`, etc.).
+func codecPlexName(codec string) string {
+	switch codec {
+	case "h264_vaapi", "h264_nvenc", "libx264":
+		return "h264"
+	case "hevc_vaapi", "hevc_nvenc", "libx265":
+		return "hevc"
+	case "libopus":
+		return "opus"
+	case "libvorbis":
+		return "vorbis"
+	}
+	return codec
 }

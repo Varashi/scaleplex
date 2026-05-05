@@ -452,10 +452,24 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 
 	progressDone := make(chan struct{}, 1)
 	if progressReader != nil {
+		rc := reportContext{
+			URL:       progressURL,
+			SessionID: req.SessionID,
+			Streams:   extractOutputStreams(finalArgs),
+			DurationS: probeDurationSeconds(ctx, extractInputPath(finalArgs)),
+		}
+		// Fire the one-shot prelude PUTs (duration + streamDetail +
+		// dimensions) before starting the periodic reporter. PMS uses
+		// these to fill in codec metadata so /header can return without
+		// falling back to a 124s disk-probe.
+		go func() {
+			httpClient := &http.Client{Timeout: 4 * time.Second}
+			sendPrelude(ctx, httpClient, rc)
+		}()
 		go func() {
 			defer close(progressDone)
 			defer progressReader.Close()
-			runProgressReporter(ctx, progressReader, progressURL, req.SessionID)
+			runProgressReporter(ctx, progressReader, rc)
 		}()
 	} else {
 		close(progressDone)
