@@ -85,6 +85,34 @@ func main() {
 		cancel()
 	}()
 
+	// NFS attribute-cache buster. The transcode dir is on shared NFS;
+	// the worker pod writes files but PMS (this pod) holds a cached
+	// negative-lookup of init-stream0.m4s and chunk-stream0-*.m4s for
+	// up to acdirmax (60s) plus retry, ~125s total. PMS's /header
+	// handler does an Exists() check on the init segment and stalls
+	// the full timeout when the cache is stale. Re-stat the cwd every
+	// 200ms to force libnfs/kernel to fetch fresh dir attrs from the
+	// server. Stops when ctx is cancelled (i.e. transcoder exits).
+	if cwd != "" {
+		go func() {
+			t := time.NewTicker(200 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					f, err := os.Open(cwd)
+					if err != nil {
+						continue
+					}
+					_, _ = f.Readdirnames(-1)
+					f.Close()
+				}
+			}
+		}()
+	}
+
 	client := &http.Client{Timeout: timeout}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, orchestratorURL+"/task", bytes.NewReader(body))
 	if err != nil {
