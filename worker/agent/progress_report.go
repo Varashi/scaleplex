@@ -52,18 +52,19 @@ var metricProgressPUT = promauto.NewCounterVec(prometheus.CounterOpts{
 // outputStream describes one of the output streams scaleplex needs to
 // register with PMS via a streamDetail PUT.
 type outputStream struct {
-	Index    int    // -map index in the output (0, 1, ...)
-	ID       int    // libavformat stream id; Plex Transcoder always sends 0
-	Codec    string // av1 | h264 | hevc | aac | eac3 | ...
-	Type     string // video | audio
-	Width    int    // video only
-	Height   int    // video only
-	FrameRate float64 // video only (e.g. 23.976)
-	Profile  string // video: Main | High | ...
-	Channels int    // audio only
-	Layout   string // audio only, e.g. "stereo"
-	SampleRate int  // audio only (Hz)
-	Language string // ISO-639 code or empty
+	Index      int     // -map index (0, 1, ...)
+	ID         int     // Plex Transcoder always sends 0
+	Codec      string  // av1 | h264 | hevc | aac | eac3 | ... (SOURCE codec)
+	Type       string  // video | audio
+	Width      int     // video only
+	Height     int     // video only
+	FrameRate  float64 // video only (e.g. 23.976)
+	Profile    string  // video: Main | High | ...; audio: LC | HE-AAC | ...
+	Level      int     // video only — h264/hevc level; PT hardcodes 5 for h264
+	Channels   int     // audio only
+	Layout     string  // audio only, e.g. "stereo" / "5.1"
+	SampleRate int     // audio only (Hz)
+	Language   string  // ISO-639 code or empty
 }
 
 // reportContext holds the per-session state the reporter needs.
@@ -219,6 +220,9 @@ func sendPrelude(ctx context.Context, c *http.Client, rc reportContext) {
 				q.Set("height", strconv.Itoa(s.Height))
 			}
 			q.Set("interlaced", "0")
+			if s.Level > 0 {
+				q.Set("level", strconv.Itoa(s.Level))
+			}
 			if s.FrameRate > 0 {
 				q.Set("frameRate", strconv.FormatFloat(s.FrameRate, 'f', 3, 64))
 			}
@@ -227,6 +231,9 @@ func sendPrelude(ctx context.Context, c *http.Client, rc reportContext) {
 				firstVideo = &rc.Streams[i]
 			}
 		case "audio":
+			if s.Profile != "" {
+				q.Set("profile", s.Profile)
+			}
 			if s.Language != "" {
 				q.Set("language", s.Language)
 			}
@@ -251,6 +258,11 @@ func sendPrelude(ctx context.Context, c *http.Client, rc reportContext) {
 		streamQ.Set("id", strconv.Itoa(s.ID))
 		streamQ.Set("codec", s.Codec)
 		streamQ.Set("type", s.Type)
+		// Audio streams in Plex Transcoder also include `profile=LC`
+		// here. Match.
+		if s.Type == "audio" && s.Profile != "" {
+			streamQ.Set("profile", s.Profile)
+		}
 		doPlexPUT(ctx, c, rc, "stream", joinQueryWithSuffix(rc.URL, "/stream", streamQ))
 	}
 	if firstVideo != nil && firstVideo.Width > 0 && firstVideo.Height > 0 {
@@ -482,6 +494,91 @@ func probeDurationSeconds(ctx context.Context, path string) float64 {
 		return 0
 	}
 	return d
+}
+
+// probeInputStreams ffprobes the source file and returns one
+// outputStream entry per input stream Plex Transcoder would register
+// via /progress/streamDetail. Reverse-engineered against a real PT
+// run: the streamDetail's `codec`, `profile`, `width/height`,
+// `channels`, `layout`, `sampleRate`, `frameRate`, `level`, and
+// `language` all reflect the SOURCE stream, not the output encoder.
+//
+// Returns nil on any error; caller falls back to argv-derived fallback.
+func probeInputStreams(ctx context.Context, path string) []outputStream {
+	if path == "" {
+		return nil
+	}
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(pctx, "/usr/bin/ffprobe",
+		"-v", "error",
+		"-show_entries", "stream=index,codec_name,codec_type,profile,width,height,r_frame_rate,channels,channel_layout,sample_rate,level:stream_tags=language",
+		"-of", "default=noprint_wrappers=1",
+		path,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var streams []outputStream
+	cur := outputStream{}
+	finalize := func() {
+		if cur.Type == "video" || cur.Type == "audio" {
+			streams = append(streams, cur)
+		}
+		cur = outputStream{}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "index":
+			finalize()
+			n, _ := strconv.Atoi(v)
+			cur.Index = n
+		case "codec_name":
+			cur.Codec = v
+		case "codec_type":
+			cur.Type = v
+		case "profile":
+			if v != "N/A" && v != "unknown" {
+				cur.Profile = v
+			}
+		case "width":
+			n, _ := strconv.Atoi(v)
+			cur.Width = n
+		case "height":
+			n, _ := strconv.Atoi(v)
+			cur.Height = n
+		case "r_frame_rate":
+			// e.g. "24000/1001" → 23.976
+			if num, den, ok := strings.Cut(v, "/"); ok {
+				n, _ := strconv.ParseFloat(num, 64)
+				d, _ := strconv.ParseFloat(den, 64)
+				if d > 0 {
+					cur.FrameRate = n / d
+				}
+			}
+		case "channels":
+			n, _ := strconv.Atoi(v)
+			cur.Channels = n
+		case "channel_layout":
+			cur.Layout = v
+		case "sample_rate":
+			n, _ := strconv.Atoi(v)
+			cur.SampleRate = n
+		case "TAG:language":
+			cur.Language = v
+		}
+	}
+	finalize()
+	return streams
 }
 
 // extractOutputStreams parses the rewritten ffmpeg argv to derive the
