@@ -35,7 +35,8 @@ FROM alpine:3.20 AS layout
 RUN mkdir -p /mod/usr/lib/plexmediaserver \
              /mod/usr/local/bin \
              /mod/custom-cont-init.d \
-             /mod/custom-services.d
+             /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/dependencies.d \
+             /mod/etc/s6-overlay/s6-rc.d/user/contents.d
 COPY --from=build /out/scaleplex-shim  /mod/usr/lib/plexmediaserver/scaleplex-shim
 COPY --from=build /out/scaleplex-relay /mod/usr/local/bin/scaleplex-relay
 
@@ -62,15 +63,21 @@ cp "$SHIM_BIN" "$TARGET"
 echo "[scaleplex] Plex Transcoder → scaleplex-shim ($(stat -c %s "$TARGET") bytes)" >&2
 EOF
 
-# longrun service: the relay. /custom-services.d/<name> becomes an s6
-# longrun via lsio's docker-mods script. The file IS the run script.
-RUN cat > /mod/custom-services.d/scaleplex-relay <<'EOF'
-#!/usr/bin/with-contenv bash
+# s6-overlay v3 longrun for the relay. Direct install under
+# /etc/s6-overlay/s6-rc.d/ because lsio's process_custom_services()
+# (which would convert /custom-services.d/* into longruns) runs
+# BEFORE mods are extracted, so anything we drop in /custom-services.d
+# arrives too late.
+RUN cat > /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/run <<'EOF'
+#!/command/with-contenv bash
 exec /usr/local/bin/scaleplex-relay
 EOF
+RUN echo longrun > /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/type && \
+    touch    /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/dependencies.d/init-services && \
+    touch    /mod/etc/s6-overlay/s6-rc.d/user/contents.d/scaleplex-relay
 
 RUN chmod +x /mod/custom-cont-init.d/99-scaleplex-shim \
-             /mod/custom-services.d/scaleplex-relay
+             /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/run
 
 FROM scratch
 LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
