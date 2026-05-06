@@ -107,7 +107,7 @@ out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 		"encode:libx264->h264_vaapi",
 		// swArgsAV1H264 carries both -crf:0 and -maxrate:0 so we go
 		// through the VBR translation, not the legacy CQP one.
-		"rc:crf+maxrate->vbr",
+		"rc:crf+maxrate->vbr+rc_mode",
 		"preset:veryfast->compression_level:6",
 		"drop:-x264opts:0",
 		"inject:sei+a53_cc",
@@ -211,12 +211,24 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 	if out.Args[bvIdx+1] != "20000k" {
 		t.Errorf("-b:v=%q want 20000k (mirrors -maxrate)", out.Args[bvIdx+1])
 	}
-	mrIdx := indexOfArg(out.Args, "-maxrate:0", encIdx)
+	// Stream-specifier suffix stripped on rewrite — h264_vaapi's
+	// rc_mode auto-detection only inspects bare -maxrate / -bufsize.
+	if containsString(out.Args, "-maxrate:0") {
+		t.Error("rewrite must drop -maxrate:0 (use bare -maxrate so VAAPI sees it)")
+	}
+	mrIdx := indexOfArg(out.Args, "-maxrate", encIdx)
 	if mrIdx <= 0 {
-		t.Fatal("missing -maxrate:0")
+		t.Fatal("missing -maxrate")
 	}
 	if out.Args[mrIdx+1] != "20000k" {
-		t.Errorf("-maxrate:0=%q want 20000k (Plex's ceiling preserved)", out.Args[mrIdx+1])
+		t.Errorf("-maxrate=%q want 20000k (Plex's ceiling preserved)", out.Args[mrIdx+1])
+	}
+	rcIdx := indexOfArg(out.Args, "-rc_mode", encIdx)
+	if rcIdx <= 0 {
+		t.Fatal("missing -rc_mode (needed to defeat iHD CQP-default fallback)")
+	}
+	if out.Args[rcIdx+1] != "VBR" {
+		t.Errorf("-rc_mode=%q want VBR", out.Args[rcIdx+1])
 	}
 }
 

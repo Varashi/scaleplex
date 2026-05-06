@@ -559,15 +559,51 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// CQP at the requested quality is the most-faithful behaviour.
 	crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1)
 	maxrateIdx := indexOfArg(args, "-maxrate:0", encCodecIdx+1)
+	bufsizeIdx := indexOfArg(args, "-bufsize:0", encCodecIdx+1)
 	if crfIdx >= 0 && maxrateIdx >= 0 && maxrateIdx+1 < len(args) {
 		maxrate := args[maxrateIdx+1]
-		args = removeArgs(args, crfIdx, 2)
-		// indices shift — re-find maxrate
-		maxrateIdx = indexOfArg(args, "-maxrate:0", encCodecIdx+1)
-		// Inject -b:v <maxrate> right after the encoder so it lands in
-		// the encoder's context and rate control picks it up.
-		args = spliceArgs(args, encCodecIdx+2, "-b:v", maxrate)
-		changes = append(changes, "rc:crf+maxrate->vbr")
+		var bufsize string
+		if bufsizeIdx >= 0 && bufsizeIdx+1 < len(args) {
+			bufsize = args[bufsizeIdx+1]
+		}
+		// Strip Plex's `-crf:0`, `-maxrate:0`, and `-bufsize:0` (we're
+		// going to re-emit them without the stream specifier and with
+		// an explicit -rc_mode so VAAPI's auto-detection doesn't pick
+		// CQP). Order: highest index first so removals don't shift
+		// the lower indices.
+		toRemove := []int{}
+		if bufsizeIdx > 0 {
+			toRemove = append(toRemove, bufsizeIdx)
+		}
+		toRemove = append(toRemove, maxrateIdx, crfIdx)
+		// sort descending
+		for i := 0; i < len(toRemove); i++ {
+			for j := i + 1; j < len(toRemove); j++ {
+				if toRemove[i] < toRemove[j] {
+					toRemove[i], toRemove[j] = toRemove[j], toRemove[i]
+				}
+			}
+		}
+		for _, idx := range toRemove {
+			args = removeArgs(args, idx, 2)
+		}
+		// Re-emit rate-control flags with explicit -rc_mode VBR. iHD's
+		// auto rc_mode picks CQP when -qp is set, **and** silently
+		// falls back to CQP-like behaviour when only `-b:v` is set
+		// without explicit mode (observed 2026-05-06 on LG WebOS seek
+		// sessions: -b:v 20Mbps, segments still hit 13 MB/s = 100
+		// Mbps). With -rc_mode VBR + -b:v + -maxrate, the encoder
+		// honors the ceiling.
+		// Stream-specifier-less names so libavcodec's rc_mode
+		// auto-detection sees them on the encoder context (the :0
+		// suffix routes through a stream-mapping path that h264_vaapi
+		// doesn't always evaluate before it picks rc_mode).
+		inject := []string{"-rc_mode", "VBR", "-b:v", maxrate, "-maxrate", maxrate}
+		if bufsize != "" {
+			inject = append(inject, "-bufsize", bufsize)
+		}
+		args = spliceArgs(args, encCodecIdx+2, inject...)
+		changes = append(changes, "rc:crf+maxrate->vbr+rc_mode")
 	} else if crfIdx >= 0 {
 		args[crfIdx] = "-qp:0"
 		changes = append(changes, "crf->qp")
