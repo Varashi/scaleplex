@@ -740,23 +740,15 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	if containsString(out.Args, "-skip_to_segment") {
 		t.Fatal("-skip_to_segment must be stripped from argv")
 	}
-	// PTS flags must SURVIVE — they prime the AAC encoder.
-	for _, mustKeep := range []string{"-copyts", "-start_at_zero"} {
+	// On seek, -start_at_zero must be stripped so output PTS keeps the
+	// input position (<off>+) and tfdt lands on the global timeline.
+	// -copyts must survive (primes the AAC encoder).
+	if containsString(out.Args, "-start_at_zero") {
+		t.Errorf("must strip -start_at_zero on seek; argv=%v", out.Args)
+	}
+	for _, mustKeep := range []string{"-copyts", "-avoid_negative_ts"} {
 		if !containsString(out.Args, mustKeep) {
-			t.Errorf("must keep %s so audio encoder primes correctly", mustKeep)
-		}
-	}
-	// Must inject -output_ts_offset matching -ss so chunk tfdt lands on
-	// the global timeline (otherwise MSE places seek chunks at PTS=0
-	// and the player can't seek into them).
-	if !containsString(out.Args, "-output_ts_offset") {
-		t.Errorf("must inject -output_ts_offset on seek; argv=%v", out.Args)
-	}
-	for i, a := range out.Args {
-		if a == "-output_ts_offset" && i+1 < len(out.Args) {
-			if out.Args[i+1] != "1563" {
-				t.Errorf("output_ts_offset=%s want 1563", out.Args[i+1])
-			}
+			t.Errorf("must keep %s on seek", mustKeep)
 		}
 	}
 }
