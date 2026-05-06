@@ -617,8 +617,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	if indexOfArg(args, "-format_options", 0) < 0 {
 		for k := 0; k+1 < len(args); k++ {
 			if args[k] == "-f" && args[k+1] == "dash" {
-				args = spliceArgs(args, k, "-format_options", "movflags=+empty_moov+default_base_moof+separate_moof")
-				changes = append(changes, "inject:-format_options=movflags+cmaf-single-frag")
+				args = spliceArgs(args, k, "-format_options", "movflags=+empty_moov+default_base_moof+separate_moof+cmaf")
+				changes = append(changes, "inject:-format_options=movflags+cmaf-strict")
 				break
 			}
 		}
