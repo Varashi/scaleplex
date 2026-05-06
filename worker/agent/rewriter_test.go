@@ -262,45 +262,30 @@ args := []string{
 	}
 }
 
-func TestRewriter_HybridInlineAss(t *testing.T) {
-out := Rewrite(swArgsWithSubs, nil, nil)
-	if !out.Applied {
-		t.Fatalf("not applied: %v", out.Changes)
+// inlineass-style argv with no sidecar on disk: bail. The previous
+// behaviour emitted a filter graph using Plex's private `inlineass`
+// filter, which stock ffmpeg doesn't have, and ffmpeg failed at runtime
+// with "Filter not found" (LG WebOS sub-burn 2026-05-06). Bailing
+// surfaces the failure in the rewriter's change list instead of
+// pretending success and exploding mid-transcode.
+func TestRewriter_InlineAss_NoSidecar_Bails(t *testing.T) {
+	out := Rewrite(swArgsWithSubs, nil, &RewriteOpts{FSExists: func(string) bool { return false }})
+	if out.Applied {
+		t.Fatalf("expected bail when no sidecar; applied=true: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:hybrid-inlineass") {
-		t.Fatalf("missing hybrid-inlineass: %v", out.Changes)
-	}
-	idx := findFilterComplex(out.Args, "[0:0]")
-	f := out.Args[idx]
-	for _, must := range []string{
-		"[0:0]hwupload[10]",
-		"scale_vaapi=w=3840:h=2160:format=nv12[11]",
-		"[11]hwdownload[12]",
-		"[12]format=pix_fmts=nv12[13]",
-		"[13]inlineass=",
-		"font_scale=1.000000",
-		"font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf",
-		"font_size=54[14]",
-		"[14]hwupload[15]",
-	} {
-		if !strings.Contains(f, must) {
-			t.Errorf("filter missing %q\n%s", must, f)
-		}
-	}
-}
-
-func TestRewriter_HybridInlineAss_MapLabel15(t *testing.T) {
-out := Rewrite(swArgsWithSubs, nil, nil)
-	idx := findFilterComplex(out.Args, "[0:0]")
-	for i := idx + 1; i < len(out.Args); i++ {
-		if out.Args[i] == "-map" {
-			if out.Args[i+1] != "[15]" {
-				t.Fatalf("map=%q want [15]", out.Args[i+1])
+	if !containsString(out.Changes, "skip:filter-pattern:") {
+		// Find any change starting with skip:filter-pattern:
+		found := false
+		for _, c := range out.Changes {
+			if strings.HasPrefix(c, "skip:filter-pattern:") {
+				found = true
+				break
 			}
-			return
+		}
+		if !found {
+			t.Fatalf("expected skip:filter-pattern bail: %v", out.Changes)
 		}
 	}
-	t.Fatal("no -map found")
 }
 
 func TestRewriter_PreferHEVC(t *testing.T) {
@@ -393,17 +378,15 @@ t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 	}
 }
 
-func TestRewriter_OverlayVAAPI_FallsBackWhenNoSidecar(t *testing.T) {
-t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
+// Sidecar-style argv with no sidecar on disk: bail. The hybrid
+// fallback that used to fire here built a graph around the Plex-private
+// `inlineass` filter that stock ffmpeg can't run (verified on the
+// worker's jellyfin-ffmpeg7: only `subtitles` and `ass` filters
+// exist; `inlineass` is absent). Bailing is the correct outcome.
+func TestRewriter_OverlayVAAPI_NoSidecar_Bails(t *testing.T) {
 	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{FSExists: func(string) bool { return false }})
-	if !out.Applied {
-		t.Fatalf("not applied: %v", out.Changes)
-	}
-	if !containsString(out.Changes, "filter:hybrid-inlineass") {
-		t.Fatalf("expected hybrid fallback: %v", out.Changes)
-	}
-	if !containsString(out.Args, "-map_inlineass") {
-		t.Fatal("-map_inlineass should remain in hybrid mode")
+	if out.Applied {
+		t.Fatalf("expected bail when no sidecar; applied=true: %v", out.Changes)
 	}
 }
 
@@ -856,5 +839,50 @@ func TestRewriter_ForceKeyFrames_NoSeekUnchanged(t *testing.T) {
 	}
 	if out.Args[idx+1] != "expr:gte(t,n_forced*3)" {
 		t.Errorf("force_key_frames expr=%q want unchanged", out.Args[idx+1])
+	}
+}
+
+// Sonarr/Radarr name `<base>.en.hi.srt` for hearing-impaired tracks,
+// `.en.cc.srt` for closed-caption, etc. The probe must find these
+// (Balls Up sidecar 2026-05-06: `.en.hi.srt` was the only English
+// track and the original probe missed it, falling through to the
+// hybrid bail and breaking LG WebOS sub-burn).
+func TestFindSidecarSubtitle_HearingImpaired(t *testing.T) {
+	media := "/media/Movies/Balls Up/Balls Up.mkv"
+	want := "/media/Movies/Balls Up/Balls Up.en.hi.srt"
+	fs := func(p string) bool { return p == want }
+	got := findSidecarSubtitle(media, "en", fs)
+	if got != want {
+		t.Errorf("got=%q want=%q", got, want)
+	}
+}
+
+func TestFindSidecarSubtitle_SDH(t *testing.T) {
+	media := "/media/Movies/X/X.mkv"
+	want := "/media/Movies/X/X.en.sdh.srt"
+	fs := func(p string) bool { return p == want }
+	if got := findSidecarSubtitle(media, "en", fs); got != want {
+		t.Errorf("got=%q want=%q", got, want)
+	}
+}
+
+func TestFindSidecarSubtitle_AltOrdering(t *testing.T) {
+	// Some renamers emit `<base>.<flag>.<lang>.srt` rather than
+	// `<base>.<lang>.<flag>.srt`. Probe both.
+	media := "/media/Movies/X/X.mkv"
+	want := "/media/Movies/X/X.forced.en.srt"
+	fs := func(p string) bool { return p == want }
+	if got := findSidecarSubtitle(media, "en", fs); got != want {
+		t.Errorf("got=%q want=%q", got, want)
+	}
+}
+
+// Plain `<base>.<lang>.srt` (the historical case) must still work.
+func TestFindSidecarSubtitle_BasicLang(t *testing.T) {
+	media := "/media/Movies/X/X.mkv"
+	want := "/media/Movies/X/X.en.srt"
+	fs := func(p string) bool { return p == want }
+	if got := findSidecarSubtitle(media, "en", fs); got != want {
+		t.Errorf("got=%q want=%q", got, want)
 	}
 }

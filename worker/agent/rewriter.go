@@ -149,8 +149,26 @@ func indexOfArg(args []string, key string, from int) int {
 }
 
 // findSidecarSubtitle probes the source media's directory for a sibling
-// SRT/ASS subtitle file. Probe order:
-//   <base>.<lang>.srt, <base>.<lang>.ass, <base>.srt, <base>.ass
+// SRT/ASS subtitle file. Probe order, given lang="en":
+//
+//   <base>.en.srt
+//   <base>.en.ass
+//   <base>.en.<flag>.srt   for flag in hi cc sdh forced default
+//   <base>.en.<flag>.ass
+//   <base>.<flag>.en.srt   (Sonarr alt ordering)
+//   <base>.<flag>.en.ass
+//   <base>.srt
+//   <base>.ass
+//
+// Sonarr/Radarr writes hearing-impaired tracks as `<base>.en.hi.srt`,
+// closed-caption as `.en.cc.srt`, signs/songs forced as `.en.forced.srt`,
+// and the default track as `.en.default.srt`. Without those expansions
+// the probe misses every file Sonarr just imported and we fall through
+// to the hybrid-inlineass bail (which means stock ffmpeg has no usable
+// subtitle source and the whole transcode fails when the client asks
+// for sub burn-in — exactly what hit LG WebOS on Balls Up
+// 2026-05-06: only `.en.hi.srt` and `.nl.srt` existed, the probe looked
+// for `.en.srt` and gave up).
 func findSidecarSubtitle(mediaPath, lang string, fsExists func(string) bool) string {
 	if mediaPath == "" {
 		return ""
@@ -158,17 +176,33 @@ func findSidecarSubtitle(mediaPath, lang string, fsExists func(string) bool) str
 	dir := filepath.Dir(mediaPath)
 	ext := filepath.Ext(mediaPath)
 	base := strings.TrimSuffix(filepath.Base(mediaPath), ext)
+
+	flags := []string{"hi", "cc", "sdh", "forced", "default"}
+	exts := []string{"srt", "ass"}
+
 	var cands []string
 	if lang != "" {
-		cands = append(cands,
-			filepath.Join(dir, base+"."+lang+".srt"),
-			filepath.Join(dir, base+"."+lang+".ass"),
-		)
+		// <base>.<lang>.<ext>
+		for _, e := range exts {
+			cands = append(cands, filepath.Join(dir, base+"."+lang+"."+e))
+		}
+		// <base>.<lang>.<flag>.<ext>
+		for _, fl := range flags {
+			for _, e := range exts {
+				cands = append(cands, filepath.Join(dir, base+"."+lang+"."+fl+"."+e))
+			}
+		}
+		// <base>.<flag>.<lang>.<ext>
+		for _, fl := range flags {
+			for _, e := range exts {
+				cands = append(cands, filepath.Join(dir, base+"."+fl+"."+lang+"."+e))
+			}
+		}
 	}
-	cands = append(cands,
-		filepath.Join(dir, base+".srt"),
-		filepath.Join(dir, base+".ass"),
-	)
+	// Last-resort: language-less defaults.
+	for _, e := range exts {
+		cands = append(cands, filepath.Join(dir, base+"."+e))
+	}
 	for _, c := range cands {
 		if fsExists(c) {
 			return c
@@ -230,16 +264,17 @@ func rewriteVideoFilter(filterStr, mediaPath string, fsExists func(string) bool,
 			}
 		}
 
-		return &filterRewrite{
-			Filter: fmt.Sprintf(
-				"[0:0]hwupload[10];[10]scale_vaapi=w=%s:h=%s:format=nv12[11];"+
-					"[11]hwdownload[12];[12]format=pix_fmts=nv12[13];"+
-					"[13]inlineass=%s[14];[14]hwupload[15]",
-				w, h, assParams),
-			OldLabel: "[2]",
-			NewLabel: "[15]",
-			Mode:     "hybrid-inlineass",
-		}
+		// No sidecar found OR overlay disabled. The previous fallback
+		// emitted an `inlineass=` filter (a Plex-private filter not in
+		// stock ffmpeg) which silently produced broken filter graphs
+		// that ffmpeg failed at runtime. Bail instead so the failure
+		// is loud and the operator can either drop the right sidecar
+		// next to the source or accept that embedded-only-subs sources
+		// can't be burned in by stock ffmpeg without a pre-extract step
+		// (TODO: extract embedded subs to a tmp file and feed
+		// `subtitles=filename=...` against that — defer until needed).
+		_, _, _ = w, h, assParams
+		return nil
 	}
 
 	if m := reFilterHDR.FindStringSubmatch(filterStr); m != nil {
@@ -309,7 +344,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	preferHEVC := envBool("HW_PREFER_HEVC")
-	overlayEnabled := envBool("HW_OVERLAY_VAAPI_ENABLED")
+	// HW_OVERLAY_VAAPI_ENABLED defaults to true. The mode it gates uses
+	// stock ffmpeg's `subtitles=` filter (file-based, libass-rendered,
+	// chained through `hwdownload`/`hwupload`) — the only sub-burn path
+	// that actually works on stock ffmpeg. The hybrid-inlineass mode it
+	// falls back to when this is off relies on Plex's private `inlineass`
+	// filter and produces ffmpeg "Filter not found" errors at runtime.
+	// Set HW_OVERLAY_VAAPI_ENABLED=false only to deliberately fall back
+	// to bail (same effect — playback fails — but with a clearer log).
+	overlayEnabled := !envBool("HW_OVERLAY_VAAPI_DISABLED")
 	renderDevice := envOr("HW_RENDER_DEVICE", "/dev/dri/renderD128")
 	vaapiDriver := envOr("HW_VAAPI_DRIVER", "iHD")
 	// Image-resident defaults: Ubuntu's intel-media-va-driver-non-free
@@ -448,7 +491,16 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	if rewritten.Mode == "overlay-vaapi" {
+	// Both subtitle-rewrite modes (overlay-vaapi sidecar and the older
+	// hybrid-inlineass that uses subtitles= on a hwdownload→hwupload
+	// roundtrip) need the Plex-private `-map_inlineass <stream>` argv
+	// flag stripped, otherwise stock ffmpeg fails with "Unrecognized
+	// option 'map_inlineass'" before the filter graph even runs. The
+	// strip used to be gated on overlay-vaapi only, which broke LG
+	// WebOS sub-burn the moment the rewriter picked hybrid-inlineass
+	// (e.g. when a sidecar SRT is found but VAAPI overlay isn't safe
+	// for the source — the fallback path).
+	if rewritten.Mode == "overlay-vaapi" || rewritten.Mode == "hybrid-inlineass" {
 		if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
 			args = removeArgs(args, miaIdx, 2)
 			changes = append(changes, "drop:-map_inlineass")
@@ -462,7 +514,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if v := os.Getenv("HW_FONTCONFIG_PATH"); v != "" {
 			env["FONTCONFIG_PATH"] = v
 		}
-		changes = append(changes, "sidecar:"+rewritten.Sidecar)
+		if rewritten.Sidecar != "" {
+			changes = append(changes, "sidecar:"+rewritten.Sidecar)
+		}
 	}
 
 	// 5. Encoder swap (next -codec:0 after -i)
