@@ -701,6 +701,21 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 		}
 
+		// Strip `-copyts` for HLS. Verified locally: with `-ss <off>` and
+		// `-copyts`, stock ffmpeg's segment muxer never emits a split — it
+		// writes one giant first segment containing the entire remaining
+		// runtime (observed: media-00173.ts grew to 222 MB / 23 min before
+		// finally splitting on Balls Up). Drop only `-copyts` and the splits
+		// resume at every keyframe past `-segment_time`. `-start_at_zero`
+		// stays in for AAC encoder priming (removing it caused 199-byte
+		// empty audio chunks earlier on DASH); `-avoid_negative_ts disabled`
+		// is also harmless on its own. Plex's ssegment fork apparently
+		// special-cases the copyts+seek path so they ship all three together.
+		if i := indexOfArg(args, "-copyts", 0); i >= 0 {
+			args = removeArgs(args, i, 1)
+			changes = append(changes, "hls:drop:-copyts")
+		}
+
 		// Rewrite -segment_list URL to the relay address. Plex points it
 		// at 127.0.0.1:32400 (PMS's loopback) which the worker pod can't
 		// reach. Same pattern as -progressurl / -manifest_name. Stock
