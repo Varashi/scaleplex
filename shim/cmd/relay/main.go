@@ -5,11 +5,26 @@
 // pod's loopback — which is what makes Plex's transcode-session
 // endpoints accept the request without extra auth.
 //
-// One protocol fix: stock ffmpeg's `-progress <url>` POSTs key=value
-// status, but Plex's progress handler is registered for PUT only and
-// 404s on POST. So we translate POST → PUT for paths matching
-// `^/video/:/transcode/session/.+/progress$` before forwarding. All
-// other traffic passes through verbatim.
+// Two protocol fixes:
+//
+//  1. Stock ffmpeg's `-progress <url>` POSTs key=value status, but Plex's
+//     progress handler is registered for PUT only and 404s on POST. We
+//     translate POST → PUT for `^/video/:/transcode/session/.+/progress$`.
+//
+//  2. HLS segment_list CSV rewrite for seek sessions. Plex's ssegment
+//     fork writes CSV entries with start_time on the *global* timeline
+//     (e.g. chunk 111 → 888.0). Stock segment muxer can't be coaxed into
+//     producing both proper splits AND global-time CSV at the same time
+//     (verified locally: with `-copyts` PMS gets correct CSV but ffmpeg
+//     never splits; without `-copyts` splits work but CSV is 0-based).
+//     PMS reads CSV start_time and serves a 0-byte body whenever it
+//     mismatches the chunk's expected window — so seek chunks return 200
+//     with empty payloads and the player gets no frames. Fix: when the
+//     worker rewrites the segment_list URL it appends
+//     `?scaleplex_seg_time=<N>`; on the manifest POST path we strip that
+//     param before forwarding and use it to rewrite each
+//     `media-NNNNN.ts,start,end` row to
+//     `media-NNNNN.ts,N*seg_time,(N+1)*seg_time`.
 //
 // Auth: ffmpeg `-progress` doesn't attach headers, so the rewriter on
 // the worker side appends `?X-Plex-Token=$X_PLEX_TOKEN` to the URL —
@@ -18,6 +33,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -28,7 +45,11 @@ import (
 	"time"
 )
 
-var progressPathRE = regexp.MustCompile(`^/video/:/transcode/session/[^/]+/[^/]+/progress$`)
+var (
+	progressPathRE = regexp.MustCompile(`^/video/:/transcode/session/[^/]+/[^/]+/progress$`)
+	manifestPathRE = regexp.MustCompile(`^/video/:/transcode/session/[^/]+/[^/]+/manifest$`)
+	csvRowRE       = regexp.MustCompile(`^(media-(\d+)\.ts),([0-9.]+),([0-9.]+)\s*$`)
+)
 
 func main() {
 	listenPort, _ := strconv.Atoi(envOr("LOCAL_RELAY_PORT", "32499"))
@@ -63,12 +84,41 @@ func main() {
 			return
 		}
 		u.Path = r.URL.Path
-		u.RawQuery = r.URL.RawQuery
 
-		out, err := http.NewRequestWithContext(r.Context(), method, u.String(), r.Body)
+		// HLS manifest CSV rewrite (see file header). The worker's rewriter
+		// passes `scaleplex_seg_time=<N>` on the segment_list URL only for
+		// HLS sessions; we strip it from the upstream query and use it to
+		// rewrite the body rows. Non-HLS or non-manifest traffic skips this
+		// branch and forwards the body unchanged.
+		var bodyReader io.Reader = r.Body
+		var contentLen int64 = r.ContentLength
+		query := r.URL.Query()
+		segTimeStr := query.Get("scaleplex_seg_time")
+		if segTimeStr != "" {
+			query.Del("scaleplex_seg_time")
+			u.RawQuery = query.Encode()
+		} else {
+			u.RawQuery = r.URL.RawQuery
+		}
+		if r.Method == http.MethodPost && segTimeStr != "" && manifestPathRE.MatchString(r.URL.Path) {
+			segTime, err := strconv.ParseFloat(segTimeStr, 64)
+			if err == nil && segTime > 0 {
+				body, err := io.ReadAll(r.Body)
+				if err == nil {
+					rewritten := rewriteSegmentListCSV(body, segTime)
+					bodyReader = bytes.NewReader(rewritten)
+					contentLen = int64(len(rewritten))
+				}
+			}
+		}
+
+		out, err := http.NewRequestWithContext(r.Context(), method, u.String(), bodyReader)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+		if contentLen >= 0 && bodyReader != r.Body {
+			out.ContentLength = contentLen
 		}
 		// Forward original headers verbatim. Strip per-hop ones; PMS
 		// reads X-Plex-Token from the URL query (the rewriter put it
@@ -112,4 +162,33 @@ func envOr(k, dflt string) string {
 		return v
 	}
 	return dflt
+}
+
+// rewriteSegmentListCSV rewrites every `media-NNNNN.ts,start,end` row so
+// start = NNNNN * segTime and end = (NNNNN+1) * segTime. PMS reads
+// segment_list rows and returns 0-byte 200s when the timestamps don't
+// match the chunk's expected playlist window (chunk N must land at
+// N*segDur..(N+1)*segDur). Stock ffmpeg writes 0-based timestamps after
+// the rewriter strips `-copyts` (which it must — copyts blocks splits).
+// Non-matching lines pass through unchanged so headers and other rows
+// the muxer might emit aren't mangled.
+func rewriteSegmentListCSV(body []byte, segTime float64) []byte {
+	lines := bytes.Split(body, []byte("\n"))
+	for i, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		m := csvRowRE.FindSubmatch(line)
+		if m == nil {
+			continue
+		}
+		idx, err := strconv.Atoi(string(m[2]))
+		if err != nil {
+			continue
+		}
+		start := float64(idx) * segTime
+		end := float64(idx+1) * segTime
+		lines[i] = []byte(fmt.Sprintf("%s,%.6f,%.6f", m[1], start, end))
+	}
+	return bytes.Join(lines, []byte("\n"))
 }
