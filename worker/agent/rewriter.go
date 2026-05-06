@@ -91,6 +91,18 @@ type RewriteOpts struct {
 	// req.Cwd). Used as the staging path for embedded-subtitle
 	// extraction. When empty, falls back to /tmp/scaleplex.
 	SessionDir string
+	// ProbeSubtitleCodec — when non-nil, the rewriter calls this to
+	// learn the codec_name of the subtitle stream Plex's
+	// -map_inlineass references. The result picks between two burn-in
+	// chains: text (subrip/ass/mov_text/...) → `subtitles=filename=`
+	// libass chain; bitmap (hdmv_pgs_subtitle/dvb_subtitle/...) →
+	// `overlay_vaapi` stream-overlay chain. Args: source file path,
+	// stream specifier (e.g. "0:3", "1:s:0"). Returns lowercase codec
+	// name or "" on probe failure (treated as text by default,
+	// extraction will likely fail loud and surface the unknown
+	// codec). Production agent wires this to a synchronous ffprobe;
+	// tests inject a fake.
+	ProbeSubtitleCodec func(source, streamSpec string) string
 }
 
 var decoderMap = map[string]string{
@@ -243,34 +255,90 @@ func escapeFilterPath(p string) string {
 	return p
 }
 
+// subtitleKind classifies a codec_name returned by ffprobe into "text"
+// (libass-renderable via subtitles= filter) vs "bitmap" (image stream,
+// must be overlaid via overlay_vaapi or CPU overlay).
+//
+// Source: ffmpeg's libavcodec/codec_desc.c. Text formats can be muxed
+// to .srt (lossy on ASS, fine on most others); bitmap formats must be
+// kept as a stream and composited frame-by-frame.
+func subtitleKind(codec string) string {
+	switch strings.ToLower(codec) {
+	case "subrip", "srt", "ass", "ssa", "mov_text", "tx3g",
+		"webvtt", "vtt", "microdvd", "jacosub", "sami",
+		"realtext", "stl", "subviewer", "hdmv_text_subtitle":
+		return "text"
+	case "hdmv_pgs_subtitle", "pgssub", "pgs",
+		"dvb_subtitle", "dvbsub",
+		"dvd_subtitle", "dvdsub",
+		"xsub":
+		return "bitmap"
+	}
+	return "unknown"
+}
+
+// SubtitleSource is the result of analysing -map_inlineass + -i argv.
+type subtitleSource struct {
+	// Kind: "text" or "bitmap" — picked by the codec probe. Empty
+	// when the rewriter couldn't detect a burn-in request.
+	Kind string
+	// Codec: the raw codec_name reported by ffprobe (e.g. "subrip",
+	// "hdmv_pgs_subtitle"). Empty if no probe ran or it failed.
+	Codec string
+	// StreamSpec: the value ffmpeg's -map_inlineass referenced
+	// (e.g. "0:3", "1:s:0"). Required for filter-graph stream
+	// references on the bitmap path.
+	StreamSpec string
+	// FilePath (text path only): a filesystem path to feed into
+	// `subtitles=filename=`. For sidecar text: Plex's pre-staged
+	// temp file. For embedded text: the agent's planned extraction
+	// target.
+	FilePath string
+	// Extract (text+embedded only): non-nil when the agent must run
+	// a side ffmpeg before spawn to produce FilePath.
+	Extract *SubtitleExtract
+	// SecondInputArgIdx — offset of the second `-i` in args.
+	// Caller drops the input pair (-1 when only one -i, or for
+	// bitmap-sidecar where we KEEP the input — the filter graph
+	// still consumes the stream).
+	SecondInputArgIdx int
+}
+
 // detectSubtitleSource inspects argv for `-map_inlineass <spec>` and
-// returns the filesystem path to use with stock ffmpeg's `subtitles=`
-// filter, plus an extraction request when needed.
+// resolves the burn-in source.
 //
-// Plex emits two distinct shapes for sub burn-in:
+// Plex emits four shapes:
 //
-//   1. Embedded subtitle in the source .mkv:
-//        -i /media/.../source.mkv
-//        -map_inlineass 0:3
-//      Single `-i`, spec `0:N`. Stock `subtitles=` can't read by stream
-//      index — we request an extraction. Agent runs a side ffmpeg
-//      before the main spawn.
+//   1. Embedded text (SRT/ASS in mkv):
+//        -i source.mkv
+//        -map_inlineass 0:3              (codec=subrip|ass|...)
+//      → text path, agent extracts to <sessionDir>/scaleplex-extract.srt
 //
-//   2. External sidecar (Plex pre-stages a copy in the session dir):
-//        -i /media/.../source.mkv
-//        -i /transcode/Transcode/Sessions/<sid>-<job>/temp-0.srt
-//        -map_inlineass 1:s:0
-//      Two `-i`s, spec `1:s:0`. The temp file is already on disk and
-//      shared via NFS; we use it directly. The second `-i` is dropped
-//      from the rewritten argv since we replace the filter graph.
+//   2. External text sidecar (Plex pre-stages):
+//        -i source.mkv
+//        -i /transcode/.../temp-0.srt
+//        -map_inlineass 1:s:0            (codec=subrip|ass|...)
+//      → text path, use staged file directly, drop second -i
 //
-// secondInputArgIdx is the offset of the second `-i` in `args` (so the
-// caller can drop both `-i` and the path that follows). Returns -1 when
-// only one `-i` is present.
-func detectSubtitleSource(args []string, sessionDir string) (subPath string, extract *SubtitleExtract, secondInputArgIdx int) {
+//   3. Embedded bitmap (PGS/VobSub/DVDSub):
+//        -i source.mkv
+//        -map_inlineass 0:3              (codec=hdmv_pgs_subtitle|...)
+//      → bitmap path, no extraction; filter graph references
+//        [0:3] as a stream and overlays it via overlay_vaapi
+//
+//   4. External bitmap sidecar (rare; .sup files):
+//        -i source.mkv
+//        -i sidecar.sup
+//        -map_inlineass 1:s:0            (codec=hdmv_pgs_subtitle|...)
+//      → bitmap path, KEEP second -i (filter pulls the stream from it)
+//
+// When opts.ProbeSubtitleCodec is non-nil, the codec probe runs and
+// Kind is populated. Without it, Kind defaults to "text" — the
+// production agent always wires up the probe; tests can override.
+func detectSubtitleSource(args []string, sessionDir string, probe func(source, streamSpec string) string) *subtitleSource {
 	miaIdx := indexOfArg(args, "-map_inlineass", 0)
 	if miaIdx < 0 || miaIdx+1 >= len(args) {
-		return "", nil, -1
+		return nil
 	}
 	streamSpec := args[miaIdx+1]
 
@@ -281,42 +349,73 @@ func detectSubtitleSource(args []string, sessionDir string) (subPath string, ext
 		}
 	}
 	if len(inputArgIdxs) == 0 {
-		return "", nil, -1
+		return nil
 	}
 
-	// Stream spec like "0:3", "1:s:0", "1:0". First numeric token
-	// before the first colon is the input index.
 	inputNum := 0
 	if colon := strings.Index(streamSpec, ":"); colon > 0 {
 		if n, err := strconv.Atoi(streamSpec[:colon]); err == nil {
 			inputNum = n
 		}
 	}
+	if inputNum >= len(inputArgIdxs) {
+		return nil
+	}
+
+	srcForProbe := args[inputArgIdxs[inputNum]+1]
+	codec := ""
+	if probe != nil {
+		codec = strings.ToLower(probe(srcForProbe, streamSpec))
+	}
+	kind := subtitleKind(codec)
+	if kind == "unknown" {
+		// No probe (test path) or probe failed. Default to text since
+		// it's the common case and the agent's extraction step will
+		// fail loud on bitmap inputs (so the operator still gets a
+		// signal, just without the cleaner overlay_vaapi path).
+		kind = "text"
+	}
+
+	res := &subtitleSource{
+		Kind:              kind,
+		Codec:             codec,
+		StreamSpec:        streamSpec,
+		SecondInputArgIdx: -1,
+	}
 
 	if inputNum == 0 {
-		// Embedded path. Schedule extraction.
-		if sessionDir == "" {
-			sessionDir = "/tmp/scaleplex"
+		// Embedded.
+		if kind == "text" {
+			if sessionDir == "" {
+				sessionDir = "/tmp/scaleplex"
+			}
+			outputFile := filepath.Join(sessionDir, "scaleplex-extract.srt")
+			res.FilePath = outputFile
+			res.Extract = &SubtitleExtract{
+				SourceFile: args[inputArgIdxs[0]+1],
+				StreamSpec: streamSpec,
+				OutputFile: outputFile,
+				Format:     "srt",
+			}
 		}
-		sourceFile := args[inputArgIdxs[0]+1]
-		// Default to srt — covers SRT/SubRip/MOV_TEXT/TX3G inputs that
-		// muxer can convert via -c:s srt. ASS sources should ideally
-		// stay ASS to preserve styling; agent ffprobes the source
-		// before extraction and overrides Format if needed (TODO).
-		outputFile := filepath.Join(sessionDir, "scaleplex-extract.srt")
-		return outputFile, &SubtitleExtract{
-			SourceFile: sourceFile,
-			StreamSpec: streamSpec,
-			OutputFile: outputFile,
-			Format:     "srt",
-		}, -1
+		// Bitmap: nothing to extract; filter graph references the
+		// stream directly via [streamSpec].
+		return res
 	}
 
-	// Sidecar path. Use the file Plex already staged.
-	if inputNum >= len(inputArgIdxs) {
-		return "", nil, -1
+	// External (second -i).
+	res.SecondInputArgIdx = inputArgIdxs[inputNum]
+	if kind == "text" {
+		// Use the staged temp file directly. Drop the second -i.
+		res.FilePath = args[inputArgIdxs[inputNum]+1]
+	} else {
+		// Bitmap sidecar: KEEP the second -i — overlay_vaapi pulls
+		// the stream from it. SecondInputArgIdx stays set so the
+		// caller can know about it (e.g. for diagnostics) but the
+		// caller skips the drop step.
+		res.SecondInputArgIdx = -1
 	}
-	return args[inputArgIdxs[inputNum]+1], nil, inputArgIdxs[inputNum]
+	return res
 }
 
 type filterRewrite struct {
@@ -328,39 +427,72 @@ type filterRewrite struct {
 }
 
 // rewriteVideoFilter translates Plex's filter graph into a stock-ffmpeg
-// equivalent. resolvedSubPath, when non-empty, is the path the burn-in
-// chain should pass to `subtitles=filename=...` (resolved by the caller
-// from -map_inlineass + -i argv shape; see detectSubtitleSource).
+// equivalent. subSrc, when non-nil, carries the resolved subtitle
+// burn-in source (text path or bitmap stream); the function picks the
+// matching filter shape. See detectSubtitleSource for source resolution.
+//
 // Falls back to the legacy fs-probe (findSidecarSubtitle) when no
-// PMS-staged path is present, mostly for robustness against PMS
-// versions that change the argv shape.
-func rewriteVideoFilter(filterStr, mediaPath, resolvedSubPath string, fsExists func(string) bool, overlayEnabled bool) *filterRewrite {
+// PMS-staged source is present — defensive for older PMS argv shapes
+// and tests that don't wire -map_inlineass through.
+func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled bool) *filterRewrite {
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
 		w, h, assParams := m[1], m[2], m[3]
+		_ = assParams
 		var lang string
 		if lm := reLanguage.FindStringSubmatch(assParams); lm != nil {
 			lang = strings.ToLower(lm[1])
 		}
-		// Prefer the path PMS already gave us via -map_inlineass + -i
-		// argv. Fall back to the fs-probe sidecar lookup if not
-		// resolved (older PMS shapes; or unit tests that pass argvs
-		// without -map_inlineass set up).
-		sidecar := resolvedSubPath
-		if sidecar == "" {
-			sidecar = findSidecarSubtitle(mediaPath, lang, fsExists)
+
+		if !overlayEnabled {
+			return nil
 		}
 
-		if sidecar != "" && overlayEnabled {
-			// hwdownload + libass + hwupload on jellyfin-ffmpeg.
-			// Bench 2026-05-05 (3× Arc A310): vs stock-ffmpeg same shape
-			// gained +25-50% per stream, mostly from jellyfin's tonemapx
-			// SIMD CPU tonemap and scale_vaapi=fast default.
-			//
-			// TODO(scaleplex): sub2video=1 + hwmap zero-copy chain to
-			// skip the 12 MB nv12 main-stream hwdownload. Needs a
-			// `[0:v]split=2[main_in][timing]; [timing]hwmap=mode=read...`
-			// wiring; first attempt failed because subtitles=...:sub2video=1
-			// requires an unlabeled video input pad for timing.
+		// Bitmap subs (PGS / VobSub / DVDSub): overlay_vaapi the
+		// stream onto the scaled main video. The subtitle stream
+		// stays in the input(s); the filter graph references it via
+		// [streamSpec] (e.g. [0:3] for embedded, [1:s:0] for sidecar
+		// .sup) without going through any intermediate file.
+		//
+		//   [0:0]                                          source video
+		//     ↓ hwupload + scale_vaapi → nv12 surface     [main]
+		//   [streamSpec]                                  PGS stream
+		//     ↓ format=bgra (libavcodec renders bitmap)
+		//     ↓ hwupload                                   [sub]
+		//   [main][sub]overlay_vaapi
+		//
+		// Output stays NV12 throughout so the encoder gets what it
+		// expects. eof_action=pass keeps the stream open after the
+		// last subtitle event; repeatlast=1 holds the final caption
+		// until video ends (matches Plex's UX).
+		if subSrc != nil && subSrc.Kind == "bitmap" && subSrc.StreamSpec != "" {
+			return &filterRewrite{
+				Filter: fmt.Sprintf(
+					"[0:0]hwupload[10];"+
+						"[10]scale_vaapi=w=%s:h=%s:format=nv12[11];"+
+						"[%s]format=bgra[12];"+
+						"[12]hwupload[13];"+
+						"[11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]",
+					w, h, subSrc.StreamSpec),
+				OldLabel: "[2]",
+				NewLabel: "[15]",
+				Mode:     "overlay-vaapi-bitmap",
+				Sidecar:  subSrc.Codec,
+			}
+		}
+
+		// Text subs (SRT/ASS/MOV_TEXT/...): libass renders the file
+		// into a CPU frame, hwupload back to GPU for the encoder.
+		sidecar := ""
+		if subSrc != nil && subSrc.Kind == "text" {
+			sidecar = subSrc.FilePath
+		}
+		if sidecar == "" {
+			// Legacy fs-probe fallback for argvs without -map_inlineass
+			// (or test fixtures that don't wire it through). Should be
+			// unreachable on real PMS argvs.
+			sidecar = findSidecarSubtitle(mediaPath, lang, fsExists)
+		}
+		if sidecar != "" {
 			subPath := escapeFilterPath(sidecar)
 			fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 			return &filterRewrite{
@@ -379,16 +511,9 @@ func rewriteVideoFilter(filterStr, mediaPath, resolvedSubPath string, fsExists f
 			}
 		}
 
-		// No sidecar found OR overlay disabled. The previous fallback
-		// emitted an `inlineass=` filter (a Plex-private filter not in
-		// stock ffmpeg) which silently produced broken filter graphs
-		// that ffmpeg failed at runtime. Bail instead so the failure
-		// is loud and the operator can either drop the right sidecar
-		// next to the source or accept that embedded-only-subs sources
-		// can't be burned in by stock ffmpeg without a pre-extract step
-		// (TODO: extract embedded subs to a tmp file and feed
-		// `subtitles=filename=...` against that — defer until needed).
-		_, _, _ = w, h, assParams
+		// No usable subtitle source resolved. Bail loud.
+		_ = w
+		_ = h
 		return nil
 	}
 
@@ -589,33 +714,53 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	// Subtitle source detection. PMS hands us the subtitle file/stream
 	// via -map_inlineass <spec> + -i shape; the rewriter resolves which
-	// case we're in (sidecar vs embedded) so the filter rewrite below
-	// can swap Plex's private `inlineass=` for stock `subtitles=`. Any
-	// embedded extraction needed is signalled to the agent via
-	// RewriteResult.SubtitleExtract.
-	subPath, subExtract, secondInputArgIdx := detectSubtitleSource(args, sessionDir)
-	if subExtract != nil {
-		changes = append(changes, "subtitle:embedded-extract:"+subExtract.StreamSpec)
-	} else if subPath != "" {
-		changes = append(changes, "subtitle:sidecar-staged")
+	// case we're in (text-sidecar / text-embedded / bitmap-embedded /
+	// bitmap-sidecar) and the filter rewrite below picks the matching
+	// stock-ffmpeg chain. Any embedded text extraction needed is
+	// signalled to the agent via RewriteResult.SubtitleExtract.
+	var probe func(string, string) string
+	if opts != nil && opts.ProbeSubtitleCodec != nil {
+		probe = opts.ProbeSubtitleCodec
+	}
+	subSrc := detectSubtitleSource(args, sessionDir, probe)
+	var subExtract *SubtitleExtract
+	if subSrc != nil {
+		subExtract = subSrc.Extract
+		switch subSrc.Kind {
+		case "text":
+			if subSrc.Extract != nil {
+				changes = append(changes, "subtitle:embedded-extract:"+subSrc.StreamSpec)
+			} else {
+				changes = append(changes, "subtitle:sidecar-staged")
+			}
+		case "bitmap":
+			label := "subtitle:bitmap:" + subSrc.StreamSpec
+			if subSrc.Codec != "" {
+				label += "(" + subSrc.Codec + ")"
+			}
+			changes = append(changes, label)
+		}
 	}
 
-	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, subPath, fsExists, overlayEnabled)
+	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled)
 	if rewritten == nil {
 		return bail("filter-pattern:" + args[vfIdx])
 	}
 	args[vfIdx] = rewritten.Filter
 	changes = append(changes, "filter:"+rewritten.Mode)
 
-	// Drop the second `-i` for sidecar burn-in. The rewritten filter
-	// graph references the file directly via `subtitles=filename=...`,
-	// so stock ffmpeg has no use for it as an input — keeping it would
-	// just trip the "stream specifier '1:s:0' matches no streams"
-	// validator on muxers that don't see the unmapped stream. Compute
-	// the offset against the post-filter args (no shifts to that point).
-	if secondInputArgIdx > 0 && secondInputArgIdx+1 < len(args) {
-		args = removeArgs(args, secondInputArgIdx, 2)
-		changes = append(changes, "drop:-i(sidecar-input)")
+	// Drop the second `-i` for text-sidecar burn-in. The rewritten
+	// filter consumes the staged file via `subtitles=filename=...`,
+	// so stock ffmpeg has no use for it as an input — keeping it
+	// would trip "stream specifier matches no streams" validators.
+	// For bitmap-sidecar we KEEP the second -i because overlay_vaapi
+	// pulls the stream from it via [1:s:0] in the filter graph.
+	if subSrc != nil && subSrc.SecondInputArgIdx > 0 {
+		idx := subSrc.SecondInputArgIdx
+		if idx+1 < len(args) {
+			args = removeArgs(args, idx, 2)
+			changes = append(changes, "drop:-i(sidecar-input)")
+		}
 	}
 
 	// 4. Update -map output label following the video filter
@@ -644,7 +789,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// WebOS sub-burn the moment the rewriter picked hybrid-inlineass
 	// (e.g. when a sidecar SRT is found but VAAPI overlay isn't safe
 	// for the source — the fallback path).
-	if rewritten.Mode == "overlay-vaapi" || rewritten.Mode == "hybrid-inlineass" {
+	if rewritten.Mode == "overlay-vaapi" || rewritten.Mode == "overlay-vaapi-bitmap" || rewritten.Mode == "hybrid-inlineass" {
 		if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
 			args = removeArgs(args, miaIdx, 2)
 			changes = append(changes, "drop:-map_inlineass")

@@ -29,6 +29,7 @@ import (
 const (
 	listenAddr = ":3501"
 	ffmpegBin  = "/usr/bin/ffmpeg"
+	// ffprobeBin lives in probesize.go (next to its primary user).
 )
 
 type taskRequest struct {
@@ -334,7 +335,10 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	skipToSegment := 0
 	seekOffsetSeconds := 0.0
 	if req.Rewrite {
-		res := Rewrite(req.Args, req.Env, &RewriteOpts{SessionDir: req.Cwd})
+		res := Rewrite(req.Args, req.Env, &RewriteOpts{
+			SessionDir:         req.Cwd,
+			ProbeSubtitleCodec: probeSubtitleCodec,
+		})
 		if res.Applied {
 			finalArgs = res.Args
 			finalEnv = res.Env
