@@ -479,15 +479,14 @@ func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
 	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
-	// 4K target → 1080p libass downscale path. Validate it composites
-	// the staged sub onto the main via overlay_vaapi.
+	// Native libass roundtrip at output resolution (the 1080split
+	// experiment was reverted — slower on iHD/Arc at every res).
 	for _, must := range []string{
-		"split=2[main_out][sub_timing]",
-		"scale_vaapi=w=1920:h=1080:format=nv12,hwdownload",
+		"[0:0]hwupload[10]",
+		"[11]hwdownload[12]",
 		"subtitles=filename='/transcode/Transcode/Sessions/plex-transcode-q5orqh9o-c7edac0f/temp-0.srt'",
-		"sub2video=1",
-		"format=bgra,hwupload,scale_vaapi=w=3840:h=1600",
-		"overlay_vaapi",
+		"fontsdir=/usr/share/fonts/truetype/dejavu",
+		"[14]hwupload[15]",
 	} {
 		if !strings.Contains(f, must) {
 			t.Errorf("filter missing %q\n%s", must, f)
