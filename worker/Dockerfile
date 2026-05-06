@@ -61,8 +61,14 @@ RUN groupadd -g 568 render2 || true && \
     useradd -u 1000 -g users -G video,render2 -m -s /bin/bash scaleplex || true
 
 COPY --from=agent-build /out/scaleplex-agent /usr/local/bin/scaleplex-agent
+COPY worker/scaleplex-entrypoint.sh /usr/local/bin/scaleplex-entrypoint
+RUN chmod +x /usr/local/bin/scaleplex-entrypoint
 
 ENV LIBVA_DRIVER_NAME=iHD
 EXPOSE 3501
 USER 1000
-ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/scaleplex-agent"]
+# Wrapper: prefers /transcode/_dev/scaleplex-agent if present (NFS-shared
+# dev overlay so a `go build && cp && pkill` round-trip swaps the binary
+# in seconds without rebuilding the image). Falls through to the baked
+# binary in production.
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/scaleplex-entrypoint"]
