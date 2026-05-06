@@ -1,13 +1,9 @@
-// scaleplex-agent — phase 1 minimal worker daemon.
+// scaleplex-agent — worker daemon.
 //
 // Listens on :3501. Accepts a task envelope on POST /task, spawns ffmpeg
 // with the supplied args + env, streams stderr back over the same HTTP
 // response (chunked). On client disconnect or POST /task/:id/kill, sends
 // SIGTERM (then SIGKILL after 5s) to ffmpeg.
-//
-// This is intentionally barebones: no arg translation yet, no Plex
-// coupling, no orchestrator. Phase 2 layers those on top once we've
-// proven the worker image + HW filter chain work in our cluster.
 
 package main
 
