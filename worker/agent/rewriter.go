@@ -545,43 +545,14 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 				mode = "overlay-vaapi-hdr"
 			}
 
-			// For >1080p output targets the libass roundtrip dominates
-			// — at 4K nv12 each frame is 12 MB hwdownload + libass +
-			// 12 MB hwupload, ~280 MB/s of pixel traffic at 24fps.
-			// Render the sub layer at 1080p instead and scale it back
-			// up via overlay_vaapi composition. Saves ~75% of the CPU
-			// memory bandwidth on 4K targets; libass scaled-up text
-			// is slightly soft but readable.
-			//
-			// Filter shape:
-			//   main video → scale to output res → split[main][sub_timing]
-			//   sub_timing → scale to 1080p → hwdownload → libass:sub2video=1
-			//                → format=bgra → hwupload → scale up to output res
-			//   [main][subs_scaled]overlay_vaapi
-			//
-			// For ≤1080p outputs, scaling adds overhead without saving
-			// anything — keep the simpler hwdl→libass→hwup path.
-			outputH, _ := strconv.Atoi(h)
-			outputW, _ := strconv.Atoi(w)
-			if outputH > 1080 {
-				mode += "-1080split"
-				return &filterRewrite{
-					Filter: fmt.Sprintf(
-						"[0:0]hwupload[a];"+
-							"[a]%s[main_full];"+
-							"[main_full]split=2[main_out][sub_timing];"+
-							"[sub_timing]scale_vaapi=w=1920:h=1080:format=nv12,hwdownload,format=pix_fmts=nv12[timing_cpu];"+
-							"[timing_cpu]subtitles=filename='%s':fontsdir=%s:sub2video=1[subs_only];"+
-							"[subs_only]format=bgra,hwupload,scale_vaapi=w=%d:h=%d[subs_scaled];"+
-							"[main_out][subs_scaled]overlay_vaapi=eof_action=pass:repeatlast=1[15]",
-						scaleStep, subPath, fontsDir, outputW, outputH),
-					OldLabel: "[2]",
-					NewLabel: "[15]",
-					Mode:     mode,
-					Sidecar:  sidecar,
-				}
-			}
-
+			// 1080split path tried (commit 925a7c3 + benched on iHD/Arc
+			// A310 2026-05-06): theory was render libass at 1080p +
+			// overlay_vaapi composite to save CPU memory bandwidth at
+			// 4K targets. Empirically slower at every output resolution
+			// — 4K: 1.01x vs native 1.28x; 3072x1280: 1.57x vs 2.32x.
+			// overlay_vaapi composition on iHD is more expensive than
+			// the libass roundtrip it replaces. Reverted; keeping the
+			// native render-at-output-res path for all sizes.
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];"+
