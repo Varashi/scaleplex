@@ -949,14 +949,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				offset = n
 			}
 		}
-		// HDR + sub-burn is the heaviest combo: hwdownload + libass
-		// (CPU full-frame canvas) + hwupload per video frame. Encoder
-		// runs at 1.5-2× realtime even at 1080p target. Bias QP higher
-		// to reduce per-frame encode work — quality already takes a
-		// hit from the tonemap step, so spending bits on near-lossless
-		// is wasted. Default boost = +6, total = +12 vs CRF (CRF=16
-		// → QP=28). Tune via HW_QP_HDR_SUB_BOOST.
-		hdrSubBoost := 6
+		// HDR + sub-burn boost. Default 0: Plex's bundled transcoder on
+		// the same hardware (Arc A310) ships qp=15 HEVC for HDR + sub
+		// burn-in and gets ~7 Mbps with no buffering issues — the encoder
+		// keeps up at near-realtime. Earlier scaleplex bench at 1.3-2×
+		// suggested a steady-state shortfall and we added a +6 boost
+		// (qp=28); subsequent diff vs Plex showed the boost was over-
+		// correcting (Plex achieves the same throughput without it).
+		// The buffer events were likely client-side, not encoder-bound.
+		// Set HW_QP_HDR_SUB_BOOST=N if HDR-sub bandwidth becomes a real
+		// bottleneck (e.g., low-bandwidth WAN client).
+		hdrSubBoost := 0
 		if v := os.Getenv("HW_QP_HDR_SUB_BOOST"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {
 				hdrSubBoost = n
