@@ -105,7 +105,9 @@ out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 		"filter:plain",
 		"map-label-update",
 		"encode:libx264->h264_vaapi",
-		"crf->qp",
+		// swArgsAV1H264 carries both -crf:0 and -maxrate:0 so we go
+		// through the VBR translation, not the legacy CQP one.
+		"rc:crf+maxrate->vbr",
 		"preset:veryfast->compression_level:6",
 		"drop:-x264opts:0",
 		"inject:sei+a53_cc",
@@ -193,12 +195,53 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 	if out.Args[clIdx+1] != "6" {
 		t.Fatalf("compression_level=%q want 6 (veryfast)", out.Args[clIdx+1])
 	}
-	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
-	if qpIdx <= 0 {
-		t.Fatal("missing -qp:0")
+	// AV1H264 fixture has both -crf and -maxrate → we translate to VBR
+	// (-b:v + -maxrate, drop -qp). CQP would silently ignore -maxrate
+	// on h264_vaapi and produce 5-7× the bitrate budget.
+	if containsString(out.Args, "-qp:0") {
+		t.Error("VBR path must drop -qp:0 (CQP ignores -maxrate on VAAPI)")
 	}
-	if out.Args[qpIdx+1] != "16" {
-		t.Fatalf("qp=%q want 16", out.Args[qpIdx+1])
+	if containsString(out.Args, "-crf:0") {
+		t.Error("-crf:0 must be consumed")
+	}
+	bvIdx := indexOfArg(out.Args, "-b:v", encIdx)
+	if bvIdx <= 0 {
+		t.Fatal("missing -b:v")
+	}
+	if out.Args[bvIdx+1] != "20000k" {
+		t.Errorf("-b:v=%q want 20000k (mirrors -maxrate)", out.Args[bvIdx+1])
+	}
+	mrIdx := indexOfArg(out.Args, "-maxrate:0", encIdx)
+	if mrIdx <= 0 {
+		t.Fatal("missing -maxrate:0")
+	}
+	if out.Args[mrIdx+1] != "20000k" {
+		t.Errorf("-maxrate:0=%q want 20000k (Plex's ceiling preserved)", out.Args[mrIdx+1])
+	}
+}
+
+// CRF without maxrate (rare — happens on Optimize jobs that don't
+// constrain bitrate) keeps the legacy crf->qp path so the encoder
+// runs in CQP at the requested quality.
+func TestRewriter_RateControl_CRFOnly_KeepsCQP(t *testing.T) {
+	args := append([]string(nil), swArgsAV1H264...)
+	// Strip -maxrate:0 and -bufsize:0
+	for i := 0; i < len(args); {
+		if args[i] == "-maxrate:0" || args[i] == "-bufsize:0" {
+			args = append(args[:i], args[i+2:]...)
+			continue
+		}
+		i++
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "crf->qp") {
+		t.Errorf("expected crf->qp without maxrate, got %v", out.Changes)
+	}
+	if !containsString(out.Args, "-qp:0") {
+		t.Error("CQP path must keep -qp:0")
 	}
 }
 
