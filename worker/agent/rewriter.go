@@ -607,11 +607,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// Plex's ffmpeg fork omits moov from segments; on stock ffmpeg we
 	// pass `-format_options` to the inner mp4 muxer to override its
 	// movflags so segments contain only moof+mdat.
+	//
+	// Notable: NO `+frag_keyframe`. With h264_vaapi's default GOP shorter
+	// than our 3s segment, +frag_keyframe forces a new moof at every
+	// keyframe — chunks ended up with two `moof+mdat` pairs, which Plex
+	// Web's MSE could buffer but couldn't seek into cleanly. PT.real
+	// emits one fragment per segment; we match that by letting dashenc
+	// drive fragmentation (one moof per segment file).
 	if indexOfArg(args, "-format_options", 0) < 0 {
 		for k := 0; k+1 < len(args); k++ {
 			if args[k] == "-f" && args[k+1] == "dash" {
-				args = spliceArgs(args, k, "-format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof+separate_moof")
-				changes = append(changes, "inject:-format_options=movflags+cmaf")
+				args = spliceArgs(args, k, "-format_options", "movflags=+empty_moov+default_base_moof+separate_moof")
+				changes = append(changes, "inject:-format_options=movflags+cmaf-single-frag")
 				break
 			}
 		}
