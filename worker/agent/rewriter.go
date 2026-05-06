@@ -533,78 +533,28 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	args[encCodecIdx+1] = hwEncoder
 	changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
 
-	// 6. Rate control translation.
+	// 6. -crf:0 → -qp:0 (CQP mode).
 	//
 	// Plex emits `-crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>`. With libx264
-	// this is "VBR with quality target Q, bitrate capped at R". VAAPI
-	// has no equivalent: when `-qp:0` is set on h264_vaapi the encoder
-	// switches to CQP (Constant Quantizer) mode and **silently ignores**
-	// `-maxrate`. At low QPs (16-20) on 4K HDR sources that means actual
-	// bitrate is 80-140 Mbps — observed 2026-05-06 on LG WebOS Balls Up:
-	// 1-second segments came in at 10-18 MB each (vs the ~2.5 MB Plex's
-	// 20 Mbps target implies), saturating the WAN link and stalling
-	// playback into permanent buffering.
+	// this is "VBR with quality target Q, bitrate capped at R". h264_vaapi
+	// has no clean equivalent — when `-qp:0` is set the encoder runs in
+	// CQP and ignores -maxrate. We accept that compromise (over budget
+	// on complex 4K HDR scenes) because the alternative (force VBR via
+	// `-rc_mode VBR -b:v <R>`) breaks rate control on -ss seek: live
+	// bench 2026-05-06 showed iHD producing 100 Mbps segments after a
+	// seek even when -rc_mode VBR + -b:v 20Mbps + -bufsize 40Mb were
+	// all explicit on the encoder context. iHD's auto rc_mode also
+	// front-loads bitrate after a seek (12-14 MB initial chunks even
+	// with VBR mode confirmed selected), so VBR doesn't actually save
+	// us on the bandwidth-constrained client path.
 	//
-	// When both -crf and -maxrate are present, we want VAAPI's VBR mode
-	// bounded by Plex's intended ceiling. Translate:
-	//   -crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>
-	// →  -b:v <R> -maxrate <R> -bufsize <B>   (drop -crf/-qp entirely)
-	//
-	// VAAPI VBR with -b:v + -maxrate at the same value is effectively
-	// CBR-with-headroom, which honors the bitrate ceiling and produces
-	// segments within size budget.
-	//
-	// When -crf is present without -maxrate (rare; means the client said
-	// "I'll take any bitrate"), keep the legacy -crf→-qp translation —
-	// CQP at the requested quality is the most-faithful behaviour.
-	crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1)
-	maxrateIdx := indexOfArg(args, "-maxrate:0", encCodecIdx+1)
-	bufsizeIdx := indexOfArg(args, "-bufsize:0", encCodecIdx+1)
-	if crfIdx >= 0 && maxrateIdx >= 0 && maxrateIdx+1 < len(args) {
-		maxrate := args[maxrateIdx+1]
-		var bufsize string
-		if bufsizeIdx >= 0 && bufsizeIdx+1 < len(args) {
-			bufsize = args[bufsizeIdx+1]
-		}
-		// Strip Plex's `-crf:0`, `-maxrate:0`, and `-bufsize:0` (we're
-		// going to re-emit them without the stream specifier and with
-		// an explicit -rc_mode so VAAPI's auto-detection doesn't pick
-		// CQP). Order: highest index first so removals don't shift
-		// the lower indices.
-		toRemove := []int{}
-		if bufsizeIdx > 0 {
-			toRemove = append(toRemove, bufsizeIdx)
-		}
-		toRemove = append(toRemove, maxrateIdx, crfIdx)
-		// sort descending
-		for i := 0; i < len(toRemove); i++ {
-			for j := i + 1; j < len(toRemove); j++ {
-				if toRemove[i] < toRemove[j] {
-					toRemove[i], toRemove[j] = toRemove[j], toRemove[i]
-				}
-			}
-		}
-		for _, idx := range toRemove {
-			args = removeArgs(args, idx, 2)
-		}
-		// Re-emit rate-control flags with explicit -rc_mode VBR. iHD's
-		// auto rc_mode picks CQP when -qp is set, **and** silently
-		// falls back to CQP-like behaviour when only `-b:v` is set
-		// without explicit mode (observed 2026-05-06 on LG WebOS seek
-		// sessions: -b:v 20Mbps, segments still hit 13 MB/s = 100
-		// Mbps). With -rc_mode VBR + -b:v + -maxrate, the encoder
-		// honors the ceiling.
-		// Stream-specifier-less names so libavcodec's rc_mode
-		// auto-detection sees them on the encoder context (the :0
-		// suffix routes through a stream-mapping path that h264_vaapi
-		// doesn't always evaluate before it picks rc_mode).
-		inject := []string{"-rc_mode", "VBR", "-b:v", maxrate, "-maxrate", maxrate}
-		if bufsize != "" {
-			inject = append(inject, "-bufsize", bufsize)
-		}
-		args = spliceArgs(args, encCodecIdx+2, inject...)
-		changes = append(changes, "rc:crf+maxrate->vbr+rc_mode")
-	} else if crfIdx >= 0 {
+	// CQP is at least predictable: the encoder runs at constant quality
+	// regardless of seek state, so playback that started fine continues
+	// fine. WAN-throttled clients still get more bitrate than Plex's
+	// intent, but that's a known iHD limitation that needs a deeper fix
+	// (probably encoder pre-warm before the real -ss output writes
+	// segments) than the rewriter alone can deliver.
+	if crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1); crfIdx >= 0 {
 		args[crfIdx] = "-qp:0"
 		changes = append(changes, "crf->qp")
 	}

@@ -105,9 +105,7 @@ out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 		"filter:plain",
 		"map-label-update",
 		"encode:libx264->h264_vaapi",
-		// swArgsAV1H264 carries both -crf:0 and -maxrate:0 so we go
-		// through the VBR translation, not the legacy CQP one.
-		"rc:crf+maxrate->vbr+rc_mode",
+		"crf->qp",
 		"preset:veryfast->compression_level:6",
 		"drop:-x264opts:0",
 		"inject:sei+a53_cc",
@@ -195,46 +193,23 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 	if out.Args[clIdx+1] != "6" {
 		t.Fatalf("compression_level=%q want 6 (veryfast)", out.Args[clIdx+1])
 	}
-	// AV1H264 fixture has both -crf and -maxrate → we translate to VBR
-	// (-b:v + -maxrate, drop -qp). CQP would silently ignore -maxrate
-	// on h264_vaapi and produce 5-7× the bitrate budget.
-	if containsString(out.Args, "-qp:0") {
-		t.Error("VBR path must drop -qp:0 (CQP ignores -maxrate on VAAPI)")
+	// CQP path: -crf:0 → -qp:0, value preserved. -maxrate:0 / -bufsize:0
+	// passed through (h264_vaapi will silently ignore them in CQP mode,
+	// but they're harmless. Reverted from the VBR experiment 2026-05-06
+	// because iHD's rate control front-loaded huge segments after -ss
+	// even with explicit -rc_mode VBR set on the encoder context).
+	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
+	if qpIdx <= 0 {
+		t.Fatal("missing -qp:0")
 	}
-	if containsString(out.Args, "-crf:0") {
-		t.Error("-crf:0 must be consumed")
-	}
-	bvIdx := indexOfArg(out.Args, "-b:v", encIdx)
-	if bvIdx <= 0 {
-		t.Fatal("missing -b:v")
-	}
-	if out.Args[bvIdx+1] != "20000k" {
-		t.Errorf("-b:v=%q want 20000k (mirrors -maxrate)", out.Args[bvIdx+1])
-	}
-	// Stream-specifier suffix stripped on rewrite — h264_vaapi's
-	// rc_mode auto-detection only inspects bare -maxrate / -bufsize.
-	if containsString(out.Args, "-maxrate:0") {
-		t.Error("rewrite must drop -maxrate:0 (use bare -maxrate so VAAPI sees it)")
-	}
-	mrIdx := indexOfArg(out.Args, "-maxrate", encIdx)
-	if mrIdx <= 0 {
-		t.Fatal("missing -maxrate")
-	}
-	if out.Args[mrIdx+1] != "20000k" {
-		t.Errorf("-maxrate=%q want 20000k (Plex's ceiling preserved)", out.Args[mrIdx+1])
-	}
-	rcIdx := indexOfArg(out.Args, "-rc_mode", encIdx)
-	if rcIdx <= 0 {
-		t.Fatal("missing -rc_mode (needed to defeat iHD CQP-default fallback)")
-	}
-	if out.Args[rcIdx+1] != "VBR" {
-		t.Errorf("-rc_mode=%q want VBR", out.Args[rcIdx+1])
+	if out.Args[qpIdx+1] != "16" {
+		t.Errorf("qp=%q want 16", out.Args[qpIdx+1])
 	}
 }
 
-// CRF without maxrate (rare — happens on Optimize jobs that don't
-// constrain bitrate) keeps the legacy crf->qp path so the encoder
-// runs in CQP at the requested quality.
+// Sanity test that -crf with no -maxrate also lands in CQP — same as
+// the AV1H264 path now, kept around because the encoder runs in CQP
+// regardless of whether -maxrate is present.
 func TestRewriter_RateControl_CRFOnly_KeepsCQP(t *testing.T) {
 	args := append([]string(nil), swArgsAV1H264...)
 	// Strip -maxrate:0 and -bufsize:0
