@@ -710,6 +710,30 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
+	// `-strict_ts:N` — Plex-private flag on the second/subtitle output
+	// pipeline. Plex's segment muxer accepts this to relax timestamp
+	// sanity checks; stock ffmpeg's segment muxer doesn't have the
+	// option and fails immediately with "Unrecognized option
+	// 'strict_ts:0'. Error splitting the argument list" — observed
+	// 2026-05-06 on Chrome/DASH playback of Superman 2025, which has
+	// embedded ASS subs that PMS extracts via a second `-f segment`
+	// output. Strip every `-strict_ts*` arg + value regardless of
+	// stream specifier.
+	for {
+		i := -1
+		for j := 0; j < len(args); j++ {
+			if strings.HasPrefix(args[j], "-strict_ts") {
+				i = j
+				break
+			}
+		}
+		if i < 0 {
+			break
+		}
+		args = removeArgs(args, i, 2)
+		changes = append(changes, "drop:-strict_ts")
+	}
+
 	// `-skip_to_segment N` — Plex DASH muxer extension that starts the
 	// dash muxer's segment_index at N. Used on seek transcode sessions
 	// (with a matching `-ss <offset>`) so chunk-stream0-NNNNN.m4s
