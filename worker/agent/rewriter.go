@@ -533,8 +533,42 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	args[encCodecIdx+1] = hwEncoder
 	changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
 
-	// 6. -crf:0 → -qp:0
-	if crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1); crfIdx >= 0 {
+	// 6. Rate control translation.
+	//
+	// Plex emits `-crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>`. With libx264
+	// this is "VBR with quality target Q, bitrate capped at R". VAAPI
+	// has no equivalent: when `-qp:0` is set on h264_vaapi the encoder
+	// switches to CQP (Constant Quantizer) mode and **silently ignores**
+	// `-maxrate`. At low QPs (16-20) on 4K HDR sources that means actual
+	// bitrate is 80-140 Mbps — observed 2026-05-06 on LG WebOS Balls Up:
+	// 1-second segments came in at 10-18 MB each (vs the ~2.5 MB Plex's
+	// 20 Mbps target implies), saturating the WAN link and stalling
+	// playback into permanent buffering.
+	//
+	// When both -crf and -maxrate are present, we want VAAPI's VBR mode
+	// bounded by Plex's intended ceiling. Translate:
+	//   -crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>
+	// →  -b:v <R> -maxrate <R> -bufsize <B>   (drop -crf/-qp entirely)
+	//
+	// VAAPI VBR with -b:v + -maxrate at the same value is effectively
+	// CBR-with-headroom, which honors the bitrate ceiling and produces
+	// segments within size budget.
+	//
+	// When -crf is present without -maxrate (rare; means the client said
+	// "I'll take any bitrate"), keep the legacy -crf→-qp translation —
+	// CQP at the requested quality is the most-faithful behaviour.
+	crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1)
+	maxrateIdx := indexOfArg(args, "-maxrate:0", encCodecIdx+1)
+	if crfIdx >= 0 && maxrateIdx >= 0 && maxrateIdx+1 < len(args) {
+		maxrate := args[maxrateIdx+1]
+		args = removeArgs(args, crfIdx, 2)
+		// indices shift — re-find maxrate
+		maxrateIdx = indexOfArg(args, "-maxrate:0", encCodecIdx+1)
+		// Inject -b:v <maxrate> right after the encoder so it lands in
+		// the encoder's context and rate control picks it up.
+		args = spliceArgs(args, encCodecIdx+2, "-b:v", maxrate)
+		changes = append(changes, "rc:crf+maxrate->vbr")
+	} else if crfIdx >= 0 {
 		args[crfIdx] = "-qp:0"
 		changes = append(changes, "crf->qp")
 	}
