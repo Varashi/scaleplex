@@ -673,24 +673,33 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// to that URL natively (CSV with -segment_list_type csv). PMS reads
 	// the CSV and synthesises the m3u8 it serves to clients.
 	if isHLS {
+		// `-f ssegment` is Plex's name for the stream-segmenter muxer;
+		// stock ffmpeg has `-f segment` which is API-compatible for the
+		// options Plex actually uses. Verified against `ffmpeg -h
+		// muxer=segment` (jellyfin-ffmpeg7): -segment_format,
+		// -segment_header_filename, -individual_header_trailer,
+		// -segment_format_options, -segment_time, -segment_list,
+		// -segment_list_type are all native. Plex's argv keeps using
+		// matroska-in-.ts for HLS to multi-channel-audio clients (Plex
+		// signals this in the public manifest as container=mkv); the
+		// client then fetches /base/header to grab the matroska codec
+		// init and treats each .ts as a continuation. Stripping
+		// -segment_header_filename caused 4K-HDR + 5.1-audio playback
+		// on Plex Android to 404 on /base/header for ~120s before the
+		// app gave up.
 		if i := indexOfArg(args, "-f", 0); i >= 0 && i+1 < len(args) && args[i+1] == "ssegment" {
 			args[i+1] = "segment"
 			changes = append(changes, "hls:f=ssegment->segment")
 		}
-		if i := indexOfArg(args, "-segment_format", 0); i >= 0 && i+1 < len(args) && args[i+1] == "matroska" {
-			args[i+1] = "mpegts"
-			changes = append(changes, "hls:segment_format=matroska->mpegts")
-		}
-		// Drop Plex-only single-token flags + their arg
-		for _, flag := range []string{"-individual_header_trailer", "-segment_header_filename", "-segment_list_separate_stream_times", "-segment_list_unfinished", "-segment_format_options"} {
+		// Drop ONLY the genuinely Plex-only segment-list flags. Everything
+		// else (segment_format, header filename, individual_header_trailer,
+		// format_options) survives untouched.
+		for _, flag := range []string{"-segment_list_separate_stream_times", "-segment_list_unfinished"} {
 			if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
 				args = removeArgs(args, i, 2)
 				changes = append(changes, "hls:drop:"+flag)
 			}
 		}
-		// `-flags +global_header` is for the inner muxer; mpegts doesn't
-		// need it. Stock segment muxer handles its own framing. Leave it
-		// alone — ffmpeg ignores it for mpegts.
 
 		// Rewrite -segment_list URL to the relay address. Plex points it
 		// at 127.0.0.1:32400 (PMS's loopback) which the worker pod can't
