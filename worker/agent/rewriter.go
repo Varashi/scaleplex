@@ -533,7 +533,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	args[encCodecIdx+1] = hwEncoder
 	changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
 
-	// 6. -crf:0 → -qp:0 (CQP mode).
+	// 6. -crf:0 <Q> → -qp:0 <Q + HW_QP_CRF_OFFSET> (CQP mode).
 	//
 	// Plex emits `-crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>`. With libx264
 	// this is "VBR with quality target Q, bitrate capped at R". h264_vaapi
@@ -543,20 +543,47 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// `-rc_mode VBR -b:v <R>`) breaks rate control on -ss seek: live
 	// bench 2026-05-06 showed iHD producing 100 Mbps segments after a
 	// seek even when -rc_mode VBR + -b:v 20Mbps + -bufsize 40Mb were
-	// all explicit on the encoder context. iHD's auto rc_mode also
-	// front-loads bitrate after a seek (12-14 MB initial chunks even
-	// with VBR mode confirmed selected), so VBR doesn't actually save
-	// us on the bandwidth-constrained client path.
+	// all explicit on the encoder context.
 	//
-	// CQP is at least predictable: the encoder runs at constant quality
-	// regardless of seek state, so playback that started fine continues
-	// fine. WAN-throttled clients still get more bitrate than Plex's
-	// intent, but that's a known iHD limitation that needs a deeper fix
-	// (probably encoder pre-warm before the real -ss output writes
-	// segments) than the rewriter alone can deliver.
-	if crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1); crfIdx >= 0 {
+	// CRF and QP aren't the same scale even though both are 0-51:
+	// libx264 CRF=16 averages ~QP 20-22 in practice (CRF adjusts QP per
+	// frame around its target), while VAAPI's `-qp` is the literal
+	// quantizer. Mapping CRF=16 → QP=16 produces near-lossless output —
+	// 4K HDR segments came in at 14 MB / 1 second on Balls Up
+	// (~110 Mbps, 5× over Plex's 20 Mbps target). Add an offset so the
+	// VAAPI QP lands closer to libx264's effective QP:
+	//
+	//   target_qp = clamp(crf + offset, 0, 51)
+	//
+	// Default offset is 6: empirically lines QP up with x264's average
+	// at the same perceptual quality level (Balls Up isolated bench
+	// 2026-05-06: QP=22 produced 5 MB + 3 MB / 1 second segments,
+	// ~40 Mbps — closer to budget while still better than Plex's
+	// 20 Mbps target nominal). Override via HW_QP_CRF_OFFSET if the
+	// quality/bitrate trade-off needs tuning.
+	if crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1); crfIdx >= 0 && crfIdx+1 < len(args) {
 		args[crfIdx] = "-qp:0"
-		changes = append(changes, "crf->qp")
+		offset := 6
+		if v := os.Getenv("HW_QP_CRF_OFFSET"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				offset = n
+			}
+		}
+		if crf, err := strconv.Atoi(args[crfIdx+1]); err == nil {
+			qp := crf + offset
+			if qp < 0 {
+				qp = 0
+			}
+			if qp > 51 {
+				qp = 51
+			}
+			args[crfIdx+1] = strconv.Itoa(qp)
+			changes = append(changes, fmt.Sprintf("crf%d->qp%d(off=%d)", crf, qp, offset))
+		} else {
+			// crf wasn't numeric (shouldn't happen with PMS argv); pass
+			// through unchanged but flip the flag name.
+			changes = append(changes, "crf->qp")
+		}
 	}
 
 	// 7. Translate -preset:0 <x264-name> → -compression_level:v <N>
