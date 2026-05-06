@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"sync"
 	"time"
 
@@ -148,7 +149,7 @@ func runManifestPublisher(ctx context.Context, dir, manifestURL, sessionID strin
 
 // startNumberRE matches each `startNumber="N"` attribute in a DASH MPD.
 // dashenc emits one per Representation/SegmentTemplate.
-var startNumberRE = regexp.MustCompile(`startNumber="\d+"`)
+var startNumberRE = regexp.MustCompile(`startNumber="(\d+)"`)
 
 // postManifest reads the manifest file and POSTs it. Empty or missing
 // file → skipped (we'll catch the next event).
@@ -166,13 +167,27 @@ func postManifest(ctx context.Context, client *http.Client, manifestURL, path, s
 	if startSeq > 1 {
 		// Renumber watcher renames ffmpeg's 1-indexed chunks to
 		// <startSeq>+k, but ffmpeg's manifest still says startNumber=1.
-		// PMS gates the chunk GET response on segment_index parsed from
-		// this body, so rewrite the attribute. Skipping the timeline
-		// `<S t=... d=...>` entries is fine — PMS only logs
-		// "Transcoder segment range: 0 - N" once it sees the count
-		// advance, which it does fine off startNumber alone.
-		repl := []byte(fmt.Sprintf(`startNumber="%d"`, startSeq))
-		body = startNumberRE.ReplaceAll(body, repl)
+		// PMS reads this body to gauge transcoder progress, so we have
+		// to shift startNumber to match the renumbered files.
+		//
+		// Important: shift by (startSeq - 1), don't clamp to startSeq.
+		// As the dash window slides, ffmpeg advances startNumber 1→2→3.
+		// If we clamped every update back to startSeq, PMS would think
+		// the transcoder is stuck and refuse to serve chunks past the
+		// first window — exactly what we saw with the clamping version
+		// (sha-a6337ea).
+		offset := startSeq - 1
+		body = startNumberRE.ReplaceAllFunc(body, func(match []byte) []byte {
+			groups := startNumberRE.FindSubmatch(match)
+			if len(groups) < 2 {
+				return match
+			}
+			n, err := strconv.Atoi(string(groups[1]))
+			if err != nil {
+				return match
+			}
+			return []byte(fmt.Sprintf(`startNumber="%d"`, n+offset))
+		})
 	}
 	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
