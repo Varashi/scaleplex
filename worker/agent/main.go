@@ -335,6 +335,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	finalEnv := req.Env
 	progressURL := ""
 	manifestURL := ""
+	skipToSegment := 0
 	if req.Rewrite {
 		res := Rewrite(req.Args, req.Env, nil)
 		if res.Applied {
@@ -342,6 +343,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			finalEnv = res.Env
 			progressURL = res.ProgressURL
 			manifestURL = res.ManifestURL
+			skipToSegment = res.SkipToSegment
 			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 		} else {
@@ -446,7 +448,11 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	// cwd to the per-session transcode dir.
 	if req.Cwd != "" {
 		go watchFirstSegment(ctx, req.Cwd, req.SessionID, resp, spawnedAt)
-		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID)
+		startSeq := 1
+		if skipToSegment > 0 {
+			startSeq = skipToSegment
+		}
+		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq)
 		if manifestURL != "" {
 			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID)
 		}

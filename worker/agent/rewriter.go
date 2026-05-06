@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -42,6 +43,15 @@ type RewriteResult struct {
 	// init-stream0.m4s. Captured + rewritten the same way as
 	// ProgressURL.
 	ManifestURL string
+	// SkipToSegment — value captured from Plex's `-skip_to_segment N`
+	// argv on a seek transcode session. Plex's ffmpeg fork starts the
+	// dash muxer's segment index at N so chunk-stream0-NNNNN.m4s aligns
+	// with PMS's request URL `.../0/(N-1).m4s`. Stock dashenc has no
+	// way to override the starting segment_index — it always counts
+	// from 1. The chunk-renumber watcher uses this value to hardlink
+	// ffmpeg's 1-indexed chunks to the N-indexed names PMS expects.
+	// Zero = initial-play session (no seek, renumber starts at 1).
+	SkipToSegment int
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -544,15 +554,27 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	//                              we strip Plex's flag and inject a huge
 	//                              extra_window_size below to keep
 	//                              everything around.
-	//   -skip_to_segment <N>     — Plex DASH muxer extension to start
-	//                              segment numbering at N; stock ffmpeg
-	//                              starts at 1, which is what Plex sends
-	//                              anyway in the cases we've seen
-	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-skip_to_segment"} {
+	for _, flag := range []string{"-loglevel_plex", "-delete_removed"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
 		}
+	}
+
+	// `-skip_to_segment N` — Plex DASH muxer extension that starts the
+	// dash muxer's segment_index at N. Used on seek transcode sessions
+	// (with a matching `-ss <offset>`) so chunk-stream0-NNNNN.m4s
+	// aligns with PMS's expected URL `.../0/(N-1).m4s`. Stock dashenc
+	// always counts from 1, so we capture N for the chunk-renumber
+	// watcher (segwatch.go) to hardlink ffmpeg's 1-indexed output to
+	// the N-indexed names PMS expects. Zero = initial-play session.
+	skipToSegment := 0
+	if i := indexOfArg(args, "-skip_to_segment", 0); i >= 0 && i+1 < len(args) {
+		if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
+			skipToSegment = n
+			changes = append(changes, "skip_to_segment:captured="+args[i+1])
+		}
+		args = removeArgs(args, i, 2)
 	}
 
 	// Keep every chunk on disk for the lifetime of the session. Stock
@@ -603,42 +625,49 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Plex's `-skip_to_segment N` extension overrides DASH segment
-	// numbering to start at N. Stock ffmpeg numbers segments by
-	// `output_pts / seg_duration + 1`. PMS gates /header on
-	// chunk-stream0-00001.m4s (its manifest hardcodes startNumber=1)
-	// and times out at ~124s if it doesn't see it.
+	// PTS handling differs between initial-play and seek sessions:
 	//
-	// Plex's argv keeps `-copyts -start_at_zero -avoid_negative_ts
-	// disabled` so source PTS pass through to output PTS, then
-	// `-skip_to_segment 1` renumbers anyway. Without that extension we
-	// must reset output PTS ourselves. Stripping `-copyts` and
-	// `-start_at_zero` was insufficient — segments still landed at 100+
-	// numbers — so we now also force the DASH muxer to start at 0 with
-	// `-output_ts_offset 0` and (if not already set) drop the negative
-	// `-avoid_negative_ts disabled` so ffmpeg's default `auto` rebase
-	// kicks in.
-	for _, flag := range []string{"-copyts", "-start_at_zero"} {
-		if i := indexOfArg(args, flag, 0); i >= 0 {
-			args = removeArgs(args, i, 1)
-			changes = append(changes, "drop:"+flag)
+	//   Initial play (no `-ss`, no `-skip_to_segment`):
+	//     Stock dashenc segments by `output_pts / seg_duration + 1`,
+	//     so input PTS that don't start at 0 (Plex passes
+	//     `-copyts -start_at_zero -avoid_negative_ts disabled`) make
+	//     chunks land at numbers like 100+. Strip those flags AND
+	//     inject `-output_ts_offset 0` so the muxer normalizes to
+	//     PTS=0 and writes chunk-stream0-00001.m4s as the first
+	//     segment. Renumbering then has nothing to do.
+	//
+	//   Seek session (`-ss <offset>` + `-skip_to_segment N`):
+	//     The chunk-renumber watcher (segwatch.go) uses the captured
+	//     skipToSegment value to hardlink ffmpeg's 1-indexed output to
+	//     N-indexed names. We MUST keep `-copyts -start_at_zero
+	//     -avoid_negative_ts disabled` so the chunks' internal mp4
+	//     timestamps stay aligned with the global timeline (otherwise
+	//     the player decodes a chunk whose URL says 1568s but whose
+	//     internal PTS is 0 — visible as audio/video desync). We do
+	//     NOT inject `-output_ts_offset 0` for the same reason.
+	if skipToSegment == 0 {
+		for _, flag := range []string{"-copyts", "-start_at_zero"} {
+			if i := indexOfArg(args, flag, 0); i >= 0 {
+				args = removeArgs(args, i, 1)
+				changes = append(changes, "drop:"+flag)
+			}
 		}
-	}
-	if i := indexOfArg(args, "-avoid_negative_ts", 0); i >= 0 && i+1 < len(args) {
-		if args[i+1] == "disabled" {
-			args = removeArgs(args, i, 2)
-			changes = append(changes, "drop:-avoid_negative_ts=disabled")
+		if i := indexOfArg(args, "-avoid_negative_ts", 0); i >= 0 && i+1 < len(args) {
+			if args[i+1] == "disabled" {
+				args = removeArgs(args, i, 2)
+				changes = append(changes, "drop:-avoid_negative_ts=disabled")
+			}
 		}
-	}
-	// Inject `-output_ts_offset 0` immediately before `-f dash` so it
-	// applies to the DASH muxer specifically. Idempotent: skip if
-	// already present. If `-f dash` isn't found we silently skip.
-	if indexOfArg(args, "-output_ts_offset", 0) < 0 {
-		for k := 0; k+1 < len(args); k++ {
-			if args[k] == "-f" && args[k+1] == "dash" {
-				args = spliceArgs(args, k, "-output_ts_offset", "0")
-				changes = append(changes, "inject:-output_ts_offset=0")
-				break
+		// Inject `-output_ts_offset 0` immediately before `-f dash` so it
+		// applies to the DASH muxer specifically. Idempotent: skip if
+		// already present. If `-f dash` isn't found we silently skip.
+		if indexOfArg(args, "-output_ts_offset", 0) < 0 {
+			for k := 0; k+1 < len(args); k++ {
+				if args[k] == "-f" && args[k+1] == "dash" {
+					args = spliceArgs(args, k, "-output_ts_offset", "0")
+					changes = append(changes, "inject:-output_ts_offset=0")
+					break
+				}
 			}
 		}
 	}
@@ -724,7 +753,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	changes = append(changes, "env:LIBVA")
 
-	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL, ManifestURL: manifestURL}
+	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL, ManifestURL: manifestURL, SkipToSegment: skipToSegment}
 }
 
 func containsString(slice []string, s string) bool {

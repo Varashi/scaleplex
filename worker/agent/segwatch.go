@@ -82,24 +82,29 @@ var segmentExts = map[string]struct{}{
 var chunkRE = regexp.MustCompile(`^chunk-stream(\d+)-0*(\d+)\.m4s$`)
 
 // watchAndRenumberChunks runs alongside watchFirstSegment. ffmpeg's
-// stock DASH muxer numbers chunks based on accumulated PTS / seg
-// duration, which our scaleplex argv (no Plex `-skip_to_segment 1`
-// extension) emits as chunk-stream<N>-00130.m4s and similar — far past
-// the startNumber=1 that PMS's manifest hardcodes. PMS waits ~124s
-// for chunk-stream0-00001.m4s before falling back to a disk-probe of
-// init-stream0.m4s, blocking /header for two minutes.
+// stock DASH muxer numbers chunks 1, 2, 3, ... regardless of input
+// PTS or `-ss` offset. PMS expects different numbers depending on
+// whether this is initial play or a seek session:
 //
-// Workaround: hardlink each new chunk to chunk-stream<N>-<seq>.m4s
-// where seq is a per-stream counter that starts at 1 and increments
-// in the order ffmpeg emits the file. PMS opens the file by the
-// sequential name and reads the original chunk's bytes.
+//   Initial play: PMS asks for chunks 1, 2, 3, ... — startSeq=1.
 //
-// Hardlinks survive ffmpeg's window_size cleanup (we strip
-// -delete_removed so the source filename also stays around). Any
-// failure here is best-effort: log and keep going.
-func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
+//   Seek (Plex argv has `-ss <off> -skip_to_segment N`): PMS computes
+//   the first expected chunk as N (1-indexed) from the seek offset
+//   and asks `.../0/(N-1).m4s` (0-indexed in URL). startSeq=N.
+//
+// Either way we hardlink each newly-written chunk to
+// chunk-stream<S>-<startSeq+k>.m4s in emission order. PMS opens by
+// the renumbered name and reads the original chunk's bytes.
+//
+// Hardlinks survive ffmpeg's window_size cleanup (the renumbered
+// names look like new files to dashenc). Any failure here is
+// best-effort: log and keep going.
+func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq int) {
 	if dir == "" {
 		return
+	}
+	if startSeq < 1 {
+		startSeq = 1
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Printf("session %s: chunk-renumber mkdir %s: %v", sessionID, dir, err)
@@ -115,8 +120,8 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
 		log.Printf("session %s: chunk-renumber add %s: %v", sessionID, dir, err)
 		return
 	}
-	log.Printf("session %s: chunk-renumber watching %s", sessionID, dir)
-	streamSeq := map[string]int{} // streamID → next sequence to assign
+	log.Printf("session %s: chunk-renumber watching %s startSeq=%d", sessionID, dir, startSeq)
+	streamCount := map[string]int{} // streamID → emitted-chunk count
 	debugCount := 0
 	for {
 		select {
@@ -139,8 +144,8 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
 				continue
 			}
 			streamID := m[1]
-			streamSeq[streamID]++
-			seq := streamSeq[streamID]
+			streamCount[streamID]++
+			seq := startSeq + streamCount[streamID] - 1
 			target := filepath.Join(dir, fmt.Sprintf("chunk-stream%s-%05d.m4s", streamID, seq))
 			if name == filepath.Base(target) {
 				// ffmpeg already wrote at the right number — nothing to do.
@@ -154,7 +159,7 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string) {
 				log.Printf("session %s: chunk-renumber link %s→%s: %v", sessionID, name, filepath.Base(target), err)
 				continue
 			}
-			if seq <= 3 {
+			if streamCount[streamID] <= 3 {
 				log.Printf("session %s: chunk-renumber stream%s: %s → %s", sessionID, streamID, name, filepath.Base(target))
 			}
 		case err, ok := <-watcher.Errors:
