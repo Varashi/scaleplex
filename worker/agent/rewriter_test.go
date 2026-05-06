@@ -105,7 +105,9 @@ out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 		"filter:plain",
 		"map-label-update",
 		"encode:libx264->h264_vaapi",
-		"crf->qp",
+		// CRF=16 → QP=22 with +6 offset (CRF and VAAPI QP scales differ;
+		// see rewriter.go for empirical bench).
+		"crf16->qp22(off=6)",
 		"preset:veryfast->compression_level:6",
 		"drop:-x264opts:0",
 		"inject:sei+a53_cc",
@@ -193,17 +195,47 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 	if out.Args[clIdx+1] != "6" {
 		t.Fatalf("compression_level=%q want 6 (veryfast)", out.Args[clIdx+1])
 	}
-	// CQP path: -crf:0 → -qp:0, value preserved. -maxrate:0 / -bufsize:0
-	// passed through (h264_vaapi will silently ignore them in CQP mode,
-	// but they're harmless. Reverted from the VBR experiment 2026-05-06
-	// because iHD's rate control front-loaded huge segments after -ss
-	// even with explicit -rc_mode VBR set on the encoder context).
+	// CQP path: -crf:0 16 → -qp:0 22 (CRF + 6 offset). The offset
+	// compensates for libx264 CRF being a quality target that floats
+	// QP per-frame around the value, while VAAPI's -qp is the literal
+	// quantizer. Mapping CRF→QP 1:1 produced near-lossless output and
+	// 5× over-budget segments on Balls Up (4K HDR); +6 lands closer to
+	// libx264's effective per-frame QP at the same perceptual quality.
+	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
+	if qpIdx <= 0 {
+		t.Fatal("missing -qp:0")
+	}
+	if out.Args[qpIdx+1] != "22" {
+		t.Errorf("qp=%q want 22 (CRF=16 + offset=6)", out.Args[qpIdx+1])
+	}
+}
+
+// HW_QP_CRF_OFFSET overrides the +6 default.
+func TestRewriter_QPOffset_EnvOverride(t *testing.T) {
+	t.Setenv("HW_QP_CRF_OFFSET", "0")
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
 	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
 	if qpIdx <= 0 {
 		t.Fatal("missing -qp:0")
 	}
 	if out.Args[qpIdx+1] != "16" {
-		t.Errorf("qp=%q want 16", out.Args[qpIdx+1])
+		t.Errorf("qp=%q want 16 (offset 0 → 1:1 mapping)", out.Args[qpIdx+1])
+	}
+}
+
+// Negative or oversized result clamps to [0, 51].
+func TestRewriter_QPOffset_Clamping(t *testing.T) {
+	t.Setenv("HW_QP_CRF_OFFSET", "100")
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
+	if qpIdx <= 0 {
+		t.Fatal("missing -qp:0")
+	}
+	if out.Args[qpIdx+1] != "51" {
+		t.Errorf("qp=%q want 51 (clamped)", out.Args[qpIdx+1])
 	}
 }
 
@@ -224,8 +256,15 @@ func TestRewriter_RateControl_CRFOnly_KeepsCQP(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "crf->qp") {
-		t.Errorf("expected crf->qp without maxrate, got %v", out.Changes)
+	hasMapping := false
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "crf16->qp22(off=") || c == "crf->qp" {
+			hasMapping = true
+			break
+		}
+	}
+	if !hasMapping {
+		t.Errorf("expected crf→qp mapping, got %v", out.Changes)
 	}
 	if !containsString(out.Args, "-qp:0") {
 		t.Error("CQP path must keep -qp:0")
