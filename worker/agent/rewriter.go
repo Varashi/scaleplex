@@ -103,6 +103,15 @@ type RewriteOpts struct {
 	// codec). Production agent wires this to a synchronous ffprobe;
 	// tests inject a fake.
 	ProbeSubtitleCodec func(source, streamSpec string) string
+	// ProbeVideoColor — when non-nil, returns the source video's color
+	// metadata. The rewriter uses `transfer` to detect HDR sources
+	// (smpte2084 = HDR10 PQ; arib-std-b67 = HLG) and injects
+	// `tonemap_vaapi` into the filter chain when Plex's argv targets
+	// SDR but the source is HDR. Without this, HDR sources sent to
+	// SDR clients render with washed colors (PQ values get crammed
+	// into BT.709 range without tonemapping). Production agent wires
+	// to ffprobe; tests inject fakes.
+	ProbeVideoColor func(source string) (transfer, primaries, space string)
 }
 
 var decoderMap = map[string]string{
@@ -262,6 +271,17 @@ func escapeFilterPath(p string) string {
 // Source: ffmpeg's libavcodec/codec_desc.c. Text formats can be muxed
 // to .srt (lossy on ASS, fine on most others); bitmap formats must be
 // kept as a stream and composited frame-by-frame.
+// isHDRTransfer returns true for HDR10 (PQ / SMPTE2084) and HLG
+// (ARIB STD-B67) color transfer characteristics. Both require a
+// tonemap pass when the encoder targets an SDR (BT.709) output.
+func isHDRTransfer(transfer string) bool {
+	switch strings.ToLower(transfer) {
+	case "smpte2084", "smpte428", "arib-std-b67":
+		return true
+	}
+	return false
+}
+
 func subtitleKind(codec string) string {
 	switch strings.ToLower(codec) {
 	case "subrip", "srt", "ass", "ssa", "mov_text", "tx3g",
@@ -431,10 +451,17 @@ type filterRewrite struct {
 // burn-in source (text path or bitmap stream); the function picks the
 // matching filter shape. See detectSubtitleSource for source resolution.
 //
+// sourceIsHDR triggers an implicit tonemap_vaapi injection when the
+// matched filter is the SDR-target "plain" pattern. Plex's bundled
+// transcoder relied on its own tonemap (opencl/cuda/sw) firing
+// implicitly; we have to spell it out for stock ffmpeg or the encoder
+// receives PQ-quantized values mapped into BT.709 range without
+// tonemapping → washed colors on every HDR-on-SDR-client transcode.
+//
 // Falls back to the legacy fs-probe (findSidecarSubtitle) when no
 // PMS-staged source is present — defensive for older PMS argv shapes
 // and tests that don't wire -map_inlineass through.
-func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled bool) *filterRewrite {
+func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled, sourceIsHDR bool) *filterRewrite {
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
 		w, h, assParams := m[1], m[2], m[3]
 		_ = assParams
@@ -534,6 +561,26 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 
 	if m := reFilterPlain.FindStringSubmatch(filterStr); m != nil {
 		w, h := m[1], m[2]
+		if sourceIsHDR {
+			// Plex's argv targets SDR (`format=pix_fmts=yuv420p|nv12`)
+			// but the source video is HDR — inject tonemap_vaapi so
+			// the encoder gets BT.709-mapped values instead of raw
+			// PQ. Without this the output looks washed and clipped on
+			// every HDR remux played to an SDR client (observed on
+			// Balls Up + LG WebOS 2026-05-06: filter chain matched
+			// "plain", no tonemap, colors visibly off).
+			return &filterRewrite{
+				Filter: fmt.Sprintf(
+					"[0:0]hwupload[0];"+
+						"[0]scale_vaapi=w=%s:h=%s:format=p010,"+
+						"tonemap_vaapi=transfer=bt709:format=nv12[1];"+
+						"[1]hwupload[2]",
+					w, h),
+				OldLabel: "[1]",
+				NewLabel: "[2]",
+				Mode:     "hdr-tonemap-vaapi-implicit",
+			}
+		}
 		return &filterRewrite{
 			Filter: fmt.Sprintf(
 				"[0:0]hwupload[0];[0]scale_vaapi=w=%s:h=%s:format=nv12[1];[1]hwupload[2]",
@@ -742,7 +789,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled)
+	// Detect HDR source — Plex's bundled transcoder used to autoinject
+	// tonemap (musl-bound opencl, sw fallback); we can't, so we ask the
+	// agent to ffprobe color metadata and pass through here. Skipped
+	// when no probe is wired (tests treat all sources as SDR by default).
+	sourceIsHDR := false
+	if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+		transfer, _, _ := opts.ProbeVideoColor(mediaPath)
+		if isHDRTransfer(transfer) {
+			sourceIsHDR = true
+			changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+		}
+	}
+
+	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR)
 	if rewritten == nil {
 		return bail("filter-pattern:" + args[vfIdx])
 	}

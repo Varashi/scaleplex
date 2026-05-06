@@ -338,6 +338,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		res := Rewrite(req.Args, req.Env, &RewriteOpts{
 			SessionDir:         req.Cwd,
 			ProbeSubtitleCodec: probeSubtitleCodec,
+			ProbeVideoColor:    probeVideoColor,
 		})
 		if res.Applied {
 			finalArgs = res.Args
