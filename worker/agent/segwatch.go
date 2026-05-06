@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -144,6 +145,16 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq
 				continue
 			}
 			streamID := m[1]
+			parsedNum, _ := strconv.Atoi(m[2])
+			// Skip our own renames: a fresh ffmpeg chunk lands at a low
+			// 1-indexed number; any chunk whose number is >= startSeq
+			// is a rename target we just produced (the rename triggers
+			// a Create event on the target name). Without this check
+			// the watcher renames its own output and loops forever
+			// (00201 → 00202 → 00203 ...).
+			if parsedNum >= startSeq {
+				continue
+			}
 			streamCount[streamID]++
 			seq := startSeq + streamCount[streamID] - 1
 			target := filepath.Join(dir, fmt.Sprintf("chunk-stream%s-%05d.m4s", streamID, seq))
