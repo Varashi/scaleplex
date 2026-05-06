@@ -331,6 +331,22 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	args := cloneArgs(inputArgs)
 	env := cloneEnv(inputEnv)
 
+	// Detect output format up-front so format-specific rewrites can branch.
+	// Plex's argv ends with one of:
+	//   -f dash           — DASH (Plex Web, Chrome on desktop, DASH-capable apps)
+	//   -f ssegment       — Plex's stream-segmenter, used for HLS-style output
+	//                       to mobile clients (iOS/Android). Stock ffmpeg
+	//                       doesn't have ssegment; we translate to `-f segment`
+	//                       with `-segment_format mpegts`.
+	outputFormat := ""
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-f" {
+			outputFormat = args[i+1]
+			break
+		}
+	}
+	isHLS := outputFormat == "ssegment"
+
 	for i := 0; i < len(args); i++ {
 		if args[i] != "-filter_complex" {
 			continue
@@ -592,8 +608,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// universal serve-chunk handler 404s the client when it asks for
 	// chunk 3 and ffmpeg already deleted it. Inject a very large
 	// extra_window_size so segments stick around. (We can't use 0 —
-	// that means "extra zero", same as deletion-on-rotate.)
-	if indexOfArg(args, "-extra_window_size", 0) < 0 {
+	// that means "extra zero", same as deletion-on-rotate.) DASH-only:
+	// stock segment muxer for HLS retains all .ts files by default.
+	if !isHLS && indexOfArg(args, "-extra_window_size", 0) < 0 {
 		for k := 0; k+1 < len(args); k++ {
 			if args[k] == "-f" && args[k+1] == "dash" {
 				args = spliceArgs(args, k, "-extra_window_size", "999999")
@@ -623,7 +640,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// Web's MSE could buffer but couldn't seek into cleanly. PT.real
 	// emits one fragment per segment; we match that by letting dashenc
 	// drive fragmentation (one moof per segment file).
-	if indexOfArg(args, "-format_options", 0) < 0 {
+	if !isHLS && indexOfArg(args, "-format_options", 0) < 0 {
 		for k := 0; k+1 < len(args); k++ {
 			if args[k] == "-f" && args[k+1] == "dash" {
 				args = spliceArgs(args, k, "-format_options", "movflags=+empty_moov+default_base_moof+separate_moof+cmaf")
@@ -631,6 +648,49 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				break
 			}
 		}
+	}
+
+	// HLS: Plex's `-f ssegment` is its custom stream-segmenter muxer.
+	// Stock ffmpeg's `-f segment` covers most of what's needed; translate.
+	//
+	// Plex argv pattern (captured from PT.real recon, 2026-05-06):
+	//   -segment_format matroska     → -segment_format mpegts (matroska
+	//                                    inside .ts is Plex's quirk; stock
+	//                                    `segment` muxer with mpegts is
+	//                                    standards-compliant HLS)
+	//   -f ssegment                  → -f segment
+	//   -individual_header_trailer 0 → DROP (Plex-only)
+	//   -segment_header_filename hdr → DROP (Plex-only; mpegts segments
+	//                                    are self-contained)
+	//   -segment_list_separate_stream_times 1 → DROP (Plex-only)
+	//   -segment_list_unfinished 1   → DROP (Plex-only)
+	//   -segment_format_options ...  → DROP (Plex-only inner-format opts)
+	//   -segment_time, -segment_start_number, -segment_time_delta,
+	//   -segment_list <url>, -segment_list_type csv, -segment_list_size,
+	//   "media-%05d.ts" output       → KEEP (stock supports all)
+	//
+	// Stock segment muxer with -segment_list <http_url> POSTs the listfile
+	// to that URL natively (CSV with -segment_list_type csv). PMS reads
+	// the CSV and synthesises the m3u8 it serves to clients.
+	if isHLS {
+		if i := indexOfArg(args, "-f", 0); i >= 0 && i+1 < len(args) && args[i+1] == "ssegment" {
+			args[i+1] = "segment"
+			changes = append(changes, "hls:f=ssegment->segment")
+		}
+		if i := indexOfArg(args, "-segment_format", 0); i >= 0 && i+1 < len(args) && args[i+1] == "matroska" {
+			args[i+1] = "mpegts"
+			changes = append(changes, "hls:segment_format=matroska->mpegts")
+		}
+		// Drop Plex-only single-token flags + their arg
+		for _, flag := range []string{"-individual_header_trailer", "-segment_header_filename", "-segment_list_separate_stream_times", "-segment_list_unfinished", "-segment_format_options"} {
+			if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
+				args = removeArgs(args, i, 2)
+				changes = append(changes, "hls:drop:"+flag)
+			}
+		}
+		// `-flags +global_header` is for the inner muxer; mpegts doesn't
+		// need it. Stock segment muxer handles its own framing. Leave it
+		// alone — ffmpeg ignores it for mpegts.
 	}
 
 	// Capture `-ss <off>` on seek sessions for the renumber watcher's
