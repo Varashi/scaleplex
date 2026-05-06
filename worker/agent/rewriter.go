@@ -624,37 +624,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Restore the seek offset to chunk-internal mp4 timestamps.
+	// Strip `-start_at_zero` on seek sessions so chunks' tfdt
+	// (track fragment decode time) lands on the global timeline.
 	//
 	// Plex's argv has `-ss <off> -copyts -start_at_zero
-	// -avoid_negative_ts disabled`. Combined, that rebases output PTS
-	// to start at 0, even though the source position is `<off>`. As a
-	// result the moof's `tfdt` (track fragment decode time) is 0 in
-	// every seek-session chunk, and Plex Web's MSE places the chunks at
-	// timeline 0-3s instead of <off>-..s. The player's currentTime sits
-	// at <off> with no buffered data → state stays BUFFERING_HAVE_NOTHING
-	// forever (observed live, sha-487ce48 + earlier).
+	// -avoid_negative_ts disabled`. With -start_at_zero, ffmpeg rebases
+	// output PTS to start at 0 even when the source position is <off>.
+	// Stock dashenc then writes tfdt=0 in every seek-session chunk.
+	// Plex Web's MSE places those chunks at timeline 0..seg_dur instead
+	// of <off>..<off>+seg_dur — the player's currentTime sits at <off>
+	// with no buffered data → BUFFERING_HAVE_NOTHING forever. Confirmed
+	// via MSE harness: PT.real seek chunk tfdt=5000s, scaleplex was
+	// tfdt=0 for the same seek.
 	//
-	// PT.real's ffmpeg fork compensates internally; stock ffmpeg needs
-	// `-output_ts_offset <off>` to add the seek offset back to output
-	// PTS so tfdt lands on the global timeline. Verified directly in the
-	// MSE harness: chunks with tfdt=0 don't extend buffer past existing
-	// initial-play range.
+	// Removing -start_at_zero on seek (only) keeps output PTS at the
+	// input PTS (which is <off>+ after `-ss <off> -copyts`), so tfdt
+	// lands at <off>. Initial-play sessions don't pass -ss so we leave
+	// -start_at_zero alone for them — it's a no-op there and AAC
+	// priming relies on it for the small negative-PTS preroll frame.
 	if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
-		ssVal := args[ssIdx+1]
-		if _, err := strconv.ParseFloat(ssVal, 64); err == nil {
-			// Replace any existing -output_ts_offset (we don't expect one)
-			if ot := indexOfArg(args, "-output_ts_offset", 0); ot >= 0 && ot+1 < len(args) {
-				args[ot+1] = ssVal
-				changes = append(changes, "set:-output_ts_offset="+ssVal)
-			} else {
-				for k := 0; k+1 < len(args); k++ {
-					if args[k] == "-f" && args[k+1] == "dash" {
-						args = spliceArgs(args, k, "-output_ts_offset", ssVal)
-						changes = append(changes, "inject:-output_ts_offset="+ssVal)
-						break
-					}
-				}
+		if _, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil {
+			if i := indexOfArg(args, "-start_at_zero", 0); i >= 0 {
+				args = removeArgs(args, i, 1)
+				changes = append(changes, "drop:-start_at_zero(seek)")
 			}
 		}
 	}
