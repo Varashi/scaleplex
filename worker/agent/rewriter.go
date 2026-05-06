@@ -52,6 +52,15 @@ type RewriteResult struct {
 	// ffmpeg's 1-indexed chunks to the N-indexed names PMS expects.
 	// Zero = initial-play session (no seek, renumber starts at 1).
 	SkipToSegment int
+	// SeekOffsetSeconds — value captured from Plex's `-ss N` argv on a
+	// seek session, used by the renumber watcher to patch each chunk's
+	// `tfdt` (track-fragment-decode-time) box. Stock dashenc writes
+	// tfdt=0 in seek-session chunks regardless of -ss/-copyts/+cmaf,
+	// which makes Plex Web's MSE place the chunks at timeline 0 instead
+	// of <off>+. We post-process by adding `SeekOffsetSeconds * tfdt's
+	// own timescale` to each tfdt baseMediaDecodeTime + sidx
+	// earliest_presentation_time after rename. Zero on initial play.
+	SeekOffsetSeconds float64
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -624,30 +633,24 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Strip `-start_at_zero` on seek sessions so chunks' tfdt
-	// (track fragment decode time) lands on the global timeline.
+	// Capture `-ss <off>` on seek sessions for the renumber watcher's
+	// tfdt patch. Stock dashenc writes tfdt=0 in seek-session chunks
+	// regardless of argv (verified: -ss + -copyts + drop -start_at_zero
+	// + +cmaf movflag still produces tfdt=0). Plex Web's MSE places
+	// such chunks at timeline 0..seg_dur — player's currentTime sits at
+	// <off> with no buffered data → BUFFERING_HAVE_NOTHING forever
+	// (confirmed via local MSE harness; PT.real seek chunks have
+	// tfdt=5000s for an offset-5000 seek, scaleplex had tfdt=0).
 	//
-	// Plex's argv has `-ss <off> -copyts -start_at_zero
-	// -avoid_negative_ts disabled`. With -start_at_zero, ffmpeg rebases
-	// output PTS to start at 0 even when the source position is <off>.
-	// Stock dashenc then writes tfdt=0 in every seek-session chunk.
-	// Plex Web's MSE places those chunks at timeline 0..seg_dur instead
-	// of <off>..<off>+seg_dur — the player's currentTime sits at <off>
-	// with no buffered data → BUFFERING_HAVE_NOTHING forever. Confirmed
-	// via MSE harness: PT.real seek chunk tfdt=5000s, scaleplex was
-	// tfdt=0 for the same seek.
-	//
-	// Removing -start_at_zero on seek (only) keeps output PTS at the
-	// input PTS (which is <off>+ after `-ss <off> -copyts`), so tfdt
-	// lands at <off>. Initial-play sessions don't pass -ss so we leave
-	// -start_at_zero alone for them — it's a no-op there and AAC
-	// priming relies on it for the small negative-PTS preroll frame.
+	// Don't drop -start_at_zero — it primes the AAC encoder; removing
+	// it caused 199-byte empty audio chunks earlier. Instead, surface
+	// the seek offset so the renumber watcher can patch tfdt and
+	// sidx.ept after the rename.
+	seekOffsetSeconds := 0.0
 	if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
-		if _, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil {
-			if i := indexOfArg(args, "-start_at_zero", 0); i >= 0 {
-				args = removeArgs(args, i, 1)
-				changes = append(changes, "drop:-start_at_zero(seek)")
-			}
+		if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
+			seekOffsetSeconds = v
+			changes = append(changes, fmt.Sprintf("seek-offset:captured=%.3fs", v))
 		}
 	}
 
@@ -779,7 +782,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	changes = append(changes, "env:LIBVA")
 
-	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL, ManifestURL: manifestURL, SkipToSegment: skipToSegment}
+	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL, ManifestURL: manifestURL, SkipToSegment: skipToSegment, SeekOffsetSeconds: seekOffsetSeconds}
 }
 
 func containsString(slice []string, s string) bool {

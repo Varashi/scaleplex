@@ -15,6 +15,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"encoding/binary"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -82,25 +83,28 @@ var segmentExts = map[string]struct{}{
 // muxer output, e.g. "chunk-stream0-00130.m4s" → ("0", "00130").
 var chunkRE = regexp.MustCompile(`^chunk-stream(\d+)-0*(\d+)\.m4s$`)
 
-// watchAndRenumberChunks runs alongside watchFirstSegment. The
-// rewriter forces stock dashenc to count segments 1, 2, 3, ... from
-// the start of THIS session (via `-output_ts_offset 0` and stripping
-// `-copyts/-start_at_zero`). PMS expects:
+// watchAndRenumberChunks runs alongside watchFirstSegment. PMS expects:
 //
 //   Initial play (Plex argv: `-skip_to_segment 1`, no `-ss`): chunks
-//   numbered 1, 2, 3, ... — startSeq=1, no rename happens.
+//   numbered 1, 2, 3, ... — startSeq=1, seekOffsetSeconds=0, no patch.
 //
 //   Seek (Plex argv: `-ss <off> -skip_to_segment N`): PMS asks
 //   `.../0/(N-1).m4s` — file chunk-stream<S>-<N>.m4s on disk.
 //   startSeq=N. Each ffmpeg-emitted chunk gets RENAMED to its
-//   N-aligned name.
+//   N-aligned name AND patched: tfdt baseMediaDecodeTime and
+//   sidx earliest_presentation_time both get `<off> * timescale`
+//   added so MSE places the chunks at the correct global-timeline
+//   position. Without the patch, every seek chunk has tfdt=0 (stock
+//   dashenc resets it per-segment regardless of -ss/-copyts/+cmaf)
+//   and Plex Web's MSE buffers them at timeline 0, leaving the
+//   player's currentTime=<off> with no playable data.
 //
 // Renaming (vs hardlinking) avoids leaving the original 1-indexed
 // filename around — that prevented dashenc's window-size rotation
 // from cleaning anything up and produced thousands of stale chunks.
 // dashenc only ever sees the new file appear (rename is atomic) and
 // proceeds.
-func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq int) {
+func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq int, seekOffsetSeconds float64) {
 	if dir == "" {
 		return
 	}
@@ -169,6 +173,13 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq
 			if err := os.Rename(ev.Name, target); err != nil {
 				log.Printf("session %s: chunk-renumber rename %s→%s: %v", sessionID, name, filepath.Base(target), err)
 				continue
+			}
+			// Patch tfdt + sidx.ept on seek sessions so chunks land
+			// on the global timeline.
+			if seekOffsetSeconds > 0 {
+				if err := patchSeekChunkTimestamps(target, seekOffsetSeconds); err != nil {
+					log.Printf("session %s: chunk-renumber tfdt-patch %s: %v", sessionID, filepath.Base(target), err)
+				}
 			}
 			if streamCount[streamID] <= 3 {
 				log.Printf("session %s: chunk-renumber stream%s: %s → %s", sessionID, streamID, name, filepath.Base(target))
@@ -239,5 +250,141 @@ func watchFirstSegment(ctx context.Context, dir, sessionID string, w *lockedWrit
 			log.Printf("session %s: segwatch err: %v", sessionID, err)
 			return
 		}
+	}
+}
+
+// patchSeekChunkTimestamps rewrites tfdt baseMediaDecodeTime and
+// sidx earliest_presentation_time in a single-fragment CMAF chunk by
+// adding `seekOffsetSeconds * timescale` (timescale read from sidx).
+//
+// File layout (post-CMAF fix): styp + sidx + moof + mdat. We read the
+// whole file into memory (chunks are 100 KB - 8 MB; cheap), find the
+// boxes by scanning, rewrite the relevant fields in place, write back.
+//
+// All multi-byte ints are big-endian per ISO BMFF.
+func patchSeekChunkTimestamps(path string, seekOffsetSeconds float64) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	timescale, sidxStart, sidxEPTOffset, sidxEPTSize, err := findSidxEPT(data)
+	if err != nil {
+		return fmt.Errorf("sidx: %w", err)
+	}
+	tfdtStart, tfdtBMDTOffset, tfdtBMDTSize, err := findTfdtBMDT(data)
+	if err != nil {
+		return fmt.Errorf("tfdt: %w", err)
+	}
+	delta := u64(uint64(seekOffsetSeconds * float64(timescale)))
+	if delta == 0 {
+		return nil
+	}
+	// Read current values
+	currEPT := readUintBE(data[sidxStart+sidxEPTOffset:], sidxEPTSize)
+	currBMDT := readUintBE(data[tfdtStart+tfdtBMDTOffset:], tfdtBMDTSize)
+	newEPT := currEPT + delta
+	newBMDT := currBMDT + delta
+	writeUintBE(data[sidxStart+sidxEPTOffset:], sidxEPTSize, newEPT)
+	writeUintBE(data[tfdtStart+tfdtBMDTOffset:], tfdtBMDTSize, newBMDT)
+	return os.WriteFile(path, data, 0o644)
+}
+
+// findSidxEPT returns (timescale, sidx_box_start, ept_offset_within_box,
+// ept_size_bytes). v0 = 4-byte ept, v1 = 8-byte.
+func findSidxEPT(data []byte) (timescale uint32, sidxStart, eptOff int, eptSize int, err error) {
+	off, size, err := findBoxAt(data, "sidx", 0)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	body := data[off+8 : off+size]
+	if len(body) < 12 {
+		return 0, 0, 0, 0, fmt.Errorf("sidx body too short")
+	}
+	version := body[0]
+	timescale = readUintBE(body[8:], 4).low32()
+	if version == 0 {
+		eptSize = 4
+	} else {
+		eptSize = 8
+	}
+	// ept starts at offset 12 in body (after vf=4, refid=4, timescale=4)
+	eptOff = 8 + 12
+	sidxStart = off
+	return
+}
+
+func findTfdtBMDT(data []byte) (tfdtStart, bmdtOff, bmdtSize int, err error) {
+	moofOff, moofSize, err := findBoxAt(data, "moof", 0)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	trafOff, trafSize, err := findBoxAt(data[moofOff+8:moofOff+moofSize], "traf", 0)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	trafAbs := moofOff + 8 + trafOff
+	tfdtRel, _, err := findBoxAt(data[trafAbs+8:trafAbs+8+trafSize-8], "tfdt", 0)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	tfdtStart = trafAbs + 8 + tfdtRel
+	body := data[tfdtStart+8:]
+	if len(body) < 8 {
+		return 0, 0, 0, fmt.Errorf("tfdt body too short")
+	}
+	version := body[0]
+	if version == 0 {
+		bmdtSize = 4
+	} else {
+		bmdtSize = 8
+	}
+	bmdtOff = 8 + 4 // size=4 + type=4 + version+flags=4
+	return
+}
+
+func findBoxAt(buf []byte, want string, start int) (int, int, error) {
+	i := start
+	for i+8 <= len(buf) {
+		size := int(binary.BigEndian.Uint32(buf[i : i+4]))
+		typ := string(buf[i+4 : i+8])
+		if size == 0 {
+			size = len(buf) - i
+		} else if size == 1 {
+			if i+16 > len(buf) {
+				return 0, 0, fmt.Errorf("trunc %s", typ)
+			}
+			size = int(binary.BigEndian.Uint64(buf[i+8 : i+16]))
+		}
+		if typ == want {
+			return i, size, nil
+		}
+		if size <= 0 {
+			return 0, 0, fmt.Errorf("non-positive size at offset %d", i)
+		}
+		i += size
+	}
+	return 0, 0, fmt.Errorf("box %q not found", want)
+}
+
+type u64 uint64
+
+func (u u64) low32() uint32 { return uint32(u & 0xffffffff) }
+
+func readUintBE(b []byte, n int) u64 {
+	switch n {
+	case 4:
+		return u64(binary.BigEndian.Uint32(b))
+	case 8:
+		return u64(binary.BigEndian.Uint64(b))
+	}
+	return 0
+}
+
+func writeUintBE(b []byte, n int, v u64) {
+	switch n {
+	case 4:
+		binary.BigEndian.PutUint32(b, uint32(v))
+	case 8:
+		binary.BigEndian.PutUint64(b, uint64(v))
 	}
 }
