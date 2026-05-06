@@ -544,6 +544,44 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 			if sourceIsHDR {
 				mode = "overlay-vaapi-hdr"
 			}
+
+			// For >1080p output targets the libass roundtrip dominates
+			// — at 4K nv12 each frame is 12 MB hwdownload + libass +
+			// 12 MB hwupload, ~280 MB/s of pixel traffic at 24fps.
+			// Render the sub layer at 1080p instead and scale it back
+			// up via overlay_vaapi composition. Saves ~75% of the CPU
+			// memory bandwidth on 4K targets; libass scaled-up text
+			// is slightly soft but readable.
+			//
+			// Filter shape:
+			//   main video → scale to output res → split[main][sub_timing]
+			//   sub_timing → scale to 1080p → hwdownload → libass:sub2video=1
+			//                → format=bgra → hwupload → scale up to output res
+			//   [main][subs_scaled]overlay_vaapi
+			//
+			// For ≤1080p outputs, scaling adds overhead without saving
+			// anything — keep the simpler hwdl→libass→hwup path.
+			outputH, _ := strconv.Atoi(h)
+			outputW, _ := strconv.Atoi(w)
+			if outputH > 1080 {
+				mode += "-1080split"
+				return &filterRewrite{
+					Filter: fmt.Sprintf(
+						"[0:0]hwupload[a];"+
+							"[a]%s[main_full];"+
+							"[main_full]split=2[main_out][sub_timing];"+
+							"[sub_timing]scale_vaapi=w=1920:h=1080:format=nv12,hwdownload,format=pix_fmts=nv12[timing_cpu];"+
+							"[timing_cpu]subtitles=filename='%s':fontsdir=%s:sub2video=1[subs_only];"+
+							"[subs_only]format=bgra,hwupload,scale_vaapi=w=%d:h=%d[subs_scaled];"+
+							"[main_out][subs_scaled]overlay_vaapi=eof_action=pass:repeatlast=1[15]",
+						scaleStep, subPath, fontsDir, outputW, outputH),
+					OldLabel: "[2]",
+					NewLabel: "[15]",
+					Mode:     mode,
+					Sidecar:  sidecar,
+				}
+			}
+
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];"+
@@ -940,8 +978,25 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				offset = n
 			}
 		}
+		// HDR + sub-burn is the heaviest combo: hwdownload + libass
+		// (CPU full-frame canvas) + hwupload per video frame. Encoder
+		// runs at 1.5-2× realtime even at 1080p target. Bias QP higher
+		// to reduce per-frame encode work — quality already takes a
+		// hit from the tonemap step, so spending bits on near-lossless
+		// is wasted. Default boost = +6, total = +12 vs CRF (CRF=16
+		// → QP=28). Tune via HW_QP_HDR_SUB_BOOST.
+		hdrSubBoost := 6
+		if v := os.Getenv("HW_QP_HDR_SUB_BOOST"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				hdrSubBoost = n
+			}
+		}
+		appliedBoost := 0
+		if sourceIsHDR && rewritten != nil && strings.HasPrefix(rewritten.Mode, "overlay-vaapi") {
+			appliedBoost = hdrSubBoost
+		}
 		if crf, err := strconv.Atoi(args[crfIdx+1]); err == nil {
-			qp := crf + offset
+			qp := crf + offset + appliedBoost
 			if qp < 0 {
 				qp = 0
 			}
@@ -949,10 +1004,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				qp = 51
 			}
 			args[crfIdx+1] = strconv.Itoa(qp)
-			changes = append(changes, fmt.Sprintf("crf%d->qp%d(off=%d)", crf, qp, offset))
+			label := fmt.Sprintf("crf%d->qp%d(off=%d", crf, qp, offset)
+			if appliedBoost > 0 {
+				label += fmt.Sprintf("+hdrsub%d", appliedBoost)
+			}
+			label += ")"
+			changes = append(changes, label)
 		} else {
-			// crf wasn't numeric (shouldn't happen with PMS argv); pass
-			// through unchanged but flip the flag name.
 			changes = append(changes, "crf->qp")
 		}
 	}
