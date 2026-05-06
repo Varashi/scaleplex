@@ -799,6 +799,48 @@ func TestRewriter_ForceKeyFrames_OffsetBySeek(t *testing.T) {
 	}
 }
 
+// HLS argv must have `-copyts` stripped. Verified locally that stock
+// ffmpeg's segment muxer with `-ss <off> -copyts` never splits — it
+// writes one giant first segment containing the entire remaining runtime
+// (Balls Up: 222 MB / 23 min in media-00173.ts). DASH path keeps
+// `-copyts` because dashenc handles it correctly.
+func TestRewriter_HLS_CopytsStripped(t *testing.T) {
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-i", "/media/Movies/M.mkv",
+		"-ss", "1384",
+		"-copyts", "-start_at_zero", "-avoid_negative_ts", "disabled",
+		"-filter_complex", "[0:0]scale=w=1022:h=426:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "23",
+		"-preset:0", "veryfast",
+		"-force_key_frames:0", "expr:gte(t,n_forced*8)",
+		"-segment_format", "matroska",
+		"-f", "ssegment",
+		"-individual_header_trailer", "0",
+		"-segment_header_filename", "header",
+		"-segment_time", "8",
+		"-segment_start_number", "173",
+		"media-%05d.ts",
+	}
+	out := Rewrite(args, map[string]string{}, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if containsString(out.Args, "-copyts") {
+		t.Errorf("HLS argv must NOT contain -copyts (segment muxer can't split with it)")
+	}
+	if !containsString(out.Changes, "hls:drop:-copyts") {
+		t.Errorf("expected hls:drop:-copyts in changes, got %v", out.Changes)
+	}
+	// AAC priming flag must survive — removing it caused 199-byte empty
+	// audio chunks on DASH and we don't want the same on HLS.
+	if !containsString(out.Args, "-start_at_zero") {
+		t.Errorf("HLS must keep -start_at_zero for AAC encoder priming")
+	}
+}
+
 // Initial play (no -ss) must leave the force_key_frames expr untouched.
 func TestRewriter_ForceKeyFrames_NoSeekUnchanged(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
