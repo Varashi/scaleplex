@@ -22,10 +22,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
@@ -49,7 +51,17 @@ const manifestFilename = "dash"
 // the file's contents to `manifestURL`. Returns when ctx is cancelled or
 // fsnotify dies. Best-effort: any single POST failure is logged but the
 // publisher keeps running.
-func runManifestPublisher(ctx context.Context, dir, manifestURL, sessionID string) {
+//
+// startSeq mirrors the renumber watcher: on a seek session ffmpeg is
+// writing chunks named 1, 2, 3, ... from the start of THIS session, but
+// the renumber rename targets are <startSeq>, <startSeq>+1, ... PMS
+// reads the manifest body to decide whether the transcoder has reached
+// the requested chunk yet (gates the segment GET response on it). If we
+// POST ffmpeg's raw manifest with `startNumber="1"`, PMS sees "only
+// segment 1 is produced" and waits SegmentedTranscoderTimeout (~120s)
+// before falling back to a disk probe. We rewrite startNumber to match
+// the renumber's startSeq so PMS sees the right window.
+func runManifestPublisher(ctx context.Context, dir, manifestURL, sessionID string, startSeq int) {
 	if dir == "" || manifestURL == "" {
 		return
 	}
@@ -71,6 +83,9 @@ func runManifestPublisher(ctx context.Context, dir, manifestURL, sessionID strin
 
 	manifestPath := filepath.Join(dir, manifestFilename)
 	client := &http.Client{Timeout: 4 * time.Second}
+	if startSeq < 1 {
+		startSeq = 1
+	}
 
 	// Debounce POSTs: ffmpeg may rewrite the file atomically (write to
 	// .tmp + rename) or update it twice in quick succession when
@@ -94,7 +109,7 @@ func runManifestPublisher(ctx context.Context, dir, manifestURL, sessionID strin
 			mu.Lock()
 			pending = false
 			mu.Unlock()
-			postManifest(ctx, client, manifestURL, manifestPath, sessionID)
+			postManifest(ctx, client, manifestURL, manifestPath, sessionID, startSeq)
 		}()
 	}
 
@@ -131,9 +146,13 @@ func runManifestPublisher(ctx context.Context, dir, manifestURL, sessionID strin
 	}
 }
 
+// startNumberRE matches each `startNumber="N"` attribute in a DASH MPD.
+// dashenc emits one per Representation/SegmentTemplate.
+var startNumberRE = regexp.MustCompile(`startNumber="\d+"`)
+
 // postManifest reads the manifest file and POSTs it. Empty or missing
 // file → skipped (we'll catch the next event).
-func postManifest(ctx context.Context, client *http.Client, manifestURL, path, sessionID string) {
+func postManifest(ctx context.Context, client *http.Client, manifestURL, path, sessionID string, startSeq int) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		// Likely a transient atomic-rename race. Don't log.
@@ -143,6 +162,17 @@ func postManifest(ctx context.Context, client *http.Client, manifestURL, path, s
 	if len(body) == 0 {
 		metricManifestPOST.WithLabelValues("empty").Inc()
 		return
+	}
+	if startSeq > 1 {
+		// Renumber watcher renames ffmpeg's 1-indexed chunks to
+		// <startSeq>+k, but ffmpeg's manifest still says startNumber=1.
+		// PMS gates the chunk GET response on segment_index parsed from
+		// this body, so rewrite the attribute. Skipping the timeline
+		// `<S t=... d=...>` entries is fine — PMS only logs
+		// "Transcoder segment range: 0 - N" once it sees the count
+		// advance, which it does fine off startNumber alone.
+		repl := []byte(fmt.Sprintf(`startNumber="%d"`, startSeq))
+		body = startNumberRE.ReplaceAll(body, repl)
 	}
 	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
