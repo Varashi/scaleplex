@@ -3,12 +3,41 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 )
+
+// probeSubtitleCodec runs ffprobe synchronously to learn the codec_name
+// of the subtitle stream Plex's `-map_inlineass` references. The
+// rewriter uses this to pick text vs bitmap burn-in chains.
+//
+// Cheap (~30-100 ms — ffprobe just reads container headers, no decode).
+// Returns "" on probe failure; the rewriter treats unknown as text and
+// the agent's extraction step will fail loud on bitmap inputs.
+func probeSubtitleCodec(source, streamSpec string) string {
+	if source == "" || streamSpec == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-select_streams", streamSpec,
+		"-show_entries", "stream=codec_name",
+		"-of", "default=nokey=1:noprint_wrappers=1",
+		source,
+	}
+	out, err := exec.CommandContext(ctx, ffprobeBin, args...).Output()
+	if err != nil {
+		log.Printf("probeSubtitleCodec: ffprobe %s %s: %v", source, streamSpec, err)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
 
 // extractSubtitleStream runs a side ffmpeg invocation to extract one
 // subtitle stream from the source media into a standalone file the

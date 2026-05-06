@@ -985,3 +985,110 @@ func TestFindSidecarSubtitle_BasicLang(t *testing.T) {
 		t.Errorf("got=%q want=%q", got, want)
 	}
 }
+
+// Bitmap embedded burn-in (PGS in a Blu-ray remux). Filter graph must:
+//   - reference the subtitle stream by its specifier ([0:3])
+//   - convert PGS bitmap → bgra (libavcodec renders the bitmap)
+//   - hwupload the rendered surface to GPU
+//   - overlay_vaapi composite onto the scaled main video
+// And: NO extraction (the stream stays in -i 0).
+func TestRewriter_OverlayVAAPI_BitmapEmbedded_PGS(t *testing.T) {
+	probe := func(source, spec string) string {
+		// Stand-in for ffprobe; report PGS for stream 0:3.
+		return "hdmv_pgs_subtitle"
+	}
+	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{
+		ProbeSubtitleCodec: probe,
+		SessionDir:         "/transcode/Transcode/Sessions/test-sid",
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "subtitle:bitmap:0:3(hdmv_pgs_subtitle)") {
+		t.Fatalf("expected subtitle:bitmap label: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "filter:overlay-vaapi-bitmap") {
+		t.Fatalf("expected overlay-vaapi-bitmap mode: %v", out.Changes)
+	}
+	if out.SubtitleExtract != nil {
+		t.Errorf("bitmap path must NOT request extraction: %+v", out.SubtitleExtract)
+	}
+	if !containsString(out.Changes, "drop:-map_inlineass") {
+		t.Errorf("missing drop:-map_inlineass: %v", out.Changes)
+	}
+	idx := findFilterComplex(out.Args, "[0:0]")
+	f := out.Args[idx]
+	for _, must := range []string{
+		"[0:0]hwupload[10]",
+		"[10]scale_vaapi=w=3840:h=2160:format=nv12[11]",
+		"[0:3]format=bgra[12]",
+		"[12]hwupload[13]",
+		"[11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]",
+	} {
+		if !strings.Contains(f, must) {
+			t.Errorf("filter missing %q\n%s", must, f)
+		}
+	}
+	if strings.Contains(f, "subtitles=filename=") {
+		t.Errorf("bitmap path must NOT use libass `subtitles=`:\n%s", f)
+	}
+}
+
+// Bitmap sidecar (.sup file as second -i). Rare but possible. The
+// rewriter must KEEP the second -i because the overlay_vaapi filter
+// pulls the stream from it via [1:s:0].
+func TestRewriter_OverlayVAAPI_BitmapSidecar_KeepsInput(t *testing.T) {
+	probe := func(source, spec string) string {
+		return "hdmv_pgs_subtitle"
+	}
+	out := Rewrite(swArgsWithSubsRealSidecar, nil, &RewriteOpts{
+		ProbeSubtitleCodec: probe,
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "filter:overlay-vaapi-bitmap") {
+		t.Fatalf("expected overlay-vaapi-bitmap mode: %v", out.Changes)
+	}
+	if containsString(out.Changes, "drop:-i(sidecar-input)") {
+		t.Fatal("bitmap-sidecar must NOT drop second -i (filter consumes the stream)")
+	}
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 2 {
+		t.Errorf("expected both -i to remain, got %d", iCount)
+	}
+	idx := findFilterComplex(out.Args, "[0:0]")
+	f := out.Args[idx]
+	if !strings.Contains(f, "[1:s:0]format=bgra") {
+		t.Errorf("filter must reference the sidecar stream:\n%s", f)
+	}
+}
+
+// subtitleKind classifies common ffprobe codec_name values.
+func TestSubtitleKind(t *testing.T) {
+	tests := map[string]string{
+		"subrip":             "text",
+		"ass":                "text",
+		"ssa":                "text",
+		"mov_text":           "text",
+		"webvtt":             "text",
+		"hdmv_text_subtitle": "text",
+		"hdmv_pgs_subtitle":  "bitmap",
+		"pgssub":             "bitmap",
+		"dvb_subtitle":       "bitmap",
+		"dvd_subtitle":       "bitmap",
+		"xsub":               "bitmap",
+		"unknown_codec_xxx":  "unknown",
+		"":                   "unknown",
+	}
+	for codec, want := range tests {
+		if got := subtitleKind(codec); got != want {
+			t.Errorf("subtitleKind(%q) = %q want %q", codec, got, want)
+		}
+	}
+}
