@@ -18,11 +18,32 @@ import (
 	"strings"
 )
 
+// SubtitleExtract describes a side ffmpeg invocation the agent must run
+// before spawning the main encoder, when Plex requested burn-in of an
+// embedded subtitle stream. Pre-extract → file → `subtitles=filename=...`
+// because stock ffmpeg's `subtitles=` filter only takes filenames, not
+// stream specifiers.
+type SubtitleExtract struct {
+	SourceFile string // input mkv path (the `-i 0` value)
+	StreamSpec string // e.g. "0:3" — what -map_inlineass pointed at
+	OutputFile string // path the agent writes the extracted sub to
+	Format     string // "srt" or "ass" — codec the agent should muxer to
+}
+
 type RewriteResult struct {
 	Args    []string
 	Env     map[string]string
 	Applied bool
 	Changes []string
+
+	// SubtitleExtract — non-nil when the rewriter needs the agent to
+	// run `ffmpeg -i <SourceFile> -map <StreamSpec> -c:s <Format>
+	// <OutputFile>` synchronously before spawning the main transcode.
+	// Populated only on burn-in sessions where Plex's -map_inlineass
+	// referenced an embedded stream (single `-i`, spec like `0:3`).
+	// Sidecar burn-in (Plex pre-stages the file as a second `-i`)
+	// sets this to nil — the file is already on disk.
+	SubtitleExtract *SubtitleExtract
 	// ProgressURL — when non-empty, the agent must run a worker-side
 	// progress reporter against this URL instead of letting ffmpeg
 	// drive `-progress`. Captured from Plex's `-progressurl` arg with
@@ -66,6 +87,10 @@ type RewriteResult struct {
 // RewriteOpts is for testability; production callers pass nil.
 type RewriteOpts struct {
 	FSExists func(string) bool
+	// SessionDir — Plex's per-session transcode dir (the agent's
+	// req.Cwd). Used as the staging path for embedded-subtitle
+	// extraction. When empty, falls back to /tmp/scaleplex.
+	SessionDir string
 }
 
 var decoderMap = map[string]string{
@@ -218,6 +243,82 @@ func escapeFilterPath(p string) string {
 	return p
 }
 
+// detectSubtitleSource inspects argv for `-map_inlineass <spec>` and
+// returns the filesystem path to use with stock ffmpeg's `subtitles=`
+// filter, plus an extraction request when needed.
+//
+// Plex emits two distinct shapes for sub burn-in:
+//
+//   1. Embedded subtitle in the source .mkv:
+//        -i /media/.../source.mkv
+//        -map_inlineass 0:3
+//      Single `-i`, spec `0:N`. Stock `subtitles=` can't read by stream
+//      index — we request an extraction. Agent runs a side ffmpeg
+//      before the main spawn.
+//
+//   2. External sidecar (Plex pre-stages a copy in the session dir):
+//        -i /media/.../source.mkv
+//        -i /transcode/Transcode/Sessions/<sid>-<job>/temp-0.srt
+//        -map_inlineass 1:s:0
+//      Two `-i`s, spec `1:s:0`. The temp file is already on disk and
+//      shared via NFS; we use it directly. The second `-i` is dropped
+//      from the rewritten argv since we replace the filter graph.
+//
+// secondInputArgIdx is the offset of the second `-i` in `args` (so the
+// caller can drop both `-i` and the path that follows). Returns -1 when
+// only one `-i` is present.
+func detectSubtitleSource(args []string, sessionDir string) (subPath string, extract *SubtitleExtract, secondInputArgIdx int) {
+	miaIdx := indexOfArg(args, "-map_inlineass", 0)
+	if miaIdx < 0 || miaIdx+1 >= len(args) {
+		return "", nil, -1
+	}
+	streamSpec := args[miaIdx+1]
+
+	var inputArgIdxs []int
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-i" {
+			inputArgIdxs = append(inputArgIdxs, i)
+		}
+	}
+	if len(inputArgIdxs) == 0 {
+		return "", nil, -1
+	}
+
+	// Stream spec like "0:3", "1:s:0", "1:0". First numeric token
+	// before the first colon is the input index.
+	inputNum := 0
+	if colon := strings.Index(streamSpec, ":"); colon > 0 {
+		if n, err := strconv.Atoi(streamSpec[:colon]); err == nil {
+			inputNum = n
+		}
+	}
+
+	if inputNum == 0 {
+		// Embedded path. Schedule extraction.
+		if sessionDir == "" {
+			sessionDir = "/tmp/scaleplex"
+		}
+		sourceFile := args[inputArgIdxs[0]+1]
+		// Default to srt — covers SRT/SubRip/MOV_TEXT/TX3G inputs that
+		// muxer can convert via -c:s srt. ASS sources should ideally
+		// stay ASS to preserve styling; agent ffprobes the source
+		// before extraction and overrides Format if needed (TODO).
+		outputFile := filepath.Join(sessionDir, "scaleplex-extract.srt")
+		return outputFile, &SubtitleExtract{
+			SourceFile: sourceFile,
+			StreamSpec: streamSpec,
+			OutputFile: outputFile,
+			Format:     "srt",
+		}, -1
+	}
+
+	// Sidecar path. Use the file Plex already staged.
+	if inputNum >= len(inputArgIdxs) {
+		return "", nil, -1
+	}
+	return args[inputArgIdxs[inputNum]+1], nil, inputArgIdxs[inputNum]
+}
+
 type filterRewrite struct {
 	Filter   string
 	OldLabel string
@@ -226,14 +327,28 @@ type filterRewrite struct {
 	Sidecar  string
 }
 
-func rewriteVideoFilter(filterStr, mediaPath string, fsExists func(string) bool, overlayEnabled bool) *filterRewrite {
+// rewriteVideoFilter translates Plex's filter graph into a stock-ffmpeg
+// equivalent. resolvedSubPath, when non-empty, is the path the burn-in
+// chain should pass to `subtitles=filename=...` (resolved by the caller
+// from -map_inlineass + -i argv shape; see detectSubtitleSource).
+// Falls back to the legacy fs-probe (findSidecarSubtitle) when no
+// PMS-staged path is present, mostly for robustness against PMS
+// versions that change the argv shape.
+func rewriteVideoFilter(filterStr, mediaPath, resolvedSubPath string, fsExists func(string) bool, overlayEnabled bool) *filterRewrite {
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
 		w, h, assParams := m[1], m[2], m[3]
 		var lang string
 		if lm := reLanguage.FindStringSubmatch(assParams); lm != nil {
 			lang = strings.ToLower(lm[1])
 		}
-		sidecar := findSidecarSubtitle(mediaPath, lang, fsExists)
+		// Prefer the path PMS already gave us via -map_inlineass + -i
+		// argv. Fall back to the fs-probe sidecar lookup if not
+		// resolved (older PMS shapes; or unit tests that pass argvs
+		// without -map_inlineass set up).
+		sidecar := resolvedSubPath
+		if sidecar == "" {
+			sidecar = findSidecarSubtitle(mediaPath, lang, fsExists)
+		}
 
 		if sidecar != "" && overlayEnabled {
 			// hwdownload + libass + hwupload on jellyfin-ffmpeg.
@@ -339,8 +454,12 @@ func removeArgs(s []string, at, n int) []string {
 
 func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) RewriteResult {
 	fsExists := func(p string) bool { _, err := os.Stat(p); return err == nil }
-	if opts != nil && opts.FSExists != nil {
-		fsExists = opts.FSExists
+	sessionDir := ""
+	if opts != nil {
+		if opts.FSExists != nil {
+			fsExists = opts.FSExists
+		}
+		sessionDir = opts.SessionDir
 	}
 
 	preferHEVC := envBool("HW_PREFER_HEVC")
@@ -467,12 +586,37 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	if i := indexOfArg(args, "-i", 0); i >= 0 && i+1 < len(args) {
 		mediaPath = args[i+1]
 	}
-	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, fsExists, overlayEnabled)
+
+	// Subtitle source detection. PMS hands us the subtitle file/stream
+	// via -map_inlineass <spec> + -i shape; the rewriter resolves which
+	// case we're in (sidecar vs embedded) so the filter rewrite below
+	// can swap Plex's private `inlineass=` for stock `subtitles=`. Any
+	// embedded extraction needed is signalled to the agent via
+	// RewriteResult.SubtitleExtract.
+	subPath, subExtract, secondInputArgIdx := detectSubtitleSource(args, sessionDir)
+	if subExtract != nil {
+		changes = append(changes, "subtitle:embedded-extract:"+subExtract.StreamSpec)
+	} else if subPath != "" {
+		changes = append(changes, "subtitle:sidecar-staged")
+	}
+
+	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, subPath, fsExists, overlayEnabled)
 	if rewritten == nil {
 		return bail("filter-pattern:" + args[vfIdx])
 	}
 	args[vfIdx] = rewritten.Filter
 	changes = append(changes, "filter:"+rewritten.Mode)
+
+	// Drop the second `-i` for sidecar burn-in. The rewritten filter
+	// graph references the file directly via `subtitles=filename=...`,
+	// so stock ffmpeg has no use for it as an input — keeping it would
+	// just trip the "stream specifier '1:s:0' matches no streams"
+	// validator on muxers that don't see the unmapped stream. Compute
+	// the offset against the post-filter args (no shifts to that point).
+	if secondInputArgIdx > 0 && secondInputArgIdx+1 < len(args) {
+		args = removeArgs(args, secondInputArgIdx, 2)
+		changes = append(changes, "drop:-i(sidecar-input)")
+	}
 
 	// 4. Update -map output label following the video filter
 	for i := vfIdx + 1; i < len(args); i++ {
@@ -1078,7 +1222,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	changes = append(changes, "env:LIBVA")
 
-	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL, ManifestURL: manifestURL, SkipToSegment: skipToSegment, SeekOffsetSeconds: seekOffsetSeconds}
+	return RewriteResult{
+		Args:              args,
+		Env:               env,
+		Applied:           true,
+		Changes:           changes,
+		ProgressURL:       progressURL,
+		ManifestURL:       manifestURL,
+		SkipToSegment:     skipToSegment,
+		SeekOffsetSeconds: seekOffsetSeconds,
+		SubtitleExtract:   subExtract,
+	}
 }
 
 func containsString(slice []string, s string) bool {
