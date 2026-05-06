@@ -594,6 +594,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
+	// Force CMAF-style segments (moof+mdat only, no per-segment moov).
+	//
+	// Stock dashenc by default emits self-contained mp4 segments — each
+	// chunk-stream<N>-NNNNN.m4s starts with `ftyp+moov` followed by the
+	// fragment. MSE source buffers reject the duplicate moov: the first
+	// chunk reinitialises the buffer, the second is treated as a new
+	// init segment too, and the player oscillates between "playing" and
+	// "buffering" without ever advancing past the first ~1s of content
+	// (observed live in the seek test, sha-019a335).
+	//
+	// Plex's ffmpeg fork omits moov from segments; on stock ffmpeg we
+	// pass `-format_options` to the inner mp4 muxer to override its
+	// movflags so segments contain only moof+mdat.
+	if indexOfArg(args, "-format_options", 0) < 0 {
+		for k := 0; k+1 < len(args); k++ {
+			if args[k] == "-f" && args[k+1] == "dash" {
+				args = spliceArgs(args, k, "-format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof+separate_moof")
+				changes = append(changes, "inject:-format_options=movflags+cmaf")
+				break
+			}
+		}
+	}
+
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest body
 	// to this URL whenever the .mpd is regenerated; PMS gates `/header`
 	// on the first such POST. Stock ffmpeg's dashenc treats manifest_name
