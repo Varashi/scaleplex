@@ -667,3 +667,48 @@ func TestRewriter_ProgressURL_NoBase_Drops(t *testing.T) {
 		t.Fatalf("missing drop change: %v", out.Changes)
 	}
 }
+
+// -manifest_name must be stripped from ffmpeg argv (stock dashenc treats
+// the value as a filename, not an HTTP URL) and the rewritten URL
+// surfaced on RewriteResult.ManifestURL with X-Plex-Token appended. The
+// publisher uses this URL to POST the manifest body — without that POST,
+// PMS's /header stalls ~125s.
+func TestRewriter_ManifestURL_CapturedAndStripped(t *testing.T) {
+	in := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "secret",
+	}
+	out := Rewrite(swArgsAV1H264, in, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if containsString(out.Args, "-manifest_name") {
+		t.Fatal("-manifest_name must be stripped from argv")
+	}
+	wantURL := "http://relay.svc:32499/.../manifest?X-Plex-Http-Pipeline=infinite&X-Plex-Token=secret"
+	if out.ManifestURL != wantURL {
+		t.Fatalf("ManifestURL=%q want %q", out.ManifestURL, wantURL)
+	}
+	if !containsString(out.Changes, "manifest_name:captured-for-publisher") {
+		t.Fatalf("missing capture change: %v", out.Changes)
+	}
+}
+
+// Without a base URL the manifest URL is dropped entirely (publisher
+// no-ops). PMS's /header stays slow but the alternative is workers
+// POSTing to an unreachable 127.0.0.1.
+func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
+	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if containsString(out.Args, "-manifest_name") {
+		t.Fatal("-manifest_name must be stripped from argv")
+	}
+	if out.ManifestURL != "" {
+		t.Fatalf("ManifestURL=%q want empty when no base", out.ManifestURL)
+	}
+	if !containsString(out.Changes, "drop:-manifest_name(no-pms-base-or-non-loopback)") {
+		t.Fatalf("missing drop change: %v", out.Changes)
+	}
+}

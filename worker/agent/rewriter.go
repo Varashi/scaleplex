@@ -32,6 +32,16 @@ type RewriteResult struct {
 	// `/header` for ~120s. The reporter sends one PUT per ffmpeg
 	// progress block instead.
 	ProgressURL string
+	// ManifestURL — when non-empty, the agent must POST the DASH
+	// manifest body to this URL whenever ffmpeg's output `dash` file
+	// is updated. Plex's ffmpeg fork drives this from a full-URL
+	// `-manifest_name`, but mainline dashenc.c doesn't recognise an
+	// HTTP `manifest_name` and writes manifest to a local file
+	// instead. Without the POST, PMS waits SegmentedTranscoderTimeout
+	// (~125s) on `/header` before falling back to disk-probing
+	// init-stream0.m4s. Captured + rewritten the same way as
+	// ProgressURL.
+	ManifestURL string
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -527,16 +537,41 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	//                              segment numbering at N; stock ffmpeg
 	//                              starts at 1, which is what Plex sends
 	//                              anyway in the cases we've seen
-	//   -manifest_name <url>     — Plex DASH muxer extension that stores
-	//                              a full URL in the .mpd; stock ffmpeg
-	//                              writes the manifest at the output
-	//                              filename and PMS doesn't read the
-	//                              file anyway (it serves its own DASH
-	//                              manifest derived from segments-on-disk)
-	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-skip_to_segment", "-manifest_name"} {
+	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-skip_to_segment"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
+		}
+	}
+
+	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest body
+	// to this URL whenever the .mpd is regenerated; PMS gates `/header`
+	// on the first such POST. Stock ffmpeg's dashenc treats manifest_name
+	// as a filename, not a URL, so we strip it from the argv (otherwise
+	// it would be written verbatim into a local file) and surface the
+	// rewritten URL on RewriteResult so the agent can POST the manifest
+	// itself. See manifest_publish.go.
+	manifestURL := ""
+	if i := indexOfArg(args, "-manifest_name", 0); i >= 0 && i+1 < len(args) {
+		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+			base = envBase
+		}
+		origURL := args[i+1]
+		args = removeArgs(args, i, 2)
+		if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
+			rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
+			if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+				if strings.Contains(rewritten, "?") {
+					rewritten += "&X-Plex-Token=" + tok
+				} else {
+					rewritten += "?X-Plex-Token=" + tok
+				}
+			}
+			manifestURL = rewritten
+			changes = append(changes, "manifest_name:captured-for-publisher")
+		} else {
+			changes = append(changes, "drop:-manifest_name(no-pms-base-or-non-loopback)")
 		}
 	}
 
@@ -661,7 +696,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	changes = append(changes, "env:LIBVA")
 
-	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL}
+	return RewriteResult{Args: args, Env: env, Applied: true, Changes: changes, ProgressURL: progressURL, ManifestURL: manifestURL}
 }
 
 func containsString(slice []string, s string) bool {
