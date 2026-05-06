@@ -748,6 +748,44 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
+	// Seek + force_key_frames expr fix.
+	//
+	// PMS sends `-force_key_frames:0 "expr:gte(t,n_forced*8)"`. With
+	// `-copyts`, the encoder's `t` starts at the seek offset (e.g. 2344s)
+	// rather than 0, so the expression is true for every frame whose
+	// `n_forced*8 <= t`. ffmpeg fires a forced keyframe on every such
+	// frame: ~294 keyframes back-to-back at the start, then ~8s of
+	// silence, repeating. The HLS segment muxer needs a keyframe to
+	// close a segment; with the run of forced keyframes followed by an
+	// 8s gap, the first segment swallows tens of minutes of content
+	// (observed: media-00293.ts reached 317 MB / 39 min before the next
+	// keyframe-aligned split landed, breaking Android Plex on seek).
+	// Plex's fork either resets `t` to 0 on seek or special-cases the
+	// expr; stock ffmpeg does neither.
+	//
+	// Rewrite the expression to evaluate against output time
+	// (t - seek_offset). Keyframe cadence then matches what PMS intended
+	// (kf at output 0, 8, 16, ...) and splits land every 8s.
+	if seekOffsetSeconds > 0 {
+		for i := 0; i+1 < len(args); i++ {
+			if !strings.HasPrefix(args[i], "-force_key_frames") {
+				continue
+			}
+			orig := args[i+1]
+			if !strings.HasPrefix(orig, "expr:") {
+				continue
+			}
+			inner := strings.TrimPrefix(orig, "expr:")
+			if !strings.Contains(inner, "(t,") && !strings.Contains(inner, "(t ,") {
+				continue
+			}
+			rewritten := strings.Replace(inner, "(t,", fmt.Sprintf("(t-%.3f,", seekOffsetSeconds), 1)
+			rewritten = strings.Replace(rewritten, "(t ,", fmt.Sprintf("(t-%.3f ,", seekOffsetSeconds), 1)
+			args[i+1] = "expr:" + rewritten
+			changes = append(changes, "force_key_frames:offset-by-seek")
+		}
+	}
+
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest body
 	// to this URL whenever the .mpd is regenerated; PMS gates `/header`
 	// on the first such POST. Stock ffmpeg's dashenc treats manifest_name
