@@ -625,46 +625,21 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// PTS rebase — applies to ALL sessions (initial play AND seek):
+	// PTS handling — keep Plex's `-copyts -start_at_zero
+	// -avoid_negative_ts disabled` exactly as PMS sends them.
 	//
-	// Stock dashenc's segment_index advances per emitted segment
-	// (default starts at 1) but our renumber needs ffmpeg to emit
-	// chunk-stream0-00001.m4s as the first chunk so it can hardlink to
-	// chunk-stream0-<startSeq>.m4s deterministically. Plex's argv
-	// keeps `-copyts -start_at_zero -avoid_negative_ts disabled`, which
-	// in combination with `-ss <offset>` makes dashenc produce huge,
-	// non-sequential filenames (observed: chunk-stream0-07813.m4s on a
-	// 26m seek, with 7000+ ghost files cluttering the session dir).
+	// Earlier rewriter versions stripped these and injected
+	// `-output_ts_offset 0` to force chunks to start at PTS=0. That
+	// "worked" for video but broke audio on every seek: with -ss <off>
+	// + 0-rebased output, the AAC encoder gets no primer samples and
+	// emits a 199-byte empty first segment (just an mp4 box, no
+	// frames). DASH players then hang on initial-audio-buffer-fill
+	// even though video chunks decode fine.
 	//
-	// Strip those flags and inject `-output_ts_offset 0` instead, which
-	// rebases output PTS to 0 regardless of input -ss. dashenc then
-	// counts segments 1,2,3 from the start of THIS session and the
-	// renumber watcher hardlinks them to PMS's expected names.
-	//
-	// For seek the chunk's internal mp4 PTS will be 0-relative (not
-	// global-timeline-aligned), but DASH players key off the MPD's
-	// URL→time mapping, so playback works without audio/video desync.
-	for _, flag := range []string{"-copyts", "-start_at_zero"} {
-		if i := indexOfArg(args, flag, 0); i >= 0 {
-			args = removeArgs(args, i, 1)
-			changes = append(changes, "drop:"+flag)
-		}
-	}
-	if i := indexOfArg(args, "-avoid_negative_ts", 0); i >= 0 && i+1 < len(args) {
-		if args[i+1] == "disabled" {
-			args = removeArgs(args, i, 2)
-			changes = append(changes, "drop:-avoid_negative_ts=disabled")
-		}
-	}
-	if indexOfArg(args, "-output_ts_offset", 0) < 0 {
-		for k := 0; k+1 < len(args); k++ {
-			if args[k] == "-f" && args[k+1] == "dash" {
-				args = spliceArgs(args, k, "-output_ts_offset", "0")
-				changes = append(changes, "inject:-output_ts_offset=0")
-				break
-			}
-		}
-	}
+	// Stock dashenc's segment_index always counts from 1 regardless
+	// of input PTS, so file numbering stays predictable for the
+	// renumber watcher. Chunk-internal mp4 PTS lands on the global
+	// timeline (matching what PT.real produces).
 
 	// Plex's `-progressurl <url>` points at 127.0.0.1:32400 — PMS's own
 	// loopback, unreachable from the worker. Earlier we translated to

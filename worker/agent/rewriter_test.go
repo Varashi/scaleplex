@@ -716,12 +716,11 @@ func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
 // `-skip_to_segment N` must be captured into RewriteResult.SkipToSegment
 // and stripped from the argv. The chunk-renumber watcher uses N as the
 // starting sequence so chunk-stream0-NNNNN.m4s names align with PMS's
-// expected URL `.../0/(N-1).m4s`. The PTS rebase block ALWAYS strips
-// -copyts/-start_at_zero/-avoid_negative_ts disabled and injects
-// -output_ts_offset 0 — chunks get internal PTS=0-relative numbering,
-// dashenc emits 1-indexed names, renumber maps to N-indexed. (Earlier
-// attempt to keep -copyts in seek mode caused dashenc to emit wildly
-// non-sequential filenames and 7000+ stale chunks per session.)
+// expected URL `.../0/(N-1).m4s`. PTS-handling flags
+// (-copyts/-start_at_zero/-avoid_negative_ts disabled) MUST be left
+// alone — stripping them rebased the AAC encoder's PTS to 0 with no
+// primer samples and produced empty (199-byte) first audio segments
+// after every seek, which DASH players hang on indefinitely.
 func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	args := append([]string(nil), swArgsAV1H264...)
 	for i := 0; i+1 < len(args); i++ {
@@ -741,19 +740,21 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	if containsString(out.Args, "-skip_to_segment") {
 		t.Fatal("-skip_to_segment must be stripped from argv")
 	}
-	for _, mustStrip := range []string{"-copyts", "-start_at_zero"} {
-		if containsString(out.Args, mustStrip) {
-			t.Errorf("must strip %s in seek mode for renumber to work", mustStrip)
+	// PTS flags must SURVIVE — they prime the AAC encoder.
+	for _, mustKeep := range []string{"-copyts", "-start_at_zero"} {
+		if !containsString(out.Args, mustKeep) {
+			t.Errorf("must keep %s so audio encoder primes correctly", mustKeep)
 		}
 	}
-	if !containsString(out.Args, "-output_ts_offset") {
-		t.Errorf("must inject -output_ts_offset 0 in seek mode")
+	// Must NOT inject -output_ts_offset 0 — that rebase blanks audio.
+	if containsString(out.Args, "-output_ts_offset") {
+		t.Errorf("must NOT inject -output_ts_offset; argv=%v", out.Args)
 	}
 }
 
 // Initial-play session (`-skip_to_segment 1`, no `-ss`) captures
 // SkipToSegment=1 and renumber starts at 1 (no-op rename since names
-// match). PTS rebase still applies.
+// match). PTS flags pass through untouched.
 func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
@@ -765,7 +766,7 @@ func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	if containsString(out.Args, "-skip_to_segment") {
 		t.Fatal("-skip_to_segment must be stripped from argv")
 	}
-	if !containsString(out.Args, "-output_ts_offset") {
-		t.Errorf("must inject -output_ts_offset 0")
+	if containsString(out.Args, "-output_ts_offset") {
+		t.Errorf("must NOT inject -output_ts_offset")
 	}
 }
