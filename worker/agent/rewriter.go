@@ -721,6 +721,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// reach. Same pattern as -progressurl / -manifest_name. Stock
 		// ffmpeg's segment muxer POSTs to this URL natively when it's
 		// HTTP, so once routed through the relay it just works.
+		//
+		// Also append `&scaleplex_seg_time=<segment_time>` so the relay
+		// can rewrite each CSV row's start/end to global-timeline values
+		// (chunk N → N*seg_time .. (N+1)*seg_time). PMS returns 0-byte
+		// bodies whenever a CSV row's start_time disagrees with the
+		// chunk's playlist window, so for seek sessions we MUST send
+		// global times — but stock ffmpeg only produces global times
+		// with `-copyts`, which we just stripped because it blocks
+		// splits. Relay rewrite is the cleanest place to fix this.
+		segTime := ""
+		if i := indexOfArg(args, "-segment_time", 0); i >= 0 && i+1 < len(args) {
+			segTime = args[i+1]
+		}
 		if i := indexOfArg(args, "-segment_list", 0); i >= 0 && i+1 < len(args) {
 			base := envOr("SCALEPLEX_PMS_BASE_URL", "")
 			if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
@@ -729,12 +742,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			origURL := args[i+1]
 			if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
 				rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
-				if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+				appendQuery := func(kv string) {
 					if strings.Contains(rewritten, "?") {
-						rewritten += "&X-Plex-Token=" + tok
+						rewritten += "&" + kv
 					} else {
-						rewritten += "?X-Plex-Token=" + tok
+						rewritten += "?" + kv
 					}
+				}
+				if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+					appendQuery("X-Plex-Token=" + tok)
+				}
+				if segTime != "" {
+					appendQuery("scaleplex_seg_time=" + segTime)
 				}
 				args[i+1] = rewritten
 				changes = append(changes, "hls:segment_list:rewrite-to-relay")
