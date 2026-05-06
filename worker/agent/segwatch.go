@@ -81,24 +81,24 @@ var segmentExts = map[string]struct{}{
 // muxer output, e.g. "chunk-stream0-00130.m4s" → ("0", "00130").
 var chunkRE = regexp.MustCompile(`^chunk-stream(\d+)-0*(\d+)\.m4s$`)
 
-// watchAndRenumberChunks runs alongside watchFirstSegment. ffmpeg's
-// stock DASH muxer numbers chunks 1, 2, 3, ... regardless of input
-// PTS or `-ss` offset. PMS expects different numbers depending on
-// whether this is initial play or a seek session:
+// watchAndRenumberChunks runs alongside watchFirstSegment. The
+// rewriter forces stock dashenc to count segments 1, 2, 3, ... from
+// the start of THIS session (via `-output_ts_offset 0` and stripping
+// `-copyts/-start_at_zero`). PMS expects:
 //
-//   Initial play: PMS asks for chunks 1, 2, 3, ... — startSeq=1.
+//   Initial play (Plex argv: `-skip_to_segment 1`, no `-ss`): chunks
+//   numbered 1, 2, 3, ... — startSeq=1, no rename happens.
 //
-//   Seek (Plex argv has `-ss <off> -skip_to_segment N`): PMS computes
-//   the first expected chunk as N (1-indexed) from the seek offset
-//   and asks `.../0/(N-1).m4s` (0-indexed in URL). startSeq=N.
+//   Seek (Plex argv: `-ss <off> -skip_to_segment N`): PMS asks
+//   `.../0/(N-1).m4s` — file chunk-stream<S>-<N>.m4s on disk.
+//   startSeq=N. Each ffmpeg-emitted chunk gets RENAMED to its
+//   N-aligned name.
 //
-// Either way we hardlink each newly-written chunk to
-// chunk-stream<S>-<startSeq+k>.m4s in emission order. PMS opens by
-// the renumbered name and reads the original chunk's bytes.
-//
-// Hardlinks survive ffmpeg's window_size cleanup (the renumbered
-// names look like new files to dashenc). Any failure here is
-// best-effort: log and keep going.
+// Renaming (vs hardlinking) avoids leaving the original 1-indexed
+// filename around — that prevented dashenc's window-size rotation
+// from cleaning anything up and produced thousands of stale chunks.
+// dashenc only ever sees the new file appear (rename is atomic) and
+// proceeds.
 func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq int) {
 	if dir == "" {
 		return
@@ -151,12 +151,12 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq
 				// ffmpeg already wrote at the right number — nothing to do.
 				continue
 			}
-			// Best-effort hardlink. If we collide (target exists from a
-			// prior session crash / restart), drop the existing one
-			// first so PMS sees the freshest content.
-			_ = os.Remove(target)
-			if err := os.Link(ev.Name, target); err != nil {
-				log.Printf("session %s: chunk-renumber link %s→%s: %v", sessionID, name, filepath.Base(target), err)
+			// Atomic rename. Removes the source side so dashenc's
+			// window-rotation can keep up; the alternative (hardlink)
+			// left thousands of stale 1-indexed files behind that
+			// dashenc never cleaned up.
+			if err := os.Rename(ev.Name, target); err != nil {
+				log.Printf("session %s: chunk-renumber rename %s→%s: %v", sessionID, name, filepath.Base(target), err)
 				continue
 			}
 			if streamCount[streamID] <= 3 {

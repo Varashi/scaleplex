@@ -716,20 +716,19 @@ func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
 // `-skip_to_segment N` must be captured into RewriteResult.SkipToSegment
 // and stripped from the argv. The chunk-renumber watcher uses N as the
 // starting sequence so chunk-stream0-NNNNN.m4s names align with PMS's
-// expected URL `.../0/(N-1).m4s`. PMS argv on a seek session also keeps
-// `-copyts -start_at_zero -avoid_negative_ts disabled` and we must NOT
-// strip those — chunk timestamps need to track the global timeline
-// (otherwise audio/video desync after seek).
-func TestRewriter_SkipToSegment_SeekKeepsCopyts(t *testing.T) {
+// expected URL `.../0/(N-1).m4s`. The PTS rebase block ALWAYS strips
+// -copyts/-start_at_zero/-avoid_negative_ts disabled and injects
+// -output_ts_offset 0 — chunks get internal PTS=0-relative numbering,
+// dashenc emits 1-indexed names, renumber maps to N-indexed. (Earlier
+// attempt to keep -copyts in seek mode caused dashenc to emit wildly
+// non-sequential filenames and 7000+ stale chunks per session.)
+func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	args := append([]string(nil), swArgsAV1H264...)
-	// Replace `-skip_to_segment 1` → `-skip_to_segment 522` (seek to
-	// chunk 521 in URL terms / chunk 522 in 1-indexed file terms).
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == "-skip_to_segment" {
 			args[i+1] = "522"
 		}
 	}
-	// And add `-ss 1563` to the front to mirror PMS's seek argv.
 	args = append([]string{"-ss", "1563"}, args...)
 
 	out := Rewrite(args, map[string]string{}, nil)
@@ -742,28 +741,19 @@ func TestRewriter_SkipToSegment_SeekKeepsCopyts(t *testing.T) {
 	if containsString(out.Args, "-skip_to_segment") {
 		t.Fatal("-skip_to_segment must be stripped from argv")
 	}
-	// Seek mode must KEEP these so chunk PTS aligns with the timeline.
-	for _, must := range []string{"-copyts", "-start_at_zero"} {
-		if !containsString(out.Args, must) {
-			t.Errorf("seek mode must keep %s; argv=%v", must, out.Args)
+	for _, mustStrip := range []string{"-copyts", "-start_at_zero"} {
+		if containsString(out.Args, mustStrip) {
+			t.Errorf("must strip %s in seek mode for renumber to work", mustStrip)
 		}
 	}
-	if !containsString(out.Args, "-avoid_negative_ts") {
-		t.Errorf("seek mode must keep -avoid_negative_ts disabled")
-	}
-	// And must NOT inject -output_ts_offset 0 (would re-base PTS to 0
-	// and break the chunk-internal timestamp alignment).
-	if containsString(out.Args, "-output_ts_offset") {
-		t.Errorf("seek mode must NOT inject -output_ts_offset; argv=%v", out.Args)
+	if !containsString(out.Args, "-output_ts_offset") {
+		t.Errorf("must inject -output_ts_offset 0 in seek mode")
 	}
 }
 
-// Initial-play session (`-skip_to_segment 1`, no `-ss`) is treated as
-// seek=1: SkipToSegment captured as 1, renumber starts at 1 (effectively
-// no renumbering since ffmpeg's stock dashenc also starts at 1). The
-// PTS-handling skip block above then leaves -copyts/-start_at_zero in
-// the argv. ffmpeg 7.x dashenc numbers segments by internal counter, so
-// keeping -copyts doesn't break chunk numbering.
+// Initial-play session (`-skip_to_segment 1`, no `-ss`) captures
+// SkipToSegment=1 and renumber starts at 1 (no-op rename since names
+// match). PTS rebase still applies.
 func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
@@ -774,5 +764,8 @@ func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	}
 	if containsString(out.Args, "-skip_to_segment") {
 		t.Fatal("-skip_to_segment must be stripped from argv")
+	}
+	if !containsString(out.Args, "-output_ts_offset") {
+		t.Errorf("must inject -output_ts_offset 0")
 	}
 }
