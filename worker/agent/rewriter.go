@@ -660,15 +660,26 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// `-strict_ts:N` — Plex-private flag on the second/subtitle output
-	// pipeline. Plex's segment muxer accepts this to relax timestamp
-	// sanity checks; stock ffmpeg's segment muxer doesn't have the
-	// option and fails immediately with "Unrecognized option
-	// 'strict_ts:0'. Error splitting the argument list" — observed
-	// 2026-05-06 on Chrome/DASH playback of Superman 2025, which has
-	// embedded ASS subs that PMS extracts via a second `-f segment`
-	// output. Strip every `-strict_ts*` arg + value regardless of
-	// stream specifier.
+	// Plex-private segment-muxer / fork-only flags. Strip globally —
+	// they appear on HLS argv (the primary output) AND on the embedded
+	// subtitle pipeline that Plex appends as a second `-f segment` on
+	// DASH transcodes when the source has embedded ASS subs. Stock
+	// ffmpeg's segment muxer rejects each with "Unrecognized option
+	// '<flag>'. Error splitting the argument list" — observed:
+	//   - 2026-05-06 LG WebOS HLS Balls Up: -segment_list_unfinished
+	//   - 2026-05-06 Chrome DASH Superman: -strict_ts:0,
+	//     -segment_list_separate_stream_times (on subtitle output)
+	for _, flag := range []string{"-segment_list_separate_stream_times", "-segment_list_unfinished"} {
+		for {
+			i := indexOfArg(args, flag, 0)
+			if i < 0 || i+1 >= len(args) {
+				break
+			}
+			args = removeArgs(args, i, 2)
+			changes = append(changes, "drop:"+flag)
+		}
+	}
+	// `-strict_ts*` (any stream specifier suffix) — same family.
 	for {
 		i := -1
 		for j := 0; j < len(args); j++ {
@@ -789,15 +800,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			args[i+1] = "segment"
 			changes = append(changes, "hls:f=ssegment->segment")
 		}
-		// Drop ONLY the genuinely Plex-only segment-list flags. Everything
-		// else (segment_format, header filename, individual_header_trailer,
-		// format_options) survives untouched.
-		for _, flag := range []string{"-segment_list_separate_stream_times", "-segment_list_unfinished"} {
-			if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
-				args = removeArgs(args, i, 2)
-				changes = append(changes, "hls:drop:"+flag)
-			}
-		}
+		// (-segment_list_separate_stream_times / -segment_list_unfinished
+		// are stripped globally above for both HLS and the DASH+subs
+		// embedded-subtitle output. Don't duplicate the strip here.)
 
 		// Strip `-copyts` for HLS. Verified locally: with `-ss <off>` and
 		// `-copyts`, stock ffmpeg's segment muxer never emits a split — it
