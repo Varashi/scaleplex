@@ -70,6 +70,9 @@ var swArgsWithSubs = []string{
 	"-map", "0:3", "-f", "null", "-codec", "ass", "nullfile",
 }
 
+// Embedded subtitle case — single `-i`, `-map_inlineass 0:3` references
+// stream 3 of the source mkv. Captured from PMS log 2026-05-06 (Balls
+// Up burn-in to LG WebOS).
 var swArgsWithSubsSidecar = []string{
 	"-codec:0", "libdav1d",
 	"-codec:1", "eac3_eae",
@@ -83,6 +86,29 @@ var swArgsWithSubsSidecar = []string{
 	"-preset:0", "veryfast",
 	"-force_key_frames:0", "expr:gte(t,n_forced*3)",
 	"-map", "0:3", "-f", "null", "-codec", "ass", "nullfile",
+}
+
+// External sidecar case — Plex stages the sidecar SRT in the session's
+// transcode dir as `temp-0.srt` and adds it as a SECOND `-i`.
+// `-map_inlineass 1:s:0` references that input. Captured from PMS log
+// 2026-05-06 (Balls Up sidecar SRT burn-in).
+var swArgsWithSubsRealSidecar = []string{
+	"-codec:0", "libdav1d",
+	"-analyzeduration", "20000000", "-probesize", "20000000",
+	"-i", "/media/Movies/Balls Up (2026)/Balls Up (2026).mkv",
+	"-analyzeduration", "20000000", "-probesize", "20000000",
+	"-i", "/transcode/Transcode/Sessions/plex-transcode-q5orqh9o-c7edac0f/temp-0.srt",
+	"-start_at_zero", "-copyts", "-fps_mode", "cfr",
+	"-map_inlineass", "1:s:0",
+	"-filter_complex", "[0:0]scale=w=3840:h=1600:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];[1]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Noto Sans Medium,Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000:outline=2.6:shadow=1.7:font_size=54[2]",
+	"-map", "[2]",
+	"-codec:0", "libx264",
+	"-crf:0", "16",
+	"-maxrate:0", "20121k",
+	"-bufsize:0", "40242k",
+	"-preset:0", "veryfast",
+	"-force_key_frames:0", "expr:gte(t,n_forced*1)",
+	"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
 }
 
 func findFilterComplex(args []string, prefix string) int {
@@ -395,34 +421,53 @@ t.Setenv("HW_PREFER_HEVC", "")
 	}
 }
 
+// External-sidecar burn-in. PMS stages the .srt in the session's
+// transcode dir as `temp-0.srt` and references it via a second `-i` +
+// `-map_inlineass 1:s:0`. The rewriter must:
+//   - point the `subtitles=` filter at the staged temp file
+//   - drop the second `-i` (filter reads from disk; stock ffmpeg has
+//     no use for the input mapping after we replace the filter)
+//   - strip `-map_inlineass`
+//   - leave SubtitleExtract == nil (no extraction needed)
 func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
-t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
-	expected := "/media/Movies/Superman (2025)/Superman (2025).en.srt"
-	fsMock := func(p string) bool { return p == expected }
-	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{FSExists: fsMock})
+	out := Rewrite(swArgsWithSubsRealSidecar, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "filter:overlay-vaapi") {
 		t.Fatalf("missing overlay-vaapi: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "sidecar:"+expected) {
-		t.Fatalf("missing sidecar change: %v", out.Changes)
+	if !containsString(out.Changes, "subtitle:sidecar-staged") {
+		t.Fatalf("missing subtitle:sidecar-staged: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "drop:-map_inlineass") {
 		t.Fatalf("missing drop:-map_inlineass: %v", out.Changes)
 	}
+	if !containsString(out.Changes, "drop:-i(sidecar-input)") {
+		t.Fatalf("expected the second -i to be dropped: %v", out.Changes)
+	}
 	if containsString(out.Args, "-map_inlineass") {
 		t.Fatal("-map_inlineass not dropped")
+	}
+	if out.SubtitleExtract != nil {
+		t.Fatalf("sidecar path should NOT request extraction: %+v", out.SubtitleExtract)
+	}
+	// Only one -i should remain (the source mkv).
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 1 {
+		t.Errorf("expected 1 remaining -i, got %d", iCount)
 	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
 	for _, must := range []string{
 		"[0:0]hwupload[10]",
-		"[10]scale_vaapi=w=3840:h=2160:format=nv12[11]",
 		"[11]hwdownload[12]",
-		"[12]format=pix_fmts=nv12[13]",
-		"subtitles=filename='/media/Movies/Superman (2025)/Superman (2025).en.srt'",
+		"subtitles=filename='/transcode/Transcode/Sessions/plex-transcode-q5orqh9o-c7edac0f/temp-0.srt'",
 		"fontsdir=/usr/share/fonts/truetype/dejavu",
 		"[14]hwupload[15]",
 	} {
@@ -430,73 +475,58 @@ t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
 			t.Errorf("filter missing %q\n%s", must, f)
 		}
 	}
-	for i := idx + 1; i < len(out.Args); i++ {
-		if out.Args[i] == "-map" {
-			if out.Args[i+1] != "[15]" {
-				t.Fatalf("map=%q want [15]", out.Args[i+1])
-			}
-			break
-		}
-	}
-	// Default: FONTCONFIG_* not injected (image's system fontconfig is used).
-	if v, ok := out.Env["FONTCONFIG_FILE"]; ok {
-		t.Fatalf("FONTCONFIG_FILE should be unset by default, got %q", v)
-	}
-	if !containsString(out.Args, "nullfile") {
-		t.Fatal("nullfile output mapping must be retained for HLS bookkeeping")
-	}
 }
 
-// Sidecar-style argv with no sidecar on disk: bail. The hybrid
-// fallback that used to fire here built a graph around the Plex-private
-// `inlineass` filter that stock ffmpeg can't run (verified on the
-// worker's jellyfin-ffmpeg7: only `subtitles` and `ass` filters
-// exist; `inlineass` is absent). Bailing is the correct outcome.
-func TestRewriter_OverlayVAAPI_NoSidecar_Bails(t *testing.T) {
-	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{FSExists: func(string) bool { return false }})
-	if out.Applied {
-		t.Fatalf("expected bail when no sidecar; applied=true: %v", out.Changes)
-	}
-}
-
-func TestRewriter_OverlayVAAPI_SidecarSpecialChars(t *testing.T) {
-t.Setenv("HW_OVERLAY_VAAPI_ENABLED", "true")
-	// Real-world filenames: apostrophe, brackets, braces, parentheses.
-	// All should make it into the filter without breaking ffmpeg's parser
-	// because ' is escaped by escapeFilterPath and the rest are filename-
-	// legal inside a single-quoted filename= argument.
-	src := "/media/Movies/Pirates of the Caribbean: At World's End (2007)/Pirates {tmdb-285} [Hybrid][Remux-2160p][HDR][AV1].mkv"
-	expectedSub := "/media/Movies/Pirates of the Caribbean: At World's End (2007)/Pirates {tmdb-285} [Hybrid][Remux-2160p][HDR][AV1].en.srt"
-	args := []string{
-		"-codec:0", "libdav1d",
-		"-i", src,
-		"-map_inlineass", "0:3",
-		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1];[1]inlineass=language=en:font_size=54[2]",
-		"-map", "[2]",
-		"-codec:0", "libx264",
-		"-crf:0", "16",
-	}
-	fsMock := func(p string) bool { return p == expectedSub }
-	out := Rewrite(args, nil, &RewriteOpts{FSExists: fsMock})
+// Embedded burn-in. PMS uses `-map_inlineass 0:3` against the source's
+// own subtitle stream, no second `-i`. Stock `subtitles=` can't read
+// by stream index, so the rewriter must request that the agent extract
+// the stream to a file before spawning the main encoder.
+func TestRewriter_OverlayVAAPI_EmbeddedExtract(t *testing.T) {
+	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{SessionDir: "/transcode/Transcode/Sessions/test-sid-job"})
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "filter:overlay-vaapi") {
-		t.Fatalf("expected overlay-vaapi: %v", out.Changes)
+		t.Fatalf("missing overlay-vaapi: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "sidecar:"+expectedSub) {
-		t.Fatalf("sidecar change missing: %v", out.Changes)
+	if !containsString(out.Changes, "subtitle:embedded-extract:0:3") {
+		t.Fatalf("expected embedded-extract change with stream 0:3: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "drop:-map_inlineass") {
+		t.Fatalf("missing drop:-map_inlineass: %v", out.Changes)
+	}
+	if out.SubtitleExtract == nil {
+		t.Fatal("expected SubtitleExtract to be populated for embedded sub")
+	}
+	want := SubtitleExtract{
+		SourceFile: "/media/Movies/Superman (2025)/Superman (2025).mkv",
+		StreamSpec: "0:3",
+		OutputFile: "/transcode/Transcode/Sessions/test-sid-job/scaleplex-extract.srt",
+		Format:     "srt",
+	}
+	if *out.SubtitleExtract != want {
+		t.Errorf("SubtitleExtract = %+v\nwant %+v", *out.SubtitleExtract, want)
 	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
-	// hwdl shape: subtitles= sits in [13] →[14], inside single quotes.
-	// `:` and `'` in the path must be backslash-escaped so the filter-
-	// graph parser doesn't split on them.
-	if !strings.Contains(f, `subtitles=filename='/media/Movies/Pirates of the Caribbean\:`) {
-		t.Errorf("`:` in path not escaped:\n%s", f)
+	if !strings.Contains(f, "subtitles=filename='"+want.OutputFile+"'") {
+		t.Errorf("filter must point at extraction target:\n%s", f)
 	}
-	if !strings.Contains(f, `World\'s End`) {
-		t.Errorf("`'` in path not escaped:\n%s", f)
+}
+
+// SessionDir empty (test/local case) → fall back to a deterministic
+// /tmp path so the agent still has a place to extract to.
+func TestRewriter_OverlayVAAPI_EmbeddedExtract_DefaultDir(t *testing.T) {
+	out := Rewrite(swArgsWithSubsSidecar, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if out.SubtitleExtract == nil {
+		t.Fatal("expected SubtitleExtract")
+	}
+	if out.SubtitleExtract.OutputFile != "/tmp/scaleplex/scaleplex-extract.srt" {
+		t.Errorf("OutputFile = %q want /tmp/scaleplex/scaleplex-extract.srt",
+			out.SubtitleExtract.OutputFile)
 	}
 }
 

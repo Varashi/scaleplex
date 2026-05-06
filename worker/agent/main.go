@@ -334,7 +334,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	skipToSegment := 0
 	seekOffsetSeconds := 0.0
 	if req.Rewrite {
-		res := Rewrite(req.Args, req.Env, nil)
+		res := Rewrite(req.Args, req.Env, &RewriteOpts{SessionDir: req.Cwd})
 		if res.Applied {
 			finalArgs = res.Args
 			finalEnv = res.Env
@@ -344,6 +344,20 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			seekOffsetSeconds = res.SeekOffsetSeconds
 			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
+			// Extract embedded subtitle stream to disk before spawning
+			// the main encoder. Stock ffmpeg's `subtitles=` filter
+			// reads from a file path, not a stream index — Plex's
+			// private `inlineass` filter does the latter, but we
+			// translated it to `subtitles=`. See rewriter.go for the
+			// argv shapes Plex emits.
+			if res.SubtitleExtract != nil {
+				if err := extractSubtitleStream(ctx, res.SubtitleExtract); err != nil {
+					http.Error(w, "subtitle extract: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+				log.Printf("session %s: extracted subtitle %s → %s",
+					req.SessionID, res.SubtitleExtract.StreamSpec, res.SubtitleExtract.OutputFile)
+			}
 		} else {
 			reason := "unknown"
 			for _, c := range res.Changes {
