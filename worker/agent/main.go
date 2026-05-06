@@ -332,6 +332,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	progressURL := ""
 	manifestURL := ""
 	skipToSegment := 0
+	seekOffsetSeconds := 0.0
 	if req.Rewrite {
 		res := Rewrite(req.Args, req.Env, nil)
 		if res.Applied {
@@ -340,6 +341,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			progressURL = res.ProgressURL
 			manifestURL = res.ManifestURL
 			skipToSegment = res.SkipToSegment
+			seekOffsetSeconds = res.SeekOffsetSeconds
 			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 		} else {
@@ -448,7 +450,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		if skipToSegment > 0 {
 			startSeq = skipToSegment
 		}
-		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq)
+		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq, seekOffsetSeconds)
 		if manifestURL != "" {
 			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID, startSeq)
 		}

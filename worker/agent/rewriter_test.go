@@ -740,13 +740,13 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	if containsString(out.Args, "-skip_to_segment") {
 		t.Fatal("-skip_to_segment must be stripped from argv")
 	}
-	// On seek, -start_at_zero must be stripped so output PTS keeps the
-	// input position (<off>+) and tfdt lands on the global timeline.
-	// -copyts must survive (primes the AAC encoder).
-	if containsString(out.Args, "-start_at_zero") {
-		t.Errorf("must strip -start_at_zero on seek; argv=%v", out.Args)
+	// On seek, capture the seek offset for the renumber watcher's tfdt
+	// patch (stock dashenc writes tfdt=0 regardless of -ss/-copyts).
+	// PTS flags survive — they prime the AAC encoder.
+	if out.SeekOffsetSeconds != 1563 {
+		t.Errorf("SeekOffsetSeconds=%v want 1563", out.SeekOffsetSeconds)
 	}
-	for _, mustKeep := range []string{"-copyts", "-avoid_negative_ts"} {
+	for _, mustKeep := range []string{"-copyts", "-start_at_zero", "-avoid_negative_ts"} {
 		if !containsString(out.Args, mustKeep) {
 			t.Errorf("must keep %s on seek", mustKeep)
 		}
