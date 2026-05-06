@@ -871,7 +871,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// WebOS sub-burn the moment the rewriter picked hybrid-inlineass
 	// (e.g. when a sidecar SRT is found but VAAPI overlay isn't safe
 	// for the source — the fallback path).
-	if rewritten.Mode == "overlay-vaapi" || rewritten.Mode == "overlay-vaapi-bitmap" || rewritten.Mode == "hybrid-inlineass" {
+	if strings.HasPrefix(rewritten.Mode, "overlay-vaapi") || rewritten.Mode == "hybrid-inlineass" {
 		if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
 			args = removeArgs(args, miaIdx, 2)
 			changes = append(changes, "drop:-map_inlineass")
