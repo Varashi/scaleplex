@@ -334,12 +334,14 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	finalArgs := req.Args
 	finalEnv := req.Env
 	progressURL := ""
+	manifestURL := ""
 	if req.Rewrite {
 		res := Rewrite(req.Args, req.Env, nil)
 		if res.Applied {
 			finalArgs = res.Args
 			finalEnv = res.Env
 			progressURL = res.ProgressURL
+			manifestURL = res.ManifestURL
 			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 		} else {
@@ -445,6 +447,9 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	if req.Cwd != "" {
 		go watchFirstSegment(ctx, req.Cwd, req.SessionID, resp, spawnedAt)
 		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID)
+		if manifestURL != "" {
+			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID)
+		}
 	}
 
 	streamDone := make(chan struct{}, 2)
