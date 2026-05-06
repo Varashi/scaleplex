@@ -530,9 +530,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// Drop Plex-Transcoder-only flags that stock ffmpeg rejects with
 	// "Unrecognized option". Each is two-token (`flag value`).
 	//   -loglevel_plex <level>   — custom Plex log verbosity, no analog
-	//   -delete_removed <bool>   — Plex DASH muxer extension; stock
-	//                              ffmpeg keeps segments by default so
-	//                              the false case is the implicit behaviour
+	//   -delete_removed <bool>   — Plex DASH muxer extension. Plex passes
+	//                              `false` to mean "never delete old
+	//                              segments". Stock dashenc has no
+	//                              equivalent flag; chunk preservation is
+	//                              instead controlled by extra_window_size
+	//                              (default 5 — segments are unlinked from
+	//                              disk after they fall extra_window_size
+	//                              past the manifest window). PMS's
+	//                              universal handler serves chunks by
+	//                              number from disk and 404s the client if
+	//                              early chunks were already deleted, so
+	//                              we strip Plex's flag and inject a huge
+	//                              extra_window_size below to keep
+	//                              everything around.
 	//   -skip_to_segment <N>     — Plex DASH muxer extension to start
 	//                              segment numbering at N; stock ffmpeg
 	//                              starts at 1, which is what Plex sends
@@ -541,6 +552,23 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
+		}
+	}
+
+	// Keep every chunk on disk for the lifetime of the session. Stock
+	// dashenc deletes segments once they fall `extra_window_size` past
+	// the manifest's sliding window (default 5 + 5 = 10 newest); PMS's
+	// universal serve-chunk handler 404s the client when it asks for
+	// chunk 3 and ffmpeg already deleted it. Inject a very large
+	// extra_window_size so segments stick around. (We can't use 0 —
+	// that means "extra zero", same as deletion-on-rotate.)
+	if indexOfArg(args, "-extra_window_size", 0) < 0 {
+		for k := 0; k+1 < len(args); k++ {
+			if args[k] == "-f" && args[k+1] == "dash" {
+				args = spliceArgs(args, k, "-extra_window_size", "999999")
+				changes = append(changes, "inject:-extra_window_size=999999")
+				break
+			}
 		}
 	}
 
