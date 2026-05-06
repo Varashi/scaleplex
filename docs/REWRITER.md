@@ -1,0 +1,312 @@
+# Argv rewriter
+
+`worker/agent/rewriter.go` translates a Plex SW transcode invocation into
+a stock-ffmpeg VAAPI invocation that produces the same output bytes
+under the same names in the same directory.
+
+The translator is **conservative** — it bails (returns `applied=false`,
+caller spawns ffmpeg with the original argv unchanged) on anything it
+doesn't recognise. This means scaleplex degrades to running Plex's own
+transcoder argv on stock ffmpeg, which mostly fails — but fails
+visibly, with ffmpeg's own error messages, instead of silently
+producing wrong output.
+
+The change list returned in `RewriteResult.Changes` is the primary
+diagnostic surface. Every transformation appends a label there, and the
+agent logs the comma-joined labels at task start:
+
+```
+session Balls_Up...c11a7e73: rewriter applied:
+  decode:libdav1d->av1, inject:init_hw_device+filter_hw_device,
+  filter:plain, map-label-update, encode:libx264->h264_vaapi,
+  crf->qp, preset:veryfast->compression_level:6, drop:-x264opts:0,
+  inject:sei+a53_cc, audio:eac3_eae->eac3, drop:-eae_prefix:1,
+  drop:-loglevel_plex, hls:f=ssegment->segment,
+  hls:drop:-segment_list_separate_stream_times,
+  hls:drop:-segment_list_unfinished, hls:drop:-copyts,
+  hls:segment_list:rewrite-to-relay, seek-offset:captured=888.000s,
+  force_key_frames:offset-by-seek, progress:append-X-Plex-Token,
+  progressurl:captured-for-reporter, loglevel:->info, drop:-nostats,
+  env:strip:EAE_ROOT, env:strip:FFMPEG_EXTERNAL_LIBS, env:LIBVA
+```
+
+Each label below maps to one of the transformations documented here.
+
+## Codec swaps
+
+### `libdav1d` → `av1` (decoder)
+
+Plex selects `libdav1d` as the AV1 software decoder. We swap to ffmpeg's
+default AV1 decoder name and add VAAPI hwaccel below it. **Label:**
+`decode:libdav1d->av1`.
+
+### `libx264` → `h264_vaapi` (encoder)
+
+The whole point. Plex passes its libx264 invocation; we replace with
+the VAAPI HW encoder.
+
+Side effects:
+- `-crf:0 N` → `-qp:0 N`. **Label:** `crf->qp`.
+- `-preset:0 <name>` → `-compression_level:0 N`. iHD's TargetUsage scale
+  has 7 levels (1=quality, 7=fastest); x264 has 9 named presets. The
+  bucketing maps `ultrafast/superfast/veryfast → 7/6/6`, `faster/fast →
+  5/4`, `medium/slow → 3/2`, `slower/veryslow → 1/1`. Picked from
+  on-cluster benchmark (3× Arc A310, 2026-05-05): cl=7 yielded
+  +30-70% throughput over cl=2 on no-sub workloads with no visible
+  quality difference at QP=22. **Label:** `preset:veryfast->compression_level:6`.
+- `-x264opts:0 <stuff>` is dropped — those options are libx264-specific,
+  not portable to VAAPI. **Label:** `drop:-x264opts:0`.
+- `-sei:0 a53_cc` is injected so VAAPI's encoder embeds Closed Caption
+  608 data the same way Plex's libx264 build does. **Label:** `inject:sei+a53_cc`.
+
+### `eac3_eae` → `eac3` (audio encoder)
+
+Plex's audio encoder name `eac3_eae` invokes the EasyAudioEncoder
+sidecar (a separate process). EAE is licensed and its temp dir is tied
+to PMS's per-restart UUID — see
+[LESSONS-FROM-CLUSTERPLEX.md#5](LESSONS-FROM-CLUSTERPLEX.md). We swap
+to libavcodec's native `eac3`/`ac3`/`aac` encoders and drop
+`-eae_prefix:N` (an EAE-specific output filename salt).
+
+**Labels:** `audio:eac3_eae->eac3` (or `->ac3` etc.), `drop:-eae_prefix:1`.
+
+## Filter chain rewrites
+
+### Plain SW filter → VAAPI filter
+
+Plex's typical filter shape:
+
+```
+[0:0]scale=w=1022:h=426:force_divisible_by=4[0];
+[0]format=pix_fmts=yuv420p|nv12[1]
+```
+
+becomes (rewriter mode `plain`):
+
+```
+[0:0]scale=w=1022:h=426:force_divisible_by=4[0];
+[0]format=pix_fmts=yuv420p|nv12,hwupload[1]
+```
+
+Plus we inject `-init_hw_device "vaapi=va:/dev/dri/renderD128,kernel_driver=i915,driver=iHD"`
+and `-filter_hw_device va` ahead of the input. **Labels:** `filter:plain`,
+`inject:init_hw_device+filter_hw_device`, `map-label-update`.
+
+The map-label update is needed because we add `hwupload` inside the
+existing chain, which can shift `[N]` labels — the rewriter walks the
+graph, increments labels mentioned later in the argv (`-map "[1]"` etc.).
+
+### Hybrid inline-ASS (sidecar SRT/ASS subtitle burn-in)
+
+Plex's `-map_inlineass 0:N` + `inlineass=...` filter is **Plex-private**.
+Stock ffmpeg only has `subtitles=` and `ass=` which expect a file path,
+not a stream index.
+
+The rewriter detects this combo and:
+
+1. Probes the source media's directory for a sibling SRT/ASS subtitle
+   file. Probe order: `<base>.<lang>.srt`, `<base>.<lang>.ass`,
+   `<base>.srt`, `<base>.ass`. (`findSidecarSubtitle()`).
+2. If found, rewrites the filter chain to:
+
+   ```
+   [0:0]scale=w=W:h=H:force_divisible_by=4[0];
+   [0]format=pix_fmts=yuv420p|nv12[12];
+   [12]hwdownload,format=nv12[13];
+   [13]subtitles=filename='<sidecar>':fontsdir=/usr/share/fonts[14];
+   [14]hwupload[15]
+   ```
+
+3. Drops the `-map_inlineass` arg.
+
+4. If no sidecar is found OR the source is `inlineass`-style (subs
+   embedded in the main video stream), bails. PGS subs always force
+   burn-in client-side; SRT-via-stream-index needs sidecar lookup to
+   work in stock ffmpeg.
+
+**Labels:** `filter:hybrid-inlineass`, `drop:-map_inlineass`.
+
+This is the path that bottlenecked clusterplex (Plex's `inlineass` was
+the only filter that worked, but it forced the whole pipeline through
+Plex Transcoder).
+
+### HDR tonemap (HDR source → SDR output)
+
+`tonemap_vaapi` is **not in Plex's ffmpeg build** (they keep
+`tonemap_cuda` and `tonemap_opencl` only). Workers run jellyfin-ffmpeg7
+which has `tonemap_vaapi`.
+
+When the rewriter sees an HDR source (color_transfer=smpte2084 etc. via
+ffprobe) targeting SDR output, it injects:
+
+```
+scale_vaapi=w=W:h=H:format=p010,
+tonemap_vaapi=transfer=bt709:format=nv12
+```
+
+into the VAAPI filter chain.
+
+### Subtitle bail conditions
+
+The translator returns `applied=false` and the agent runs original argv
+when:
+
+- Filter graph contains a `subtitles=...` already (Plex's own SW path —
+  not our hybrid)
+- Decoder is unrecognised
+- Filter shape doesn't match any known mode (plain / hybrid-inlineass /
+  overlay-vaapi-sidecar / etc.)
+
+These are diagnostic dead-ends rather than failures: stock ffmpeg with
+the original Plex argv will fail, but the failure surface is ffmpeg's
+own error rather than scaleplex producing bad output.
+
+## URL rewrites
+
+ffmpeg has three flags that POST/PUT to a callback URL during the run.
+Plex hardcodes them at `http://127.0.0.1:32400/...` (PMS's loopback,
+unreachable from worker pods). The rewriter rewrites these to the
+relay's URL on the PMS pod:
+
+| Flag | Plex sets | Rewritten to |
+|---|---|---|
+| `-progressurl` | `http://127.0.0.1:32400/.../progress` | `${SCALEPLEX_PMS_BASE_URL}/.../progress?X-Plex-Token=${X_PLEX_TOKEN}` |
+| `-manifest_name` | `http://127.0.0.1:32400/.../manifest?...` | (DASH only — captured for `manifest_publish.go`, stripped from argv) |
+| `-segment_list` | `http://127.0.0.1:32400/.../manifest?...` | `${SCALEPLEX_PMS_BASE_URL}/.../manifest?...&X-Plex-Token=...&scaleplex_seg_time=<N>` |
+
+`SCALEPLEX_PMS_BASE_URL` is set in the worker DaemonSet env, e.g.
+`http://clusterplex-pms.clusterplex.svc:32499`. The relay sidecar
+listens on 32499 and forwards to 32400.
+
+**Labels:** `progress:append-X-Plex-Token`, `progressurl:captured-for-reporter`,
+`manifest_name:captured-for-publisher`, `hls:segment_list:rewrite-to-relay`.
+
+ffmpeg's `-progress` doesn't attach Authorization headers, so the token
+goes in the query string — the relay just forwards it through.
+
+## DASH-specific rewrites
+
+The rewriter detects DASH via `outputFormat == "dash"`.
+
+- `-extra_window_size 999999` injected. Without it, ffmpeg's dashenc
+  cleanup deletes chunks the moment they fall out of the rolling
+  window, but PMS's NFS-readdir-driven serve is asynchronous and
+  occasionally races the cleanup → 404 to client.
+- `-format_options "movflags=+empty_moov+default_base_moof+separate_moof+cmaf"`
+  injected before `-f dash`. Stock dashenc emits self-contained mp4
+  segments by default (`ftyp+moov+styp+sidx+moof+mdat`) which MSE
+  rejects as duplicate-init. The CMAF flags trim each chunk to
+  `styp+sidx+moof+mdat`.
+- `-skip_to_segment N` captured into `RewriteResult.SkipToSegment` and
+  stripped from argv. `segwatch.watchAndRenumberChunks` uses N as the
+  starting sequence so chunk filenames align with the `.mpd`'s
+  `startNumber=`. See [SEEK.md#dash-seek](SEEK.md#dash-seek) for why.
+- `-ss <off>` captured into `RewriteResult.SeekOffsetSeconds`. The
+  segwatch's `patchSeekChunkTimestamps` uses it to add
+  `seekOffset*timescale` to each chunk's `tfdt.bmdt` and `sidx.ept`
+  after the rename. See [SEEK.md#dash-seek](SEEK.md#dash-seek).
+- `-manifest_name <url>` extracted; `manifest_publish.go` POSTs the
+  `.mpd` body on each rewrite (Plex's ffmpeg fork does this natively;
+  stock dashenc treats `-manifest_name` as a filename).
+
+PTS handling on DASH **stays as Plex sends it** (`-copyts -start_at_zero
+-avoid_negative_ts disabled`). Removing `-start_at_zero` blanked the AAC
+encoder's primer samples and produced 199-byte empty audio segments
+after every seek; the bug only became visible when DASH players hung
+on initial-audio-buffer-fill while video chunks decoded fine.
+
+## HLS-specific rewrites
+
+Detected via `outputFormat == "ssegment"`. Plex's argv:
+
+```
+-f ssegment -segment_format matroska -individual_header_trailer 0
+-segment_header_filename header -segment_time 8 -segment_start_number N
+-segment_time_delta 0.0625 -segment_list <URL> -segment_list_type csv
+-segment_list_size 5 -segment_list_separate_stream_times 1
+-segment_list_unfinished 1 -segment_format_options output_ts_offset=10
+-max_delay 5000000 -avoid_negative_ts disabled "media-%05d.ts"
+```
+
+Rewriter changes:
+
+- `-f ssegment` → `-f segment`. ssegment is Plex-private. Stock segment
+  muxer is API-compatible for the options Plex actually uses.
+  **Label:** `hls:f=ssegment->segment`.
+- `-segment_format matroska` and `-segment_header_filename header` are
+  **kept**. Plex uses mkv-in-.ts when the codec/audio combo can't fit
+  mpegts (4K HDR + 5.1 EAC3, Atmos passthrough, etc.). Stock segment
+  muxer supports this — verified locally.
+- Drop Plex-only flags: `-segment_list_separate_stream_times`,
+  `-segment_list_unfinished`. **Labels:**
+  `hls:drop:-segment_list_separate_stream_times`,
+  `hls:drop:-segment_list_unfinished`.
+- **Drop `-copyts`.** This one's load-bearing — see
+  [SEEK.md#hls-seek](SEEK.md#hls-seek). Stock segment muxer with
+  `-ss <off> -copyts` never splits; first segment swallows the entire
+  remaining runtime. Without `-copyts` splits resume normally.
+  **Label:** `hls:drop:-copyts`.
+- Rewrite `-segment_list <PMS-loopback>` to `<relay>?...&scaleplex_seg_time=<N>`.
+  The `scaleplex_seg_time` query param tells the relay to rewrite each
+  CSV row's start_time to the global timeline. Without it, PMS would
+  serve every seek chunk as 200/0-bytes (CSV rows say chunk N starts at
+  PTS 0 instead of N×8s). **Label:** `hls:segment_list:rewrite-to-relay`.
+
+## `-force_key_frames` rewrite (seek path)
+
+Plex always emits `-force_key_frames:0 "expr:gte(t,n_forced*8)"`. With
+`-copyts -ss 1384`, the encoder's `t` starts at 1384, the expression is
+true for every frame whose `n_forced*8 <= t`, and ffmpeg fires ~`off/8`
+forced keyframes back-to-back at the start, then nothing for 8s. The
+HLS segment muxer needs a keyframe to close — first segment swallows
+tens of minutes (observed: 222 MB / 23 min on Balls Up).
+
+When seek is captured (`-ss > 0`), the rewriter rewrites the expression
+to subtract the seek offset:
+
+```
+expr:gte(t,n_forced*8)  →  expr:gte(t-1384.000,n_forced*8)
+```
+
+The keyframe cadence then matches PMS's intent (kf at output 0, 8, 16,
+…) and segments split every 8s. **Label:** `force_key_frames:offset-by-seek`.
+
+## Other tweaks
+
+- `-loglevel quiet` / `-loglevel <whatever>` → `-loglevel info`. We need
+  ffmpeg's stream-mapping lines so the agent can identify input streams
+  for the progress reporter. **Label:** `loglevel:->info`.
+- `-loglevel_plex error` dropped. Plex-private flag. **Label:** `drop:-loglevel_plex`.
+- `-nostats` dropped — PMS doesn't actually need it, and stripping it
+  gives us periodic stderr-progress lines for the reporter.
+  **Label:** `drop:-nostats`.
+
+## Environment scrubbing
+
+Plex passes some env vars that don't apply to a stock-ffmpeg run:
+
+- `EAE_ROOT` (EAE state dir) — stripped. **Label:** `env:strip:EAE_ROOT`.
+- `FFMPEG_EXTERNAL_LIBS` (Plex's codec sidecar dir) — stripped.
+  **Label:** `env:strip:FFMPEG_EXTERNAL_LIBS`.
+- `LIBVA_DRIVER_NAME` injected as `iHD` (overridable via worker env).
+  **Label:** `env:LIBVA`.
+
+`X_PLEX_TOKEN` is read out of env into the rewritten URLs and *not*
+passed through to ffmpeg's environment (no need; the URL carries it).
+
+## Test coverage
+
+`worker/agent/rewriter_test.go` (~30 cases) covers every transformation
+documented above and a few "must-NOT-touch" guards:
+
+- Initial play with no `-ss` must not rewrite `force_key_frames`.
+- HLS argv must have `-copyts` stripped; DASH must keep it.
+- VAAPI hwaccel injection must not duplicate when already present.
+- Map-label updates must not corrupt graphs that already use shifted
+  labels.
+- Sidecar SRT discovery falls back to bail when no file is found
+  (rather than producing a broken filter chain).
+
+The bail path is exercised explicitly in tests
+(`TestRewriter_Bail_*`) — a regression that quietly succeeded would be
+worse than one that bailed.
