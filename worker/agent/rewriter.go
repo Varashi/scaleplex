@@ -491,18 +491,36 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 		// expects. eof_action=pass keeps the stream open after the
 		// last subtitle event; repeatlast=1 holds the final caption
 		// until video ends (matches Plex's UX).
+		// HDR-aware scale step. When source is HDR but encoder targets
+		// SDR (which sub burn-in always does — both `subtitles=` and
+		// `overlay_vaapi` produce BT.709 output), the scale_vaapi must
+		// run in p010 → tonemap_vaapi → nv12. Without it the PQ values
+		// crash into BT.709 NV12 range with no transfer-function
+		// conversion → washed colors. Same root cause as the plain-
+		// filter HDR path (see reFilterPlain branch below).
+		scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
+		if sourceIsHDR {
+			scaleStep = fmt.Sprintf(
+				"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
+				w, h)
+		}
+
 		if subSrc != nil && subSrc.Kind == "bitmap" && subSrc.StreamSpec != "" {
+			mode := "overlay-vaapi-bitmap"
+			if sourceIsHDR {
+				mode = "overlay-vaapi-bitmap-hdr"
+			}
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];"+
-						"[10]scale_vaapi=w=%s:h=%s:format=nv12[11];"+
+						"[10]%s[11];"+
 						"[%s]format=bgra[12];"+
 						"[12]hwupload[13];"+
 						"[11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]",
-					w, h, subSrc.StreamSpec),
+					scaleStep, subSrc.StreamSpec),
 				OldLabel: "[2]",
 				NewLabel: "[15]",
-				Mode:     "overlay-vaapi-bitmap",
+				Mode:     mode,
 				Sidecar:  subSrc.Codec,
 			}
 		}
@@ -522,18 +540,22 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 		if sidecar != "" {
 			subPath := escapeFilterPath(sidecar)
 			fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
+			mode := "overlay-vaapi"
+			if sourceIsHDR {
+				mode = "overlay-vaapi-hdr"
+			}
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];"+
-						"[10]scale_vaapi=w=%s:h=%s:format=nv12[11];"+
+						"[10]%s[11];"+
 						"[11]hwdownload[12];"+
 						"[12]format=pix_fmts=nv12[13];"+
 						"[13]subtitles=filename='%s':fontsdir=%s[14];"+
 						"[14]hwupload[15]",
-					w, h, subPath, fontsDir),
+					scaleStep, subPath, fontsDir),
 				OldLabel: "[2]",
 				NewLabel: "[15]",
-				Mode:     "overlay-vaapi",
+				Mode:     mode,
 				Sidecar:  sidecar,
 			}
 		}
