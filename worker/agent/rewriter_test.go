@@ -421,6 +421,21 @@ t.Setenv("HW_PREFER_HEVC", "")
 	}
 }
 
+// containsAnyWithPrefix returns true when any change starts with the
+// given prefix — handy for filter modes whose suffix varies (-hdr,
+// -1080split, -bitmap, ...).
+func containsAnyWithPrefix(slice []string, prefix string) bool {
+	for _, s := range slice {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// Update the second sidecar test (already in this file) and the
+// other overlay-vaapi assertions to use the prefix matcher.
+
 // External-sidecar burn-in. PMS stages the .srt in the session's
 // transcode dir as `temp-0.srt` and references it via a second `-i` +
 // `-map_inlineass 1:s:0`. The rewriter must:
@@ -434,7 +449,7 @@ func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:overlay-vaapi") {
+	if !containsAnyWithPrefix(out.Changes, "filter:overlay-vaapi") {
 		t.Fatalf("missing overlay-vaapi: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "subtitle:sidecar-staged") {
@@ -464,12 +479,15 @@ func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
 	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
+	// 4K target → 1080p libass downscale path. Validate it composites
+	// the staged sub onto the main via overlay_vaapi.
 	for _, must := range []string{
-		"[0:0]hwupload[10]",
-		"[11]hwdownload[12]",
+		"split=2[main_out][sub_timing]",
+		"scale_vaapi=w=1920:h=1080:format=nv12,hwdownload",
 		"subtitles=filename='/transcode/Transcode/Sessions/plex-transcode-q5orqh9o-c7edac0f/temp-0.srt'",
-		"fontsdir=/usr/share/fonts/truetype/dejavu",
-		"[14]hwupload[15]",
+		"sub2video=1",
+		"format=bgra,hwupload,scale_vaapi=w=3840:h=1600",
+		"overlay_vaapi",
 	} {
 		if !strings.Contains(f, must) {
 			t.Errorf("filter missing %q\n%s", must, f)
@@ -486,7 +504,7 @@ func TestRewriter_OverlayVAAPI_EmbeddedExtract(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:overlay-vaapi") {
+	if !containsAnyWithPrefix(out.Changes, "filter:overlay-vaapi") {
 		t.Fatalf("missing overlay-vaapi: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "subtitle:embedded-extract:0:3") {
