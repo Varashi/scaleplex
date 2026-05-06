@@ -454,7 +454,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		}
 		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq)
 		if manifestURL != "" {
-			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID)
+			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID, startSeq)
 		}
 	}
 
