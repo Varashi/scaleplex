@@ -691,6 +691,31 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// `-flags +global_header` is for the inner muxer; mpegts doesn't
 		// need it. Stock segment muxer handles its own framing. Leave it
 		// alone — ffmpeg ignores it for mpegts.
+
+		// Rewrite -segment_list URL to the relay address. Plex points it
+		// at 127.0.0.1:32400 (PMS's loopback) which the worker pod can't
+		// reach. Same pattern as -progressurl / -manifest_name. Stock
+		// ffmpeg's segment muxer POSTs to this URL natively when it's
+		// HTTP, so once routed through the relay it just works.
+		if i := indexOfArg(args, "-segment_list", 0); i >= 0 && i+1 < len(args) {
+			base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+			if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+				base = envBase
+			}
+			origURL := args[i+1]
+			if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
+				rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
+				if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+					if strings.Contains(rewritten, "?") {
+						rewritten += "&X-Plex-Token=" + tok
+					} else {
+						rewritten += "?X-Plex-Token=" + tok
+					}
+				}
+				args[i+1] = rewritten
+				changes = append(changes, "hls:segment_list:rewrite-to-relay")
+			}
+		}
 	}
 
 	// Capture `-ss <off>` on seek sessions for the renumber watcher's
