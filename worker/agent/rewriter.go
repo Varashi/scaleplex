@@ -624,6 +624,41 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
+	// Restore the seek offset to chunk-internal mp4 timestamps.
+	//
+	// Plex's argv has `-ss <off> -copyts -start_at_zero
+	// -avoid_negative_ts disabled`. Combined, that rebases output PTS
+	// to start at 0, even though the source position is `<off>`. As a
+	// result the moof's `tfdt` (track fragment decode time) is 0 in
+	// every seek-session chunk, and Plex Web's MSE places the chunks at
+	// timeline 0-3s instead of <off>-..s. The player's currentTime sits
+	// at <off> with no buffered data → state stays BUFFERING_HAVE_NOTHING
+	// forever (observed live, sha-487ce48 + earlier).
+	//
+	// PT.real's ffmpeg fork compensates internally; stock ffmpeg needs
+	// `-output_ts_offset <off>` to add the seek offset back to output
+	// PTS so tfdt lands on the global timeline. Verified directly in the
+	// MSE harness: chunks with tfdt=0 don't extend buffer past existing
+	// initial-play range.
+	if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
+		ssVal := args[ssIdx+1]
+		if _, err := strconv.ParseFloat(ssVal, 64); err == nil {
+			// Replace any existing -output_ts_offset (we don't expect one)
+			if ot := indexOfArg(args, "-output_ts_offset", 0); ot >= 0 && ot+1 < len(args) {
+				args[ot+1] = ssVal
+				changes = append(changes, "set:-output_ts_offset="+ssVal)
+			} else {
+				for k := 0; k+1 < len(args); k++ {
+					if args[k] == "-f" && args[k+1] == "dash" {
+						args = spliceArgs(args, k, "-output_ts_offset", ssVal)
+						changes = append(changes, "inject:-output_ts_offset="+ssVal)
+						break
+					}
+				}
+			}
+		}
+	}
+
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest body
 	// to this URL whenever the .mpd is regenerated; PMS gates `/header`
 	// on the first such POST. Stock ffmpeg's dashenc treats manifest_name

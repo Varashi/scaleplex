@@ -746,15 +746,25 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 			t.Errorf("must keep %s so audio encoder primes correctly", mustKeep)
 		}
 	}
-	// Must NOT inject -output_ts_offset 0 — that rebase blanks audio.
-	if containsString(out.Args, "-output_ts_offset") {
-		t.Errorf("must NOT inject -output_ts_offset; argv=%v", out.Args)
+	// Must inject -output_ts_offset matching -ss so chunk tfdt lands on
+	// the global timeline (otherwise MSE places seek chunks at PTS=0
+	// and the player can't seek into them).
+	if !containsString(out.Args, "-output_ts_offset") {
+		t.Errorf("must inject -output_ts_offset on seek; argv=%v", out.Args)
+	}
+	for i, a := range out.Args {
+		if a == "-output_ts_offset" && i+1 < len(out.Args) {
+			if out.Args[i+1] != "1563" {
+				t.Errorf("output_ts_offset=%s want 1563", out.Args[i+1])
+			}
+		}
 	}
 }
 
 // Initial-play session (`-skip_to_segment 1`, no `-ss`) captures
 // SkipToSegment=1 and renumber starts at 1 (no-op rename since names
-// match). PTS flags pass through untouched.
+// match). PTS flags pass through untouched. No -ss → no
+// -output_ts_offset injection.
 func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
@@ -767,6 +777,6 @@ func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 		t.Fatal("-skip_to_segment must be stripped from argv")
 	}
 	if containsString(out.Args, "-output_ts_offset") {
-		t.Errorf("must NOT inject -output_ts_offset")
+		t.Errorf("must NOT inject -output_ts_offset on initial play (no -ss)")
 	}
 }
