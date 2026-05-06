@@ -119,8 +119,17 @@ func extractSubtitleStream(ctx context.Context, ex *SubtitleExtract) error {
 	// conversion. Start simple: convert everything to srt. This loses
 	// ASS styling (bold, colour, position) but gains compatibility —
 	// most Plex sub-burn requests are SRT anyway.
+	//
+	// -probesize / -analyzeduration capped to 1 MB / 1 s. ffmpeg's
+	// defaults (5 MB / 5 s) are tuned for unknown formats; on a 30+ GB
+	// 4K HDR mkv they pull tens of MB through NFS and add 15-20 s to
+	// extraction startup before any sub bytes are read. Sub stream
+	// metadata is in the container header — trivial to find with a
+	// 1 MB probe (verified on Balls Up: extraction 21 s → ~1 s).
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-y",
+		"-probesize", "1000000",
+		"-analyzeduration", "1000000",
 		"-i", ex.SourceFile,
 		"-map", ex.StreamSpec,
 		"-c:s", codec,
