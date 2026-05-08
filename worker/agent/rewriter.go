@@ -691,6 +691,29 @@ func removeArgs(s []string, at, n int) []string {
 	return out
 }
 
+// dropSidecarInput removes the sidecar `-i` AND any per-input options
+// that preceded it (everything between input-0's path and input-1's
+// path). Per ffmpeg argv spec those options apply to the next `-i`,
+// so removing only the `-i` flag leaves them dangling — they then
+// re-bind as positional output options on the LAST `-i`. PMS in
+// seek+sub-burn mode places `-ss <T>` in this slot so the SRT input
+// seeks to the same timestamp; if it dangles after our drop it
+// becomes an output seek, ffmpeg discards every encoded frame whose
+// PTS < T, and the segment muxer hangs forever. Returns the modified
+// args slice and true if anything was removed.
+func dropSidecarInput(args []string, secondInputIdx int) ([]string, bool) {
+	if secondInputIdx <= 0 || secondInputIdx+1 >= len(args) {
+		return args, false
+	}
+	firstInputIdx := indexOfArg(args, "-i", 0)
+	startDrop := secondInputIdx
+	if firstInputIdx >= 0 && firstInputIdx < secondInputIdx {
+		startDrop = firstInputIdx + 2 // after input-0's `-i path`
+	}
+	n := secondInputIdx + 2 - startDrop
+	return removeArgs(args, startDrop, n), true
+}
+
 // stripNullSubOutput removes Plex's trailing null subtitle output
 // declaration: `-map <sub-stream-spec> -f null -codec ass <output_name>`.
 // Plex appends this as a second output after the main segment muxer's
@@ -943,10 +966,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// would trip "stream specifier matches no streams" validators.
 		// For bitmap-sidecar we KEEP the second -i because overlay_vaapi
 		// pulls the stream from it via [1:s:0] in the filter graph.
+		// dropSidecarInput also removes the per-input options that
+		// preceded the second -i (e.g. the duplicate `-ss <T>` PMS
+		// places there in seek mode); leaving them in dangles them as
+		// output options after the last -i, breaking the encoder.
 		if subSrc != nil && subSrc.SecondInputArgIdx > 0 {
-			idx := subSrc.SecondInputArgIdx
-			if idx+1 < len(args) {
-				args = removeArgs(args, idx, 2)
+			if newArgs, dropped := dropSidecarInput(args, subSrc.SecondInputArgIdx); dropped {
+				args = newArgs
 				changes = append(changes, "drop:-i(sidecar-input)")
 			}
 		}
@@ -1104,9 +1130,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				changes = append(changes, "subtitle:sidecar-staged")
 				changes = append(changes, "sidecar:"+sidecarPath)
 
-				// Drop the sidecar `-i` (subtitles= reads it from disk).
-				if subSrc.SecondInputArgIdx > 0 && subSrc.SecondInputArgIdx+1 < len(args) {
-					args = removeArgs(args, subSrc.SecondInputArgIdx, 2)
+				// Drop the sidecar `-i` AND its per-input options. PMS
+				// in seek+sub-burn mode puts `-ss <T>` here so ffmpeg
+				// seeks the SRT to match the source. dropSidecarInput
+				// removes the whole input-1 option block (between the
+				// two -i flags) so nothing dangles as output seek.
+				if newArgs, dropped := dropSidecarInput(args, subSrc.SecondInputArgIdx); dropped {
+					args = newArgs
 					changes = append(changes, "drop:-i(sidecar-input)")
 				}
 				// Strip Plex-only -map_inlineass.

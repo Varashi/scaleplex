@@ -1541,6 +1541,130 @@ func TestRewriter_HWDecode_SubtitleBurnIn(t *testing.T) {
 	}
 }
 
+// PMS HW-decode + force-burn + SEEK. Captured live 2026-05-08 from
+// clusterplex-worker-sjsp4 session 6783, Plex Android, The Accountant
+// AV1 4K HDR10+, Original Quality, seek to 1816s. PMS places `-ss 1816`
+// before BOTH inputs (source mkv AND staged SRT) so the SRT input
+// seeks to match. The rewriter must drop the whole input-1 option
+// block when dropping the SRT `-i`; leaving the dangling `-ss 1816`
+// makes ffmpeg interpret it as positional output seek and discard
+// every encoded frame whose PTS < 1816 (output PTS starts at 0 with
+// -copyts stripped on HLS, never reaches 1816), the segment muxer
+// waits indefinitely, Plex Android shows "Connection error".
+func TestRewriter_HWDecode_SubBurn_SeekDropsSecondInputSs(t *testing.T) {
+	probe := func(_, _ string) string { return "subrip" }
+	args := []string{
+		"-codec:0", "av1",
+		"-hwaccel:0", "vaapi",
+		"-hwaccel_output_format:0", "vaapi",
+		"-hwaccel_device:0", "vaapi",
+		"-codec:1", "eac3_eae",
+		"-eae_prefix:1", "tok_",
+		"-ss", "1816",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/Movies/The Accountant.mkv",
+		"-ss", "1816",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/transcode/sess/temp-0.srt",
+		"-start_at_zero",
+		"-copyts",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_hw_device", "vaapi",
+		"-y", "-nostats", "-loglevel", "quiet",
+		"-loglevel_plex", "error",
+		"-progressurl", "http://127.0.0.1:32400/sess/job/progress",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=3840:h=2160:format=p010[1];[1]hwdownload,format=p010[2];[2]inlineass=font_size=54[3];[3]hwupload[4]",
+		"-map", "[4]",
+		"-codec:0", "hevc_vaapi", "-qp:0", "15",
+		"-maxrate:0", "20121k", "-bufsize:0", "40242k",
+		"-r:0", "23.975",
+		"-sei:0", "-a53_cc",
+		"-force_key_frames:0", "expr:gte(t,n_forced*1)",
+		"-filter_complex", "[0:1] aresample=async=1:ochl='5.1':osr=48000[5]",
+		"-map", "[5]",
+		"-codec:1", "aac", "-b:1", "774k",
+		"-segment_format", "matroska", "-f", "ssegment",
+		"-individual_header_trailer", "0",
+		"-segment_header_filename", "header",
+		"-segment_time", "1",
+		"-segment_start_number", "1816",
+		"-segment_time_delta", "0.0625",
+		"-segment_list", "http://127.0.0.1:32400/sess/job/manifest?X-Plex-Http-Pipeline=infinite",
+		"-segment_list_type", "csv",
+		"-segment_list_size", "5",
+		"-segment_list_separate_stream_times", "1",
+		"-segment_list_unfinished", "1",
+		"-segment_format_options", "output_ts_offset=10",
+		"-max_delay", "5000000",
+		"-avoid_negative_ts", "disabled",
+		"-map_metadata", "-1",
+		"-map_chapters", "-1",
+		"media-%05d.ts",
+		"-map", "1:s:0",
+		"-f", "null",
+		"-codec", "ass",
+		"nullfile",
+	}
+	out := Rewrite(args, map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}, &RewriteOpts{
+		SessionDir:         "/transcode/sess",
+		ProbeSubtitleCodec: probe,
+	})
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
+	}
+
+	// Count remaining `-ss` flags. The input-0 -ss must survive (real
+	// input seek). The input-1 -ss must be GONE (would dangle as
+	// output seek otherwise).
+	ssCount := 0
+	for i := 0; i < len(out.Args); i++ {
+		if out.Args[i] == "-ss" {
+			ssCount++
+		}
+	}
+	if ssCount != 1 {
+		t.Fatalf("want exactly 1 remaining -ss (the input-0 seek), got %d. args=%v", ssCount, out.Args)
+	}
+
+	// And the surviving -ss must be BEFORE the (only) -i — i.e. it's
+	// an input option, not a positional output option.
+	iIdx := indexOfArg(out.Args, "-i", 0)
+	ssIdx := indexOfArg(out.Args, "-ss", 0)
+	if ssIdx < 0 {
+		t.Fatal("missing -ss after rewrite")
+	}
+	if ssIdx > iIdx {
+		t.Fatalf("-ss landed AFTER -i (would be output seek); ssIdx=%d iIdx=%d", ssIdx, iIdx)
+	}
+
+	// Sanity: only one -i remains
+	iCount := 0
+	for i := 0; i < len(out.Args); i++ {
+		if out.Args[i] == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 1 {
+		t.Fatalf("want 1 remaining -i (source), got %d", iCount)
+	}
+
+	// Seek-offset captured for diagnostics
+	if !containsString(out.Changes, "seek-offset:captured=1816.000s") {
+		t.Errorf("seek-offset not captured: %v", out.Changes)
+	}
+	// HLS-specific seek + force_key_frames untouched (Plex's expr
+	// is correct on HLS without -copyts)
+	if containsString(out.Changes, "force_key_frames:offset-by-seek") {
+		t.Errorf("HLS+seek must NOT rewrite force_key_frames")
+	}
+}
+
 // HW-decode without -hwaccel flag is treated as unknown SW decoder
 // (we don't auto-detect from the codec name alone — Plex has been
 // known to send `av1` as a SW probe arg too).
