@@ -1058,24 +1058,47 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
 				}
 				w, h := m[1], m[2]
-				scaleFmt := m[3]
-				if scaleFmt == "" {
-					scaleFmt = "nv12"
-				}
-				hwdlFmt := m[4]
 				sidecarPath := subSrc.FilePath
 				if sidecarPath == "" {
 					return bail("hw-decode-sub:no-sidecar")
 				}
 				subPath := escapeFilterPath(sidecarPath)
 				fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
+				// Force nv12 across the libass step. PMS's chain keeps
+				// p010 end-to-end (Plex's bundled inlineass reads 10-bit
+				// fine), but stock `subtitles=` on p010 has caused the
+				// encoder pipeline to stall after the first seek-time
+				// fontselect with no further output for 30+s on Plex
+				// Android force-burn sessions (live repro 2026-05-08:
+				// Plex Android, force-burn subs, seek to 1750s, encoder
+				// never opens). Initial play (no -ss) doesn't reproduce
+				// because the first 5s of typical content has no
+				// subtitle rendering. nv12 throughout the libass step
+				// matches the SW path's HDR handling and sidesteps the
+				// p010+libass interaction. We lose HDR pass-through on
+				// sub-burn sessions specifically; sub burn always
+				// composites SDR libass glyphs anyway, so HDR survival
+				// past the burn is best-effort. tonemap_vaapi handles
+				// HDR-source conversion before the libass step.
+				if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+					if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
+						sourceIsHDR = true
+						changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+					}
+				}
+				scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
+				if sourceIsHDR {
+					scaleStep = fmt.Sprintf(
+						"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
+						w, h)
+				}
 				args[vfIdx] = fmt.Sprintf(
 					"[0:0]hwupload[0];"+
-						"[0]scale_vaapi=w=%s:h=%s:format=%s[1];"+
-						"[1]hwdownload,format=%s[2];"+
+						"[0]%s[1];"+
+						"[1]hwdownload,format=nv12[2];"+
 						"[2]subtitles=filename='%s':fontsdir=%s[3];"+
 						"[3]hwupload[4]",
-					w, h, scaleFmt, hwdlFmt, subPath, fontsDir,
+					scaleStep, subPath, fontsDir,
 				)
 				changes = append(changes, "hw-decode:filter:inlineass->subtitles")
 				changes = append(changes, "subtitle:sidecar-staged")
