@@ -150,11 +150,15 @@ func mapX264PresetToVAAPI(preset string) string {
 	return "7"
 }
 
-func encoderMap(preferHEVC bool) map[string]string {
-	if preferHEVC {
-		return map[string]string{"libx264": "hevc_vaapi", "libx265": "hevc_vaapi"}
-	}
-	return map[string]string{"libx264": "h264_vaapi", "libx265": "hevc_vaapi"}
+// encoderMap routes PMS's chosen software encoder to its VAAPI
+// equivalent. PMS picks libx264 vs libx265 per session based on its
+// own server prefs (TranscoderHEVCEncodingMode) and client capability
+// negotiation; the worker tracks that choice rather than forcing one
+// codec, so the DASH/HLS manifest's codec_string already matches the
+// output stream.
+var encoderMap = map[string]string{
+	"libx264": "h264_vaapi",
+	"libx265": "hevc_vaapi",
 }
 
 var (
@@ -665,7 +669,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		sessionDir = opts.SessionDir
 	}
 
-	preferHEVC := envBool("HW_PREFER_HEVC")
 	// HW_OVERLAY_VAAPI_ENABLED defaults to true. The mode it gates uses
 	// stock ffmpeg's `subtitles=` filter (file-based, libass-rendered,
 	// chained through `hwdownload`/`hwupload`) — the only sub-burn path
@@ -906,7 +909,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		return bail("no-encoder")
 	}
 	swEncoder := args[encCodecIdx+1]
-	hwEncoder, ok := encoderMap(preferHEVC)[swEncoder]
+	hwEncoder, ok := encoderMap[swEncoder]
 	if !ok {
 		return bail("unknown-encoder:" + swEncoder)
 	}
