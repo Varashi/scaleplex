@@ -120,6 +120,20 @@ var decoderMap = map[string]string{
 	"libx264":  "h264",
 }
 
+// hwDecodeShortCodecs is the set of bare codec names PMS emits in the
+// `-codec:0` slot when its HW probe succeeded and it wants the worker
+// to use VAAPI hwaccel for decode. Distinct from decoderMap (which
+// holds Plex software-decoder names like libdav1d) — when PMS sends
+// one of these alongside `-hwaccel:0 vaapi`, the rest of the argv
+// (filter chain, encoder, CQP) is already VAAPI-shaped and we
+// pass it through.
+var hwDecodeShortCodecs = map[string]struct{}{
+	"av1":  {},
+	"hevc": {},
+	"h264": {},
+	"vp9":  {},
+}
+
 // x264PresetToVAAPI maps Plex's libx264 -preset names onto iHD's VAAPI
 // TargetUsage scale (compression_level 1..7, where 7 = fastest /
 // "ultrafast" and 1 = highest quality / "veryslow"). The bucketing is
@@ -177,7 +191,14 @@ var (
 		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[\d+\];` +
 			`.*zscale.*tonemap.*format=pix_fmts=[^\[]*nv12\[(\d+)\]$`)
 	reLanguage = regexp.MustCompile(`(?:^|:)language=([a-zA-Z]{2,3})`)
-	reInitHW   = regexp.MustCompile(`^vaapi=vaapi:?$`)
+	// reInitHW accepts both PMS argv shapes for `-init_hw_device`:
+	//   `vaapi=vaapi:`                                — SW-decode, PMS
+	//   doesn't know the device because the worker chooses it.
+	//   `vaapi=vaapi:/dev/dri/renderDNNN[,driver=NAME]` — HW-decode,
+	//   PMS reads HardwareDevicePath + iHD driver from its own probe.
+	// In either case the rewriter overwrites with HW_RENDER_DEVICE +
+	// HW_VAAPI_DRIVER defaults so the worker pod's device wins.
+	reInitHW   = regexp.MustCompile(`^vaapi=vaapi:(?:/dev/dri/[A-Za-z0-9_]+(?:,driver=[A-Za-z0-9_]+)?)?$`)
 )
 
 func envBool(k string) bool { return os.Getenv(k) == "true" }
@@ -737,23 +758,42 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		return bail("no-input")
 	}
 
-	// 1. Decoder swap (FIRST -codec:0 must precede -i)
+	// 1. Decoder.
+	//
+	// Two argv shapes:
+	//
+	//   SW-decode (Plex's `HardwareAcceleratedCodecs=0` or no HW probe):
+	//     -codec:0 libdav1d -i ...                 (libhevc / libx264)
+	//   PMS lets the worker handle HW decode by rewriting decoder to
+	//   the native codec name + injecting -hwaccel:0 vaapi flags below.
+	//
+	//   HW-decode (`HardwareAcceleratedCodecs=1` and HW probe succeeded):
+	//     -codec:0 av1 -hwaccel:0 vaapi -hwaccel_output_format:0 vaapi
+	//     -hwaccel_device:0 vaapi -i ...
+	//   PMS already produced the full VAAPI argv: short codec name,
+	//   hwaccel flags, scale_vaapi filter chain, h264_vaapi / hevc_vaapi
+	//   encoder with -qp:0 directly. We pass that through and only do
+	//   the Plex-quirk strips (phases 9-24).
 	decCodecIdx := indexOfArg(args, "-codec:0", 0)
 	if decCodecIdx < 0 || decCodecIdx >= inputIdx {
 		return bail("no-decoder")
 	}
 	swDecoder := args[decCodecIdx+1]
-	hwDecoder, ok := decoderMap[swDecoder]
-	if !ok {
+	isHWDecode := false
+	if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort && indexOfArg(args, "-hwaccel:0", 0) >= 0 {
+		isHWDecode = true
+		changes = append(changes, "decode:hw-passthrough:"+swDecoder)
+	} else if hwDecoder, ok := decoderMap[swDecoder]; ok {
+		args[decCodecIdx+1] = hwDecoder
+		args = spliceArgs(args, decCodecIdx+2,
+			"-hwaccel:0", "vaapi",
+			"-hwaccel_output_format:0", "vaapi",
+			"-hwaccel_device:0", "vaapi",
+		)
+		changes = append(changes, "decode:"+swDecoder+"->"+hwDecoder)
+	} else {
 		return bail("unknown-decoder:" + swDecoder)
 	}
-	args[decCodecIdx+1] = hwDecoder
-	args = spliceArgs(args, decCodecIdx+2,
-		"-hwaccel:0", "vaapi",
-		"-hwaccel_output_format:0", "vaapi",
-		"-hwaccel_device:0", "vaapi",
-	)
-	changes = append(changes, "decode:"+swDecoder+"->"+hwDecoder)
 
 	// 2. -init_hw_device patch or inject
 	initIdx := indexOfArg(args, "-init_hw_device", 0)
@@ -777,144 +817,176 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		changes = append(changes, "inject:init_hw_device+filter_hw_device")
 	}
 
-	// 3. Video -filter_complex rewrite
-	vfIdx := -1
-	for i := 0; i < len(args); i++ {
-		if args[i] == "-filter_complex" && i+1 < len(args) && strings.HasPrefix(args[i+1], "[0:0]") {
-			vfIdx = i + 1
-			break
-		}
-	}
-	if vfIdx < 0 {
-		return bail("no-video-filter")
-	}
-	mediaPath := ""
-	if i := indexOfArg(args, "-i", 0); i >= 0 && i+1 < len(args) {
-		mediaPath = args[i+1]
-	}
-
-	// Subtitle source detection. PMS hands us the subtitle file/stream
-	// via -map_inlineass <spec> + -i shape; the rewriter resolves which
-	// case we're in (text-sidecar / text-embedded / bitmap-embedded /
-	// bitmap-sidecar) and the filter rewrite below picks the matching
-	// stock-ffmpeg chain. Any embedded text extraction needed is
-	// signalled to the agent via RewriteResult.SubtitleExtract.
-	var probe func(string, string) string
-	if opts != nil && opts.ProbeSubtitleCodec != nil {
-		probe = opts.ProbeSubtitleCodec
-	}
-	subSrc := detectSubtitleSource(args, sessionDir, probe)
-	var subExtract *SubtitleExtract
-	if subSrc != nil {
-		subExtract = subSrc.Extract
-		switch subSrc.Kind {
-		case "text":
-			if subSrc.Extract != nil {
-				changes = append(changes, "subtitle:embedded-extract:"+subSrc.StreamSpec)
-			} else {
-				changes = append(changes, "subtitle:sidecar-staged")
-			}
-		case "bitmap":
-			label := "subtitle:bitmap:" + subSrc.StreamSpec
-			if subSrc.Codec != "" {
-				label += "(" + subSrc.Codec + ")"
-			}
-			changes = append(changes, label)
-		}
-	}
-
-	// Detect HDR source — Plex's bundled transcoder used to autoinject
-	// tonemap (musl-bound opencl, sw fallback); we can't, so we ask the
-	// agent to ffprobe color metadata and pass through here. Skipped
-	// when no probe is wired (tests treat all sources as SDR by default).
-	sourceIsHDR := false
-	if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
-		transfer, _, _ := opts.ProbeVideoColor(mediaPath)
-		if isHDRTransfer(transfer) {
-			sourceIsHDR = true
-			changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
-		}
-	}
-
-	rewritten := rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR)
-	if rewritten == nil {
-		return bail("filter-pattern:" + args[vfIdx])
-	}
-	args[vfIdx] = rewritten.Filter
-	changes = append(changes, "filter:"+rewritten.Mode)
-
-	// Drop the second `-i` for text-sidecar burn-in. The rewritten
-	// filter consumes the staged file via `subtitles=filename=...`,
-	// so stock ffmpeg has no use for it as an input — keeping it
-	// would trip "stream specifier matches no streams" validators.
-	// For bitmap-sidecar we KEEP the second -i because overlay_vaapi
-	// pulls the stream from it via [1:s:0] in the filter graph.
-	if subSrc != nil && subSrc.SecondInputArgIdx > 0 {
-		idx := subSrc.SecondInputArgIdx
-		if idx+1 < len(args) {
-			args = removeArgs(args, idx, 2)
-			changes = append(changes, "drop:-i(sidecar-input)")
-		}
-	}
-
-	// 4. Update -map output label following the video filter
-	for i := vfIdx + 1; i < len(args); i++ {
-		if args[i] != "-map" {
-			continue
-		}
-		v := args[i+1]
-		if v == rewritten.OldLabel || v == `"`+rewritten.OldLabel+`"` {
-			if strings.HasPrefix(v, `"`) {
-				args[i+1] = `"` + rewritten.NewLabel + `"`
-			} else {
-				args[i+1] = rewritten.NewLabel
-			}
-			changes = append(changes, "map-label-update")
-			break
-		}
-	}
-
-	// Both subtitle-rewrite modes (overlay-vaapi sidecar and the older
-	// hybrid-inlineass that uses subtitles= on a hwdownload→hwupload
-	// roundtrip) need the Plex-private `-map_inlineass <stream>` argv
-	// flag stripped, otherwise stock ffmpeg fails with "Unrecognized
-	// option 'map_inlineass'" before the filter graph even runs. The
-	// strip used to be gated on overlay-vaapi only, which broke LG
-	// WebOS sub-burn the moment the rewriter picked hybrid-inlineass
-	// (e.g. when a sidecar SRT is found but VAAPI overlay isn't safe
-	// for the source — the fallback path).
-	if strings.HasPrefix(rewritten.Mode, "overlay-vaapi") || rewritten.Mode == "hybrid-inlineass" {
-		if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
-			args = removeArgs(args, miaIdx, 2)
-			changes = append(changes, "drop:-map_inlineass")
-		}
-		// Fontconfig is opt-in; the worker image ships a system-wide
-		// fontconfig (fc-cache built at image-build time) that libass
-		// finds without any env nudging.
-		if v := os.Getenv("HW_FONTCONFIG_FILE"); v != "" {
-			env["FONTCONFIG_FILE"] = v
-		}
-		if v := os.Getenv("HW_FONTCONFIG_PATH"); v != "" {
-			env["FONTCONFIG_PATH"] = v
-		}
-		if rewritten.Sidecar != "" {
-			changes = append(changes, "sidecar:"+rewritten.Sidecar)
-		}
-	}
-
-	// 5. Encoder swap (next -codec:0 after -i)
+	// Locate output -codec:0 (after -i) up-front; both SW and HW paths
+	// reference it for later phases (CRF→QP, preset→cl, sei inject).
 	newInputIdx := indexOfArg(args, "-i", 0)
 	encCodecIdx := indexOfArg(args, "-codec:0", newInputIdx+1)
 	if encCodecIdx < 0 {
 		return bail("no-encoder")
 	}
-	swEncoder := args[encCodecIdx+1]
-	hwEncoder, ok := encoderMap[swEncoder]
-	if !ok {
-		return bail("unknown-encoder:" + swEncoder)
+
+	mediaPath := ""
+	if i := indexOfArg(args, "-i", 0); i >= 0 && i+1 < len(args) {
+		mediaPath = args[i+1]
 	}
-	args[encCodecIdx+1] = hwEncoder
-	changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
+
+	// SW-decode-only artefacts. In HW-decode mode PMS already shaped
+	// the filter chain, encoder, and map labels for VAAPI; we leave
+	// them untouched. Subtitle burn-in for HW-decode mode is not yet
+	// supported (PMS likely doesn't request it when HW probe matches).
+	var rewritten *filterRewrite
+	var subSrc *subtitleSource
+	var subExtract *SubtitleExtract
+	sourceIsHDR := false
+
+	if !isHWDecode {
+		// 3. Video -filter_complex rewrite
+		vfIdx := -1
+		for i := 0; i < len(args); i++ {
+			if args[i] == "-filter_complex" && i+1 < len(args) && strings.HasPrefix(args[i+1], "[0:0]") {
+				vfIdx = i + 1
+				break
+			}
+		}
+		if vfIdx < 0 {
+			return bail("no-video-filter")
+		}
+
+		// Subtitle source detection. PMS hands us the subtitle file/stream
+		// via -map_inlineass <spec> + -i shape; the rewriter resolves which
+		// case we're in (text-sidecar / text-embedded / bitmap-embedded /
+		// bitmap-sidecar) and the filter rewrite below picks the matching
+		// stock-ffmpeg chain. Any embedded text extraction needed is
+		// signalled to the agent via RewriteResult.SubtitleExtract.
+		var probe func(string, string) string
+		if opts != nil && opts.ProbeSubtitleCodec != nil {
+			probe = opts.ProbeSubtitleCodec
+		}
+		subSrc = detectSubtitleSource(args, sessionDir, probe)
+		if subSrc != nil {
+			subExtract = subSrc.Extract
+			switch subSrc.Kind {
+			case "text":
+				if subSrc.Extract != nil {
+					changes = append(changes, "subtitle:embedded-extract:"+subSrc.StreamSpec)
+				} else {
+					changes = append(changes, "subtitle:sidecar-staged")
+				}
+			case "bitmap":
+				label := "subtitle:bitmap:" + subSrc.StreamSpec
+				if subSrc.Codec != "" {
+					label += "(" + subSrc.Codec + ")"
+				}
+				changes = append(changes, label)
+			}
+		}
+
+		// Detect HDR source — Plex's bundled transcoder used to autoinject
+		// tonemap (musl-bound opencl, sw fallback); we can't, so we ask the
+		// agent to ffprobe color metadata and pass through here. Skipped
+		// when no probe is wired (tests treat all sources as SDR by default).
+		if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+			transfer, _, _ := opts.ProbeVideoColor(mediaPath)
+			if isHDRTransfer(transfer) {
+				sourceIsHDR = true
+				changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+			}
+		}
+
+		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR)
+		if rewritten == nil {
+			return bail("filter-pattern:" + args[vfIdx])
+		}
+		args[vfIdx] = rewritten.Filter
+		changes = append(changes, "filter:"+rewritten.Mode)
+
+		// Drop the second `-i` for text-sidecar burn-in. The rewritten
+		// filter consumes the staged file via `subtitles=filename=...`,
+		// so stock ffmpeg has no use for it as an input — keeping it
+		// would trip "stream specifier matches no streams" validators.
+		// For bitmap-sidecar we KEEP the second -i because overlay_vaapi
+		// pulls the stream from it via [1:s:0] in the filter graph.
+		if subSrc != nil && subSrc.SecondInputArgIdx > 0 {
+			idx := subSrc.SecondInputArgIdx
+			if idx+1 < len(args) {
+				args = removeArgs(args, idx, 2)
+				changes = append(changes, "drop:-i(sidecar-input)")
+			}
+		}
+
+		// 4. Update -map output label following the video filter
+		for i := vfIdx + 1; i < len(args); i++ {
+			if args[i] != "-map" {
+				continue
+			}
+			v := args[i+1]
+			if v == rewritten.OldLabel || v == `"`+rewritten.OldLabel+`"` {
+				if strings.HasPrefix(v, `"`) {
+					args[i+1] = `"` + rewritten.NewLabel + `"`
+				} else {
+					args[i+1] = rewritten.NewLabel
+				}
+				changes = append(changes, "map-label-update")
+				break
+			}
+		}
+
+		// Both subtitle-rewrite modes (overlay-vaapi sidecar and the older
+		// hybrid-inlineass that uses subtitles= on a hwdownload→hwupload
+		// roundtrip) need the Plex-private `-map_inlineass <stream>` argv
+		// flag stripped, otherwise stock ffmpeg fails with "Unrecognized
+		// option 'map_inlineass'" before the filter graph even runs. The
+		// strip used to be gated on overlay-vaapi only, which broke LG
+		// WebOS sub-burn the moment the rewriter picked hybrid-inlineass
+		// (e.g. when a sidecar SRT is found but VAAPI overlay isn't safe
+		// for the source — the fallback path).
+		if strings.HasPrefix(rewritten.Mode, "overlay-vaapi") || rewritten.Mode == "hybrid-inlineass" {
+			if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
+				args = removeArgs(args, miaIdx, 2)
+				changes = append(changes, "drop:-map_inlineass")
+			}
+			// Fontconfig is opt-in; the worker image ships a system-wide
+			// fontconfig (fc-cache built at image-build time) that libass
+			// finds without any env nudging.
+			if v := os.Getenv("HW_FONTCONFIG_FILE"); v != "" {
+				env["FONTCONFIG_FILE"] = v
+			}
+			if v := os.Getenv("HW_FONTCONFIG_PATH"); v != "" {
+				env["FONTCONFIG_PATH"] = v
+			}
+			if rewritten.Sidecar != "" {
+				changes = append(changes, "sidecar:"+rewritten.Sidecar)
+			}
+		}
+
+		// 5. Encoder swap (libx264 → h264_vaapi etc.)
+		// Re-locate encCodecIdx because the splices above may have
+		// shifted indices.
+		newInputIdx = indexOfArg(args, "-i", 0)
+		encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+		if encCodecIdx < 0 {
+			return bail("no-encoder")
+		}
+		swEncoder := args[encCodecIdx+1]
+		hwEncoder, ok := encoderMap[swEncoder]
+		if !ok {
+			return bail("unknown-encoder:" + swEncoder)
+		}
+		args[encCodecIdx+1] = hwEncoder
+		changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
+	} else {
+		// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
+		// that, but leave the filter chain, map labels, and encoder
+		// argument intact.
+		swEncoder := args[encCodecIdx+1]
+		switch swEncoder {
+		case "h264_vaapi", "hevc_vaapi":
+			// expected
+		default:
+			return bail("hw-decode:unexpected-encoder:" + swEncoder)
+		}
+		changes = append(changes, "encode:hw-passthrough:"+swEncoder)
+	}
 
 	// 6. -crf:0 <Q> → -qp:0 <Q + HW_QP_CRF_OFFSET> (CQP mode).
 	//
