@@ -1334,6 +1334,170 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 	}
 }
 
+// PMS HW-decode + force-burn subtitle. Captured live from
+// clusterplex-worker-5v2zj 2026-05-08 18:10Z, Plex Android playing
+// The Accountant with a forced English SDH track and the Plex pref
+// "Burn Subtitles: Always" set. PMS extracts the SRT to
+// /transcode/<session>/temp-0.srt and adds it as a second -i + a
+// `-map_inlineass 1:s:0` directive; the filter graph hwdownloads
+// from VAAPI to CPU for libass, then hwuploads back. The rewriter
+// must swap inlineass→subtitles=, drop the sidecar input + the
+// inlineass map flag + Plex's trailing null sub output.
+var hwDecodeArgsAV1HEVCSubBurn = []string{
+	"-codec:0", "av1",
+	"-hwaccel:0", "vaapi",
+	"-hwaccel_output_format:0", "vaapi",
+	"-hwaccel_device:0", "vaapi",
+	"-codec:1", "eac3_eae",
+	"-eae_prefix:1", "bb137193_",
+	"-analyzeduration", "20000000",
+	"-probesize", "20000000",
+	"-i", "/media/Movies/The Accountant.mkv",
+	"-analyzeduration", "20000000",
+	"-probesize", "20000000",
+	"-i", "/transcode/sess/temp-0.srt",
+	"-start_at_zero",
+	"-copyts",
+	"-fps_mode", "cfr",
+	"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+	"-filter_hw_device", "vaapi",
+	"-y",
+	"-nostats",
+	"-loglevel", "quiet",
+	"-loglevel_plex", "error",
+	"-progressurl", "http://127.0.0.1:32400/sess/job/progress",
+	"-map_inlineass", "1:s:0",
+	"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1024:h=576:format=p010[1];[1]hwdownload,format=p010[2];[2]inlineass=font_scale=1.0:font_path=/x:font_size=54[3];[3]hwupload[4]",
+	"-map", "[4]",
+	"-metadata:s:0", "language=eng",
+	"-codec:0", "hevc_vaapi",
+	"-qp:0", "24",
+	"-maxrate:0", "1541k",
+	"-bufsize:0", "3082k",
+	"-r:0", "23.975",
+	"-sei:0", "-a53_cc",
+	"-force_key_frames:0", "expr:gte(t,n_forced*5)",
+	"-filter_complex", "[0:1] aresample=async=1:ochl='5.1':rematrix_maxval=0.000000dB:osr=48000[5]",
+	"-map", "[5]",
+	"-metadata:s:1", "language=eng",
+	"-codec:1", "aac",
+	"-b:1", "351k",
+	"-segment_format", "matroska",
+	"-f", "ssegment",
+	"-individual_header_trailer", "0",
+	"-flags", "+global_header",
+	"-segment_header_filename", "header",
+	"-segment_time", "5",
+	"-segment_start_number", "0",
+	"-segment_time_delta", "0.0625",
+	"-segment_list", "http://127.0.0.1:32400/sess/job/manifest?X-Plex-Http-Pipeline=infinite",
+	"-segment_list_type", "csv",
+	"-segment_list_size", "5",
+	"-segment_list_separate_stream_times", "1",
+	"-segment_list_unfinished", "1",
+	"-segment_format_options", "output_ts_offset=10",
+	"-max_delay", "5000000",
+	"-avoid_negative_ts", "disabled",
+	"-map_metadata", "-1",
+	"-map_chapters", "-1",
+	"media-%05d.ts",
+	"-map", "1:s:0",
+	"-f", "null",
+	"-codec", "ass",
+	"nullfile",
+}
+
+func TestRewriter_HWDecode_SubtitleBurnIn(t *testing.T) {
+	probe := func(_, _ string) string { return "subrip" }
+	out := Rewrite(hwDecodeArgsAV1HEVCSubBurn, map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}, &RewriteOpts{
+		SessionDir:         "/transcode/sess",
+		ProbeSubtitleCodec: probe,
+	})
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
+	}
+
+	mustContain := []string{
+		"decode:hw-passthrough:av1",
+		"encode:hw-passthrough:hevc_vaapi",
+		"hw-decode:filter:inlineass->subtitles",
+		"subtitle:sidecar-staged",
+		"sidecar:/transcode/sess/temp-0.srt",
+		"drop:-i(sidecar-input)",
+		"drop:-map_inlineass",
+		"drop:null-sub-output",
+		"audio:eac3_eae->eac3",
+		"hls:f=ssegment->segment",
+	}
+	for _, want := range mustContain {
+		if !containsString(out.Changes, want) {
+			t.Errorf("missing change %q; got %v", want, out.Changes)
+		}
+	}
+
+	// Filter chain must mention subtitles= and not inlineass=.
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-filter_complex" && strings.HasPrefix(out.Args[i+1], "[0:0]") {
+			f := out.Args[i+1]
+			if strings.Contains(f, "inlineass=") {
+				t.Fatalf("filter still contains inlineass=: %q", f)
+			}
+			if !strings.Contains(f, "subtitles=filename='/transcode/sess/temp-0.srt'") {
+				t.Fatalf("filter missing subtitles= for staged SRT: %q", f)
+			}
+			// Output label must remain [4] so the existing -map [4] works
+			if !strings.HasSuffix(f, "[3]hwupload[4]") {
+				t.Fatalf("filter chain must end at [4]: %q", f)
+			}
+			break
+		}
+	}
+
+	// Only one -i should remain (source mkv); sidecar -i dropped
+	iCount := 0
+	for i := 0; i < len(out.Args); i++ {
+		if out.Args[i] == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 1 {
+		t.Fatalf("want 1 remaining -i, got %d", iCount)
+	}
+
+	// `-map_inlineass` must be gone
+	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
+		t.Fatalf("-map_inlineass not stripped")
+	}
+
+	// Null sub output (`-map 1:s:0 -f null -codec ass nullfile`) gone
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-f" && out.Args[i+1] == "null" {
+			t.Fatalf("-f null (null sub output) not stripped: %v", out.Args[i:])
+		}
+	}
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-codec" && out.Args[i+1] == "ass" {
+			t.Fatalf("-codec ass (null sub output tail) not stripped")
+		}
+	}
+
+	// `-map [4]` for the video must still be there (output label
+	// preserved).
+	foundMap4 := false
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-map" && out.Args[i+1] == "[4]" {
+			foundMap4 = true
+			break
+		}
+	}
+	if !foundMap4 {
+		t.Fatalf("video -map [4] missing after rewrite")
+	}
+}
+
 // HW-decode without -hwaccel flag is treated as unknown SW decoder
 // (we don't auto-detect from the codec name alone — Plex has been
 // known to send `av1` as a SW probe arg too).

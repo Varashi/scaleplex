@@ -183,6 +183,17 @@ var (
 	reFilterPlain = regexp.MustCompile(
 		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
 			`\[0\]format=pix_fmts=[^\[]*nv12\[1\]$`)
+	// HW-decode + inlineass burn-in. PMS sends this when both
+	// HardwareAcceleratedCodecs=1 AND a force-burn subtitle target.
+	// Filter graph: GPU scale → CPU drop for libass → hwupload back.
+	// We swap `inlineass=...` for stock `subtitles=filename=...` and
+	// keep the surrounding hwupload/scale_vaapi/hwdownload chain.
+	reFilterHWAss = regexp.MustCompile(
+		`^\[0:0\]hwupload\[0\];` +
+			`\[0\]scale_vaapi=w=(\d+):h=(\d+)(?::format=([A-Za-z0-9]+))?\[1\];` +
+			`\[1\]hwdownload,format=([A-Za-z0-9]+)\[2\];` +
+			`\[2\]inlineass=([^\[]+)\[3\];` +
+			`\[3\]hwupload\[4\]$`)
 	// HDR→SDR PMS pattern: scale → zscale(linear) → format(gbrpf32le) →
 	// zscale(primaries=bt709) → tonemap → zscale(bt709) → format(nv12).
 	// Capture leading w/h and the final output label number; the middle is
@@ -680,6 +691,32 @@ func removeArgs(s []string, at, n int) []string {
 	return out
 }
 
+// stripNullSubOutput removes Plex's trailing null subtitle output
+// declaration: `-map <sub-stream-spec> -f null -codec ass <output_name>`.
+// Plex appends this as a second output after the main segment muxer's
+// filename, with the -map referring to the sidecar input. Once we drop
+// that input, the -map dangles and ffmpeg fails with "stream specifier
+// matches no streams". Mutates *args in place; returns true if the
+// pattern was found and removed.
+func stripNullSubOutput(args *[]string) bool {
+	a := *args
+	for i := 0; i+6 < len(a); i++ {
+		if a[i] != "-map" {
+			continue
+		}
+		if a[i+2] != "-f" || a[i+3] != "null" {
+			continue
+		}
+		if a[i+4] != "-codec" || a[i+5] != "ass" {
+			continue
+		}
+		// a[i+1] is the stream-spec, a[i+6] is the output name.
+		*args = removeArgs(a, i, 7)
+		return true
+	}
+	return false
+}
+
 func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) RewriteResult {
 	fsExists := func(p string) bool { _, err := os.Stat(p); return err == nil }
 	sessionDir := ""
@@ -986,6 +1023,88 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			return bail("hw-decode:unexpected-encoder:" + swEncoder)
 		}
 		changes = append(changes, "encode:hw-passthrough:"+swEncoder)
+
+		// Sub burn-in: PMS sends `-map_inlineass` even in HW-decode
+		// mode, with a filter graph that runs Plex's private
+		// `inlineass` filter on the CPU side of an
+		// hwdownload/hwupload sandwich. Stock ffmpeg has no
+		// inlineass; we swap it for `subtitles=filename=<staged
+		// SRT>:fontsdir=…` (libass) keeping the rest of the chain
+		// (and labels [0]–[4]) intact, so PMS's `-map [4]` still
+		// resolves and HDR p010 is preserved end-to-end.
+		var probe func(string, string) string
+		if opts != nil && opts.ProbeSubtitleCodec != nil {
+			probe = opts.ProbeSubtitleCodec
+		}
+		subSrc = detectSubtitleSource(args, sessionDir, probe)
+		if subSrc != nil {
+			switch subSrc.Kind {
+			case "text":
+				subExtract = subSrc.Extract
+				vfIdx := -1
+				for i := 0; i < len(args); i++ {
+					if args[i] == "-filter_complex" && i+1 < len(args) &&
+						strings.Contains(args[i+1], "inlineass=") &&
+						strings.HasPrefix(args[i+1], "[0:0]") {
+						vfIdx = i + 1
+						break
+					}
+				}
+				if vfIdx < 0 {
+					return bail("hw-decode-sub:no-inlineass-filter")
+				}
+				m := reFilterHWAss.FindStringSubmatch(args[vfIdx])
+				if m == nil {
+					return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
+				}
+				w, h := m[1], m[2]
+				scaleFmt := m[3]
+				if scaleFmt == "" {
+					scaleFmt = "nv12"
+				}
+				hwdlFmt := m[4]
+				sidecarPath := subSrc.FilePath
+				if sidecarPath == "" {
+					return bail("hw-decode-sub:no-sidecar")
+				}
+				subPath := escapeFilterPath(sidecarPath)
+				fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
+				args[vfIdx] = fmt.Sprintf(
+					"[0:0]hwupload[0];"+
+						"[0]scale_vaapi=w=%s:h=%s:format=%s[1];"+
+						"[1]hwdownload,format=%s[2];"+
+						"[2]subtitles=filename='%s':fontsdir=%s[3];"+
+						"[3]hwupload[4]",
+					w, h, scaleFmt, hwdlFmt, subPath, fontsDir,
+				)
+				changes = append(changes, "hw-decode:filter:inlineass->subtitles")
+				changes = append(changes, "subtitle:sidecar-staged")
+				changes = append(changes, "sidecar:"+sidecarPath)
+
+				// Drop the sidecar `-i` (subtitles= reads it from disk).
+				if subSrc.SecondInputArgIdx > 0 && subSrc.SecondInputArgIdx+1 < len(args) {
+					args = removeArgs(args, subSrc.SecondInputArgIdx, 2)
+					changes = append(changes, "drop:-i(sidecar-input)")
+				}
+				// Strip Plex-only -map_inlineass.
+				if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
+					args = removeArgs(args, miaIdx, 2)
+					changes = append(changes, "drop:-map_inlineass")
+				}
+				// Strip Plex's null-sub output (-map <sub-ref> -f null
+				// -codec ass <name>) — references the now-dropped
+				// sidecar input.
+				if removed := stripNullSubOutput(&args); removed {
+					changes = append(changes, "drop:null-sub-output")
+				}
+				// Indices shifted by the splices above; re-locate
+				// encCodecIdx for the phases below.
+				newInputIdx = indexOfArg(args, "-i", 0)
+				encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+			case "bitmap":
+				return bail("hw-decode-sub:bitmap-unsupported")
+			}
+		}
 	}
 
 	// 6. -crf:0 <Q> → -qp:0 <Q + HW_QP_CRF_OFFSET> (CQP mode).
