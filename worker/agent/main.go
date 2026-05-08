@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -338,9 +339,14 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		// Env-gated argv capture for debugging new PMS argv shapes
 		// (HW-decode mode, Plex version bumps, etc.). Off by default to
 		// keep logs clean; flip WORKER_DUMP_ARGV=1 on the worker pod or
-		// DaemonSet env when investigating.
+		// DaemonSet env when investigating. Logs to stderr AND, when
+		// the dir exists / can be created, writes a JSON capture under
+		// $WORKER_ARGV_CORPUS_DIR (default /transcode/_argv-corpus,
+		// shared NFS so it survives pod restarts and is reachable from
+		// outside the cluster). Idempotent on session_id.
 		if os.Getenv("WORKER_DUMP_ARGV") != "" {
 			log.Printf("session %s: argv=%q", req.SessionID, req.Args)
+			persistArgvCapture(req.SessionID, req.Cwd, req.Args, req.Env)
 		}
 		res := Rewrite(req.Args, req.Env, &RewriteOpts{
 			SessionDir:         req.Cwd,
@@ -634,6 +640,64 @@ func streamPrefixed(rc io.ReadCloser, w *lockedWriter, prefix string, done chan<
 		if err != nil {
 			return
 		}
+	}
+}
+
+// persistArgvCapture writes a JSON capture of the PMS argv to the
+// shared corpus dir (default /transcode/_argv-corpus on NFS). Survives
+// pod restarts, accessible from anywhere the NFS is mounted. The
+// captures feed cmd/argv-extract for pattern recognition and seed
+// rewriter test fixtures. Best-effort — failures are logged but never
+// fail the session.
+func persistArgvCapture(sessionID, cwd string, args []string, env map[string]string) {
+	dir := os.Getenv("WORKER_ARGV_CORPUS_DIR")
+	if dir == "" {
+		dir = "/transcode/_argv-corpus"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("argv-capture mkdir %s: %v", dir, err)
+		return
+	}
+	path := filepath.Join(dir, sessionID+".json")
+	if _, err := os.Stat(path); err == nil {
+		return // idempotent
+	}
+	type capture struct {
+		SessionID  string            `json:"session_id"`
+		CapturedAt string            `json:"captured_at"`
+		WorkerPod  string            `json:"worker_pod,omitempty"`
+		WorkerHost string            `json:"worker_host,omitempty"`
+		Cwd        string            `json:"session_cwd,omitempty"`
+		Argv       []string          `json:"argv"`
+		Env        map[string]string `json:"env,omitempty"`
+	}
+	host, _ := os.Hostname()
+	c := capture{
+		SessionID:  sessionID,
+		CapturedAt: time.Now().UTC().Format(time.RFC3339),
+		WorkerPod:  os.Getenv("HOSTNAME"),
+		WorkerHost: host,
+		Cwd:        cwd,
+		Argv:       args,
+		Env:        env,
+	}
+	tmp, err := os.CreateTemp(dir, sessionID+".*.tmp")
+	if err != nil {
+		log.Printf("argv-capture create %s: %v", dir, err)
+		return
+	}
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(&c); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		log.Printf("argv-capture encode %s: %v", sessionID, err)
+		return
+	}
+	tmp.Close()
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		os.Remove(tmp.Name())
+		log.Printf("argv-capture rename %s: %v", sessionID, err)
 	}
 }
 
