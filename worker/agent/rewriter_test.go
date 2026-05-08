@@ -383,20 +383,23 @@ func TestRewriter_InlineAss_NoSidecar_Bails(t *testing.T) {
 	}
 }
 
-func TestRewriter_PreferHEVC(t *testing.T) {
-t.Setenv("HW_PREFER_HEVC", "true")
+// PMS picks libx265 when its prefs + client caps both ask for HEVC.
+// Worker must follow that signal and emit hevc_vaapi (manifest's
+// codec_string is generated from the same PMS-side choice, so they
+// stay in sync).
+func TestRewriter_PMSHEVCMapsToHEVCVAAPI(t *testing.T) {
 	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
 		"-map", "[1]",
-		"-codec:0", "libx264", "-crf:0", "16", "-preset:0", "veryfast",
+		"-codec:0", "libx265", "-crf:0", "20", "-x265-params", "no-info=1",
 	}
 	out := Rewrite(args, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "encode:libx264->hevc_vaapi") {
+	if !containsString(out.Changes, "encode:libx265->hevc_vaapi") {
 		t.Fatalf("missing hevc encode change: %v", out.Changes)
 	}
 	inputIdx := indexOfArg(out.Args, "-i", 0)
@@ -406,8 +409,8 @@ t.Setenv("HW_PREFER_HEVC", "true")
 	}
 }
 
-func TestRewriter_PreferHEVCOff(t *testing.T) {
-t.Setenv("HW_PREFER_HEVC", "")
+// PMS picks libx264 (default H264 path) → worker emits h264_vaapi.
+func TestRewriter_PMSH264MapsToH264VAAPI(t *testing.T) {
 	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -417,7 +420,7 @@ t.Setenv("HW_PREFER_HEVC", "")
 	}
 	out := Rewrite(args, nil, nil)
 	if !containsString(out.Changes, "encode:libx264->h264_vaapi") {
-		t.Fatalf("default-off should map to h264_vaapi: %v", out.Changes)
+		t.Fatalf("libx264 should map to h264_vaapi: %v", out.Changes)
 	}
 }
 
