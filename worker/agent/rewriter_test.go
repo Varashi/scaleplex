@@ -1188,6 +1188,172 @@ func TestRewriter_NoColorProbe_AssumesSDR(t *testing.T) {
 	}
 }
 
+// PMS HW-decode argv pattern, captured live 2026-05-08 from
+// `clusterplex-worker-qfltf` with HardwareAcceleratedCodecs=1 +
+// TranscoderHEVCEncodingMode=always + Plex for Android client on
+// The Accountant (AV1 4K HDR10+ source). Plex's HW probe succeeded
+// in PMS so the argv is already VAAPI-shaped: short codec name,
+// hwaccel flags, scale_vaapi filter chain, hevc_vaapi encoder with
+// -qp:0 directly. Worker only needs to strip Plex-fork-only flags
+// and translate the HLS muxer (-f ssegment, -copyts, segment_list
+// URL).
+var hwDecodeArgsAV1HEVC = []string{
+	"-codec:0", "av1",
+	"-hwaccel:0", "vaapi",
+	"-hwaccel_output_format:0", "vaapi",
+	"-hwaccel_device:0", "vaapi",
+	"-codec:1", "eac3_eae",
+	"-eae_prefix:1", "75ca5833-5cc4-42de-87c9-a730f93350f5_",
+	"-analyzeduration", "20000000",
+	"-probesize", "20000000",
+	"-i", "/media/Movies/The Accountant.mkv",
+	"-start_at_zero",
+	"-copyts",
+	"-fps_mode", "cfr",
+	"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+	"-filter_hw_device", "vaapi",
+	"-y",
+	"-nostats",
+	"-loglevel", "quiet",
+	"-loglevel_plex", "error",
+	"-progressurl", "http://127.0.0.1:32400/video/:/transcode/session/sid/job/progress",
+	"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=3840:h=2160:format=p010[1];[1]hwupload[2]",
+	"-map", "[2]",
+	"-metadata:s:0", "language=eng",
+	"-codec:0", "hevc_vaapi",
+	"-qp:0", "15",
+	"-maxrate:0", "20121k",
+	"-bufsize:0", "40242k",
+	"-r:0", "23.975999999999999",
+	"-sei:0", "-a53_cc",
+	"-force_key_frames:0", "expr:gte(t,n_forced*1)",
+	"-filter_complex", "[0:1] aresample=async=1:ochl='5.1':rematrix_maxval=0.000000dB:osr=48000[3]",
+	"-map", "[3]",
+	"-metadata:s:1", "language=eng",
+	"-codec:1", "aac",
+	"-b:1", "774k",
+	"-segment_format", "matroska",
+	"-f", "ssegment",
+	"-individual_header_trailer", "0",
+	"-flags", "+global_header",
+	"-segment_header_filename", "header",
+	"-segment_time", "1",
+	"-segment_start_number", "0",
+	"-segment_time_delta", "0.0625",
+	"-segment_list", "http://127.0.0.1:32400/video/:/transcode/session/sid/job/manifest?X-Plex-Http-Pipeline=infinite",
+	"-segment_list_type", "csv",
+	"-segment_list_size", "5",
+	"-segment_list_separate_stream_times", "1",
+	"-segment_list_unfinished", "1",
+	"-segment_format_options", "output_ts_offset=10",
+	"-max_delay", "5000000",
+	"-avoid_negative_ts", "disabled",
+	"-map_metadata", "-1",
+	"-map_chapters", "-1",
+	"media-%05d.ts",
+}
+
+func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}
+	out := Rewrite(hwDecodeArgsAV1HEVC, env, nil)
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
+	}
+
+	mustContain := []string{
+		"decode:hw-passthrough:av1",
+		"encode:hw-passthrough:hevc_vaapi",
+		"audio:eac3_eae->eac3",
+		"drop:-eae_prefix:1",
+		"drop:-loglevel_plex",
+		"drop:-segment_list_separate_stream_times",
+		"drop:-segment_list_unfinished",
+		"hls:f=ssegment->segment",
+		"hls:drop:-copyts",
+		"hls:segment_list:rewrite-to-relay",
+		"progressurl:captured-for-reporter",
+		"progress:append-X-Plex-Token",
+		"loglevel:->info",
+		"drop:-nostats",
+		"env:LIBVA",
+	}
+	for _, want := range mustContain {
+		if !containsString(out.Changes, want) {
+			t.Errorf("missing change %q; got %v", want, out.Changes)
+		}
+	}
+
+	mustNotContain := []string{
+		"encode:libx265->hevc_vaapi", // never claim a swap; PMS gave it to us
+		"encode:libx264->h264_vaapi",
+		"filter:plain",
+		"filter:hdr-tonemap-vaapi",
+	}
+	for _, bad := range mustNotContain {
+		if containsString(out.Changes, bad) {
+			t.Errorf("unexpected change %q in HW-decode mode; got %v", bad, out.Changes)
+		}
+	}
+
+	// Encoder argv unchanged (still hevc_vaapi)
+	newInputIdx := indexOfArg(out.Args, "-i", 0)
+	encIdx := indexOfArg(out.Args, "-codec:0", newInputIdx+1)
+	if encIdx < 0 || out.Args[encIdx+1] != "hevc_vaapi" {
+		t.Fatalf("encoder must remain hevc_vaapi; got args near %d: %v", encIdx, out.Args[encIdx:min(encIdx+4, len(out.Args))])
+	}
+
+	// HLS: -f ssegment must be translated to -f segment
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-f" && out.Args[i+1] == "ssegment" {
+			t.Fatalf("-f ssegment not translated")
+		}
+	}
+	// -copyts must be gone (HLS path)
+	if indexOfArg(out.Args, "-copyts", 0) >= 0 {
+		t.Fatalf("-copyts not stripped from HLS argv")
+	}
+	// -loglevel_plex must be gone
+	if indexOfArg(out.Args, "-loglevel_plex", 0) >= 0 {
+		t.Fatalf("-loglevel_plex not stripped")
+	}
+	// -progressurl must be gone (captured into RewriteResult instead)
+	if indexOfArg(out.Args, "-progressurl", 0) >= 0 {
+		t.Fatalf("-progressurl not stripped from argv")
+	}
+	if out.ProgressURL == "" {
+		t.Fatalf("ProgressURL not captured")
+	}
+	if !strings.Contains(out.ProgressURL, "relay.svc:32499") {
+		t.Fatalf("ProgressURL not rewritten to relay base: %q", out.ProgressURL)
+	}
+	if !strings.Contains(out.ProgressURL, "X-Plex-Token=tok123") {
+		t.Fatalf("ProgressURL missing token: %q", out.ProgressURL)
+	}
+}
+
+// HW-decode without -hwaccel flag is treated as unknown SW decoder
+// (we don't auto-detect from the codec name alone — Plex has been
+// known to send `av1` as a SW probe arg too).
+func TestRewriter_HWDecode_RequiresHWAccelFlag(t *testing.T) {
+	args := []string{
+		"-codec:0", "av1",
+		"-i", "/media/m.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=p010[1];[1]hwupload[2]",
+		"-map", "[2]", "-codec:0", "hevc_vaapi", "-qp:0", "15",
+	}
+	out := Rewrite(args, nil, nil)
+	if out.Applied {
+		t.Fatal("must bail without -hwaccel:0 flag — short codec name alone isn't enough signal")
+	}
+	if !containsString(out.Changes, "skip:unknown-decoder:av1") {
+		t.Fatalf("expected skip:unknown-decoder:av1; got %v", out.Changes)
+	}
+}
+
 // isHDRTransfer classification.
 func TestIsHDRTransfer(t *testing.T) {
 	cases := map[string]bool{
