@@ -59,6 +59,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[scaleplex-shim] orchestrator=%s session=%s cwd=%s args=%d\n",
 			orchestratorURL, sessionID, cwd, len(args))
 	}
+	// Durable argv capture: emit full argv to stderr (lands in PMS log,
+	// which has weeks of retention on PMS's persistent volume vs the
+	// worker pod's ephemeral container log buffer). Same Go %q-printed
+	// slice format the worker uses, so cmd/argv-extract parses both.
+	if envBool("SCALEPLEX_DUMP_ARGV") {
+		fmt.Fprintf(os.Stderr, "[scaleplex-shim] session %s: argv=%q\n", sessionID, args)
+	}
 
 	body, err := json.Marshal(taskRequest{
 		SessionID: sessionID,
