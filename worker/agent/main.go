@@ -335,6 +335,13 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	skipToSegment := 0
 	seekOffsetSeconds := 0.0
 	if req.Rewrite {
+		// Env-gated argv capture for debugging new PMS argv shapes
+		// (HW-decode mode, Plex version bumps, etc.). Off by default to
+		// keep logs clean; flip WORKER_DUMP_ARGV=1 on the worker pod or
+		// DaemonSet env when investigating.
+		if os.Getenv("WORKER_DUMP_ARGV") != "" {
+			log.Printf("session %s: argv=%q", req.SessionID, req.Args)
+		}
 		res := Rewrite(req.Args, req.Env, &RewriteOpts{
 			SessionDir:         req.Cwd,
 			ProbeSubtitleCodec: probeSubtitleCodec,
