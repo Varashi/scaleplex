@@ -1,12 +1,17 @@
 // argv-extract reads scaleplex worker logs on stdin and emits one
-// JSON per session into $CORPUS_DIR (default test/argv-corpus/).
+// JSON per session into $CORPUS_DIR (default ~/scaleplex-corpus/).
 // Idempotent: skips sessions whose JSON already exists.
+//
+// Corpus deliberately lives outside the repo working tree because
+// captured argv contains real source paths from the user's media
+// library (privacy: title strings, household viewing habits).
+// Override CORPUS_DIR if you want it elsewhere.
 //
 // Usage:
 //
 //	kubectl -n clusterplex logs -l app.kubernetes.io/controller=worker \
-//	  --tail=20000 --since=4h --prefix=true \
-//	  | CORPUS_DIR=test/argv-corpus go run ./cmd/argv-extract
+//	  --tail=99999 --since=24h --prefix=true \
+//	  | go run ./cmd/argv-extract
 //
 // Each emitted file captures:
 //   - session_id, captured_at, worker_pod
@@ -161,7 +166,11 @@ func extractStructuralMeta(c *Capture) {
 func main() {
 	corpusDir := os.Getenv("CORPUS_DIR")
 	if corpusDir == "" {
-		corpusDir = "test/argv-corpus"
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			home = "."
+		}
+		corpusDir = filepath.Join(home, "scaleplex-corpus")
 	}
 	if err := os.MkdirAll(corpusDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", corpusDir, err)
