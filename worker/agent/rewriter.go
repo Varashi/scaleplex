@@ -1679,6 +1679,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	changes = append(changes, "env:LIBVA")
 
+	// HOME override: Plex Transcoder env carries HOME pointing at
+	// Plex's data root (/config/Library/Application Support/Plex Media
+	// Server) which doesn't exist on the worker pod. Fontconfig reads
+	// HOME to locate $HOME/.cache/fontconfig; with no writable cache
+	// dir it falls back to in-memory mode and re-scans every font on
+	// every libass fontselect call. On a sub-burn session the first
+	// fontselect can block for 2+ minutes and stall the encoder.
+	// Repointing HOME at the worker image's /home/ubuntu (which has
+	// a pre-populated cache from the Dockerfile's `fc-cache` run as
+	// uid 1000) makes libass return ms-fast.
+	env["HOME"] = envOr("HW_RUNTIME_HOME", "/home/ubuntu")
+	changes = append(changes, "env:HOME")
+
 	return RewriteResult{
 		Args:              args,
 		Env:               env,

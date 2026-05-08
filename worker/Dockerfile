@@ -66,7 +66,26 @@ RUN chmod +x /usr/local/bin/scaleplex-entrypoint
 
 ENV LIBVA_DRIVER_NAME=iHD
 EXPOSE 3501
+
+# Pre-populate fontconfig cache for the runtime user (uid 1000 = ubuntu
+# in the Ubuntu 24.04 base image). Plex's transcoder env carries
+# HOME=/config/Library/Application Support/Plex Media Server, which
+# the worker forwards to the spawned ffmpeg. Fontconfig reads HOME to
+# locate the per-user cache dir; with HOME pointing at a path that
+# doesn't exist on the worker pod and /var/cache/fontconfig owned by
+# root (read-only for uid 1000), fontconfig errors with "No writable
+# cache directories" and falls back to a non-cached scan-on-every-call
+# mode. libass's `subtitles=` filter triggers fontselect at the first
+# subtitle frame; without a cache that call blocks for 2+ minutes on
+# the worker pod, ffmpeg never produces a segment, and Plex's HLS
+# client times out with "Connection error" (live repro 2026-05-08:
+# Plex Android, force-burn subs + seek, 2 min wall clock no segments).
+#
+# Building the cache here as uid 1000 with HOME=/home/ubuntu lands the
+# *.cache-N files in /home/ubuntu/.cache/fontconfig. The rewriter sets
+# HOME=/home/ubuntu in the spawn env so libass finds the cache.
 USER 1000
+RUN HOME=/home/ubuntu fc-cache -f
 # Wrapper: prefers /transcode/_dev/scaleplex-agent if present (NFS-shared
 # dev overlay so a `go build && cp && pkill` round-trip swaps the binary
 # in seconds without rebuilding the image). Falls through to the baked
