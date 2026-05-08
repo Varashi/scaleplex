@@ -1509,25 +1509,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Seek + force_key_frames expr fix.
+	// Seek + force_key_frames expr fix — DASH only.
 	//
-	// PMS sends `-force_key_frames:0 "expr:gte(t,n_forced*8)"`. With
-	// `-copyts`, the encoder's `t` starts at the seek offset (e.g. 2344s)
-	// rather than 0, so the expression is true for every frame whose
-	// `n_forced*8 <= t`. ffmpeg fires a forced keyframe on every such
-	// frame: ~294 keyframes back-to-back at the start, then ~8s of
-	// silence, repeating. The HLS segment muxer needs a keyframe to
-	// close a segment; with the run of forced keyframes followed by an
-	// 8s gap, the first segment swallows tens of minutes of content
-	// (observed: media-00293.ts reached 317 MB / 39 min before the next
-	// keyframe-aligned split landed, breaking Android Plex on seek).
-	// Plex's fork either resets `t` to 0 on seek or special-cases the
-	// expr; stock ffmpeg does neither.
+	// PMS sends `-force_key_frames:0 "expr:gte(t,n_forced*8)"`. The
+	// rewrite needed depends on whether `-copyts` is in play:
 	//
-	// Rewrite the expression to evaluate against output time
-	// (t - seek_offset). Keyframe cadence then matches what PMS intended
-	// (kf at output 0, 8, 16, ...) and splits land every 8s.
-	if seekOffsetSeconds > 0 {
+	//   DASH (we keep `-copyts`): encoder `t` runs in input time, so
+	//   it starts at the seek offset (e.g. 2344s). Plex's expr is true
+	//   for every frame, ffmpeg fires ~294 forced keyframes back-to-
+	//   back, breaks the segment muxer (first segment swallows tens
+	//   of minutes). Rewrite to `gte(t-<offset>, n*8)` so keyframes
+	//   land at output times 0, 8, 16, ...
+	//
+	//   HLS (we strip `-copyts` earlier in this function): encoder
+	//   `t` already runs in output time, starts at 0. Plex's expr
+	//   `gte(t, n*8)` is correct as-is — keyframes fire at t=0, 8,
+	//   16. If we apply the (t - seek_offset) rewrite here the expr
+	//   never fires (always `false` for output-time t < seek_offset),
+	//   the muxer waits forever for a keyframe to close the first
+	//   segment, no .ts files are produced, the player times out
+	//   with "Connection error" (observed live 2026-05-08 Plex
+	//   Android, 2 min wall clock, zero segments, force burn-in +
+	//   seek to 3345s).
+	if seekOffsetSeconds > 0 && !isHLS {
 		for i := 0; i+1 < len(args); i++ {
 			if !strings.HasPrefix(args[i], "-force_key_frames") {
 				continue

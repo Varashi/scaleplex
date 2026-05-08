@@ -943,6 +943,49 @@ func TestRewriter_HLS_CopytsStripped(t *testing.T) {
 	}
 }
 
+// HLS+seek must leave the force_key_frames expr untouched. Encoder
+// time `t` runs in OUTPUT time on HLS (we strip `-copyts`) — Plex's
+// `gte(t, n*8)` is already correct, fires keyframes at output 0,
+// 8, 16. If we rewrite to `gte(t-<seek>, n*8)` the expr is always
+// false (output t < seek_offset), no keyframes fire, segment muxer
+// hangs forever (live regression 2026-05-08, Plex Android force-burn
+// + seek to 3345s, zero segments produced in 2 min).
+func TestRewriter_HLS_Seek_LeavesForceKeyFramesUntouched(t *testing.T) {
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-i", "/media/Movies/M.mkv",
+		"-ss", "1384",
+		"-copyts", "-start_at_zero", "-avoid_negative_ts", "disabled",
+		"-filter_complex", "[0:0]scale=w=1022:h=426:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "23",
+		"-preset:0", "veryfast",
+		"-force_key_frames:0", "expr:gte(t,n_forced*8)",
+		"-segment_format", "matroska",
+		"-f", "ssegment",
+		"-individual_header_trailer", "0",
+		"-segment_header_filename", "header",
+		"-segment_time", "8",
+		"-segment_start_number", "173",
+		"media-%05d.ts",
+	}
+	out := Rewrite(args, map[string]string{}, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if containsString(out.Changes, "force_key_frames:offset-by-seek") {
+		t.Fatal("HLS+seek must NOT rewrite force_key_frames (encoder t already runs in output time)")
+	}
+	idx := indexOfArg(out.Args, "-force_key_frames:0", 0)
+	if idx < 0 || idx+1 >= len(out.Args) {
+		t.Fatal("missing -force_key_frames:0")
+	}
+	if out.Args[idx+1] != "expr:gte(t,n_forced*8)" {
+		t.Errorf("force_key_frames expr=%q want unchanged", out.Args[idx+1])
+	}
+}
+
 // Initial play (no -ss) must leave the force_key_frames expr untouched.
 func TestRewriter_ForceKeyFrames_NoSeekUnchanged(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
