@@ -1403,19 +1403,36 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// 9. Audio: Plex emits `-codec:1 eac3_eae -eae_prefix:1 <token>`
-	// (eac3_eae is Plex's custom encoder backed by EasyAudioEncoder over
-	// a localhost socket — only present in Plex Transcoder, not in
-	// stock/jellyfin ffmpeg). Walk the whole arg list and replace every
-	// `<codec-flag> eac3_eae` with `<codec-flag> eac3`. PMS sometimes
-	// repeats the codec flag (early near-input and again after video
-	// codec block).
+	// 9. Audio: Plex emits `-codec:N <codec>_eae -eae_prefix:N <token>`
+	// (the `*_eae` family is Plex's EasyAudioEncoder over a localhost
+	// socket — only present in Plex Transcoder, not in stock/jellyfin
+	// ffmpeg). Walk the whole arg list and replace every
+	// `<audio-codec-flag> X_eae` with the safe stock equivalent.
+	// Mapping: eac3_eae → eac3 (clean stock encoder); other *_eae
+	// (truehd_eae seen 4× in corpus on Atmos remuxes) → eac3 fallback
+	// because stock truehd encoder is flagged experimental and
+	// jellyfin-ffmpeg7 still requires `-strict experimental` plus
+	// produces sub-realtime; client loses bitstream passthrough but
+	// keeps working audio. Add explicit cases here when a base codec
+	// becomes worth preserving (e.g. ac3_eae→ac3 if it ever surfaces).
+	eaeBaseFor := func(eaeName string) string {
+		base, ok := strings.CutSuffix(eaeName, "_eae")
+		if !ok {
+			return ""
+		}
+		switch base {
+		case "eac3", "ac3":
+			return base
+		default:
+			return "eac3"
+		}
+	}
 	{
 		// Plex audio stream index varies by which track the client picked
 		// (`-codec:1` for the first audio track, `-codec:2` for a switch
 		// to the second, etc.) — accept any non-negative N. Stream :0 is
-		// the video stream in PMS argv but eac3_eae is only ever an
-		// audio encoder, so the value test below (`== "eac3_eae"`)
+		// the video stream in PMS argv but `*_eae` is only ever an
+		// audio encoder, so the value test below (suffix == "_eae")
 		// rules out collisions on :0 in practice.
 		audioCodecFlag := func(s string) bool {
 			if s == "-c:a" {
@@ -1433,15 +1450,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 			return false
 		}
-		swapped := false
+		swapped := map[string]string{}
 		for i := 0; i < len(args); i++ {
-			if audioCodecFlag(args[i]) && i+1 < len(args) && args[i+1] == "eac3_eae" {
-				args[i+1] = "eac3"
-				swapped = true
+			if !audioCodecFlag(args[i]) || i+1 >= len(args) {
+				continue
+			}
+			if base := eaeBaseFor(args[i+1]); base != "" {
+				swapped[args[i+1]] = base
+				args[i+1] = base
 			}
 		}
-		if swapped {
-			changes = append(changes, "audio:eac3_eae->eac3")
+		for from, to := range swapped {
+			changes = append(changes, "audio:"+from+"->"+to)
 		}
 	}
 	// Drop -eae_prefix:N (any stream spec). Walk because there may be

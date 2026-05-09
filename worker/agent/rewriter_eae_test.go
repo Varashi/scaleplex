@@ -54,6 +54,73 @@ func TestRewriter_EAE_AudioCodecSwap(t *testing.T) {
 	}
 }
 
+// MHA-style argv: client switched to track 2 (Japanese audio), PMS
+// emitted -codec:2 eac3_eae. Pre-fix the audioCodecFlag whitelist
+// only matched :0/:1, leaving eac3_eae intact and ffmpeg bailed
+// "Unknown decoder 'eac3_eae'" exit 8 (live repro 2026-05-10).
+func TestRewriter_EAE_MultiStreamIndex(t *testing.T) {
+	args := append([]string{
+		"-codec:0", "libdav1d",
+		"-codec:2", "eac3_eae",
+		"-eae_prefix:2", "anytoken_",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/Anime/MHA.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "16",
+		"-preset:0", "veryfast",
+		"-codec:2", "eac3_eae",
+		"-b:2", "256k",
+	})
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "audio:eac3_eae->eac3") {
+		t.Fatalf("missing audio:eac3_eae->eac3: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "drop:-eae_prefix:2") {
+		t.Fatalf("missing drop:-eae_prefix:2: %v", out.Changes)
+	}
+	if containsString(out.Args, "eac3_eae") {
+		t.Fatal("eac3_eae must not survive on stream :2")
+	}
+}
+
+// Atmos remux: PMS emits -codec:1 truehd_eae for TrueHD passthrough.
+// Stock truehd encoder is experimental and very slow; rewriter falls
+// back to eac3 so the session at least produces audio.
+func TestRewriter_EAE_TrueHDFallback(t *testing.T) {
+	args := []string{
+		"-codec:0", "hevc",
+		"-hwaccel:0", "vaapi",
+		"-codec:1", "truehd_eae",
+		"-eae_prefix:1", "anytoken_",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/Movies/Atmos.mkv",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=3840:h=2160:format=p010[1]",
+		"-map", "[1]",
+		"-codec:0", "hevc_vaapi",
+		"-codec:1", "truehd_eae",
+		"-b:1", "768k",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "audio:truehd_eae->eac3") {
+		t.Fatalf("missing audio:truehd_eae->eac3: %v", out.Changes)
+	}
+	if containsString(out.Args, "truehd_eae") {
+		t.Fatal("truehd_eae must not survive the rewrite")
+	}
+}
+
 func TestRewriter_StripsPlexEnv(t *testing.T) {
 	in := map[string]string{
 		"EAE_ROOT":             "/run/plex-temp/.../EasyAudioEncoder",
