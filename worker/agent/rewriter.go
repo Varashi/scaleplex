@@ -960,6 +960,31 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		args[vfIdx] = rewritten.Filter
 		changes = append(changes, "filter:"+rewritten.Mode)
 
+		// 4. Update -map output label following the video filter.
+		// MUST run BEFORE dropSidecarInput: that drop removes args
+		// from BEFORE vfIdx (the input-1 option block), which shifts
+		// vfIdx downward. Iterating from the old vfIdx+1 then misses
+		// the `-map <oldlabel>` that's now closer to the filter, and
+		// the rewriter silently leaves a stale label → ffmpeg fails
+		// with "Output with label '<old>' does not exist in any
+		// defined filter graph" (live repro 2026-05-09 session 7347:
+		// SW HDR + text-sidecar sub-burn, exit status 234).
+		for i := vfIdx + 1; i < len(args); i++ {
+			if args[i] != "-map" {
+				continue
+			}
+			v := args[i+1]
+			if v == rewritten.OldLabel || v == `"`+rewritten.OldLabel+`"` {
+				if strings.HasPrefix(v, `"`) {
+					args[i+1] = `"` + rewritten.NewLabel + `"`
+				} else {
+					args[i+1] = rewritten.NewLabel
+				}
+				changes = append(changes, "map-label-update")
+				break
+			}
+		}
+
 		// Drop the second `-i` for text-sidecar burn-in. The rewritten
 		// filter consumes the staged file via `subtitles=filename=...`,
 		// so stock ffmpeg has no use for it as an input — keeping it
@@ -974,23 +999,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			if newArgs, dropped := dropSidecarInput(args, subSrc.SecondInputArgIdx); dropped {
 				args = newArgs
 				changes = append(changes, "drop:-i(sidecar-input)")
-			}
-		}
-
-		// 4. Update -map output label following the video filter
-		for i := vfIdx + 1; i < len(args); i++ {
-			if args[i] != "-map" {
-				continue
-			}
-			v := args[i+1]
-			if v == rewritten.OldLabel || v == `"`+rewritten.OldLabel+`"` {
-				if strings.HasPrefix(v, `"`) {
-					args[i+1] = `"` + rewritten.NewLabel + `"`
-				} else {
-					args[i+1] = rewritten.NewLabel
-				}
-				changes = append(changes, "map-label-update")
-				break
 			}
 		}
 
