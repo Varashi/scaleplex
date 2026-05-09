@@ -855,7 +855,41 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		return bail("unknown-decoder:" + swDecoder)
 	}
 
-	// 2. -init_hw_device patch or inject
+	// 1.5. Pre-emptive sidecar drop (SW-decode-only path). PMS staged
+	// a temp-0.srt as a second `-i` for sub-burn sessions. We need to
+	// drop it BEFORE phase 2 (-init_hw_device inject) because phase 2
+	// injects after the FIRST -i, which lands in input-1's option
+	// block — `dropSidecarInput` would then eat the just-injected
+	// `-init_hw_device` (between the two -i flags), leaving ffmpeg
+	// without a hwdevice ("No VA display found for device vaapi",
+	// "No device available for decoder: device type vaapi needed for
+	// codec av1"). Live repro 2026-05-09 sessions 7347, 7359, 7418,
+	// 7448, 7455, 7475: SW HDR + sub-burn The Accountant on Plex
+	// Android, all hit the bug.
+	//
+	// HW-decode mode: PMS already provides a fully-shaped argv with
+	// -init_hw_device set; we don't inject anything in phase 2 (we
+	// just patch the device path). Sidecar drop in HW mode happens
+	// later inside the isHWDecode branch.
+	var earlySubSrc *subtitleSource
+	if !isHWDecode {
+		var probe func(string, string) string
+		if opts != nil && opts.ProbeSubtitleCodec != nil {
+			probe = opts.ProbeSubtitleCodec
+		}
+		earlySubSrc = detectSubtitleSource(args, sessionDir, probe)
+		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 {
+			if newArgs, dropped := dropSidecarInput(args, earlySubSrc.SecondInputArgIdx); dropped {
+				args = newArgs
+				if removed := stripNullSubOutput(&args); removed {
+					_ = removed // logged later via change tags
+				}
+			}
+		}
+	}
+
+	// 2. -init_hw_device patch or inject (now safe — second -i and
+	// its option block already gone for SW sub-burn sessions).
 	initIdx := indexOfArg(args, "-init_hw_device", 0)
 	if initIdx >= 0 {
 		if !reInitHW.MatchString(args[initIdx+1]) {
@@ -918,11 +952,22 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// bitmap-sidecar) and the filter rewrite below picks the matching
 		// stock-ffmpeg chain. Any embedded text extraction needed is
 		// signalled to the agent via RewriteResult.SubtitleExtract.
-		var probe func(string, string) string
-		if opts != nil && opts.ProbeSubtitleCodec != nil {
-			probe = opts.ProbeSubtitleCodec
+		//
+		// Reuse earlySubSrc when phase 1.5 already detected + acted on a
+		// text-sidecar drop — the second -i is gone now, so re-detecting
+		// here would return nil for the sidecar case and the filter
+		// rewrite would fail to find a sidecar path. For bitmap subs and
+		// embedded subs (no second -i to drop), earlySubSrc is nil and
+		// we still need to detect.
+		if earlySubSrc != nil {
+			subSrc = earlySubSrc
+		} else {
+			var probe func(string, string) string
+			if opts != nil && opts.ProbeSubtitleCodec != nil {
+				probe = opts.ProbeSubtitleCodec
+			}
+			subSrc = detectSubtitleSource(args, sessionDir, probe)
 		}
-		subSrc = detectSubtitleSource(args, sessionDir, probe)
 		if subSrc != nil {
 			subExtract = subSrc.Extract
 			switch subSrc.Kind {
@@ -985,32 +1030,26 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 		}
 
-		// Drop the second `-i` for text-sidecar burn-in. The rewritten
-		// filter consumes the staged file via `subtitles=filename=...`,
-		// so stock ffmpeg has no use for it as an input — keeping it
-		// would trip "stream specifier matches no streams" validators.
-		// For bitmap-sidecar we KEEP the second -i because overlay_vaapi
-		// pulls the stream from it via [1:s:0] in the filter graph.
-		// dropSidecarInput also removes the per-input options that
-		// preceded the second -i (e.g. the duplicate `-ss <T>` PMS
-		// places there in seek mode); leaving them in dangles them as
-		// output options after the last -i, breaking the encoder.
-		if subSrc != nil && subSrc.SecondInputArgIdx > 0 {
-			if newArgs, dropped := dropSidecarInput(args, subSrc.SecondInputArgIdx); dropped {
-				args = newArgs
-				changes = append(changes, "drop:-i(sidecar-input)")
-				// Strip Plex's trailing null-sub output declaration
-				// (`-map <ref> -f null -codec ass <name>`). It refers
-				// to input 1 (the SRT we just dropped); leaving it
-				// makes ffmpeg fail with "Invalid input file index: 1"
-				// during argv parsing. Same path the HW-decode branch
-				// already handles; SW path missed it because the
-				// label-mismatch bug masked it (ffmpeg never got far
-				// enough to parse the trailing args before label-update
-				// was fixed).
-				if removed := stripNullSubOutput(&args); removed {
-					changes = append(changes, "drop:null-sub-output")
+		// Sidecar drop already happened in phase 1.5 (early, before
+		// init_hw_device injection). Just emit the change-tag here so
+		// the rewriter changelog still reflects what we did. The
+		// sub-source detection ran twice; reconcile via earlySubSrc.
+		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 {
+			changes = append(changes, "drop:-i(sidecar-input)")
+			// Did stripNullSubOutput actually remove anything? It runs
+			// in phase 1.5; we re-search to confirm before tagging.
+			// (We can also infer: if there was a `-map <X> -f null
+			// -codec ass <name>` block in the original args, it was
+			// removed — but to keep the tag honest, we just check.)
+			hasNullF := false
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-f" && args[i+1] == "null" {
+					hasNullF = true
+					break
 				}
+			}
+			if !hasNullF {
+				changes = append(changes, "drop:null-sub-output")
 			}
 		}
 
