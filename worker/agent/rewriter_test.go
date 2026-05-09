@@ -1665,6 +1665,109 @@ func TestRewriter_HWDecode_SubBurn_SeekDropsSecondInputSs(t *testing.T) {
 	}
 }
 
+// SW-decode + HDR + text-sidecar sub-burn. PMS argv places
+// per-input options before each -i, so dropSidecarInput removes a
+// chunk of args from BEFORE the filter_complex value, shifting its
+// index downward. The map-label-update phase MUST run before that
+// drop or it iterates from a stale vfIdx and silently misses the
+// `-map [2]` it's supposed to rewrite. Live repro 2026-05-09 session
+// 7347, Plex Android, HardwareAcceleratedCodecs=0, The Accountant
+// AV1 4K HDR10+ + force-burn English SDH; ffmpeg failed exit 234
+// with "Output with label '2' does not exist in any defined filter
+// graph". Argv from that session preserved here as the regression
+// fixture.
+func TestRewriter_SWDecode_HDR_SubBurn_MapLabelUpdated(t *testing.T) {
+	probe := func(_, _ string) string { return "subrip" }
+	colorProbe := func(_ string) (string, string, string) { return "smpte2084", "bt2020", "bt2020nc" }
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-codec:1", "eac3_eae",
+		"-eae_prefix:1", "tok_",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/Movies/The Accountant.mkv",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/transcode/sess/temp-0.srt",
+		"-start_at_zero",
+		"-copyts",
+		"-fps_mode", "cfr",
+		"-y", "-nostats", "-loglevel", "quiet",
+		"-loglevel_plex", "error",
+		"-progressurl", "http://127.0.0.1:32400/sess/job/progress",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]scale=w=3840:h=2160:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];[1]inlineass=font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+		"-crf:0", "16",
+		"-maxrate:0", "20121k",
+		"-bufsize:0", "40242k",
+		"-preset:0", "veryfast",
+		"-x264opts:0", "subme=0:me_range=4",
+		"-force_key_frames:0", "expr:gte(t,n_forced*1)",
+		"-filter_complex", "[0:1] aresample=async=1:ochl='5.1':osr=48000[3]",
+		"-map", "[3]",
+		"-codec:1", "aac",
+		"-b:1", "774k",
+		"-segment_format", "matroska", "-f", "ssegment",
+		"-individual_header_trailer", "0",
+		"-segment_header_filename", "header",
+		"-segment_time", "1",
+		"-segment_start_number", "0",
+		"-segment_list", "http://127.0.0.1:32400/sess/job/manifest",
+		"-segment_list_type", "csv",
+		"-segment_list_size", "5",
+		"-segment_list_separate_stream_times", "1",
+		"-segment_list_unfinished", "1",
+		"-segment_format_options", "output_ts_offset=10",
+		"-avoid_negative_ts", "disabled",
+		"media-%05d.ts",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}, &RewriteOpts{
+		SessionDir:         "/transcode/sess",
+		ProbeSubtitleCodec: probe,
+		ProbeVideoColor:    colorProbe,
+	})
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "filter:overlay-vaapi-hdr") {
+		t.Fatalf("expected filter:overlay-vaapi-hdr; got %v", out.Changes)
+	}
+	if !containsString(out.Changes, "map-label-update") {
+		t.Fatalf("MAP NOT UPDATED — this is the bug. changes=%v", out.Changes)
+	}
+	// `-map [2]` (the OldLabel from filter rewrite) must be GONE;
+	// in its place must be `-map [15]` (the NewLabel for overlay-vaapi).
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-map" && out.Args[i+1] == "[2]" {
+			t.Fatalf("stale -map [2] survived rewrite at idx=%d", i)
+		}
+	}
+	found15 := false
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-map" && out.Args[i+1] == "[15]" {
+			found15 = true
+			break
+		}
+	}
+	if !found15 {
+		t.Fatalf("expected -map [15] (NewLabel for overlay-vaapi); not found. args=%v", out.Args)
+	}
+	// Sidecar drop applied
+	if !containsString(out.Changes, "drop:-i(sidecar-input)") {
+		t.Errorf("expected drop:-i(sidecar-input); got %v", out.Changes)
+	}
+	// `-map_inlineass` Plex-only flag stripped
+	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
+		t.Errorf("-map_inlineass not stripped")
+	}
+}
+
 // HW-decode without -hwaccel flag is treated as unknown SW decoder
 // (we don't auto-detect from the codec name alone — Plex has been
 // known to send `av1` as a SW probe arg too).
