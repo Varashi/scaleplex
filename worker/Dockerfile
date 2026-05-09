@@ -101,6 +101,13 @@ EXPOSE 3501
 # Building the cache here as uid 1000 with HOME=/home/ubuntu lands the
 # *.cache-N files in /home/ubuntu/.cache/fontconfig. The rewriter sets
 # HOME=/home/ubuntu in the spawn env so libass finds the cache.
+# /home/ubuntu may not exist on every base-image refresh (Ubuntu 24.04
+# normally ships a default `ubuntu` user at uid 1000, but BuildKit cache
+# refreshes have surfaced a missing /home/ubuntu in CI). Ensure it
+# exists + is writable before fc-cache so the slim cache lands in a
+# writeable per-user dir instead of falling back to the read-only
+# system fontdir.
+RUN install -d -o 1000 -g users -m 0755 /home/ubuntu/.cache/fontconfig
 USER 1000
 # Cache built against /opt/scaleplex/fonts.conf (slim) — produces a
 # tiny cache that mmaps in microseconds vs the system-corpus cache.
