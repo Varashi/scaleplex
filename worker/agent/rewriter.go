@@ -1411,10 +1411,25 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// repeats the codec flag (early near-input and again after video
 	// codec block).
 	{
+		// Plex audio stream index varies by which track the client picked
+		// (`-codec:1` for the first audio track, `-codec:2` for a switch
+		// to the second, etc.) — accept any non-negative N. Stream :0 is
+		// the video stream in PMS argv but eac3_eae is only ever an
+		// audio encoder, so the value test below (`== "eac3_eae"`)
+		// rules out collisions on :0 in practice.
 		audioCodecFlag := func(s string) bool {
-			switch s {
-			case "-codec:0", "-codec:1", "-c:a", "-c:a:0", "-c:a:1":
+			if s == "-c:a" {
 				return true
+			}
+			if rest, ok := strings.CutPrefix(s, "-codec:"); ok {
+				if _, err := strconv.Atoi(rest); err == nil {
+					return true
+				}
+			}
+			if rest, ok := strings.CutPrefix(s, "-c:a:"); ok {
+				if _, err := strconv.Atoi(rest); err == nil {
+					return true
+				}
 			}
 			return false
 		}
