@@ -148,6 +148,17 @@ func TestReplayCorpus(t *testing.T) {
 			start := time.Now()
 			cmd := exec.CommandContext(ctx, "/usr/bin/ffmpeg", args...)
 			cmd.Env = appendOrSetEnv(os.Environ(), res.Env)
+			// chdir to the per-session tmp dir so relative paths in
+			// the captured argv (e.g. `-segment_header_filename header`,
+			// `-segment_list dash`, the segment muxer's transient
+			// `dash.tmp`) land in our writable replay sandbox instead
+			// of the test process's CWD (often /, unwritable for
+			// uid 1000). Without this ffmpeg fast-fails with the
+			// misleading "Could not write header (incorrect codec
+			// parameters ?): Permission denied" the moment the
+			// segment muxer tries to open `header`.
+			cmd.Dir = filepath.Join("/tmp/replay", c.SessionID)
+			_ = os.MkdirAll(cmd.Dir, 0o755)
 			out, runErr := cmd.CombinedOutput()
 			dur := time.Since(start)
 
