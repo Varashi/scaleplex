@@ -221,6 +221,19 @@ func envOr(k, dflt string) string {
 	return dflt
 }
 
+// subtitlesForceStyle returns the `:force_style='...'` suffix for the stock
+// `subtitles=` filter. Pinning the font face skips libass's per-frame
+// fontselect via fontconfig (the dominant cold-init cost). Override via
+// HW_SUBTITLE_FORCE_STYLE; empty value disables. Default mirrors the
+// DejaVu Sans face shipped in the slim worker fontsdir.
+func subtitlesForceStyle() string {
+	v := envOr("HW_SUBTITLE_FORCE_STYLE", "FontName=DejaVu Sans")
+	if v == "" {
+		return ""
+	}
+	return ":force_style='" + v + "'"
+}
+
 func indexOfArg(args []string, key string, from int) int {
 	for i := from; i < len(args); i++ {
 		if args[i] == key {
@@ -595,9 +608,9 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 						"[10]%s[11];"+
 						"[11]hwdownload[12];"+
 						"[12]format=pix_fmts=nv12[13];"+
-						"[13]subtitles=filename='%s':fontsdir=%s[14];"+
+						"[13]subtitles=filename='%s':fontsdir=%s%s[14];"+
 						"[14]hwupload[15]",
-					scaleStep, subPath, fontsDir),
+					scaleStep, subPath, fontsDir, subtitlesForceStyle()),
 				OldLabel: "[2]",
 				NewLabel: "[15]",
 				Mode:     mode,
@@ -1193,9 +1206,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					"[0:0]hwupload[0];"+
 						"[0]%s[1];"+
 						"[1]hwdownload,format=nv12[2];"+
-						"[2]subtitles=filename='%s':fontsdir=%s[3];"+
+						"[2]subtitles=filename='%s':fontsdir=%s%s[3];"+
 						"[3]hwupload[4]",
-					scaleStep, subPath, fontsDir,
+					scaleStep, subPath, fontsDir, subtitlesForceStyle(),
 				)
 				changes = append(changes, "hw-decode:filter:inlineass->subtitles")
 				changes = append(changes, "subtitle:sidecar-staged")

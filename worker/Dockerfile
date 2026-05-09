@@ -45,11 +45,23 @@ RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|'
       intel-media-va-driver-non-free \
       libva2 libva-drm2 \
       vainfo \
-      fontconfig fonts-dejavu-core fonts-noto-core \
+      fontconfig fonts-dejavu-core \
       tini && \
     apt-get purge -y --auto-remove gpg && \
-    rm -rf /var/lib/apt/lists/* && \
-    fc-cache -f
+    rm -rf /var/lib/apt/lists/*
+
+# Slim fontconfig config — restricts the font search universe to the
+# DejaVu dir only. libass's `subtitles=` filter calls fontconfig once at
+# filter init for fontselect; with the system-wide config (~100+ font
+# faces from fonts-noto-core etc.) that scan dominates first-frame
+# latency and pushes startup speed below realtime for the first ~1s of
+# every transcode. Pinning to dejavu drops the corpus to ~14 files and
+# matches Plex's own `fonts.conf` strategy (point at one private dir,
+# nothing else). Combine with rewriter's `force_style='FontName=DejaVu
+# Sans'` to skip fontconfig pattern matching entirely on the primary
+# face.
+RUN install -d -m 0755 /opt/scaleplex
+COPY worker/fonts.conf /opt/scaleplex/fonts.conf
 
 # /usr/lib/jellyfin-ffmpeg/{ffmpeg,ffprobe} is the install path; symlink
 # into /usr/bin so the agent's hardcoded paths keep working.
@@ -65,6 +77,11 @@ COPY worker/scaleplex-entrypoint.sh /usr/local/bin/scaleplex-entrypoint
 RUN chmod +x /usr/local/bin/scaleplex-entrypoint
 
 ENV LIBVA_DRIVER_NAME=iHD
+# libass + fontconfig: point at the slim config so fontselect scans 14
+# DejaVu files instead of the system corpus. The rewriter sets HOME=
+# /home/ubuntu in the spawn env so libass finds the per-user cache the
+# next stage builds.
+ENV FONTCONFIG_FILE=/opt/scaleplex/fonts.conf
 EXPOSE 3501
 
 # Pre-populate fontconfig cache for the runtime user (uid 1000 = ubuntu
@@ -85,7 +102,9 @@ EXPOSE 3501
 # *.cache-N files in /home/ubuntu/.cache/fontconfig. The rewriter sets
 # HOME=/home/ubuntu in the spawn env so libass finds the cache.
 USER 1000
-RUN HOME=/home/ubuntu fc-cache -f
+# Cache built against /opt/scaleplex/fonts.conf (slim) — produces a
+# tiny cache that mmaps in microseconds vs the system-corpus cache.
+RUN HOME=/home/ubuntu FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f
 # Wrapper: prefers /transcode/_dev/scaleplex-agent if present (NFS-shared
 # dev overlay so a `go build && cp && pkill` round-trip swaps the binary
 # in seconds without rebuilding the image). Falls through to the baked
