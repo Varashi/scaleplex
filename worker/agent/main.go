@@ -547,6 +547,14 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 
 	recordSpeedFromOutput(stderrTail.String())
 
+	rawTail := stderrTail.String()
+	const maxTail = 1024
+	tail := rawTail
+	if len(tail) > maxTail {
+		tail = "..." + tail[len(tail)-maxTail:]
+	}
+	tailEscaped := strings.ReplaceAll(strings.ReplaceAll(tail, "\r", "\\r"), "\n", "\\n")
+
 	if waitErr != nil {
 		// Was it killed via context (registry.kill or client disconnect)
 		// vs ffmpeg crash? Distinguish for the metric.
@@ -555,20 +563,57 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		} else {
 			metricSessionsTotal.WithLabelValues("error").Inc()
 		}
-		// Log stderr tail so failures don't need manual replay to debug.
-		tail := stderrTail.String()
-		const maxTail = 1024
-		if len(tail) > maxTail {
-			tail = "..." + tail[len(tail)-maxTail:]
-		}
-		tail = strings.ReplaceAll(strings.ReplaceAll(tail, "\r", "\\r"), "\n", "\\n")
 		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: %v\n", waitErr)
-		log.Printf("session %s: ffmpeg exit: %v stderr_tail=%s", req.SessionID, waitErr, tail)
+		log.Printf("session %s: ffmpeg exit: %v stderr_tail=%s", req.SessionID, waitErr, tailEscaped)
 	} else {
 		metricSessionsTotal.WithLabelValues("success").Inc()
 		fmt.Fprintf(resp, "[scaleplex] ffmpeg exit: success\n")
 		log.Printf("session %s: ffmpeg ok", req.SessionID)
 	}
+
+	// Stamp the outcome onto the corpus capture so replay can flag
+	// historical regressions (this argv exited 0 once but exits N now).
+	if os.Getenv("WORKER_DUMP_ARGV") == "1" {
+		oc := captureOutcome{
+			DurationMs: time.Since(spawnedAt).Milliseconds(),
+			StderrTail: tail,
+			Segments:   countSegments(req.Cwd),
+			EndedAt:    time.Now().UTC().Format(time.RFC3339),
+		}
+		if waitErr == nil {
+			oc.ExitStatus = 0
+		} else if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			oc.ExitStatus = exitErr.ExitCode()
+			if exitErr.ProcessState != nil && !exitErr.ProcessState.Exited() {
+				oc.Signal = exitErr.ProcessState.String()
+			}
+		} else {
+			oc.ExitStatus = -1
+			oc.Signal = waitErr.Error()
+		}
+		persistArgvOutcome(req.SessionID, oc)
+	}
+}
+
+// countSegments counts ts/m4s segment files written under the per-session
+// cwd. Cheap stat-only walk; logs failures and returns 0. Cwd may be
+// empty (spawned without cwd) — treat as 0.
+func countSegments(cwd string) int {
+	if cwd == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(cwd)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".ts") || strings.HasSuffix(name, ".m4s") {
+			n++
+		}
+	}
+	return n
 }
 
 // ringBuffer keeps the last N bytes appended to it. Cheap thread-safe
@@ -643,6 +688,49 @@ func streamPrefixed(rc io.ReadCloser, w *lockedWriter, prefix string, done chan<
 	}
 }
 
+// captureClientInfo extracts Plex client identification from the env
+// the shim forwards. Plex Transcoder inherits X_PLEX_* vars from the
+// parent PMS process, so the shim's collectEnv() picks them up. Lets
+// corpus analysis cluster bugs by client class (PS4 vs LG WebOS vs
+// Android vs Apple TV). Returns nil if no identifying env present.
+func captureClientInfo(env map[string]string) *captureClient {
+	if env == nil {
+		return nil
+	}
+	c := &captureClient{
+		Product:    env["X_PLEX_PRODUCT"],
+		DeviceName: env["X_PLEX_DEVICE_NAME"],
+		Platform:   env["X_PLEX_PLATFORM"],
+		Version:    env["X_PLEX_VERSION"],
+		Username:   env["X_PLEX_USERNAME"],
+	}
+	if c.Product == "" && c.DeviceName == "" && c.Platform == "" && c.Version == "" && c.Username == "" {
+		return nil
+	}
+	return c
+}
+
+type captureClient struct {
+	Product    string `json:"product,omitempty"`
+	DeviceName string `json:"device_name,omitempty"`
+	Platform   string `json:"platform,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Username   string `json:"username,omitempty"`
+}
+
+// captureOutcome is stamped onto the JSON after ffmpeg exits. Turns the
+// corpus into a regression-detection set: replay can compare a session's
+// historical outcome (exit_status, segments_created, stderr_tail) to
+// what the current rewriter produces.
+type captureOutcome struct {
+	ExitStatus int    `json:"exit_status"`
+	Signal     string `json:"signal,omitempty"`
+	DurationMs int64  `json:"duration_ms"`
+	Segments   int    `json:"segments_created,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
+	EndedAt    string `json:"ended_at"`
+}
+
 // persistArgvCapture writes a JSON capture of the PMS argv to the
 // shared corpus dir (default /transcode/_argv-corpus on NFS). Survives
 // pod restarts, accessible from anywhere the NFS is mounted. The
@@ -670,6 +758,8 @@ func persistArgvCapture(sessionID, cwd string, args []string, env map[string]str
 		Cwd        string            `json:"session_cwd,omitempty"`
 		Argv       []string          `json:"argv"`
 		Env        map[string]string `json:"env,omitempty"`
+		Client     *captureClient    `json:"client,omitempty"`
+		Outcome    *captureOutcome   `json:"outcome,omitempty"`
 	}
 	host, _ := os.Hostname()
 	c := capture{
@@ -680,25 +770,73 @@ func persistArgvCapture(sessionID, cwd string, args []string, env map[string]str
 		Cwd:        cwd,
 		Argv:       args,
 		Env:        env,
+		Client:     captureClientInfo(env),
 	}
-	tmp, err := os.CreateTemp(dir, sessionID+".*.tmp")
+	if err := writeCaptureJSON(path, dir, sessionID, &c); err != nil {
+		log.Printf("argv-capture %s: %v", sessionID, err)
+	}
+}
+
+// persistArgvOutcome merges an outcome record into an existing capture
+// JSON. Best-effort: missing capture (corpus dir down, capture skipped
+// for this session) is logged and ignored. Atomic via tmp+rename so
+// concurrent sweeps never read a half-written record.
+func persistArgvOutcome(sessionID string, outcome captureOutcome) {
+	dir := os.Getenv("WORKER_ARGV_CORPUS_DIR")
+	if dir == "" {
+		dir = "/transcode/_argv-corpus"
+	}
+	path := filepath.Join(dir, sessionID+".json")
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("argv-capture create %s: %v", dir, err)
+		// Capture didn't land (capture disabled / NFS hiccup) — nothing
+		// to merge into.
+		return
+	}
+	var existing map[string]any
+	if err := json.Unmarshal(raw, &existing); err != nil {
+		log.Printf("argv-outcome %s decode: %v", sessionID, err)
+		return
+	}
+	existing["outcome"] = outcome
+	tmp, err := os.CreateTemp(dir, sessionID+".outcome.*.tmp")
+	if err != nil {
+		log.Printf("argv-outcome create %s: %v", sessionID, err)
 		return
 	}
 	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(&c); err != nil {
+	if err := enc.Encode(&existing); err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
-		log.Printf("argv-capture encode %s: %v", sessionID, err)
+		log.Printf("argv-outcome encode %s: %v", sessionID, err)
 		return
 	}
 	tmp.Close()
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		os.Remove(tmp.Name())
-		log.Printf("argv-capture rename %s: %v", sessionID, err)
+		log.Printf("argv-outcome rename %s: %v", sessionID, err)
 	}
+}
+
+func writeCaptureJSON(path, dir, sessionID string, c any) error {
+	tmp, err := os.CreateTemp(dir, sessionID+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(c); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return fmt.Errorf("encode: %w", err)
+	}
+	tmp.Close()
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		os.Remove(tmp.Name())
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
 }
 
 func buildEnv(supplied map[string]string) []string {
