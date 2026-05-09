@@ -59,16 +59,32 @@ Side effects:
 - `-sei:0 a53_cc` is injected so VAAPI's encoder embeds Closed Caption
   608 data the same way Plex's libx264 build does. **Label:** `inject:sei+a53_cc`.
 
-### `eac3_eae` → `eac3` (audio encoder)
+### `*_eae` → stock encoder (audio encoder)
 
-Plex's audio encoder name `eac3_eae` invokes the EasyAudioEncoder
-sidecar (a separate process). EAE is licensed and its temp dir is tied
-to PMS's per-restart UUID — see
-[LESSONS-FROM-CLUSTERPLEX.md#5](LESSONS-FROM-CLUSTERPLEX.md). We swap
-to libavcodec's native `eac3`/`ac3`/`aac` encoders and drop
-`-eae_prefix:N` (an EAE-specific output filename salt).
+Plex's `*_eae` codec names invoke the EasyAudioEncoder sidecar (a
+separate process). EAE is licensed and its temp dir is tied to PMS's
+per-restart UUID — see
+[LESSONS-FROM-CLUSTERPLEX.md#5](LESSONS-FROM-CLUSTERPLEX.md). The
+rewriter strips the `_eae` suffix and substitutes the stock libavcodec
+equivalent:
 
-**Labels:** `audio:eac3_eae->eac3` (or `->ac3` etc.), `drop:-eae_prefix:1`.
+| Plex codec    | Replacement | Notes                                                               |
+| ------------- | ----------- | ------------------------------------------------------------------- |
+| `eac3_eae`    | `eac3`      | Stock encoder is clean.                                             |
+| `ac3_eae`     | `ac3`       | Stock encoder is clean.                                             |
+| `truehd_eae`  | `eac3`      | Stock `truehd` encoder is flagged experimental and runs sub-realtime; client loses bitstream passthrough but keeps audio. |
+| `<other>_eae` | `eac3`      | Forward-compatible default for codecs the family table doesn't list yet. |
+
+The matcher accepts any `-codec:N` or `-c:a:N` flag for any
+non-negative N — the audio track index reflects which audio stream the
+client picked, not a fixed slot. Hardcoding `:0`/`:1` only crashes the
+moment a multi-audio source is touched (validated 2026-05-10:
+`-codec:2 eac3_eae` from Plex Android audio-track switch on a multi-
+language anime episode). The drop-suffix logic also strips
+`-eae_prefix:N` for the same N.
+
+**Labels:** `audio:eac3_eae->eac3`, `audio:truehd_eae->eac3`,
+`drop:-eae_prefix:1` (etc.).
 
 ## Filter chain rewrites
 
@@ -119,12 +135,42 @@ The rewriter detects this combo and:
 
 3. Drops the `-map_inlineass` arg.
 
-4. If no sidecar is found OR the source is `inlineass`-style (subs
+4. **HLS+seek PTS-shift bracket**: HLS path strips `-copyts` (stock
+   ssegment muxer can't split chunks with `-copyts` + seek). Without
+   the shift, fast-seek rebases frame PTS to 0, but `subtitles=`
+   filter looks up SRT cues at absolute time — every cue lookup
+   misses, subs render blank for the entire seek session. The
+   rewriter brackets `subtitles=` with two `setpts` pieces only when
+   `isHLS && seekOff > 0`:
+
+   ```
+   [12]hwdownload,format=nv12,setpts=PTS+<T>/TB[13];   # pre: feed libass absolute time
+   [13]subtitles=filename=...[14];
+   [14]setpts=PTS-<T>/TB,hwupload[15]                  # post: restore 0-based PTS for muxer
+   ```
+
+   The post-shift restores 0-based PTS so the segment muxer cuts
+   cleanly and the relay sidecar's CSV rewrite produces the expected
+   global-timeline window. DASH path keeps `-copyts` and doesn't need
+   the shift. Plex's `inlineass` worked because Plex's fork supports
+   `-copyts` + ssegment splits simultaneously; stock can't do both.
+
+5. **`force_style` pin**: appended as `:force_style='FontName=DejaVu
+   Sans'` (overridable via `HW_SUBTITLE_FORCE_STYLE`). Pins the
+   primary face so libass skips fontconfig pattern matching at filter
+   init. Mirrors Plex's `inlineass` `font_path=` direct-open trick
+   within the bounds of stock ffmpeg's `subtitles=` filter (which
+   doesn't expose `font_path=`). See
+   [reference_libass_cold_start.md] in the user's auto-memory for the
+   full cold-start mitigation analysis.
+
+6. If no sidecar is found OR the source is `inlineass`-style (subs
    embedded in the main video stream), bails. PGS subs always force
    burn-in client-side; SRT-via-stream-index needs sidecar lookup to
    work in stock ffmpeg.
 
-**Labels:** `filter:hybrid-inlineass`, `drop:-map_inlineass`.
+**Labels:** `filter:hybrid-inlineass`, `drop:-map_inlineass`,
+`subtitle:pts-shift=<T>s` (HLS+seek).
 
 This is the path that bottlenecked clusterplex (Plex's `inlineass` was
 the only filter that worked, but it forced the whole pipeline through
@@ -306,6 +352,25 @@ documented above and a few "must-NOT-touch" guards:
   labels.
 - Sidecar SRT discovery falls back to bail when no file is found
   (rather than producing a broken filter chain).
+- `*_eae` audio swap accepts any `-codec:N` index (`rewriter_eae_test.go::TestRewriter_EAE_MultiStreamIndex`)
+  + handles `truehd_eae` fallback to `eac3` (`TestRewriter_EAE_TrueHDFallback`).
+- HLS + seek + sub-burn brackets `subtitles=` with `setpts` so libass
+  reads absolute time while the encoder still emits 0-based PTS.
+
+## Replay regression set
+
+The argv corpus on shared NFS at `/transcode/_argv-corpus` is the
+canonical input for `worker/agent/replay_test.go` (build-tagged
+`replay`). Each entry stores `{argv, env, client, outcome}` — the
+client identification (Plex Product / Device / Platform / Version /
+Username from `X_PLEX_*`) plus ffmpeg's exit status, duration,
+segments-created, and stderr tail. Replay then re-runs every captured
+argv through the current rewriter and compares outcomes — historical
+exit-0 successes that now exit non-zero are flagged as regressions.
+The capture+outcome plumbing is identical on both surfaces:
+clusterplex worker (Go agent — `persistArgvCapture` +
+`persistArgvOutcome`) and production plex (bash tee-wrapper —
+`CLIENT:KEY=VALUE` headers + `OUTCOME:exit_status=N ...` footer).
 
 The bail path is exercised explicitly in tests
 (`TestRewriter_Bail_*`) — a regression that quietly succeeded would be
