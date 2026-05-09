@@ -345,14 +345,21 @@ args := []string{
 	if !containsString(out.Changes, "inject:init_hw_device+filter_hw_device") {
 		t.Fatalf("missing injection: %v", out.Changes)
 	}
+	// Injection lands BEFORE the first -i (global ffmpeg option scope).
+	// Placing it after -i puts it in per-output scope where the av1
+	// hwaccel decoder doesn't see the device — ffmpeg fails with
+	// "No VA display found for device vaapi" at filter graph build.
 	i := indexOfArg(out.Args, "-i", 0)
+	if i < 4 {
+		t.Fatalf("-i too early; injection should precede it. args=%v", out.Args)
+	}
 	want := []string{
 		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
 		"-filter_hw_device", "vaapi",
 	}
 	for k, w := range want {
-		if out.Args[i+2+k] != w {
-			t.Fatalf("arg[%d]=%q want %q", i+2+k, out.Args[i+2+k], w)
+		if out.Args[i-4+k] != w {
+			t.Fatalf("arg[%d]=%q want %q", i-4+k, out.Args[i-4+k], w)
 		}
 	}
 }
