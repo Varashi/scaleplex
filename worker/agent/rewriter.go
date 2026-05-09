@@ -234,6 +234,40 @@ func subtitlesForceStyle() string {
 	return ":force_style='" + v + "'"
 }
 
+// subtitlesSeekShift returns (pre, post) setpts pieces to bracket a stock
+// `subtitles=filename=` filter when -copyts has been stripped (HLS path)
+// AND the session is seek-resumed. Without the bracket, frame PTS arrives
+// at the libass filter rebased to 0, while SRT cues live at absolute
+// time — every cue lookup misses, subs render blank for the entire
+// session. The pre setpts offsets PTS by the seek time so libass sees
+// absolute time and matches cues; the post setpts undoes the offset so
+// the segment muxer emits 0-based chunk PTS (the relay sidecar later
+// rewrites CSV start_time to the expected global-timeline window).
+//
+// Returns ("", "") when no shift is needed (seekOff <= 0). Pre is meant
+// to be appended after a comma-separated filter chain segment (leading
+// comma included); post is meant to be prepended (trailing comma
+// included).
+func subtitlesSeekShift(seekOff float64) (pre, post string) {
+	if seekOff <= 0 {
+		return "", ""
+	}
+	return fmt.Sprintf(",setpts=PTS+%.3f/TB", seekOff),
+		fmt.Sprintf("setpts=PTS-%.3f/TB,", seekOff)
+}
+
+// captureSeekSeconds returns the value of the first `-ss N` argv pair as
+// seconds, or 0 if none/invalid. Used by the HW + SW sub-burn paths to
+// know whether to bracket libass with PTS-shift setpts pieces.
+func captureSeekSeconds(args []string) float64 {
+	if i := indexOfArg(args, "-ss", 0); i >= 0 && i+1 < len(args) {
+		if v, err := strconv.ParseFloat(args[i+1], 64); err == nil && v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
 func indexOfArg(args []string, key string, from int) int {
 	for i := from; i < len(args); i++ {
 		if args[i] == key {
@@ -510,7 +544,7 @@ type filterRewrite struct {
 // Falls back to the legacy fs-probe (findSidecarSubtitle) when no
 // PMS-staged source is present — defensive for older PMS argv shapes
 // and tests that don't wire -map_inlineass through.
-func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled, sourceIsHDR bool) *filterRewrite {
+func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled, sourceIsHDR bool, seekShiftSeconds float64) *filterRewrite {
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
 		w, h, assParams := m[1], m[2], m[3]
 		_ = assParams
@@ -602,15 +636,16 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 			// overlay_vaapi composition on iHD is more expensive than
 			// the libass roundtrip it replaces. Reverted; keeping the
 			// native render-at-output-res path for all sizes.
+			preShift, postShift := subtitlesSeekShift(seekShiftSeconds)
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];"+
 						"[10]%s[11];"+
 						"[11]hwdownload[12];"+
-						"[12]format=pix_fmts=nv12[13];"+
+						"[12]format=pix_fmts=nv12%s[13];"+
 						"[13]subtitles=filename='%s':fontsdir=%s%s[14];"+
-						"[14]hwupload[15]",
-					scaleStep, subPath, fontsDir, subtitlesForceStyle()),
+						"[14]%shwupload[15]",
+					scaleStep, preShift, subPath, fontsDir, subtitlesForceStyle(), postShift),
 				OldLabel: "[2]",
 				NewLabel: "[15]",
 				Mode:     mode,
@@ -1023,7 +1058,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 		}
 
-		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR)
+		seekShift := 0.0
+		if isHLS {
+			seekShift = captureSeekSeconds(args)
+		}
+		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR, seekShift)
+		if rewritten != nil && seekShift > 0 && subSrc != nil && subSrc.Kind == "text" {
+			changes = append(changes, fmt.Sprintf("subtitle:pts-shift=%.3fs", seekShift))
+		}
 		if rewritten == nil {
 			return bail("filter-pattern:" + args[vfIdx])
 		}
@@ -1202,13 +1244,21 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
 						w, h)
 				}
+				preShift, postShift := "", ""
+				if isHLS {
+					if so := captureSeekSeconds(args); so > 0 {
+						preShift, postShift = subtitlesSeekShift(so)
+						changes = append(changes, fmt.Sprintf("subtitle:pts-shift=%.3fs", so))
+					}
+				}
 				args[vfIdx] = fmt.Sprintf(
 					"[0:0]hwupload[0];"+
 						"[0]%s[1];"+
-						"[1]hwdownload,format=nv12[2];"+
+						"[1]hwdownload,format=nv12%s[2];"+
 						"[2]subtitles=filename='%s':fontsdir=%s%s[3];"+
-						"[3]hwupload[4]",
-					scaleStep, subPath, fontsDir, subtitlesForceStyle(),
+						"[3]%shwupload[4]",
+					scaleStep, preShift, subPath, fontsDir, subtitlesForceStyle(),
+					postShift,
 				)
 				changes = append(changes, "hw-decode:filter:inlineass->subtitles")
 				changes = append(changes, "subtitle:sidecar-staged")
