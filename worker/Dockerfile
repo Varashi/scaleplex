@@ -84,34 +84,21 @@ ENV LIBVA_DRIVER_NAME=iHD
 ENV FONTCONFIG_FILE=/opt/scaleplex/fonts.conf
 EXPOSE 3501
 
-# Pre-populate fontconfig cache for the runtime user (uid 1000 = ubuntu
-# in the Ubuntu 24.04 base image). Plex's transcoder env carries
-# HOME=/config/Library/Application Support/Plex Media Server, which
-# the worker forwards to the spawned ffmpeg. Fontconfig reads HOME to
-# locate the per-user cache dir; with HOME pointing at a path that
-# doesn't exist on the worker pod and /var/cache/fontconfig owned by
-# root (read-only for uid 1000), fontconfig errors with "No writable
-# cache directories" and falls back to a non-cached scan-on-every-call
-# mode. libass's `subtitles=` filter triggers fontselect at the first
-# subtitle frame; without a cache that call blocks for 2+ minutes on
-# the worker pod, ffmpeg never produces a segment, and Plex's HLS
-# client times out with "Connection error" (live repro 2026-05-08:
-# Plex Android, force-burn subs + seek, 2 min wall clock no segments).
+# Pre-populate the system fontconfig cache against the slim config.
+# Runs as root so /var/cache/fontconfig is writeable; uid 1000 has
+# read access at runtime, so the spawned ffmpeg/libass picks up the
+# cache without any HOME tricks. Avoids the per-user .cache/fontconfig
+# layer that broke under BuildKit cache refreshes (fc-cache fell back
+# to writing per-dir caches into /usr/share/fonts/truetype/dejavu and
+# failed there).
 #
-# Building the cache here as uid 1000 with HOME=/home/ubuntu lands the
-# *.cache-N files in /home/ubuntu/.cache/fontconfig. The rewriter sets
-# HOME=/home/ubuntu in the spawn env so libass finds the cache.
-# /home/ubuntu may not exist on every base-image refresh (Ubuntu 24.04
-# normally ships a default `ubuntu` user at uid 1000, but BuildKit cache
-# refreshes have surfaced a missing /home/ubuntu in CI). Ensure it
-# exists + is writable before fc-cache so the slim cache lands in a
-# writeable per-user dir instead of falling back to the read-only
-# system fontdir.
-RUN install -d -o 1000 -g users -m 0755 /home/ubuntu/.cache/fontconfig
-USER 1000
-# Cache built against /opt/scaleplex/fonts.conf (slim) — produces a
-# tiny cache that mmaps in microseconds vs the system-corpus cache.
-RUN HOME=/home/ubuntu FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f
+# Without a populated cache libass's `subtitles=` filter triggers a
+# fontselect on the first subtitle frame; on the original system-wide
+# config that scan blocked for 2+ minutes on the worker pod, ffmpeg
+# never produced a segment, and Plex's HLS client timed out with
+# "Connection error" (live repro 2026-05-08: Plex Android, force-burn
+# subs + seek, 2 min wall clock no segments).
+RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v 2>&1 | tail -3
 # Wrapper: prefers /transcode/_dev/scaleplex-agent if present (NFS-shared
 # dev overlay so a `go build && cp && pkill` round-trip swaps the binary
 # in seconds without rebuilding the image). Falls through to the baked
