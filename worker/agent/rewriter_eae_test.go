@@ -59,7 +59,7 @@ func TestRewriter_EAE_AudioCodecSwap(t *testing.T) {
 // only matched :0/:1, leaving eac3_eae intact and ffmpeg bailed
 // "Unknown decoder 'eac3_eae'" exit 8 (live repro 2026-05-10).
 func TestRewriter_EAE_MultiStreamIndex(t *testing.T) {
-	args := append([]string{
+	args := []string{
 		"-codec:0", "libdav1d",
 		"-codec:2", "eac3_eae",
 		"-eae_prefix:2", "anytoken_",
@@ -74,7 +74,7 @@ func TestRewriter_EAE_MultiStreamIndex(t *testing.T) {
 		"-preset:0", "veryfast",
 		"-codec:2", "eac3_eae",
 		"-b:2", "256k",
-	})
+	}
 	out := Rewrite(args, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
