@@ -902,9 +902,21 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 		changes = append(changes, "init_hw_device")
 	} else {
+		// Inject -init_hw_device + -filter_hw_device BEFORE the first
+		// -i so they're parsed as global options. Placing them after
+		// -i puts them in ffmpeg's per-output option scope, where
+		// -init_hw_device's per-input dispatch silently fails to bind
+		// the hwaccel device to the input stream — ffmpeg parses the
+		// option but the av1 hwaccel decoder doesn't see it,
+		// resulting in "No VA display found for device vaapi" /
+		// "No device available for decoder" at filter graph build.
+		// Live repro 2026-05-09 session 7561 (SW HDR + sub-burn The
+		// Accountant on Plex Android): rewriter applied with both
+		// drop:-i(sidecar-input) and inject:init_hw_device, but
+		// ffmpeg still failed to bind vaapi until injection moved
+		// to global position.
 		newInputIdx := indexOfArg(args, "-i", 0)
-		injectAt := newInputIdx + 2
-		args = spliceArgs(args, injectAt,
+		args = spliceArgs(args, newInputIdx,
 			"-init_hw_device", "vaapi=vaapi:"+renderDevice+",driver="+vaapiDriver,
 			"-filter_hw_device", "vaapi",
 		)
