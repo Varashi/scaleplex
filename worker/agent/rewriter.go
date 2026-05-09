@@ -999,6 +999,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			if newArgs, dropped := dropSidecarInput(args, subSrc.SecondInputArgIdx); dropped {
 				args = newArgs
 				changes = append(changes, "drop:-i(sidecar-input)")
+				// Strip Plex's trailing null-sub output declaration
+				// (`-map <ref> -f null -codec ass <name>`). It refers
+				// to input 1 (the SRT we just dropped); leaving it
+				// makes ffmpeg fail with "Invalid input file index: 1"
+				// during argv parsing. Same path the HW-decode branch
+				// already handles; SW path missed it because the
+				// label-mismatch bug masked it (ffmpeg never got far
+				// enough to parse the trailing args before label-update
+				// was fixed).
+				if removed := stripNullSubOutput(&args); removed {
+					changes = append(changes, "drop:null-sub-output")
+				}
 			}
 		}
 
