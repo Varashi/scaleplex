@@ -87,6 +87,8 @@ type Capture struct {
 	SessionCwd       string            `json:"session_cwd,omitempty"`
 	Argv             []string          `json:"argv"`
 	Env              map[string]string `json:"env,omitempty"`
+	Client           *CaptureClient    `json:"client,omitempty"`
+	Outcome          *CaptureOutcome   `json:"outcome,omitempty"`
 	RewriterApplied  *bool             `json:"rewriter_applied,omitempty"`
 	RewriterChanges  []string          `json:"rewriter_changes,omitempty"`
 	RewriterSkipWhy  string            `json:"rewriter_skip_why,omitempty"`
@@ -103,6 +105,29 @@ type Capture struct {
 	SegmentsCreated  int               `json:"segments_created"`
 	EncodeSpeed      string            `json:"encode_speed,omitempty"`
 	ExitReason       string            `json:"exit_reason,omitempty"`
+}
+
+// CaptureClient mirrors worker/agent's captureClient — Plex client
+// identification extracted from the X_PLEX_* env vars the shim
+// forwards. Lets corpus analysis cluster bugs by client class.
+type CaptureClient struct {
+	Product    string `json:"product,omitempty"`
+	DeviceName string `json:"device_name,omitempty"`
+	Platform   string `json:"platform,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Username   string `json:"username,omitempty"`
+}
+
+// CaptureOutcome mirrors worker/agent's captureOutcome — ffmpeg exit
+// status stamped onto the JSON post-spawn so replay can flag historical
+// regressions.
+type CaptureOutcome struct {
+	ExitStatus int    `json:"exit_status"`
+	Signal     string `json:"signal,omitempty"`
+	DurationMs int64  `json:"duration_ms"`
+	Segments   int    `json:"segments_created,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
+	EndedAt    string `json:"ended_at,omitempty"`
 }
 
 func parseQuotedSlice(body string) []string {
