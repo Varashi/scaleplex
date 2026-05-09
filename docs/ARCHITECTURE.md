@@ -146,6 +146,21 @@ the agent first SIGTERMs any running ffmpeg for that session (5s grace,
 then SIGKILL), then starts the new one. Avoids the
 two-transcoders-on-one-GPU contention clusterplex saw.
 
+**Argv corpus capture (gated by `WORKER_DUMP_ARGV=1`):** every task
+spawn writes `<session_id>.json` to `/transcode/_argv-corpus` with
+`{argv, env, client, ...}` then merges `outcome` (exit_status, signal,
+duration_ms, segments_created, stderr_tail, ended_at) post-spawn via
+atomic tmp+rename. Client identification is extracted from the
+`X_PLEX_*` env vars Plex Transcoder inherits from PMS — lets corpus
+analysis cluster bugs by client class (PS4 vs LG WebOS vs Apple TV
+etc.). The same enrichments are emitted by the production plex
+tee-wrapper as `CLIENT:KEY=VALUE` headers + `OUTCOME:...` footer in
+the `.argv` files. The corpus feeds `worker/agent/replay_test.go` for
+regression detection: each entry's historical outcome is compared to
+what the current rewriter produces; mismatches surface as test
+failures. See `cmd/argv-extract/sweep.sh` to refresh the corpus from
+both NFS surfaces.
+
 ## Data flow
 
 1. **Client click → playback request.** PMS receives the request, decides
