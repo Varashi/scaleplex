@@ -443,9 +443,16 @@ func parseWorkerNFSJSON(body []byte) (*Capture, error) {
 }
 
 // parsePlexWrapper parses a file written by the Plex production
-// wrapper. Format: ISO8601 timestamp newline-terminated, then
-// NUL-separated argv. session_id derived from filename (basename
-// without `.argv` extension).
+// wrapper. Format:
+//
+//	<ISO8601 timestamp>\n
+//	[CLIENT:KEY=VALUE\n]*           — optional client identification
+//	<argv1>\0<argv2>\0...\0
+//	[OUTCOME:exit_status=N duration_ms=M segments_created=K ended_at=...\n]?
+//
+// The CLIENT and OUTCOME lines can land before or after the NUL block;
+// we strip them out and keep only NUL-separated argv as the body.
+// session_id derived from filename (basename without `.argv` extension).
 func parsePlexWrapper(body []byte, basename string) (*Capture, error) {
 	nl := bytes.IndexByte(body, '\n')
 	var ts string
@@ -456,13 +463,67 @@ func parsePlexWrapper(body []byte, basename string) (*Capture, error) {
 		ts = string(bytes.TrimSpace(body[:nl]))
 		rest = body[nl+1:]
 	}
+
+	// Strip CLIENT: and OUTCOME: header/footer lines. They sit between
+	// newlines, never inside a NUL-separated argv slot, so we can
+	// extract them line-at-a-time before splitting on NULs.
+	var client *CaptureClient
+	var outcome *CaptureOutcome
+	for {
+		nl := bytes.IndexByte(rest, '\n')
+		if nl < 0 {
+			break
+		}
+		line := rest[:nl]
+		// Both prefixes appear at the very start of a line.
+		if bytes.HasPrefix(line, []byte("CLIENT:")) {
+			if client == nil {
+				client = &CaptureClient{}
+			}
+			parseClientLine(string(line[len("CLIENT:"):]), client)
+			rest = rest[nl+1:]
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("OUTCOME:")) {
+			outcome = parseOutcomeLine(string(line[len("OUTCOME:"):]))
+			rest = rest[nl+1:]
+			continue
+		}
+		break
+	}
+	// Outcome can also land at the end of the file (most common — wrapper
+	// appends after Plex Transcoder exits). Split off any trailing line
+	// after the last NUL.
+	if outcome == nil {
+		if last := bytes.LastIndexByte(rest, '\n'); last >= 0 && last == len(rest)-1 {
+			// trailing newline; check the line before it
+			body := rest[:last]
+			if lineStart := bytes.LastIndexByte(body, '\n'); lineStart >= 0 {
+				lastLine := body[lineStart+1:]
+				if bytes.HasPrefix(lastLine, []byte("OUTCOME:")) {
+					outcome = parseOutcomeLine(string(lastLine[len("OUTCOME:"):]))
+					rest = rest[:lineStart+1]
+				}
+			} else if bytes.HasPrefix(body, []byte("OUTCOME:")) {
+				outcome = parseOutcomeLine(string(body[len("OUTCOME:"):]))
+				rest = rest[:0]
+			}
+		}
+	}
+
 	parts := bytes.Split(rest, []byte{0})
 	argv := make([]string, 0, len(parts))
 	for _, p := range parts {
 		if len(p) == 0 {
 			continue
 		}
-		argv = append(argv, string(p))
+		// NUL splits leak trailing newlines from the OUTCOME line if it
+		// landed after the argv block. Strip surrounding whitespace.
+		s := string(bytes.TrimSpace(p))
+		if s == "" {
+			continue
+		}
+		argv = append(argv, s)
 	}
 	if len(argv) == 0 {
 		return nil, errors.New("no argv")
@@ -476,9 +537,82 @@ func parsePlexWrapper(body []byte, basename string) (*Capture, error) {
 		CaptureSource: sourcePlexWrapper,
 		CapturedAt:    ts,
 		Argv:          argv,
+		Client:        client,
+		Outcome:       outcome,
 	}
 	extractStructuralMeta(c)
+	if outcome != nil && c.SegmentsCreated == 0 && outcome.Segments > 0 {
+		c.SegmentsCreated = outcome.Segments
+	}
 	return c, nil
+}
+
+// parseClientLine fills the matching CaptureClient field from a
+// `KEY=VALUE` snippet emitted by the Plex production wrapper. Unknown
+// keys are ignored (forward-compatible with new wrapper fields).
+func parseClientLine(kv string, c *CaptureClient) {
+	eq := strings.IndexByte(kv, '=')
+	if eq < 0 {
+		return
+	}
+	k := kv[:eq]
+	v := strings.TrimSpace(kv[eq+1:])
+	if v == "" {
+		return
+	}
+	switch k {
+	case "PRODUCT":
+		c.Product = v
+	case "DEVICE_NAME":
+		c.DeviceName = v
+	case "PLATFORM":
+		c.Platform = v
+	case "VERSION":
+		c.Version = v
+	case "USERNAME":
+		c.Username = v
+	}
+}
+
+// parseOutcomeLine parses the wrapper's `key=value key=value ...` outcome
+// footer. Returns nil if no recognised fields land.
+func parseOutcomeLine(s string) *CaptureOutcome {
+	o := &CaptureOutcome{}
+	matched := false
+	for _, tok := range strings.Fields(s) {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			continue
+		}
+		k, v := tok[:eq], tok[eq+1:]
+		switch k {
+		case "exit_status":
+			if n, err := strconv.Atoi(v); err == nil {
+				o.ExitStatus = n
+				matched = true
+			}
+		case "signal":
+			o.Signal = v
+			matched = true
+		case "duration_ms":
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				o.DurationMs = n
+				matched = true
+			}
+		case "segments_created":
+			if n, err := strconv.Atoi(v); err == nil {
+				o.Segments = n
+				matched = true
+			}
+		case "ended_at":
+			o.EndedAt = v
+			matched = true
+		}
+	}
+	if !matched {
+		return nil
+	}
+	return o
 }
 
 func main() {
