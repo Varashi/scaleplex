@@ -739,6 +739,176 @@ func removeArgs(s []string, at, n int) []string {
 	return out
 }
 
+// tryOptimizeRemux detects + handles Plex Optimize argv shapes where
+// video output is `-codec:0 copy` (no transcode). Returns (result,
+// true) on match. See callsite for rationale.
+func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]string) (RewriteResult, bool) {
+	iIdx := indexOfArg(args, "-i", 0)
+	if iIdx < 0 {
+		return RewriteResult{}, false
+	}
+	// Decoder side: bare stock decoder, no hwaccel.
+	dIdx := indexOfArg(args, "-codec:0", 0)
+	if dIdx < 0 || dIdx >= iIdx || dIdx+1 >= len(args) {
+		return RewriteResult{}, false
+	}
+	dec := args[dIdx+1]
+	if _, ok := hwDecodeShortCodecs[dec]; !ok {
+		return RewriteResult{}, false
+	}
+	if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
+		return RewriteResult{}, false
+	}
+	// Encoder side: first `-codec:0` after -i must be `copy`.
+	encIdx := indexOfArg(args, "-codec:0", iIdx+1)
+	if encIdx < 0 || encIdx+1 >= len(args) || args[encIdx+1] != "copy" {
+		return RewriteResult{}, false
+	}
+
+	out := cloneArgs(args)
+	changes := []string{"decode:remux:" + dec, "encode:copy(passthrough)"}
+
+	// 1. Strip Plex-private flags.
+	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-strict_ts:0", "-strict_ts"} {
+		for {
+			i := indexOfArg(out, flag, 0)
+			if i < 0 || i+1 >= len(out) {
+				break
+			}
+			out = removeArgs(out, i, 2)
+			changes = append(changes, "drop:"+flag)
+		}
+	}
+	for {
+		i := indexOfArg(out, "-xioerror", 0)
+		if i < 0 {
+			break
+		}
+		out = removeArgs(out, i, 1)
+		changes = append(changes, "drop:-xioerror")
+	}
+
+	// 2. Swap *_eae audio decoders to base stock decoders. Reuses the
+	// same logic as the main rewriter — ec3/ac3 base codecs are valid
+	// stock decoders, others fall back to eac3.
+	eaeBase := func(name string) string {
+		base, ok := strings.CutSuffix(name, "_eae")
+		if !ok {
+			return ""
+		}
+		switch base {
+		case "eac3", "ac3":
+			return base
+		default:
+			return "eac3"
+		}
+	}
+	swapped := map[string]string{}
+	for i := 0; i < len(out); i++ {
+		s := out[i]
+		isAudioFlag := s == "-c:a"
+		if !isAudioFlag {
+			if rest, ok := strings.CutPrefix(s, "-codec:"); ok {
+				if _, err := strconv.Atoi(rest); err == nil {
+					isAudioFlag = true
+				}
+			}
+		}
+		if !isAudioFlag {
+			if rest, ok := strings.CutPrefix(s, "-c:a:"); ok {
+				if _, err := strconv.Atoi(rest); err == nil {
+					isAudioFlag = true
+				}
+			}
+		}
+		if !isAudioFlag || i+1 >= len(out) {
+			continue
+		}
+		if base := eaeBase(out[i+1]); base != "" {
+			swapped[out[i+1]] = base
+			out[i+1] = base
+		}
+	}
+	for from, to := range swapped {
+		changes = append(changes, "audio:"+from+"->"+to)
+	}
+
+	// 3. Drop -eae_prefix:N (any stream spec).
+	for {
+		removed := false
+		for i := 0; i < len(out); i++ {
+			if strings.HasPrefix(out[i], "-eae_prefix") {
+				dropped := out[i]
+				out = removeArgs(out, i, 2)
+				changes = append(changes, "drop:"+dropped)
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			break
+		}
+	}
+
+	// 4. Capture -progressurl for the worker reporter.
+	progressURL := ""
+	if i := indexOfArg(out, "-progressurl", 0); i >= 0 && i+1 < len(out) {
+		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+			base = envBase
+		}
+		origURL := out[i+1]
+		out = removeArgs(out, i, 2)
+		if base != "" {
+			rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
+			if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+				if strings.Contains(rewritten, "?") {
+					rewritten += "&X-Plex-Token=" + tok
+				} else {
+					rewritten += "?X-Plex-Token=" + tok
+				}
+				changes = append(changes, "progress:append-X-Plex-Token")
+			}
+			progressURL = rewritten
+			changes = append(changes, "progressurl:captured-for-reporter")
+		} else {
+			changes = append(changes, "drop:-progressurl(no-pms-base)")
+		}
+	}
+
+	// 5. Loglevel quiet→info so the worker can stream stderr to PMS.
+	if i := indexOfArg(out, "-loglevel", 0); i >= 0 && i+1 < len(out) {
+		if v := out[i+1]; v == "quiet" || v == "panic" || v == "fatal" {
+			out[i+1] = "info"
+			changes = append(changes, "loglevel:->info")
+		}
+	}
+	if i := indexOfArg(out, "-nostats", 0); i >= 0 {
+		out = removeArgs(out, i, 1)
+		changes = append(changes, "drop:-nostats")
+	}
+
+	// 6. Env strips matching the main rewriter — keep X_PLEX_TOKEN.
+	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
+		if _, ok := env[k]; ok {
+			delete(env, k)
+			changes = append(changes, "env:strip:"+k)
+		}
+	}
+	// HOME override so libass / fontconfig find the worker-side cache,
+	// even though Optimize-remux jobs typically don't burn subs. Safe.
+	env["HOME"] = envOr("HW_RUNTIME_HOME", "/home/ubuntu")
+	changes = append(changes, "env:HOME")
+
+	return RewriteResult{
+		Args:        out,
+		Env:         env,
+		Applied:     true,
+		Changes:     changes,
+		ProgressURL: progressURL,
+	}, true
+}
+
 // dropSidecarInput removes the sidecar `-i` AND any per-input options
 // that preceded it (everything between input-0's path and input-1's
 // path). Per ffmpeg argv spec those options apply to the next `-i`,
@@ -862,6 +1032,27 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	args := cloneArgs(inputArgs)
 	env := cloneEnv(inputEnv)
+
+	// Plex Optimize remux fast-path. PMS emits a bare `-codec:0 h264`
+	// (or hevc/av1/vp9) input decoder — no `-hwaccel:0` — paired with
+	// `-codec:0 copy` on the first video output, when the Optimize
+	// target preset already matches the source resolution / bitrate
+	// and video can be passed through. Worker has nothing to do
+	// video-side; the full rewriter pipeline doesn't apply (no
+	// init_hw_device, no encoder swap, no filter chain). But the
+	// argv still carries Plex-private flags (-loglevel_plex,
+	// -progressurl) and EAE audio decoders (-codec:N eac3_eae)
+	// that stock ffmpeg can't handle.
+	//
+	// This branch handles those minimal fixes and returns. Without it
+	// the main rewriter bails with "unknown-decoder:h264" (decoder
+	// allowlist requires a paired hwaccel) and Optimize never works
+	// on non-AV1 sources — observed 2026-05-10 with Pat & Mat
+	// (h264) and All Creatures (hevc) → ffmpeg exit 8 on
+	// "Unknown decoder 'eac3_eae'". Live test confirmed.
+	if remux, ok := tryOptimizeRemux(args, env, inputEnv); ok {
+		return remux
+	}
 
 	// Detect output format up-front so format-specific rewrites can branch.
 	// Plex's argv ends with one of:
