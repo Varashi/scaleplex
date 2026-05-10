@@ -11,7 +11,40 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
+
+// dutyCycle escalates with depth so an abandoned-tab session converges
+// to ~1% GPU instead of staying at the normal-buffer-ahead duty.
+// CONT phase MUST stay non-zero across all tiers — that's the only
+// path by which the progress pipe drains, so PMS can clear canThrottle
+// when the client buffer dips again.
+func TestDutyCycle_EscalatesWithDepth(t *testing.T) {
+	cases := []struct {
+		depth     time.Duration
+		wantStop  time.Duration
+		wantCont  time.Duration
+	}{
+		{0, 200 * time.Millisecond, 50 * time.Millisecond},
+		{29 * time.Second, 200 * time.Millisecond, 50 * time.Millisecond},
+		{30 * time.Second, 1000 * time.Millisecond, 50 * time.Millisecond},
+		{119 * time.Second, 1000 * time.Millisecond, 50 * time.Millisecond},
+		{120 * time.Second, 5000 * time.Millisecond, 50 * time.Millisecond},
+		{1 * time.Hour, 5000 * time.Millisecond, 50 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		stop, cont := dutyCycle(tc.depth)
+		if stop != tc.wantStop || cont != tc.wantCont {
+			t.Errorf("dutyCycle(%v) = (%v,%v), want (%v,%v)",
+				tc.depth, stop, cont, tc.wantStop, tc.wantCont)
+		}
+		if cont == 0 {
+			t.Errorf("dutyCycle(%v) cont=0 — would deadlock progress pipe", tc.depth)
+		}
+	}
+}
 
 // throttleSignal: state transitions are atomic and visible across
 // goroutines.
@@ -156,6 +189,89 @@ func TestThrottleController_PausesAndResumes(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("controller did not exit after ctx cancel")
 	}
+}
+
+// While throttled, depth metric must advance with wall time and reset
+// to 0 when throttle clears.
+func TestThrottleController_DepthGaugeAdvancesAndResets(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("no sleep binary")
+	}
+	cmd := exec.Command("sleep", "5")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGCONT)
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	const session = "depth-test"
+	sig := &throttleSignal{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		throttleController(ctx, session, cmd.Process.Pid, sig)
+		close(done)
+	}()
+
+	gauge := metricThrottleDepthSeconds.WithLabelValues(session)
+	read := func() float64 {
+		var m dto.Metric
+		if err := gauge.Write(&m); err != nil {
+			t.Fatalf("read gauge: %v", err)
+		}
+		return m.GetGauge().GetValue()
+	}
+
+	if v := read(); v != 0 {
+		t.Fatalf("depth before throttle: %v want 0", v)
+	}
+
+	sig.set(true)
+	// Wait two duty cycles (~500ms) so the controller has time to write
+	// at least two depth samples.
+	time.Sleep(550 * time.Millisecond)
+	if v := read(); v < 0.2 {
+		t.Fatalf("depth after ~500ms throttle: %v want >=0.2s", v)
+	}
+
+	sig.set(false)
+	// Controller may be mid-pulse (up to stopFor=200ms + contFor=50ms
+	// before it re-reads sig). Give it one full cycle plus margin.
+	if !waitForGaugeZero(t, gauge, 500*time.Millisecond) {
+		var m dto.Metric
+		_ = gauge.Write(&m)
+		t.Fatalf("depth after throttle off: %v want 0", m.GetGauge().GetValue())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("controller did not exit after ctx cancel")
+	}
+}
+
+// waitForGaugeZero polls a Prometheus gauge until it reads 0 or the
+// deadline expires. Used because throttleController has up to a 250ms
+// state-detection latency (it samples sig.on() at the top of each
+// duty-cycle iteration).
+func waitForGaugeZero(t *testing.T, g prometheus.Gauge, deadline time.Duration) bool {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		var m dto.Metric
+		if err := g.Write(&m); err == nil && m.GetGauge().GetValue() == 0 {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
 }
 
 // procState reads /proc/<pid>/status and returns the State byte
