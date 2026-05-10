@@ -815,6 +815,63 @@ func TestRewriter_OptimizeRemux_hevc_PreservesSidecars(t *testing.T) {
 	}
 }
 
+// Detection-shape argv carries `-codec:1 aac` even when the source
+// audio is actually EAC3/AC3/DTS. PMS expects Plex's bundled EAE to
+// bridge any source codec; stock ffmpeg honours the hint literally
+// and the AAC decoder fails on the EAC3 bitstream with exit 8. The
+// no-decoder bail path drops audio-side input decoder hints so
+// ffmpeg auto-detects from each stream's codec_id (always picks
+// correctly).
+func TestRewriter_Bail_NoDecoder_DropsAudioInputHints(t *testing.T) {
+	args := []string{
+		"-codec:1", "aac",
+		"-eae_prefix:1", "abc-prefix_",
+		"-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/media/Series/Show/S01E01.mkv",
+		"-y", "-nostats", "-loglevel", "quiet",
+		"-loglevel_plex", "error",
+		"-filter_complex", "[0:1] aresample=async=1:ochl='stereo':osr=48000[0]",
+		"-map", "[0]",
+		"-codec:0", "flac", "-b:0", "4096k",
+		"-f", "flac", "-t", "30",
+		"/transcode/Transcode/Detection/some-uuid",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("scrub should mark Applied=true: %v", out.Changes)
+	}
+	// -codec:1 (input audio decoder hint) gone.
+	for i, a := range out.Args {
+		if a == "-codec:1" && i+1 < len(out.Args) && out.Args[i+1] == "aac" {
+			// must NOT be before -i
+			iIdx := indexOfArg(out.Args, "-i", 0)
+			if i < iIdx {
+				t.Fatalf("input-side -codec:1 aac still present pre--i: %v", out.Args)
+			}
+		}
+	}
+	// -eae_prefix:1 also gone (orphaned without the codec hint).
+	for _, a := range out.Args {
+		if strings.HasPrefix(a, "-eae_prefix") {
+			t.Fatalf("-eae_prefix should be dropped: %v", out.Args)
+		}
+	}
+	// Output-side -codec:0 flac (the encode hint) MUST survive — it's
+	// AFTER -i, post-input-stream output codec, not a decode hint.
+	hasFLAC := false
+	for i, a := range out.Args {
+		if a == "-codec:0" && i+1 < len(out.Args) && out.Args[i+1] == "flac" {
+			iIdx := indexOfArg(out.Args, "-i", 0)
+			if i > iIdx {
+				hasFLAC = true
+			}
+		}
+	}
+	if !hasFLAC {
+		t.Errorf("output -codec:0 flac was dropped (must survive): %v", out.Args)
+	}
+}
+
 // PMS spawns audio-only Detection ffmpeg jobs (intro / credits / voice
 // activity ML pre-pass) for every video item. They have no video
 // decoder so the rewriter bails with skip:no-decoder, but they ALSO
