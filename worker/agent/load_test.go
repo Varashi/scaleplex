@@ -81,13 +81,11 @@ func TestEngineSampler_CounterRollback(t *testing.T) {
 	}
 }
 
-// No engines discovered → 0 forever, never panics.
+// No engines discovered → 0 forever, never panics. Belt-and-braces:
+// disable both sysfs (bad path) and PMU (env kill switch).
 func TestEngineSampler_NoEngines(t *testing.T) {
-	t.Setenv("WORKER_GPU_ENGINES", "")
-	// Ensure no real /sys/class/drm matches by overriding to an empty
-	// list via the env var path (empty string means "use default
-	// glob"); use a non-existent path to force the empty-list branch.
 	t.Setenv("WORKER_GPU_ENGINES", "/nonexistent/no/such/file")
+	t.Setenv("WORKER_GPU_DISABLE", "1")
 
 	s := newEngineSampler()
 	if got := s.sample(); got != 0 {
@@ -96,5 +94,32 @@ func TestEngineSampler_NoEngines(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if got := s.sample(); got != 0 {
 		t.Fatalf("with bad path %v want 0", got)
+	}
+	if s.numEngines() != 0 {
+		t.Fatalf("numEngines %d want 0", s.numEngines())
+	}
+}
+
+func TestParseEventConfig(t *testing.T) {
+	cases := []struct {
+		in   string
+		want uint64
+		ok   bool
+	}{
+		{"config=0x4", 4, true},
+		{"config=0x600100000", 0x600100000, true},
+		{"config=42", 42, true},                  // no 0x prefix → decimal
+		{"event=0xa,config=0x10", 0x10, true},    // skip non-config keys
+		{"  config=0x1  ", 1, true},              // whitespace tolerance
+		{"config=0xZZ", 0, false},                // bogus hex
+		{"event=0xa", 0, false},                  // no config key
+		{"", 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := parseEventConfig(tc.in)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("parseEventConfig(%q) = (%#x,%v) want (%#x,%v)",
+				tc.in, got, ok, tc.want, tc.ok)
+		}
 	}
 }
