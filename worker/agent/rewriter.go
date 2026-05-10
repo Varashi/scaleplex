@@ -816,12 +816,47 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	libvaDriversPath := os.Getenv("HW_LIBVA_DRIVERS_PATH")
 
 	changes := []string{}
+	// On bail we don't run the full rewriter, but Plex-private flags
+	// MUST still come off — stock ffmpeg exits status 8 on the first
+	// unrecognised one ("Unrecognized option 'loglevel_plex'"). PMS
+	// emits these on EVERY ffmpeg spawn, including audio-only Detection
+	// jobs (intro / credits / voice-activity ML pre-pass) that the
+	// rewriter bails on with skip:no-decoder. Without this scrub
+	// every such session 8'd out, blocking PMS marker generation.
+	scrubPlexFlagsOnBail := func(args []string) ([]string, []string) {
+		var bailChanges []string
+		for _, flag := range []string{"-loglevel_plex", "-progressurl", "-delete_removed"} {
+			for {
+				i := indexOfArg(args, flag, 0)
+				if i < 0 || i+1 >= len(args) {
+					break
+				}
+				args = removeArgs(args, i, 2)
+				bailChanges = append(bailChanges, "drop:"+flag+"(bail)")
+			}
+		}
+		// -xioerror is a Plex-private boolean flag (no value).
+		for {
+			i := indexOfArg(args, "-xioerror", 0)
+			if i < 0 {
+				break
+			}
+			args = removeArgs(args, i, 1)
+			bailChanges = append(bailChanges, "drop:-xioerror(bail)")
+		}
+		return args, bailChanges
+	}
 	bail := func(reason string) RewriteResult {
+		args := cloneArgs(inputArgs)
+		args, scrub := scrubPlexFlagsOnBail(args)
+		merged := append([]string{}, changes...)
+		merged = append(merged, scrub...)
+		merged = append(merged, "skip:"+reason)
 		return RewriteResult{
-			Args:    cloneArgs(inputArgs),
+			Args:    args,
 			Env:     cloneEnv(inputEnv),
-			Applied: false,
-			Changes: append(changes, "skip:"+reason),
+			Applied: len(scrub) > 0, // scrub did work → tell caller to use rewritten args
+			Changes: merged,
 		}
 	}
 

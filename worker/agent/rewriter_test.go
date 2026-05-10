@@ -702,6 +702,50 @@ args := []string{
 	}
 }
 
+// PMS spawns audio-only Detection ffmpeg jobs (intro / credits / voice
+// activity ML pre-pass) for every video item. They have no video
+// decoder so the rewriter bails with skip:no-decoder, but they ALSO
+// carry Plex-private flags (-loglevel_plex, -progressurl) that stock
+// ffmpeg rejects with exit 8. The bail path must still scrub those
+// flags or every Detection job fails on this cluster — observed
+// 2026-05-10 as a flood of exit-8 sessions blocking PMS marker
+// generation. Reproduces the captured-from-clusterplex argv shape.
+func TestRewriter_Bail_StripsPlexPrivateFlags(t *testing.T) {
+	args := []string{
+		"-codec:1", "aac", "-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/media/Series/Show/S01E01.mkv",
+		"-y", "-nostats", "-loglevel", "quiet",
+		"-loglevel_plex", "error",
+		"-progressurl", "http://127.0.0.1:32400/video/:/transcode/session/abc/def/progress",
+		"-filter_complex", "[0:1] aresample=async=1:ochl='stereo':osr=48000[0]",
+		"-map", "[0]",
+		"-codec:0", "flac", "-b:0", "4096k",
+		"-f", "flac", "-t", "30",
+		"/transcode/Transcode/Detection/some-uuid",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("scrub should mark Applied=true so worker uses cleaned args; changes=%v", out.Changes)
+	}
+	if containsString(out.Args, "-loglevel_plex") {
+		t.Errorf("-loglevel_plex still present: %v", out.Args)
+	}
+	if containsString(out.Args, "-progressurl") {
+		t.Errorf("-progressurl still present: %v", out.Args)
+	}
+	// Should still mark a bail reason.
+	hasBail := false
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "skip:") {
+			hasBail = true
+			break
+		}
+	}
+	if !hasBail {
+		t.Errorf("expected skip: change still present alongside scrub: %v", out.Changes)
+	}
+}
+
 func TestRewriter_Bail_FilterMismatch_NoCorruption(t *testing.T) {
 args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
