@@ -40,6 +40,20 @@ Plex selects `libdav1d` as the AV1 software decoder. We swap to ffmpeg's
 default AV1 decoder name and add VAAPI hwaccel below it. **Label:**
 `decode:libdav1d->av1`.
 
+### Bare short codec name without `-hwaccel:0` (decoder upgrade)
+
+PMS sometimes stages a SW-shaped argv (libx264/libx265 encoder, software
+`scale` filter) but emits the canonical short codec name (`hevc`, `h264`,
+`av1`, `vp9`) in `-codec:0` instead of a `libfoo` SW decoder. Without
+`-hwaccel:0`, ffmpeg decodes in software and the SW encoder runs — no
+hardware acceleration. The rewriter detects this shape and injects the
+hwaccel flags so the rest of the SW-upgrade tail runs (encoder swap,
+filter chain rewrite). Only fires when the post-`-i` encoder is a known
+SW encoder (`libx264`/`libx265`); a HW encoder there means the argv is
+malformed in a way we can't safely reshape, and we bail with
+`skip:unknown-decoder:<codec>`. **Label:** `decode:bare-hw-upgrade:hevc`
+(or `h264` / `av1` / `vp9`).
+
 ### `libx264` → `h264_vaapi` (encoder)
 
 The whole point. Plex passes its libx264 invocation; we replace with
