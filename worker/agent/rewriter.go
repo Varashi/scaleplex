@@ -894,16 +894,37 @@ func stripEAEEnvVars(env map[string]string) (map[string]string, []string) {
 	return env, changes
 }
 
-// dropInputAudioDecoderHints removes every `-codec:N <value>` /
-// `-c:a:N <value>` / `-c:a <value>` pair that appears BEFORE the first
-// `-i` flag (input-side decoder hints). Stock ffmpeg auto-detects each
-// stream's decoder from codec_id when no hint is set; PMS sometimes
-// pipes a wrong hint (e.g. `-codec:1 aac` for an EAC3 audio stream)
-// expecting Plex's bundled EAE engine to bridge it. Without this drop,
-// stock ffmpeg fails on the bitstream parse with empty stderr (because
-// `-loglevel quiet`) and exit status 8. Used in the no-decoder bail
-// path — when there's no `-codec:0` for video, all `-codec:N` hints
-// are audio and dropping them is unconditionally safe.
+// inputDecoderHintFlag returns true when arg s is an input-side
+// decoder-codec flag. Matches all ffmpeg stream-specifier shapes
+// per ffmpeg-all(1):
+//   -codec:STREAMSPEC, -c:STREAMSPEC
+//   -c:v / -c:a / -c:s / -c:d / -c:t  (type-only shorthand)
+// where STREAMSPEC is anything: digit ("1"), type+index ("a:0"),
+// stream-id ("#0x02" — Plex Transcoder's preferred form), program,
+// metadata pattern, etc. We don't validate; whatever PMS sends, the
+// flag pair gets dropped on bail.
+func inputDecoderHintFlag(s string) bool {
+	if s == "-c:v" || s == "-c:a" || s == "-c:s" || s == "-c:d" || s == "-c:t" {
+		return true
+	}
+	for _, prefix := range []string{"-codec:", "-c:"} {
+		if rest, ok := strings.CutPrefix(s, prefix); ok && rest != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// dropInputAudioDecoderHints removes every input-side `-codec:* <value>`
+// pair (any stream-spec form) plus any orphaned `-eae_prefix:N`. Stock
+// ffmpeg auto-detects each stream's decoder from codec_id when no hint
+// is set; PMS often pipes a wrong hint (e.g. `-codec:#0x02 aac` for an
+// EAC3 audio stream) expecting Plex's bundled EAE engine to bridge it.
+// Without this drop, stock ffmpeg fails on the bitstream parse with
+// empty stderr (because `-loglevel quiet`) and exit status 8. Used in
+// the no-decoder bail path — caller has already decided the rewriter
+// can't reason about this argv shape, so deferring to ffmpeg auto-
+// detection is the safest forward path.
 func dropInputAudioDecoderHints(args []string) ([]string, []string) {
 	var changes []string
 	for {
@@ -913,7 +934,7 @@ func dropInputAudioDecoderHints(args []string) ([]string, []string) {
 			break
 		}
 		for i := 0; i < iIdx && i+1 < len(args); i++ {
-			if !audioCodecFlag(args[i]) {
+			if !inputDecoderHintFlag(args[i]) {
 				continue
 			}
 			tag := "drop:" + args[i] + "=" + args[i+1] + "(bail)"
