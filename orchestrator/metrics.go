@@ -41,7 +41,7 @@ func updateWorkerMetrics() {
 	healthy, unhealthy := 0, 0
 	totalActive := 0
 	for _, w := range pl.list() {
-		active, _, ok := w.snapshot()
+		active, _, _, ok := w.snapshot()
 		if ok {
 			healthy++
 			totalActive += active
