@@ -340,6 +340,103 @@ Plex passes some env vars that don't apply to a stock-ffmpeg run:
 `X_PLEX_TOKEN` is read out of env into the rewritten URLs and *not*
 passed through to ffmpeg's environment (no need; the URL carries it).
 
+## Optimize-remux fast-path
+
+When PMS issues a Plex Optimize job whose target preset matches the
+source resolution / bitrate, it emits a different argv shape than a
+real transcode:
+
+- bare `-codec:0 {h264|hevc|av1|vp9}` for input (no `-hwaccel:0`)
+- `-codec:0 copy` on the first video output (video pass-through)
+- `-codec:N <eae>` audio decoder hints + `-eae_prefix:N <token>`
+- output written to `<library>/Plex Versions/Optimized for TV/.inProgress/<name>.mp4`
+
+The main rewriter pipeline can't reason about this shape (its decoder
+phase requires either an `-hwaccel:0` paired with a known short codec
+name, or a known SW decoder like `libdav1d`). It used to bail with
+`skip:unknown-decoder:h264` and ffmpeg failed downstream on the EAE
+audio decoder.
+
+`tryOptimizeRemux` runs at the top of `Rewrite()` before any of the
+main pipeline. It detects the shape (bare decoder + no hwaccel + first
+post-`-i` `-codec:0 copy`) and short-circuits: no `-init_hw_device`
+inject, no encoder swap, no filter chain. Just the minimal fix-ups
+that still apply, all sharing helpers with the main rewriter so a fix
+in one path lands in both:
+
+- Drop `-loglevel_plex`, `-delete_removed`, `-strict_ts:N`, `-xioerror`
+- `swapEAEAudioDecoders` — `*_eae` → stock base codec (`eac3_eae`→`eac3`)
+- `dropEAEPrefixFlags` — orphaned `-eae_prefix:N` pairs
+- `capturePMSProgressURL` — strip `-progressurl`, surface the rewritten
+  URL on `RewriteResult.ProgressURL` so the worker reporter can use it
+- `upgradeLoglevelFromQuiet` — `quiet|panic|fatal` → `info`
+- `dropNostatsFlag`, `stripEAEEnvVars`, `setWorkerHomeEnv`
+
+Multi-input shapes (Optimize jobs reference up to 18 sub-sidecar
+inputs via `-map 1:s:0`, `-map 2:s:0`, etc. for SRT-copy outputs) pass
+through untouched — the fast-path never calls `dropSidecarInput`.
+
+**Labels:** `decode:remux:<codec>`, `encode:copy(passthrough)`, plus
+the standard scrub labels.
+
+**Tests:** `TestRewriter_OptimizeRemux_h264_EAE`,
+`TestRewriter_OptimizeRemux_hevc_PreservesSidecars`. Live-validated
+2026-05-10 against:
+
+| Source | Codec / audio | Output | Note |
+|---|---|---|---|
+| Pat & Mat S01E04 | h264 SDTV + EAC3 | h264 + AAC 2ch (40 MB) | small SDTV control |
+| All Creatures S04E04 | hevc 480p + EAC3 + 2 sub sidecars | hevc + AAC 6ch + 3 SRT sidecars (738 MB) | multi-input passthrough |
+
+The four prior Optimize cases (Deadline / Bob's Burgers / Adventure
+Time / Friends) hit the main rewriter's HW-decode-passthrough path
+because their argv shape includes `-hwaccel:0 vaapi` (the 2026-05-08
+commit `c93034d` accepts that shape directly).
+
+## Bail-path scrubs
+
+When the main rewriter bails, the original argv is returned with one
+focused fix applied: anything Plex-Transcoder-specific that stock
+ffmpeg can't parse must come off, or the spawn fails on the first
+unrecognised flag with empty stderr (loglevel quiet hides the error).
+
+`scrubPlexFlagsOnBail` runs unconditionally on every bail. It drops:
+
+- `-loglevel_plex <level>` — Plex-private log verbosity
+- `-progressurl <url>` — Plex progress sink
+- `-delete_removed <bool>` — Plex DASH muxer extension
+- `-xioerror` — Plex-private boolean
+
+Bails with `Applied=true` when the scrub mutated the argv, so the
+worker spawns the cleaned copy.
+
+`dropInputAudioDecoderHints` runs on `bail("no-decoder")` specifically
+— that bail reason fires when there's no `-codec:0` for video before
+`-i`. PMS's audio-only jobs (Detection / intro / credits / voice
+activity ML pre-pass) carry input-side audio decoder hints
+(`-codec:1 aac`, `-codec:#0x02 aac` etc.) that PMS pipes through
+expecting Plex's bundled EAE engine to bridge any source codec. Stock
+ffmpeg honours the hint literally, fails on the bitstream parse when
+the hint mismatches the actual codec, and exits 8.
+
+`inputDecoderHintFlag` matches every ffmpeg stream-specifier shape per
+`ffmpeg-all(1)`:
+
+- `-codec:*`, `-c:*` — any specifier (digit, `#stream_id`, type+index,
+  program, metadata pattern)
+- `-c:v`, `-c:a`, `-c:s`, `-c:d`, `-c:t` — type-only shorthand
+
+When it matches a flag *before* `-i`, the pair is dropped and
+`-eae_prefix:N` companion pairs are also stripped. Stock ffmpeg auto-
+detects each stream's decoder from `codec_id` when no hint is set,
+which always picks correctly.
+
+**Labels:** `drop:<flag>=<value>(bail)`, `drop:-eae_prefix(bail)`,
+plus `skip:no-decoder` on the changes list.
+
+**Tests:** `TestRewriter_Bail_StripsPlexPrivateFlags`,
+`TestRewriter_Bail_NoDecoder_DropsAudioInputHints`.
+
 ## Test coverage
 
 `worker/agent/rewriter_test.go` (~30 cases) covers every transformation
