@@ -192,6 +192,72 @@ func TestPickOrder_InFlightBreaksTie(t *testing.T) {
 	}
 }
 
+// Worker accepts the task, streams a few bytes, then closes the
+// connection abruptly to simulate pod death mid-session. Orchestrator
+// must transparently swap to a healthy alternative worker; PMS-facing
+// stream stays open.
+func TestHandleTask_RecoversMidStreamFailure(t *testing.T) {
+	resetGlobals()
+
+	dying := http.NewServeMux()
+	dying.HandleFunc("/capability", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(capabilityResponse{FFmpegOK: true})
+	})
+	dying.HandleFunc("/task/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted) // checkpoint not needed for this test
+	})
+	dying.HandleFunc("/task", func(w http.ResponseWriter, r *http.Request) {
+		// Hijack so we can write bytes then forcibly close the conn —
+		// httptest's chunked writer doesn't expose that directly.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("hijack unsupported")
+			return
+		}
+		conn, bufrw, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		bufrw.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n")
+		bufrw.WriteString("8\r\n[stdout]\r\n") // chunked frame
+		bufrw.Flush()
+		conn.Close() // simulate pod death — abrupt close after some bytes
+	})
+	dyingSrv := httptest.NewServer(dying)
+	defer dyingSrv.Close()
+
+	healthy := &stubWorker{capability: capabilityResponse{FFmpegOK: true}}
+	healthySrv := httptest.NewServer(healthy.handler())
+	defer healthySrv.Close()
+
+	// Make dying worker rank first.
+	dyingWk := addWorker(t, dyingSrv.URL, 0, 0, true)
+	healthyWk := addWorker(t, healthySrv.URL, 1, 0, true)
+	_ = healthyWk
+	_ = dyingWk
+
+	body := `{"session_id":"recover-1","args":["-i","x.mkv"]}`
+	req := httptest.NewRequest(http.MethodPost, "/task", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handleTask(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.String()
+	// Should contain bytes from BOTH workers (partial from dying, then
+	// success from healthy).
+	if !strings.Contains(out, "[stdout]") {
+		t.Errorf("missing dying-worker bytes: %q", out)
+	}
+	if !strings.Contains(out, "ffmpeg exit: success") {
+		t.Errorf("missing healthy-worker bytes (no recovery happened?): %q", out)
+	}
+	if atomic.LoadInt32(&healthy.taskCallCount) != 1 {
+		t.Errorf("healthy worker should have been called once, got %d", healthy.taskCallCount)
+	}
+}
+
 func TestProbeWorker_ParsesCapability(t *testing.T) {
 	resetGlobals()
 	stub := &stubWorker{capability: capabilityResponse{

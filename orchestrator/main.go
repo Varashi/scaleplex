@@ -388,6 +388,21 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Phase 4b/4d: if Plex's transcoder supervisor is retrying after
+	// a worker crash or graceful migration, our checkpoint cache keyed
+	// on the Plex transcode-session-UUID will hold the last segment
+	// seq. Inject resume flags before forwarding so the worker picks
+	// up exactly where the previous one stopped instead of redoing
+	// chunks the client has already buffered.
+	if newArgs, resumed := resumeIfApplicable(req.Args); resumed {
+		req.Args = newArgs
+		// Re-encode the body so the worker sees the rewritten argv.
+		if nb, err := json.Marshal(req); err == nil {
+			body = nb
+		}
+		metricDispatchTotal.WithLabelValues("resumed").Inc()
+	}
+
 	// Re-pick before each try so the in-flight count from earlier
 	// dispatches is reflected — sequential candidates after a 503 should
 	// also be ranked freshly.
@@ -406,7 +421,12 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		tried[wk] = true
 		log.Printf("session %s: try worker %s (load=%.3f, attempt=%d)", req.SessionID, wk.url, wk.load(), len(tried))
 		wk.dispatchBegin()
+		// Start a checkpoint poller scoped to this PMS-facing request
+		// — it shuts down when the request context is cancelled.
+		pollCtx, cancelPoll := context.WithCancel(r.Context())
+		go pollCheckpoint(pollCtx, wk.url, req.SessionID, req.Args)
 		ok := proxyToWorker(w, r, wk.url, body, req.SessionID)
+		cancelPoll()
 		wk.dispatchEnd()
 		if ok {
 			metricDispatchAttempts.Observe(float64(len(tried)))
@@ -424,57 +444,170 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "all workers at capacity", http.StatusServiceUnavailable)
 }
 
+// proxyToWorker forwards the PMS-facing POST to a worker and streams
+// the worker's chunked response back. Returns true on success / fatal
+// PMS-side write error / non-503 worker error (meaning "don't try
+// another worker"); false on 503 ("try the next candidate").
+//
+// Phase 4d: if the worker stream errors mid-flight (pod death, network
+// drop) AFTER we've already started streaming bytes back to PMS, we
+// transparently swap to a healthy alternative worker — using the
+// checkpoint cache to inject resume flags so the new ffmpeg picks up
+// where the old one stopped. The PMS-facing connection stays open;
+// the shim sees a brief stall (1-3s for the new worker to spin up)
+// then segments resume.
 func proxyToWorker(w http.ResponseWriter, r *http.Request, workerURL string, body []byte, sessionID string) bool {
+	currentURL := workerURL
+	currentBody := body
+	headersWritten := false
+	tried := map[string]bool{currentURL: true}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		ok, status, didHeader, midStream := streamFromUpstream(
+			w, r, currentURL, currentBody, sessionID, headersWritten,
+		)
+		if status == http.StatusServiceUnavailable && !headersWritten {
+			// 503 from initial connect — caller should pick the next candidate.
+			return false
+		}
+		if didHeader {
+			headersWritten = true
+		}
+		if ok {
+			// Upstream finished cleanly OR PMS-side write failed
+			// (client gone). Either way we're done.
+			return true
+		}
+		if !midStream {
+			// Initial-connect failure with no bytes flowed and not 503;
+			// surface as 502 for caller telemetry. http.Error already
+			// fired in streamFromUpstream → done.
+			return true
+		}
+		// Mid-stream failure with PMS still listening. Try recovery.
+		next := pickRecoveryWorker(tried)
+		if next == nil {
+			log.Printf("session %s: mid-stream failure on %s, no alt worker available", sessionID, currentURL)
+			return true
+		}
+		log.Printf("session %s: mid-stream failure on %s, recovering to %s (attempt=%d)", sessionID, currentURL, next.url, attempt+1)
+		metricDispatchTotal.WithLabelValues("recovered").Inc()
+		// Inject resume flags from checkpoint cache into the body
+		// (idempotent — replaces values if already injected).
+		var req taskRequest
+		if err := json.Unmarshal(currentBody, &req); err == nil {
+			if newArgs, resumed := resumeIfApplicable(req.Args); resumed {
+				req.Args = newArgs
+				if nb, err := json.Marshal(req); err == nil {
+					currentBody = nb
+				}
+			}
+		}
+		currentURL = next.url
+		tried[currentURL] = true
+	}
+	log.Printf("session %s: recovery exhausted attempts", sessionID)
+	return true
+}
+
+// streamFromUpstream opens one connection to the named worker and
+// pipes its body to w until either side errors. On the very first
+// successful response it writes the PMS-facing status+headers (gated
+// by `headersWritten`).
+//
+// Returns:
+//   - ok        : true if upstream completed cleanly OR pms-side write failed
+//   - status    : HTTP status from upstream (0 if dial failed)
+//   - didHeader : true if we wrote PMS-facing headers this call
+//   - midStream : true if the failure happened AFTER any bytes flowed
+//                 (signals 4d crash-recovery should kick in)
+func streamFromUpstream(
+	w http.ResponseWriter,
+	r *http.Request,
+	workerURL string,
+	body []byte,
+	sessionID string,
+	headersWritten bool,
+) (ok bool, status int, didHeader bool, midStream bool) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	preq, err := http.NewRequestWithContext(ctx, http.MethodPost, workerURL+"/task", strings.NewReader(string(body)))
 	if err != nil {
-		http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
-		return true
+		if !headersWritten {
+			http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
+		}
+		return true, 0, false, false
 	}
 	preq.Header.Set("Content-Type", "application/json")
 	resp, err := proxyClient.Do(preq)
 	if err != nil {
 		log.Printf("session %s: worker %s error: %v", sessionID, workerURL, err)
-		http.Error(w, "worker dial: "+err.Error(), http.StatusBadGateway)
-		return true
+		if !headersWritten {
+			http.Error(w, "worker dial: "+err.Error(), http.StatusBadGateway)
+		}
+		return true, 0, false, false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		// Try next candidate. Drain body so the connection can be reused.
 		_, _ = io.Copy(io.Discard, resp.Body)
 		log.Printf("session %s: worker %s at capacity, falling through", sessionID, workerURL)
-		return false
+		return false, http.StatusServiceUnavailable, false, false
 	}
 
 	sessions.set(sessionID, workerURL)
 	defer sessions.del(sessionID)
 
-	for k, v := range resp.Header {
-		w.Header()[k] = v
+	if !headersWritten {
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(resp.StatusCode)
+		didHeader = true
 	}
-	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
 	if flusher != nil {
 		flusher.Flush()
 	}
+
+	bytesFlowed := false
 	buf := make([]byte, 4096)
 	for {
-		n, err := resp.Body.Read(buf)
+		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			bytesFlowed = true
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return true
+				// PMS gone — give up entirely, no recovery.
+				return true, resp.StatusCode, didHeader, false
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
-		if err != nil {
-			return true
+		if rerr != nil {
+			if rerr == io.EOF {
+				return true, resp.StatusCode, didHeader, false
+			}
+			// Mid-stream failure = recover. Initial failure = return cleanly
+			// (the caller's outer loop is responsible for picking another
+			// worker via pickOrder, just like a 503).
+			return false, resp.StatusCode, didHeader, bytesFlowed
 		}
 	}
+}
+
+// pickRecoveryWorker returns a healthy worker not in `tried`, ranked by
+// the same load score as fresh dispatch. Distinct from the outer
+// dispatch loop because we may need to swap to a previously-tried-and-
+// rejected (503) worker if it's the only healthy option left.
+func pickRecoveryWorker(tried map[string]bool) *worker {
+	for _, w := range pl.pickOrder() {
+		if !tried[w.url] {
+			return w
+		}
+	}
+	return nil
 }
 
 func handleTaskByID(w http.ResponseWriter, r *http.Request) {
