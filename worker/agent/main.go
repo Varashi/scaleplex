@@ -73,6 +73,25 @@ type taskRegistry struct {
 type runningTask struct {
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
+
+	// Frozen at spawn — captured so /task/<id>/checkpoint can hand a
+	// recovering worker enough context to pick up where this one left
+	// off without re-running the rewriter. argv/env are POST-REWRITE
+	// (what we actually exec'd).
+	argv         []string
+	env          map[string]string
+	cwd          string
+	sourcePath   string
+	progressURL  string
+	manifestURL  string
+	seekOffsetS  float64
+	startedAt    time.Time
+
+	// Live counter. segwatch's chunk renumberer bumps this on each
+	// successful rename so the checkpoint reports the highest segment
+	// PMS could already have fetched. atomic so the checkpoint
+	// handler can read without locking.
+	lastSeq atomic.Int64
 }
 
 func (r *taskRegistry) register(id string, t *runningTask) {
@@ -107,6 +126,12 @@ func (r *taskRegistry) kill(id string) bool {
 	log.Printf("session %s: kill requested", id)
 	t.cancel()
 	return true
+}
+
+func (r *taskRegistry) get(id string) *runningTask {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tasks[id]
 }
 
 var registry = &taskRegistry{tasks: make(map[string]*runningTask)}
@@ -465,7 +490,19 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	log.Printf("session %s: spawned ffmpeg pid=%d", req.SessionID, cmd.Process.Pid)
 	spawnedAt := time.Now()
 
-	registry.register(req.SessionID, &runningTask{cmd: cmd, cancel: cancel})
+	task := &runningTask{
+		cmd:         cmd,
+		cancel:      cancel,
+		argv:        finalArgs,
+		env:         finalEnv,
+		cwd:         req.Cwd,
+		sourcePath:  extractInputPath(finalArgs),
+		progressURL: progressURL,
+		manifestURL: manifestURL,
+		seekOffsetS: seekOffsetSeconds,
+		startedAt:   spawnedAt,
+	}
+	registry.register(req.SessionID, task)
 	metricActiveSessions.Set(float64(registry.activeCount()))
 	defer func() {
 		registry.unregister(req.SessionID)
@@ -497,7 +534,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		if skipToSegment > 0 {
 			startSeq = skipToSegment
 		}
-		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq, seekOffsetSeconds)
+		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq, seekOffsetSeconds, &task.lastSeq)
 		if manifestURL != "" {
 			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID, startSeq)
 		}
@@ -670,19 +707,26 @@ func handleTaskByID(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if suffix != "kill" {
+	switch suffix {
+	case "kill":
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if !registry.kill(id) {
+			http.Error(w, "no such session", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	case "checkpoint":
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		handleCheckpoint(w, id)
+	default:
 		http.Error(w, "unknown task subpath", http.StatusNotFound)
-		return
 	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-	if !registry.kill(id) {
-		http.Error(w, "no such session", http.StatusNotFound)
-		return
-	}
-	w.WriteHeader(http.StatusAccepted)
 }
 
 // streamPrefixed copies pipe → response writer with a prefix per chunk.
