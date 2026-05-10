@@ -157,6 +157,7 @@ A proper Helm chart is on the roadmap; the placeholder lives at
 - [`docs/REWRITER.md`](docs/REWRITER.md) — every Plex-private argv quirk and its stock-ffmpeg translation.
 - [`docs/SEEK.md`](docs/SEEK.md) — DASH and HLS seek deep-dive (the hardest problems we shipped).
 - [`docs/LATENCY.md`](docs/LATENCY.md) — first-frame latency budget and design levers.
+- [`docs/RESILIENCE.md`](docs/RESILIENCE.md) — PMS canThrottle pass-through, multi-engine GPU load, mid-stream worker recovery.
 - [`docs/PLAN.md`](docs/PLAN.md) — original implementation plan (historical; mostly delivered).
 - [`docs/LESSONS-FROM-CLUSTERPLEX.md`](docs/LESSONS-FROM-CLUSTERPLEX.md) — concrete pitfalls scaleplex avoids by design.
 

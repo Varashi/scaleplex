@@ -1,5 +1,31 @@
 # scaleplex implementation plan
 
+## Status (2026-05-10)
+
+Phases 1–7 of the original implementation plan landed during 2026-05-05 / -06.
+Production cutover from clusterplex completed 2026-05-06.
+
+A second tranche of resilience work shipped 2026-05-10:
+
+- **PMS canThrottle pass-through** (depth-tiered SIGSTOP/SIGCONT duty
+  cycle, Phase 1 + 2 of resilience). See `docs/RESILIENCE.md`.
+- **Multi-engine GPU load** in `/capability` and routing
+  (`max(session_saturation, gpu_load)`), Phase 3a. Sysfs + i915-PMU
+  dual reader.
+- **Checkpoint cache + transparent mid-stream worker recovery**
+  (Phase 4a/b/d). Worker pod death migrates the session to a healthy
+  worker without dropping the PMS-facing connection.
+- **Phase 4c (proactive rebalance)** — PARKED. Reconsider when
+  concurrent-session count exceeds ~6 or contention shows up in
+  playback metrics.
+
+The original implementation phases below are kept for historical
+context. Work tracked from here lives in `docs/RESILIENCE.md`,
+`docs/REWRITER.md`, and `docs/SEEK.md`.
+
+---
+
+
 ## Pod-startup budget (applies to every phase)
 
 Worker / orchestrator / shim pods aim for **≤2s `Pending → Ready` on a
