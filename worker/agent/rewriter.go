@@ -1384,9 +1384,32 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	swDecoder := args[decCodecIdx+1]
 	isHWDecode := false
-	if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort && indexOfArg(args, "-hwaccel:0", 0) >= 0 {
-		isHWDecode = true
-		changes = append(changes, "decode:hw-passthrough:"+swDecoder)
+	if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
+		if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
+			isHWDecode = true
+			changes = append(changes, "decode:hw-passthrough:"+swDecoder)
+		} else {
+			// Bare short codec name (hevc/h264/av1/vp9) without -hwaccel:0.
+			// Only safe to auto-upgrade when the encoder side is genuinely
+			// SW-shaped (libx264/libx265) — that's the case where PMS
+			// staged a SW pipeline but happened to emit the canonical
+			// codec name in the decoder slot. If the encoder is already
+			// HW-shaped (e.g. h264_vaapi), the argv is malformed in a way
+			// we can't safely reshape; bail rather than guess.
+			if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
+				if _, isSW := encoderMap[args[peer+1]]; !isSW {
+					return bail("unknown-decoder:" + swDecoder)
+				}
+			} else {
+				return bail("unknown-decoder:" + swDecoder)
+			}
+			args = spliceArgs(args, decCodecIdx+2,
+				"-hwaccel:0", "vaapi",
+				"-hwaccel_output_format:0", "vaapi",
+				"-hwaccel_device:0", "vaapi",
+			)
+			changes = append(changes, "decode:bare-hw-upgrade:"+swDecoder)
+		}
 	} else if hwDecoder, ok := decoderMap[swDecoder]; ok {
 		args[decCodecIdx+1] = hwDecoder
 		args = spliceArgs(args, decCodecIdx+2,
