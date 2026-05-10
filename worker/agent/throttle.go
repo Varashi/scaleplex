@@ -45,7 +45,40 @@ var (
 		Name: "scaleplex_worker_throttle_seconds_total",
 		Help: "Cumulative wall time the worker spent in PMS-asserted throttle.",
 	}, []string{"session"})
+
+	// Depth = seconds since the current continuous throttle started.
+	// Resets to 0 on exit. Drives duty-cycle escalation; expose for
+	// dashboards so operators can spot parked / abandoned sessions
+	// (depth keeps climbing while client never drains the buffer).
+	metricThrottleDepthSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "scaleplex_worker_throttle_depth_seconds",
+		Help: "Seconds since the current continuous throttle began (0 when not throttled).",
+	}, []string{"session"})
 )
+
+// dutyCycle returns (stop, cont) durations for the SIGSTOP/SIGCONT
+// pulse, escalating as the throttle persists. CONT phase stays small
+// so the progress pipe keeps draining and PMS-side PUTs keep firing
+// — that's the only path by which canThrottle can be cleared, so we
+// must not silence it even on the most aggressive tier.
+//
+// Tier rationale (validated against typical PMS behaviour 2026-05-10):
+//   - <30s:   normal client buffer-ahead, expect frequent on/off churn.
+//             Light pause keeps GPU mostly fed.
+//   - 30-120s: client has stopped consuming; might be paused / tab
+//             backgrounded. Burn ~5% GPU.
+//   - 120s+:   almost certainly abandoned tab, PMS hasn't yet timed
+//             out the session. Burn ~1% GPU until PMS releases.
+func dutyCycle(depth time.Duration) (stop, cont time.Duration) {
+	switch {
+	case depth < 30*time.Second:
+		return 200 * time.Millisecond, 50 * time.Millisecond
+	case depth < 120*time.Second:
+		return 1000 * time.Millisecond, 50 * time.Millisecond
+	default:
+		return 5000 * time.Millisecond, 50 * time.Millisecond
+	}
+}
 
 // throttleSignal is the shared state between progress_report (writer)
 // and throttleController (reader). Atomic int32 0=off, 1=on.
@@ -80,6 +113,7 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 	throttledStart := time.Now() // only meaningful while wasOn=true
 	gauge := metricThrottleState.WithLabelValues(sessionID)
 	counter := metricThrottleSeconds.WithLabelValues(sessionID)
+	depthGauge := metricThrottleDepthSeconds.WithLabelValues(sessionID)
 
 	flush := func() {
 		// Final SIGCONT on shutdown so the parent's cmd.Wait isn't
@@ -89,6 +123,7 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 			counter.Add(time.Since(throttledStart).Seconds())
 			gauge.Set(0)
 		}
+		depthGauge.Set(0)
 	}
 	defer flush()
 
@@ -104,9 +139,11 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 				throttledStart = time.Now()
 				gauge.Set(1)
 			} else {
-				log.Printf("session %s: throttle OFF", sessionID)
-				counter.Add(time.Since(throttledStart).Seconds())
+				depth := time.Since(throttledStart)
+				log.Printf("session %s: throttle OFF (was throttled %.1fs)", sessionID, depth.Seconds())
+				counter.Add(depth.Seconds())
 				gauge.Set(0)
+				depthGauge.Set(0)
 				if err := syscall.Kill(pgid, syscall.SIGCONT); err != nil && err != syscall.ESRCH {
 					log.Printf("session %s: SIGCONT pgid=%d: %v", sessionID, pgid, err)
 				}
@@ -123,8 +160,15 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 			continue
 		}
 
-		// Throttled: STOP 200ms, then CONT 50ms. Bail out
-		// immediately on ctx cancellation between phases.
+		// Throttled: pulse SIGSTOP/SIGCONT. Duty cycle escalates with
+		// time-in-throttle (see dutyCycle()): light pause for normal
+		// buffer-ahead; aggressive throttle once we cross zombie /
+		// abandoned thresholds. Bail out immediately on ctx cancellation
+		// between phases.
+		depth := time.Since(throttledStart)
+		depthGauge.Set(depth.Seconds())
+		stopFor, contFor := dutyCycle(depth)
+
 		if err := syscall.Kill(pgid, syscall.SIGSTOP); err != nil {
 			if err == syscall.ESRCH {
 				return // process gone
@@ -134,7 +178,7 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(stopFor):
 		}
 		if err := syscall.Kill(pgid, syscall.SIGCONT); err != nil {
 			if err == syscall.ESRCH {
@@ -145,7 +189,7 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(contFor):
 		}
 	}
 }
