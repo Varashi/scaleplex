@@ -55,6 +55,14 @@ type capabilityResponse struct {
 	// MaxSessions is a soft cap; 0 means unlimited (default until we
 	// have real Arc A310 capacity numbers from phase 6 testing).
 	MaxSessions int `json:"max_sessions"`
+	// GPULoad is the mean busy fraction across this worker's video
+	// engines (vcs/vecs), 0..1. Multi-engine GPUs naturally report
+	// lower values for the same session count, biasing routing toward
+	// them. 0 on CPU-only workers.
+	GPULoad float64 `json:"gpu_load"`
+	// GPUEngines counts the discovered video engines so the orchestrator
+	// (or a dashboard) can sanity-check the gpu_load reading.
+	GPUEngines int `json:"gpu_engines"`
 }
 
 type taskRegistry struct {
@@ -127,6 +135,9 @@ func main() {
 	if _, err := os.Stat(ffmpegBin); err == nil {
 		metricFFmpegOK.Set(1)
 	}
+
+	engineSamplerInst = startEngineSampler()
+	log.Printf("gpu engines discovered: %d", engineSamplerInst.numEngines())
 
 	go prewarm()
 
@@ -215,6 +226,10 @@ func handleCapability(w http.ResponseWriter, r *http.Request) {
 	resp.RenderNodes = listRenderNodes()
 	resp.ActiveSessions = registry.activeCount()
 	resp.MaxSessions = maxSessions()
+	if engineSamplerInst != nil {
+		resp.GPULoad = engineSamplerInst.load()
+		resp.GPUEngines = engineSamplerInst.numEngines()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }

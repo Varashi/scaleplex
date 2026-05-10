@@ -194,13 +194,62 @@ func TestPickOrder_InFlightBreaksTie(t *testing.T) {
 
 func TestProbeWorker_ParsesCapability(t *testing.T) {
 	resetGlobals()
-	stub := &stubWorker{capability: capabilityResponse{FFmpegOK: true, ActiveSessions: 2, MaxSessions: 0}}
+	stub := &stubWorker{capability: capabilityResponse{
+		FFmpegOK: true, ActiveSessions: 2, MaxSessions: 0,
+		GPULoad: 0.4, GPUEngines: 2,
+	}}
 	srv := httptest.NewServer(stub.handler())
 	defer srv.Close()
 	wk := addWorker(t, srv.URL, 0, 0, false)
 	probeWorker(probeClient, wk)
-	active, max, healthy := wk.snapshot()
-	if !healthy || active != 2 || max != 0 {
-		t.Fatalf("active=%d max=%d healthy=%v", active, max, healthy)
+	active, max, gpuLoad, healthy := wk.snapshot()
+	if !healthy || active != 2 || max != 0 || gpuLoad != 0.4 {
+		t.Fatalf("active=%d max=%d gpuLoad=%v healthy=%v", active, max, gpuLoad, healthy)
 	}
+	if wk.gpuEngines != 2 {
+		t.Fatalf("gpuEngines=%d want 2", wk.gpuEngines)
+	}
+}
+
+// load() returns the dominant of session-cap saturation and GPU
+// busy% — whichever is closer to 1.0 wins. Reflects "constrained
+// resource leads" routing principle.
+func TestLoad_TakesMaxOfSessionAndGPU(t *testing.T) {
+	cases := []struct {
+		name   string
+		active int
+		max    int
+		gpu    float64
+		want   float64
+	}{
+		{"both zero", 0, 0, 0, 0},
+		{"sessions dominate", 9, 10, 0.2, 0.9},
+		{"gpu dominates", 1, 10, 0.8, 0.8},
+		{"unlimited cap idle, gpu signals load", 0, 0, 0.5, 0.5},
+		{"both saturated", 10, 10, 1.0, 1.0},
+		{"multi-engine half busy outranks single-engine empty",
+			0, 0, 0.5, 0.5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &worker{
+				healthy:        true,
+				activeSessions: tc.active,
+				maxSessions:    tc.max,
+				gpuLoad:        tc.gpu,
+			}
+			got := w.load()
+			if abs(got-tc.want) > 1e-9 {
+				t.Fatalf("load=%v want %v (active=%d max=%d gpu=%v)",
+					got, tc.want, tc.active, tc.max, tc.gpu)
+			}
+		})
+	}
+}
+
+func abs(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
 }

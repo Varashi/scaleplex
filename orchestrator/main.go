@@ -42,9 +42,11 @@ const (
 )
 
 type capabilityResponse struct {
-	FFmpegOK       bool `json:"ffmpeg_ok"`
-	ActiveSessions int  `json:"active_sessions"`
-	MaxSessions    int  `json:"max_sessions"`
+	FFmpegOK       bool    `json:"ffmpeg_ok"`
+	ActiveSessions int     `json:"active_sessions"`
+	MaxSessions    int     `json:"max_sessions"`
+	GPULoad        float64 `json:"gpu_load"`    // 0..1 mean across video engines
+	GPUEngines     int     `json:"gpu_engines"` // vcs/vecs engine count
 }
 
 type worker struct {
@@ -53,33 +55,48 @@ type worker struct {
 
 	mu             sync.Mutex
 	healthy        bool
-	activeSessions int   // last reported by /capability poll (5s stale)
-	inFlight       int32 // dispatched-here-but-not-yet-finished count
+	activeSessions int     // last reported by /capability poll (5s stale)
+	inFlight       int32   // dispatched-here-but-not-yet-finished count
 	maxSessions    int
+	gpuLoad        float64 // 0..1 mean across video engines (last reported)
+	gpuEngines     int
 	lastErr        string
 	lastUpdated    time.Time
 }
 
-func (w *worker) snapshot() (active, max int, healthy bool) {
+func (w *worker) snapshot() (active, max int, gpuLoad float64, healthy bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.activeSessions, w.maxSessions, w.healthy
+	return w.activeSessions, w.maxSessions, w.gpuLoad, w.healthy
 }
 
-// load is the ranking score. Combines the worker's last-reported
-// active_sessions with the orchestrator's local in-flight count so two
-// concurrent requests don't both pick the same worker just because the
-// /capability cache is 5s stale.
+// load is the ranking score. Takes the dominant of two signals:
+//  1. session-count saturation: (active+inflight)/max  — caps spawn rate
+//  2. GPU saturation: mean busy% across video engines — caps real work
+//
+// Multi-engine GPUs (Arc A310 has 2 vcs engines) naturally report half
+// the gpu_load for the same number of sessions, so this score biases
+// routing toward them — exactly the behaviour we want when scheduling
+// a new transcode.
+//
+// In-flight count is added to active so two concurrent requests don't
+// both pick the same worker while /capability is mid-stale.
 func (w *worker) load() float64 {
-	active, max, healthy := w.snapshot()
+	active, max, gpuLoad, healthy := w.snapshot()
 	if !healthy {
 		return float64(1 << 30)
 	}
 	combined := float64(active) + float64(atomic.LoadInt32(&w.inFlight))
-	if max <= 0 {
-		return combined
+	var sessLoad float64
+	if max > 0 {
+		sessLoad = combined / float64(max)
+	} else {
+		sessLoad = combined
 	}
-	return combined / float64(max)
+	if gpuLoad > sessLoad {
+		return gpuLoad
+	}
+	return sessLoad
 }
 
 func (w *worker) dispatchBegin() { atomic.AddInt32(&w.inFlight, 1) }
@@ -177,6 +194,8 @@ func probeWorker(client *http.Client, w *worker) {
 	w.healthy = c.FFmpegOK
 	w.activeSessions = c.ActiveSessions
 	w.maxSessions = c.MaxSessions
+	w.gpuLoad = c.GPULoad
+	w.gpuEngines = c.GPUEngines
 	w.lastErr = ""
 	w.lastUpdated = time.Now()
 	w.mu.Unlock()
@@ -189,7 +208,7 @@ func (p *pool) pickOrder() []*worker {
 	all := p.list()
 	healthy := make([]*worker, 0, len(all))
 	for _, w := range all {
-		if _, _, ok := w.snapshot(); ok {
+		if _, _, _, ok := w.snapshot(); ok {
 			healthy = append(healthy, w)
 		}
 	}
@@ -299,7 +318,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func handleReady(w http.ResponseWriter, r *http.Request) {
 	for _, wk := range pl.list() {
-		if _, _, healthy := wk.snapshot(); healthy {
+		if _, _, _, healthy := wk.snapshot(); healthy {
 			w.WriteHeader(http.StatusOK)
 			io.WriteString(w, "ready\n")
 			return
@@ -318,6 +337,8 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 		ActiveSessions int     `json:"active_sessions"`
 		InFlight       int32   `json:"in_flight"`
 		MaxSessions    int     `json:"max_sessions"`
+		GPULoad        float64 `json:"gpu_load"`
+		GPUEngines     int     `json:"gpu_engines"`
 		Load           float64 `json:"load"`
 		LastErr        string  `json:"last_err,omitempty"`
 		LastUpdatedAgo string  `json:"last_updated_ago,omitempty"`
@@ -332,6 +353,8 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 			ActiveSessions: wk.activeSessions,
 			InFlight:       atomic.LoadInt32(&wk.inFlight),
 			MaxSessions:    wk.maxSessions,
+			GPULoad:        wk.gpuLoad,
+			GPUEngines:     wk.gpuEngines,
 			Load:           load,
 			LastErr:        wk.lastErr,
 		}
