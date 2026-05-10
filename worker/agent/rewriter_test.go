@@ -702,6 +702,119 @@ args := []string{
 	}
 }
 
+// Plex Optimize remux argv for a genuine h264 source — bare decoder,
+// no -hwaccel, video output is -codec:0 copy. Worker has no video
+// work to do but must still strip Plex-private flags AND swap
+// -codec:1 eac3_eae for stock eac3, or ffmpeg fails on
+// "Unknown decoder 'eac3_eae'". Reproduces Pat & Mat S01E04 capture
+// 2026-05-10 (clusterplex source) before the fast-path landed.
+func TestRewriter_OptimizeRemux_h264_EAE(t *testing.T) {
+	args := []string{
+		"-codec:0", "h264",
+		"-codec:1", "eac3_eae",
+		"-eae_prefix:1", "abcdef-prefix_",
+		"-noaccurate_seek",
+		"-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/media/SeriesNL/Show/S01E01.mkv",
+		"-y", "-nostats", "-loglevel", "quiet", "-loglevel_plex", "error",
+		"-progressurl", "http://127.0.0.1:32400/video/:/transcode/session/sid/job/progress",
+		"-map", "0:0", "-codec:0", "copy",
+		"-filter_complex", "[0:1] aresample=async=1:ochl='stereo':osr=48000[0]",
+		"-map", "[0]",
+		"-codec:1", "aac", "-b:1", "256k",
+		"-f", "mp4", "-movflags", "+faststart",
+		"/media/SeriesNL/Show/Plex Versions/Optimized for TV/.inProgress/S01E01.mp4.99",
+	}
+	out := Rewrite(args, map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://pms.local:32400",
+		"X_PLEX_TOKEN":           "tok",
+	}, nil)
+	if !out.Applied {
+		t.Fatalf("remux fast-path should fire: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "decode:remux:h264") {
+		t.Errorf("missing decode:remux:h264 tag: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "audio:eac3_eae->eac3") {
+		t.Errorf("missing eae swap: %v", out.Changes)
+	}
+	// Decoder + encoder shape preserved.
+	dec := indexOfArg(out.Args, "-codec:0", 0)
+	if dec < 0 || out.Args[dec+1] != "h264" {
+		t.Errorf("decoder slot mangled: %v", out.Args)
+	}
+	if containsString(out.Args, "-loglevel_plex") {
+		t.Errorf("-loglevel_plex still present: %v", out.Args)
+	}
+	if containsString(out.Args, "-progressurl") {
+		t.Errorf("-progressurl should be captured + stripped: %v", out.Args)
+	}
+	if containsString(out.Args, "eac3_eae") {
+		t.Errorf("eac3_eae should be swapped: %v", out.Args)
+	}
+	if containsString(out.Args, "-eae_prefix:1") {
+		t.Errorf("-eae_prefix should be dropped: %v", out.Args)
+	}
+	if out.ProgressURL == "" {
+		t.Errorf("progressURL not captured")
+	}
+	// Crucially, MUST NOT inject -init_hw_device — there's no GPU work.
+	if containsString(out.Args, "-init_hw_device") {
+		t.Errorf("init_hw_device must NOT be injected for remux: %v", out.Args)
+	}
+}
+
+// hevc + sidecar SRT + multiple sub-copy outputs (the All Creatures
+// shape). Sidecar inputs MUST survive — they're referenced by
+// -map 1:s:0 / -map 2:s:0 sub copy outputs. The dropSidecarInput
+// helper from the SW-decode path would break this; the remux
+// fast-path bypasses that helper entirely.
+func TestRewriter_OptimizeRemux_hevc_PreservesSidecars(t *testing.T) {
+	args := []string{
+		"-codec:0", "hevc",
+		"-codec:1", "eac3_eae",
+		"-eae_prefix:1", "abc_",
+		"-noaccurate_seek",
+		"-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/media/Series/Show/S04E04.mkv",
+		"-noaccurate_seek",
+		"-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/transcode/Transcode/Sessions/sess/temp-0.srt",
+		"-noaccurate_seek",
+		"-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/transcode/Transcode/Sessions/sess/temp-1.srt",
+		"-y", "-nostats", "-loglevel", "quiet", "-loglevel_plex", "error",
+		"-map", "0:0", "-codec:0", "copy",
+		"-filter_complex", "[0:1] aresample=async=1:ochl='stereo':osr=48000[0]",
+		"-map", "[0]",
+		"-codec:1", "aac", "-b:1", "256k",
+		"-f", "mp4",
+		"/media/Series/Show/Plex Versions/Optimized for TV/.inProgress/S04E04.mp4.99",
+		"-map", "1:s:0", "-codec:0", "copy", "-strict_ts:0", "0", "-f", "srt",
+		"/media/Series/Show/Plex Versions/Optimized for TV/.inProgress/S04E04.mp4.99.111.sidecar",
+		"-map", "2:s:0", "-codec:0", "copy", "-strict_ts:0", "0", "-f", "srt",
+		"/media/Series/Show/Plex Versions/Optimized for TV/.inProgress/S04E04.mp4.99.222.sidecar",
+	}
+	out := Rewrite(args, map[string]string{}, nil)
+	if !out.Applied {
+		t.Fatalf("remux fast-path should fire: %v", out.Changes)
+	}
+	// Three -i must survive (source + 2 sidecars).
+	count := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			count++
+		}
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 -i, got %d: %v", count, out.Args)
+	}
+	// -map 1:s:0 / 2:s:0 must still be present (point at sidecar inputs).
+	if !containsString(out.Args, "1:s:0") || !containsString(out.Args, "2:s:0") {
+		t.Errorf("sidecar -map references lost: %v", out.Args)
+	}
+}
+
 // PMS spawns audio-only Detection ffmpeg jobs (intro / credits / voice
 // activity ML pre-pass) for every video item. They have no video
 // decoder so the rewriter bails with skip:no-decoder, but they ALSO
