@@ -1008,6 +1008,57 @@ func dropInputAudioDecoderHints(args []string) ([]string, []string) {
 	return args, changes
 }
 
+// reHWPassthroughSDRChain matches PMS's HW-decode HDR→SDR filter
+// chain — the case where PMS naively drops 10-bit HDR (p010) to 8-bit
+// SDR (nv12) by setting format=nv12 on scale_vaapi, with no
+// transfer-function conversion. The pattern is the canonical 3-step
+// shape PMS emits when targeting an 8-bit encoder (h264_vaapi, or
+// hevc_vaapi default Main profile):
+//
+//   [0:0]hwupload[A];[A]scale_vaapi=w=W:h=H:format=nv12[B];[B]hwupload[C]
+//
+// Backreferences aren't supported in RE2; we capture all six tokens
+// and validate label-pair equality in injectHWPassthroughTonemap.
+//
+// Captures: source-stream label, A, W, H, A-consumer / B-producer,
+// B-consumer / C-producer, final label C.
+var reHWPassthroughSDRChain = regexp.MustCompile(
+	`^\[([0-9:]+)\]hwupload\[(\w+)\];` +
+		`\[(\w+)\]scale_vaapi=w=(\d+):h=(\d+):format=nv12\[(\w+)\];` +
+		`\[(\w+)\]hwupload\[(\w+)\]$`,
+)
+
+// injectHWPassthroughTonemap rewrites the matched chain to route
+// through tonemap_vaapi for proper PQ→BT.709 transfer-function
+// conversion. The result has the same final output label so PMS's
+// `-map [<final>]` keeps resolving:
+//
+//   [0:0]hwupload[a];[a]scale_vaapi=...:format=p010[b];[b]tonemap_vaapi=transfer=bt709:format=nv12[final]
+//
+// (Drops the redundant trailing hwupload — tonemap_vaapi outputs to
+// a VAAPI surface already.)
+//
+// Returns (newFilter, true) on match, ("", false) otherwise.
+func injectHWPassthroughTonemap(filterStr string) (string, bool) {
+	m := reHWPassthroughSDRChain.FindStringSubmatch(filterStr)
+	if m == nil {
+		return "", false
+	}
+	in, a1, a2, w, h, b1, b2, final := m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]
+	// Label pairs must connect: a1 (output of first hwupload) ==
+	// a2 (input of scale_vaapi); b1 (output of scale_vaapi) ==
+	// b2 (input of trailing hwupload). Otherwise it's not the chain
+	// we recognise.
+	if a1 != a2 || b1 != b2 {
+		return "", false
+	}
+	out := fmt.Sprintf(
+		"[%s]hwupload[%s];[%s]scale_vaapi=w=%s:h=%s:format=p010[%s];[%s]tonemap_vaapi=transfer=bt709:format=nv12[%s]",
+		in, a1, a1, w, h, b1, b1, final,
+	)
+	return out, true
+}
+
 // setWorkerHomeEnv repoints HOME at the worker image's pre-populated
 // /home/ubuntu (with fontconfig cache) so libass fontselect lands ms-
 // fast instead of blocking 2+ minutes on a fresh corpus scan.
@@ -1620,6 +1671,41 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			return bail("hw-decode:unexpected-encoder:" + swEncoder)
 		}
 		changes = append(changes, "encode:hw-passthrough:"+swEncoder)
+
+		// HW-decode HDR→SDR tonemap injection. PMS's HW-passthrough
+		// filter chain for SDR-encode targets (h264_vaapi, or
+		// hevc_vaapi default Main profile) drops 10-bit p010 to 8-bit
+		// nv12 via naive `format=nv12` on scale_vaapi — no transfer-
+		// function curve, PQ values shoved into BT.709 8-bit range
+		// produce washed/clipped colors. Plex's bundled transcoder
+		// papered over this with its own opencl/cuda/sw tonemap; we
+		// have to spell it out for stock ffmpeg.
+		//
+		// Live observation 2026-05-10 PM: streaming Big Hero 6 4K HDR
+		// with videoCodec=h264 → PMS chain
+		//   [0:0]hwupload[0];[0]scale_vaapi=...:format=nv12[1];[1]hwupload[2]
+		// ran clean (no error) but output had crushed highlights.
+		//
+		// Detect via reHWPassthroughSDRChain (matches PMS's exact
+		// 3-step shape). Gate on sourceIsHDR so we don't double-tonemap
+		// SDR sources. Only fires for the SDR-target shape — if PMS
+		// asked for `format=p010` the regex doesn't match and HDR is
+		// preserved as-is.
+		if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+			if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
+				sourceIsHDR = true
+				for i := 0; i < len(args); i++ {
+					if args[i] == "-filter_complex" && i+1 < len(args) {
+						if newFilter, ok := injectHWPassthroughTonemap(args[i+1]); ok {
+							args[i+1] = newFilter
+							changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+							changes = append(changes, "filter:hw-passthrough-tonemap-injected")
+							break
+						}
+					}
+				}
+			}
+		}
 
 		// Sub burn-in: PMS sends `-map_inlineass` even in HW-decode
 		// mode, with a filter graph that runs Plex's private
