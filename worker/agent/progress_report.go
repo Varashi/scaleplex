@@ -26,6 +26,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -73,6 +74,7 @@ type reportContext struct {
 	Streams    []outputStream
 	DurationS  float64 // total source duration in seconds (0 = unknown)
 	SessionID  string
+	Throttle   *throttleSignal // updated from progress PUT response bodies
 }
 
 // runProgressReporter consumes ffmpeg -progress output from r and PUTs
@@ -170,10 +172,18 @@ func putProgressTick(ctx context.Context, c *http.Client, rc reportContext, blk 
 	} else {
 		q.Set("remaining", "-1")
 	}
-	if !math.IsNaN(speedF) {
-		q.Set("speed", strconv.FormatFloat(speedF, 'f', -1, 64))
-	} else {
-		q.Set("speed", "inf")
+	// Plex Transcoder omits &speed= when its own throttle is engaged
+	// (fftools/ffmpeg.c: "Only pass back speed if we're not throttled").
+	// PMS uses speed to estimate buffer-build-up; signalling "no speed"
+	// while throttled prevents PMS from concluding the session is fast
+	// enough to clear canThrottle prematurely.
+	throttled := rc.Throttle != nil && rc.Throttle.on()
+	if !throttled {
+		if !math.IsNaN(speedF) {
+			q.Set("speed", strconv.FormatFloat(speedF, 'f', -1, 64))
+		} else {
+			q.Set("speed", "inf")
+		}
 	}
 
 	fullURL := joinQuery(rc.URL, q)
@@ -330,13 +340,30 @@ func doPlexPUT(ctx context.Context, c *http.Client, rc reportContext, kind, full
 		if ctx.Err() == nil {
 			log.Printf("session %s: progress PUT (%s): %v", rc.SessionID, kind, err)
 		}
+		// Fail open: clear throttle on transport error so we don't strand
+		// a session paused if PMS becomes unreachable.
+		if rc.Throttle != nil {
+			rc.Throttle.set(false)
+		}
 		return
 	}
+	// Read up to 4KB of the body so the throttle signal can be parsed
+	// (`canThrottle` substring per fftools/ffmpeg.c). 4KB matches Plex
+	// Transcoder's PMS_IssueHttpRequest fast-path; PMS replies are tiny.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	metricProgressPUT.WithLabelValues(kind, httpClass(resp.StatusCode)).Inc()
 	if resp.StatusCode >= 400 {
 		log.Printf("session %s: progress PUT (%s) status=%d", rc.SessionID, kind, resp.StatusCode)
+		// Fail open on 4xx/5xx — same reason as transport error above.
+		if rc.Throttle != nil {
+			rc.Throttle.set(false)
+		}
+		return
+	}
+	if rc.Throttle != nil && kind == "progress" {
+		rc.Throttle.set(bytes.Contains(body, []byte("canThrottle")))
 	}
 }
 
