@@ -746,23 +746,45 @@ func removeArgs(s []string, at, n int) []string {
 // + adjust env" work. Extracted here so both call paths stay in sync
 // when a flag is added or a base codec needs new handling.
 
-// eaeBaseFor maps a `*_eae` codec name to the closest stock equivalent.
-// eac3/ac3 base codecs survive (stock has matching encoders); anything
-// else (truehd_eae, mlp_eae) falls back to eac3 because stock truehd
-// encoder is flagged experimental and runs sub-realtime under
-// jellyfin-ffmpeg7.
-func eaeBaseFor(eaeName string) string {
+// eaeBaseFor maps a `*_eae` codec name to the stock equivalent.
+// **Direction-sensitive** because the answer differs:
+//
+//   - decode: every base codec (eac3, ac3, truehd, mlp) has a working
+//     stock decoder. Strip the _eae suffix and let ffmpeg run.
+//   - encode: stock has eac3 + ac3 encoders; truehd/mlp encoders are
+//     experimental and run sub-realtime under jellyfin-ffmpeg7. Fall
+//     back to eac3 for those (lossy but functional).
+//
+// Pre-2026-05-10 PM: a single direction-blind helper applied the
+// encode-side fallback to both positions. That broke real TrueHD
+// sources at the input decoder slot — ffmpeg was told to decode
+// TrueHD bytes with the eac3 decoder and failed on the bitstream
+// parse (live-validated 2026-05-10 PM with a fresh TrueHD download).
+func eaeBaseFor(eaeName string, direction eaeDirection) string {
 	base, ok := strings.CutSuffix(eaeName, "_eae")
 	if !ok {
 		return ""
 	}
-	switch base {
-	case "eac3", "ac3":
+	switch direction {
+	case eaeDecode:
+		// All base codecs decodable in stock ffmpeg.
 		return base
-	default:
-		return "eac3"
+	default: // eaeEncode
+		switch base {
+		case "eac3", "ac3":
+			return base
+		default:
+			return "eac3"
+		}
 	}
 }
+
+type eaeDirection int
+
+const (
+	eaeDecode eaeDirection = iota
+	eaeEncode
+)
 
 // audioCodecFlag returns true when arg s is an audio-track codec
 // option ("-c:a", "-codec:N", "-c:a:N" with any digit N). Stream :0
@@ -786,18 +808,38 @@ func audioCodecFlag(s string) bool {
 }
 
 // swapEAEAudioDecoders replaces every `<audio-codec-flag> X_eae` value
-// pair with the stock equivalent returned by eaeBaseFor. Mutates args
-// in place; returns it for fluent use plus the {orig→base} map so the
-// caller can append "audio:<from>-><to>" change tags.
-func swapEAEAudioDecoders(args []string) ([]string, map[string]string) {
-	swapped := map[string]string{}
+// pair with the stock equivalent returned by eaeBaseFor. Position-aware:
+// pairs that sit BEFORE the first `-i` are input decoder hints (use
+// the real base codec — stock ffmpeg has decoders for all of them);
+// pairs AFTER `-i` are output encoder selections (eac3/ac3 survive,
+// truehd/mlp fall back to eac3 because stock has no working encoder
+// for those). Mutates args in place; returns it for fluent use plus
+// a deduplicated list of (from→to) swap pairs the caller emits as
+// change tags. Pairs aren't deduped *per direction* because the same
+// source codec name can land at two different targets (truehd_eae
+// at input → truehd, at output → eac3 — both must surface as tags).
+func swapEAEAudioDecoders(args []string) ([]string, [][2]string) {
+	iIdx := indexOfArg(args, "-i", 0)
+	seen := map[[2]string]struct{}{}
+	var swapped [][2]string
 	for i := 0; i < len(args); i++ {
 		if !audioCodecFlag(args[i]) || i+1 >= len(args) {
 			continue
 		}
-		if base := eaeBaseFor(args[i+1]); base != "" {
-			swapped[args[i+1]] = base
-			args[i+1] = base
+		dir := eaeEncode
+		if iIdx >= 0 && i < iIdx {
+			dir = eaeDecode
+		}
+		from := args[i+1]
+		to := eaeBaseFor(from, dir)
+		if to == "" {
+			continue
+		}
+		args[i+1] = to
+		key := [2]string{from, to}
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			swapped = append(swapped, key)
 		}
 	}
 	return args, swapped
@@ -1026,10 +1068,10 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	// 2-6. Audio EAE swap, eae_prefix drop, progressurl capture,
 	// loglevel + nostats fix-ups, env strips. All shared with the
 	// main rewriter — see helpers above for rationale.
-	var swapped map[string]string
+	var swapped [][2]string
 	out, swapped = swapEAEAudioDecoders(out)
-	for from, to := range swapped {
-		changes = append(changes, "audio:"+from+"->"+to)
+	for _, p := range swapped {
+		changes = append(changes, "audio:"+p[0]+"->"+p[1])
 	}
 	var droppedPrefixes []string
 	out, droppedPrefixes = dropEAEPrefixFlags(out)
@@ -1819,10 +1861,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// keeps working audio. Add explicit cases here when a base codec
 	// becomes worth preserving (e.g. ac3_eae→ac3 if it ever surfaces).
 	{
-		var swapped map[string]string
+		var swapped [][2]string
 		args, swapped = swapEAEAudioDecoders(args)
-		for from, to := range swapped {
-			changes = append(changes, "audio:"+from+"->"+to)
+		for _, p := range swapped {
+			changes = append(changes, "audio:"+p[0]+"->"+p[1])
 		}
 	}
 	{

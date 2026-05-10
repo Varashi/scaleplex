@@ -121,6 +121,96 @@ func TestRewriter_EAE_TrueHDFallback(t *testing.T) {
 	}
 }
 
+// TrueHD source where the audio is decoded but never re-encoded
+// (`-codec:N copy` on output, or audio mapped through filter that
+// doesn't transcode). Pre-2026-05-10-PM: rewriter mapped the input
+// `-codec:1 truehd_eae` to `eac3`, asking ffmpeg to decode TrueHD
+// bytes with the eac3 decoder → bitstream parse fail → exit 8 silent.
+// Post-fix: input position maps to `truehd` (real stock decoder).
+func TestRewriter_EAE_TrueHDInputDecodeUsesTrueHD(t *testing.T) {
+	args := []string{
+		"-codec:0", "hevc",
+		"-hwaccel:0", "vaapi",
+		"-codec:1", "truehd_eae",
+		"-eae_prefix:1", "tok_",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/Movies/TrueHDRemux.mkv",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=3840:h=2160:format=p010[1]",
+		"-map", "[1]",
+		"-codec:0", "hevc_vaapi",
+		// Audio output: copy passthrough — no encoder swap needed.
+		"-map", "0:1",
+		"-codec:1", "copy",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "audio:truehd_eae->truehd") {
+		t.Fatalf("input-side truehd_eae must map to truehd: %v", out.Changes)
+	}
+	// The first -codec:1 (BEFORE -i) is an INPUT decoder hint; verify
+	// it landed at "truehd", not "eac3".
+	iIdx := indexOfArg(out.Args, "-i", 0)
+	for i := 0; i < iIdx-1; i++ {
+		if out.Args[i] == "-codec:1" {
+			if out.Args[i+1] != "truehd" {
+				t.Fatalf("input -codec:1 = %q, want truehd: %v", out.Args[i+1], out.Args)
+			}
+			break
+		}
+	}
+}
+
+// Both directions present in one argv: input -codec:1 truehd_eae +
+// output -codec:1 truehd_eae. Direction-aware swap MUST land them
+// differently — input becomes `truehd` (decoder works), output
+// becomes `eac3` (no stock truehd encoder, lossy fallback).
+func TestRewriter_EAE_TrueHDBothDirections(t *testing.T) {
+	args := []string{
+		"-codec:0", "hevc",
+		"-hwaccel:0", "vaapi",
+		"-codec:1", "truehd_eae", // INPUT decoder
+		"-eae_prefix:1", "tok_",
+		"-i", "/media/Movies/Atmos.mkv",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_complex", "[0:0]hwupload[0]",
+		"-map", "[0]",
+		"-codec:0", "hevc_vaapi",
+		"-map", "0:1",
+		"-codec:1", "truehd_eae", // OUTPUT encoder
+		"-b:1", "768k",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "audio:truehd_eae->truehd") {
+		t.Errorf("missing input-side decode tag: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "audio:truehd_eae->eac3") {
+		t.Errorf("missing output-side encode-fallback tag: %v", out.Changes)
+	}
+	// truehd_eae must not survive anywhere.
+	if containsString(out.Args, "truehd_eae") {
+		t.Fatalf("truehd_eae must not survive: %v", out.Args)
+	}
+	// Verify positional mapping landed correctly.
+	iIdx := indexOfArg(out.Args, "-i", 0)
+	for i := 0; i < iIdx-1; i++ {
+		if out.Args[i] == "-codec:1" && out.Args[i+1] != "truehd" {
+			t.Fatalf("input -codec:1 = %q, want truehd", out.Args[i+1])
+		}
+	}
+	for i := iIdx + 1; i < len(out.Args)-1; i++ {
+		if out.Args[i] == "-codec:1" && out.Args[i+1] != "eac3" && out.Args[i+1] != "copy" {
+			t.Fatalf("output -codec:1 = %q, want eac3", out.Args[i+1])
+		}
+	}
+}
+
 func TestRewriter_StripsPlexEnv(t *testing.T) {
 	in := map[string]string{
 		"EAE_ROOT":             "/run/plex-temp/.../EasyAudioEncoder",
