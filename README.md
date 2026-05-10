@@ -38,6 +38,9 @@ bookkeeping is unchanged.
 | DASH (Plex Web Chrome) | ✓ | ✓ | ✓ | Real-time + Optimize jobs |
 | HLS / mpegts (Plex Android) | ✓ | ✓ | — | |
 | HLS / matroska (Plex Android, 4K HDR + 5.1 EAC3) | ✓ | ✓ | ✓ | mkv-in-.ts triggered when codec/audio combo can't fit mpegts |
+| Plex Optimize (HW-decode shape: `-hwaccel:0 vaapi`) | ✓ | n/a | n/a | hevc_vaapi mp4 + faststart, multi-track audio + sub-sidecar copy |
+| Plex Optimize (remux shape: bare decoder + `-codec:0 copy`) | ✓ | n/a | n/a | covered by `tryOptimizeRemux` fast-path; preserves multi-input sidecar SRTs |
+| PMS Detection / ML pre-pass (intro / credits / voice activity markers) | ✓ | n/a | n/a | bail-path scrub strips Plex-private flags + input audio decoder hints (any stream-spec form) so ffmpeg auto-detects the right decoder |
 
 **Source matrix tested:** AV1 + HEVC + H264 sources; SDR + HDR10; SRT sidecar
 subs (burn-in via `subtitles=` filter chained through `overlay_vaapi`).
