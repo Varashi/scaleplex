@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -104,7 +105,7 @@ var chunkRE = regexp.MustCompile(`^chunk-stream(\d+)-0*(\d+)\.m4s$`)
 // from cleaning anything up and produced thousands of stale chunks.
 // dashenc only ever sees the new file appear (rename is atomic) and
 // proceeds.
-func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq int, seekOffsetSeconds float64) {
+func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq int, seekOffsetSeconds float64, lastSeq *atomic.Int64) {
 	if dir == "" {
 		return
 	}
@@ -183,6 +184,17 @@ func watchAndRenumberChunks(ctx context.Context, dir, sessionID string, startSeq
 			}
 			if streamCount[streamID] <= 3 {
 				log.Printf("session %s: chunk-renumber stream%s: %s → %s", sessionID, streamID, name, filepath.Base(target))
+			}
+			// Bump checkpoint counter to highest emitted seq across
+			// streams so /task/<id>/checkpoint can hand a recovering
+			// worker the right -segment_start_number.
+			if lastSeq != nil {
+				for {
+					prev := lastSeq.Load()
+					if int64(seq) <= prev || lastSeq.CompareAndSwap(prev, int64(seq)) {
+						break
+					}
+				}
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
