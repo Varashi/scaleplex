@@ -894,6 +894,57 @@ func stripEAEEnvVars(env map[string]string) (map[string]string, []string) {
 	return env, changes
 }
 
+// dropInputAudioDecoderHints removes every `-codec:N <value>` /
+// `-c:a:N <value>` / `-c:a <value>` pair that appears BEFORE the first
+// `-i` flag (input-side decoder hints). Stock ffmpeg auto-detects each
+// stream's decoder from codec_id when no hint is set; PMS sometimes
+// pipes a wrong hint (e.g. `-codec:1 aac` for an EAC3 audio stream)
+// expecting Plex's bundled EAE engine to bridge it. Without this drop,
+// stock ffmpeg fails on the bitstream parse with empty stderr (because
+// `-loglevel quiet`) and exit status 8. Used in the no-decoder bail
+// path — when there's no `-codec:0` for video, all `-codec:N` hints
+// are audio and dropping them is unconditionally safe.
+func dropInputAudioDecoderHints(args []string) ([]string, []string) {
+	var changes []string
+	for {
+		removed := false
+		iIdx := indexOfArg(args, "-i", 0)
+		if iIdx < 0 {
+			break
+		}
+		for i := 0; i < iIdx && i+1 < len(args); i++ {
+			if !audioCodecFlag(args[i]) {
+				continue
+			}
+			tag := "drop:" + args[i] + "=" + args[i+1] + "(bail)"
+			args = removeArgs(args, i, 2)
+			changes = append(changes, tag)
+			removed = true
+			break
+		}
+		if !removed {
+			break
+		}
+	}
+	// Also drop -eae_prefix:N pairs — orphaned now that the codec
+	// hint they referenced is gone.
+	for {
+		removed := false
+		for i := 0; i < len(args); i++ {
+			if strings.HasPrefix(args[i], "-eae_prefix") && i+1 < len(args) {
+				args = removeArgs(args, i, 2)
+				changes = append(changes, "drop:-eae_prefix(bail)")
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			break
+		}
+	}
+	return args, changes
+}
+
 // setWorkerHomeEnv repoints HOME at the worker image's pre-populated
 // /home/ubuntu (with fontconfig cache) so libass fontselect lands ms-
 // fast instead of blocking 2+ minutes on a fresh corpus scan.
@@ -1103,11 +1154,34 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		args, scrub := scrubPlexFlagsOnBail(args)
 		merged := append([]string{}, changes...)
 		merged = append(merged, scrub...)
+		// Detection / audio-only ML pre-pass argv (output to
+		// /transcode/Transcode/Detection/<uuid>) bails with no-decoder
+		// because there's no `-codec:0` for video. Those argvs ALSO
+		// carry input-side audio decoder hints — `-codec:N <hint>`
+		// before `-i` — that PMS pipes through expecting Plex's EAE
+		// engine to decode the bytes regardless of source codec.
+		// Stock ffmpeg honours the hint literally: when PMS sends
+		// `-codec:1 aac` for a stream that's actually EAC3/AC3/DTS
+		// (very common — PMS uses one canonical hint per probe call),
+		// the AAC decoder fails on the bitstream parse and ffmpeg
+		// exits 8.
+		//
+		// Drop those input-side hints in the no-decoder bail. ffmpeg
+		// auto-detects the decoder from each stream's codec_id when
+		// no hint is set, which always picks correctly.
+		var hintChanges []string
+		if reason == "no-decoder" {
+			args, hintChanges = dropInputAudioDecoderHints(args)
+			merged = append(merged, hintChanges...)
+		}
 		merged = append(merged, "skip:"+reason)
+		// Applied=true whenever we mutated argv (scrub OR hint drops),
+		// so the worker uses our rewritten copy instead of the input.
+		applied := len(scrub) > 0 || len(hintChanges) > 0
 		return RewriteResult{
 			Args:    args,
 			Env:     cloneEnv(inputEnv),
-			Applied: len(scrub) > 0, // scrub did work → tell caller to use rewritten args
+			Applied: applied,
 			Changes: merged,
 		}
 	}
