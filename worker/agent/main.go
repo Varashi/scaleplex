@@ -137,7 +137,7 @@ func main() {
 	}
 
 	engineSamplerInst = startEngineSampler()
-	log.Printf("gpu engines discovered: %d", engineSamplerInst.numEngines())
+	log.Printf("gpu engines discovered: %d (mode=%s)", engineSamplerInst.numEngines(), engineSamplerInst.modeTag())
 
 	go prewarm()
 

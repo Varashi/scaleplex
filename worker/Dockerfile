@@ -76,6 +76,21 @@ COPY --from=agent-build /out/scaleplex-agent /usr/local/bin/scaleplex-agent
 COPY worker/scaleplex-entrypoint.sh /usr/local/bin/scaleplex-entrypoint
 RUN chmod +x /usr/local/bin/scaleplex-entrypoint
 
+# File-capability so the agent can perf_event_open() the i915 PMU even
+# when running as uid 1000. K8s `capabilities.add` alone only seeds the
+# container's bounding set; Linux drops effective caps on exec for
+# non-root processes unless the binary carries cap bits via setcap.
+# `cap_perfmon=ep` promotes them on exec — strictly narrower than the
+# legacy SYS_ADMIN that the kernel split out in 5.8. Older Intel iGPU
+# workers don't need this (sysfs reader path); harmless if unused.
+# The pod manifest also adds PERFMON to the container's bounding set so
+# the file cap actually has somewhere to land.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libcap2-bin && \
+    setcap cap_perfmon=ep /usr/local/bin/scaleplex-agent && \
+    apt-get purge -y --auto-remove libcap2-bin && \
+    rm -rf /var/lib/apt/lists/*
+
 ENV LIBVA_DRIVER_NAME=iHD
 # libass + fontconfig: point at the slim config so fontselect scans 14
 # DejaVu files instead of the system corpus. The rewriter sets HOME=
