@@ -739,6 +739,169 @@ func removeArgs(s []string, at, n int) []string {
 	return out
 }
 
+// ─── shared rewriter helpers ─────────────────────────────────────────
+//
+// Both the main rewriter and tryOptimizeRemux need to do the same
+// "strip Plex-private cruft + rewrite EAE audio + capture progressurl
+// + adjust env" work. Extracted here so both call paths stay in sync
+// when a flag is added or a base codec needs new handling.
+
+// eaeBaseFor maps a `*_eae` codec name to the closest stock equivalent.
+// eac3/ac3 base codecs survive (stock has matching encoders); anything
+// else (truehd_eae, mlp_eae) falls back to eac3 because stock truehd
+// encoder is flagged experimental and runs sub-realtime under
+// jellyfin-ffmpeg7.
+func eaeBaseFor(eaeName string) string {
+	base, ok := strings.CutSuffix(eaeName, "_eae")
+	if !ok {
+		return ""
+	}
+	switch base {
+	case "eac3", "ac3":
+		return base
+	default:
+		return "eac3"
+	}
+}
+
+// audioCodecFlag returns true when arg s is an audio-track codec
+// option ("-c:a", "-codec:N", "-c:a:N" with any digit N). Stream :0
+// is video in PMS argv; suffix-test on the value (e.g. "_eae") rules
+// out video-stream collisions when callers gate further.
+func audioCodecFlag(s string) bool {
+	if s == "-c:a" {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(s, "-codec:"); ok {
+		if _, err := strconv.Atoi(rest); err == nil {
+			return true
+		}
+	}
+	if rest, ok := strings.CutPrefix(s, "-c:a:"); ok {
+		if _, err := strconv.Atoi(rest); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// swapEAEAudioDecoders replaces every `<audio-codec-flag> X_eae` value
+// pair with the stock equivalent returned by eaeBaseFor. Mutates args
+// in place; returns it for fluent use plus the {orig→base} map so the
+// caller can append "audio:<from>-><to>" change tags.
+func swapEAEAudioDecoders(args []string) ([]string, map[string]string) {
+	swapped := map[string]string{}
+	for i := 0; i < len(args); i++ {
+		if !audioCodecFlag(args[i]) || i+1 >= len(args) {
+			continue
+		}
+		if base := eaeBaseFor(args[i+1]); base != "" {
+			swapped[args[i+1]] = base
+			args[i+1] = base
+		}
+	}
+	return args, swapped
+}
+
+// dropEAEPrefixFlags walks args and removes every `-eae_prefix:N
+// <token>` pair (PMS adds one per *_eae codec; sessions can have 1-3).
+// Returns updated args and the flag names dropped (for change tags).
+func dropEAEPrefixFlags(args []string) ([]string, []string) {
+	var dropped []string
+	for {
+		removed := false
+		for i := 0; i < len(args); i++ {
+			if strings.HasPrefix(args[i], "-eae_prefix") {
+				dropped = append(dropped, args[i])
+				args = removeArgs(args, i, 2)
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			break
+		}
+	}
+	return args, dropped
+}
+
+// capturePMSProgressURL strips `-progressurl <url>` from args, rewrites
+// the PMS host to SCALEPLEX_PMS_BASE_URL, and appends the per-session
+// X_PLEX_TOKEN as a query param. Returns updated args, the rewritten
+// URL (empty when capture failed for any reason), and the change tags
+// to record.
+func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string, string, []string) {
+	i := indexOfArg(args, "-progressurl", 0)
+	if i < 0 || i+1 >= len(args) {
+		return args, "", nil
+	}
+	base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+	if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+		base = envBase
+	}
+	origURL := args[i+1]
+	args = removeArgs(args, i, 2)
+	if base == "" {
+		return args, "", []string{"drop:-progressurl(no-pms-base)"}
+	}
+	rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
+	changes := []string{}
+	if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+		if strings.Contains(rewritten, "?") {
+			rewritten += "&X-Plex-Token=" + tok
+		} else {
+			rewritten += "?X-Plex-Token=" + tok
+		}
+		changes = append(changes, "progress:append-X-Plex-Token")
+	}
+	changes = append(changes, "progressurl:captured-for-reporter")
+	return args, rewritten, changes
+}
+
+// upgradeLoglevelFromQuiet rewrites `-loglevel quiet|panic|fatal` to
+// `info`. PMS's JobRunner expects "Stream mapping:" lines on stderr to
+// detect transcoder readiness; quiet stalls /header for ~125s.
+func upgradeLoglevelFromQuiet(args []string) ([]string, bool) {
+	if i := indexOfArg(args, "-loglevel", 0); i >= 0 && i+1 < len(args) {
+		if v := args[i+1]; v == "quiet" || v == "panic" || v == "fatal" {
+			args[i+1] = "info"
+			return args, true
+		}
+	}
+	return args, false
+}
+
+// dropNostatsFlag removes `-nostats` so ffmpeg emits its periodic
+// `size= time= bitrate= speed=` line for PMS's stats parser.
+func dropNostatsFlag(args []string) ([]string, bool) {
+	if i := indexOfArg(args, "-nostats", 0); i >= 0 {
+		return removeArgs(args, i, 1), true
+	}
+	return args, false
+}
+
+// stripEAEEnvVars removes EAE_ROOT and FFMPEG_EXTERNAL_LIBS — both
+// point at Plex Transcoder paths that don't exist on the worker pod.
+// X_PLEX_TOKEN is intentionally KEPT for the progress reporter.
+func stripEAEEnvVars(env map[string]string) (map[string]string, []string) {
+	var changes []string
+	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
+		if _, ok := env[k]; ok {
+			delete(env, k)
+			changes = append(changes, "env:strip:"+k)
+		}
+	}
+	return env, changes
+}
+
+// setWorkerHomeEnv repoints HOME at the worker image's pre-populated
+// /home/ubuntu (with fontconfig cache) so libass fontselect lands ms-
+// fast instead of blocking 2+ minutes on a fresh corpus scan.
+func setWorkerHomeEnv(env map[string]string) map[string]string {
+	env["HOME"] = envOr("HW_RUNTIME_HOME", "/home/ubuntu")
+	return env
+}
+
 // tryOptimizeRemux detects + handles Plex Optimize argv shapes where
 // video output is `-codec:0 copy` (no transcode). Returns (result,
 // true) on match. See callsite for rationale.
@@ -788,116 +951,35 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 		changes = append(changes, "drop:-xioerror")
 	}
 
-	// 2. Swap *_eae audio decoders to base stock decoders. Reuses the
-	// same logic as the main rewriter — ec3/ac3 base codecs are valid
-	// stock decoders, others fall back to eac3.
-	eaeBase := func(name string) string {
-		base, ok := strings.CutSuffix(name, "_eae")
-		if !ok {
-			return ""
-		}
-		switch base {
-		case "eac3", "ac3":
-			return base
-		default:
-			return "eac3"
-		}
-	}
-	swapped := map[string]string{}
-	for i := 0; i < len(out); i++ {
-		s := out[i]
-		isAudioFlag := s == "-c:a"
-		if !isAudioFlag {
-			if rest, ok := strings.CutPrefix(s, "-codec:"); ok {
-				if _, err := strconv.Atoi(rest); err == nil {
-					isAudioFlag = true
-				}
-			}
-		}
-		if !isAudioFlag {
-			if rest, ok := strings.CutPrefix(s, "-c:a:"); ok {
-				if _, err := strconv.Atoi(rest); err == nil {
-					isAudioFlag = true
-				}
-			}
-		}
-		if !isAudioFlag || i+1 >= len(out) {
-			continue
-		}
-		if base := eaeBase(out[i+1]); base != "" {
-			swapped[out[i+1]] = base
-			out[i+1] = base
-		}
-	}
+	// 2-6. Audio EAE swap, eae_prefix drop, progressurl capture,
+	// loglevel + nostats fix-ups, env strips. All shared with the
+	// main rewriter — see helpers above for rationale.
+	var swapped map[string]string
+	out, swapped = swapEAEAudioDecoders(out)
 	for from, to := range swapped {
 		changes = append(changes, "audio:"+from+"->"+to)
 	}
-
-	// 3. Drop -eae_prefix:N (any stream spec).
-	for {
-		removed := false
-		for i := 0; i < len(out); i++ {
-			if strings.HasPrefix(out[i], "-eae_prefix") {
-				dropped := out[i]
-				out = removeArgs(out, i, 2)
-				changes = append(changes, "drop:"+dropped)
-				removed = true
-				break
-			}
-		}
-		if !removed {
-			break
-		}
+	var droppedPrefixes []string
+	out, droppedPrefixes = dropEAEPrefixFlags(out)
+	for _, d := range droppedPrefixes {
+		changes = append(changes, "drop:"+d)
 	}
-
-	// 4. Capture -progressurl for the worker reporter.
-	progressURL := ""
-	if i := indexOfArg(out, "-progressurl", 0); i >= 0 && i+1 < len(out) {
-		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
-		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
-			base = envBase
-		}
-		origURL := out[i+1]
-		out = removeArgs(out, i, 2)
-		if base != "" {
-			rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
-			if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
-				if strings.Contains(rewritten, "?") {
-					rewritten += "&X-Plex-Token=" + tok
-				} else {
-					rewritten += "?X-Plex-Token=" + tok
-				}
-				changes = append(changes, "progress:append-X-Plex-Token")
-			}
-			progressURL = rewritten
-			changes = append(changes, "progressurl:captured-for-reporter")
-		} else {
-			changes = append(changes, "drop:-progressurl(no-pms-base)")
-		}
+	var progressURL string
+	var progressChanges []string
+	out, progressURL, progressChanges = capturePMSProgressURL(out, inputEnv)
+	changes = append(changes, progressChanges...)
+	if newOut, ok := upgradeLoglevelFromQuiet(out); ok {
+		out = newOut
+		changes = append(changes, "loglevel:->info")
 	}
-
-	// 5. Loglevel quiet→info so the worker can stream stderr to PMS.
-	if i := indexOfArg(out, "-loglevel", 0); i >= 0 && i+1 < len(out) {
-		if v := out[i+1]; v == "quiet" || v == "panic" || v == "fatal" {
-			out[i+1] = "info"
-			changes = append(changes, "loglevel:->info")
-		}
-	}
-	if i := indexOfArg(out, "-nostats", 0); i >= 0 {
-		out = removeArgs(out, i, 1)
+	if newOut, ok := dropNostatsFlag(out); ok {
+		out = newOut
 		changes = append(changes, "drop:-nostats")
 	}
-
-	// 6. Env strips matching the main rewriter — keep X_PLEX_TOKEN.
-	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
-		if _, ok := env[k]; ok {
-			delete(env, k)
-			changes = append(changes, "env:strip:"+k)
-		}
-	}
-	// HOME override so libass / fontconfig find the worker-side cache,
-	// even though Optimize-remux jobs typically don't burn subs. Safe.
-	env["HOME"] = envOr("HW_RUNTIME_HOME", "/home/ubuntu")
+	var envChanges []string
+	env, envChanges = stripEAEEnvVars(env)
+	changes = append(changes, envChanges...)
+	env = setWorkerHomeEnv(env)
 	changes = append(changes, "env:HOME")
 
 	return RewriteResult{
@@ -1641,70 +1723,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// produces sub-realtime; client loses bitstream passthrough but
 	// keeps working audio. Add explicit cases here when a base codec
 	// becomes worth preserving (e.g. ac3_eae→ac3 if it ever surfaces).
-	eaeBaseFor := func(eaeName string) string {
-		base, ok := strings.CutSuffix(eaeName, "_eae")
-		if !ok {
-			return ""
-		}
-		switch base {
-		case "eac3", "ac3":
-			return base
-		default:
-			return "eac3"
-		}
-	}
 	{
-		// Plex audio stream index varies by which track the client picked
-		// (`-codec:1` for the first audio track, `-codec:2` for a switch
-		// to the second, etc.) — accept any non-negative N. Stream :0 is
-		// the video stream in PMS argv but `*_eae` is only ever an
-		// audio encoder, so the value test below (suffix == "_eae")
-		// rules out collisions on :0 in practice.
-		audioCodecFlag := func(s string) bool {
-			if s == "-c:a" {
-				return true
-			}
-			if rest, ok := strings.CutPrefix(s, "-codec:"); ok {
-				if _, err := strconv.Atoi(rest); err == nil {
-					return true
-				}
-			}
-			if rest, ok := strings.CutPrefix(s, "-c:a:"); ok {
-				if _, err := strconv.Atoi(rest); err == nil {
-					return true
-				}
-			}
-			return false
-		}
-		swapped := map[string]string{}
-		for i := 0; i < len(args); i++ {
-			if !audioCodecFlag(args[i]) || i+1 >= len(args) {
-				continue
-			}
-			if base := eaeBaseFor(args[i+1]); base != "" {
-				swapped[args[i+1]] = base
-				args[i+1] = base
-			}
-		}
+		var swapped map[string]string
+		args, swapped = swapEAEAudioDecoders(args)
 		for from, to := range swapped {
 			changes = append(changes, "audio:"+from+"->"+to)
 		}
 	}
-	// Drop -eae_prefix:N (any stream spec). Walk because there may be
-	// multiple, and removeArgs shifts indexes.
-	for {
-		removed := false
-		for i := 0; i < len(args); i++ {
-			if strings.HasPrefix(args[i], "-eae_prefix") {
-				dropped := args[i]
-				args = removeArgs(args, i, 2)
-				changes = append(changes, "drop:"+dropped)
-				removed = true
-				break
-			}
-		}
-		if !removed {
-			break
+	{
+		var dropped []string
+		args, dropped = dropEAEPrefixFlags(args)
+		for _, d := range dropped {
+			changes = append(changes, "drop:"+d)
 		}
 	}
 
@@ -2055,71 +2085,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// "first" report it never sees. So we strip `-progressurl` from the
 	// argv entirely and surface the rewritten URL on RewriteResult so
 	// the agent can run its own reporter (one PUT per progress block).
-	progressURL := ""
-	if i := indexOfArg(args, "-progressurl", 0); i >= 0 && i+1 < len(args) {
-		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
-		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
-			base = envBase
-		}
-		origURL := args[i+1]
-		args = removeArgs(args, i, 2)
-		if base != "" {
-			rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
-			// Plex's progress endpoint is auth-gated by the per-session
-			// X_PLEX_TOKEN that PMS pipes into the spawn env. The PUT
-			// has no headers we control on this side, so embed the
-			// token in the URL query.
-			if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
-				if strings.Contains(rewritten, "?") {
-					rewritten += "&X-Plex-Token=" + tok
-				} else {
-					rewritten += "?X-Plex-Token=" + tok
-				}
-				changes = append(changes, "progress:append-X-Plex-Token")
-			}
-			progressURL = rewritten
-			changes = append(changes, "progressurl:captured-for-reporter")
-		} else {
-			changes = append(changes, "drop:-progressurl(no-pms-base)")
-		}
+	var progressURL string
+	{
+		var pchanges []string
+		args, progressURL, pchanges = capturePMSProgressURL(args, inputEnv)
+		changes = append(changes, pchanges...)
 	}
 
-	// PMS sets `-loglevel quiet`, which silences everything ffmpeg
-	// would normally write to stderr. PMS's JobRunner reads the
-	// child's stderr to detect transcoder readiness — without
-	// "Stream mapping:" / "[dash @ ...] Representation N init segment
-	// will be written to" lines, /header sits ~125s waiting for a
-	// signal it never gets. Upgrade to `info` so those lines emit;
-	// they ride the worker→orchestrator→shim stream back to PMS via
-	// the shim's stderr.
-	if i := indexOfArg(args, "-loglevel", 0); i >= 0 && i+1 < len(args) {
-		if args[i+1] == "quiet" || args[i+1] == "panic" || args[i+1] == "fatal" {
-			args[i+1] = "info"
-			changes = append(changes, "loglevel:->info")
-		}
+	if newArgs, ok := upgradeLoglevelFromQuiet(args); ok {
+		args = newArgs
+		changes = append(changes, "loglevel:->info")
 	}
-	// Also drop -nostats so ffmpeg emits its periodic
-	// "size= time= bitrate= speed=" stderr line that PMS's
-	// transcoder-statistics parser hooks into.
-	if i := indexOfArg(args, "-nostats", 0); i >= 0 {
-		args = removeArgs(args, i, 1)
+	if newArgs, ok := dropNostatsFlag(args); ok {
+		args = newArgs
 		changes = append(changes, "drop:-nostats")
 	}
 
-	// 10. Strip env vars that point at Plex-Transcoder-only paths
-	// (won't exist on the worker pod and confuse libavcodec init).
-	// X_PLEX_TOKEN is INTENTIONALLY kept — it's the per-session auth
-	// the progress endpoint expects (PMS routes PUT
-	// /video/:/transcode/session/<token>/<uuid>/progress with that
-	// token as X-Plex-Token); a future POST→PUT relay can use it.
-	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
-		if _, ok := env[k]; ok {
-			delete(env, k)
-			changes = append(changes, "env:strip:"+k)
-		}
+	{
+		var echanges []string
+		env, echanges = stripEAEEnvVars(env)
+		changes = append(changes, echanges...)
 	}
 
-	// 11. VAAPI driver discovery env. Only override if explicitly set;
+	// VAAPI driver discovery env. Only override if explicitly set;
 	// libva otherwise auto-discovers iHD on the worker image.
 	env["LIBVA_DRIVER_NAME"] = vaapiDriver
 	if libvaDriversPath != "" {
@@ -2127,17 +2115,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	changes = append(changes, "env:LIBVA")
 
-	// HOME override: Plex Transcoder env carries HOME pointing at
-	// Plex's data root (/config/Library/Application Support/Plex Media
-	// Server) which doesn't exist on the worker pod. Fontconfig reads
-	// HOME to locate $HOME/.cache/fontconfig; with no writable cache
-	// dir it falls back to in-memory mode and re-scans every font on
-	// every libass fontselect call. On a sub-burn session the first
-	// fontselect can block for 2+ minutes and stall the encoder.
-	// Repointing HOME at the worker image's /home/ubuntu (which has
-	// a pre-populated cache from the Dockerfile's `fc-cache` run as
-	// uid 1000) makes libass return ms-fast.
-	env["HOME"] = envOr("HW_RUNTIME_HOME", "/home/ubuntu")
+	env = setWorkerHomeEnv(env)
 	changes = append(changes, "env:HOME")
 
 	return RewriteResult{
