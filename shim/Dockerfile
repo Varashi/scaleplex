@@ -70,7 +70,15 @@ EOF
 # arrives too late.
 RUN cat > /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/run <<'EOF'
 #!/command/with-contenv bash
-exec /usr/local/bin/scaleplex-relay
+# Drop to abc (uid 1000, gid 1000) — the lsio Plex container's main
+# user. The relay reads/writes matroska chunk files on the NFS
+# /transcode volume (for in-line Cluster.Timecode patching before
+# forwarding the segment_list CSV to PMS); chunks are written by
+# ffmpeg-as-abc on the worker, and NFS root_squash strips uid 0 so
+# root can't read them. Without dropping, "permission denied" on
+# every chunk → no patch → mpv anchors timeline to chunk-0's
+# unpatched Timecode=0 → Plex Windows playhead never moves.
+exec s6-setuidgid abc /usr/local/bin/scaleplex-relay
 EOF
 RUN echo longrun > /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/type && \
     touch    /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/dependencies.d/init-services && \
