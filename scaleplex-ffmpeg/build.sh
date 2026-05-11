@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
 # Build scaleplex-ffmpeg = jellyfin-ffmpeg7 + our patches.
 #
-# Steps:
-#  1. Clone jellyfin-ffmpeg at the tag pinned in ./VERSION (or arg $1)
-#     into a temp checkout dir.
-#  2. Copy patches/*.patch into the checkout's debian/patches/ and
-#     append filenames to debian/patches/series.
-#  3. Run jellyfin's docker-build pipeline (Dockerfile.in + docker-build.sh)
-#     which produces a fully-bundled .deb in dist/deb/.
-#  4. Copy the resulting deb into ./dist/ at the repo root.
+# Two-image pipeline:
+#   1. scaleplex-ffmpeg-deps:<tag>  — slow-changing base. Re-namespaced
+#      jellyfin checkout + every bundled dep pre-compiled into
+#      /usr/lib/scaleplex-ffmpeg/. Built by ./build-deps.sh, only re-built
+#      when VERSION (jellyfin tag) bumps.
+#   2. scaleplex-ffmpeg-builder:<tag>  — fast-changing patches-on-top
+#      layer. Copies our debian/patches/*.patch over, appends to series,
+#      runs dpkg-buildpackage. This is the per-iteration build.
 #
-# Requires: docker (or podman-docker), git, ~6 GB free disk, ~30-60 min
-# build time. The build container is ephemeral; no host pollution.
+# Per-iteration cost drops from ~60 min (compile every dep + ffmpeg) to
+# ~5-10 min (just ffmpeg + linking against the prebaked deps).
+#
+# The deps image is auto-pulled from GHCR. If you haven't yet built the
+# deps image for the current VERSION, run build-deps.sh first (or set
+# AUTO_BUILD_DEPS=1).
+#
+# Steps:
+#  1. docker pull ghcr.io/varashi/scaleplex-ffmpeg-deps:<tag>
+#  2. Copy patches/*.patch into a temp build context.
+#  3. Build a tiny patches-on-top image that overlays patches and
+#     compiles ffmpeg via docker-build.sh --build-only.
+#  4. docker run extracts the deb into ./dist/.
+#
+# Requires: docker (or podman-docker), git, ~2 GB transient. Build time
+# dominated by ffmpeg's own ~5-10 min compile.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 TAG="${1:-$(tr -d '[:space:]' < VERSION)}"
-# Workdir picks the first writable location available:
-#   1. $WORKDIR_BASE (explicit override)
-#   2. /build/scaleplex-ffmpeg-build (local fast-disk mount, if present)
-#   3. $RUNNER_TEMP/scaleplex-ffmpeg-build (GHA hosted runner)
-#   4. ./.build adjacent to this script (final fallback — gitignored)
+DEPS_IMAGE="${DEPS_IMAGE:-ghcr.io/varashi/scaleplex-ffmpeg-deps}"
+DEPS_REF="${DEPS_IMAGE}:${TAG}"
+
+# Workdir: same selection logic as build-deps.sh.
 if [[ -n "${WORKDIR_BASE:-}" ]]; then
   :
 elif [[ -d /build && -w /build ]]; then
@@ -43,59 +56,69 @@ fi
 
 mkdir -p "$DIST"
 rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
 
-echo "==> Cloning jellyfin-ffmpeg @ $TAG → $WORKDIR"
-git clone --depth 1 --branch "$TAG" \
-  https://github.com/jellyfin/jellyfin-ffmpeg.git "$WORKDIR"
+echo "==> Resolving deps base image: $DEPS_REF"
+if ! docker image inspect "$DEPS_REF" >/dev/null 2>&1; then
+  if docker pull "$DEPS_REF"; then
+    :
+  elif [[ "${AUTO_BUILD_DEPS:-0}" == "1" ]]; then
+    echo "==> Deps image not in registry — building locally via build-deps.sh"
+    ./build-deps.sh "$TAG"
+  else
+    cat >&2 <<EOF
+==> Deps image $DEPS_REF is not available locally or on GHCR.
 
-echo "==> Renaming jellyfin-ffmpeg → scaleplex-ffmpeg in debian + build scripts"
-# We re-namespace the deb so the resulting package, install path, and
-# dpkg state are unambiguously ours and never conflict with an
-# upstream jellyfin-ffmpeg install. URL references to jellyfin's git
-# repo / homepage are preserved (origin tracking).
+   Either:
+     - Run ./build-deps.sh $TAG to build it locally (~30-40 min)
+     - Set AUTO_BUILD_DEPS=1 to do that automatically
+     - Push the deps image from the build-ffmpeg-deps GHA workflow
+EOF
+    exit 1
+  fi
+fi
+
+echo "==> Staging patches+deb build context"
+# Tiny build context — just our patches + a wrapper.
+cp -r "$PATCHES" "$WORKDIR/patches"
+
+cat > "$WORKDIR/Dockerfile" <<EOF
+# Patches-on-top layer. The deps image already has:
+#   - the re-namespaced ffmpeg source at \${SOURCE_DIR} = /ffmpeg
+#   - every bundled dep installed under /usr/lib/scaleplex-ffmpeg/
+#   - all apt+pip build deps installed
+#   - docker-build.sh patched with --deps-only / --build-only flags
+#
+# We layer in our debian/patches/*.patch, append them to the series,
+# then dpkg-buildpackage picks them up at run time. Patches apply via
+# quilt during dpkg-buildpackage's source-prep — no need to apply here.
+FROM ${DEPS_REF}
+
+COPY patches/ /scaleplex-patches/
+
+# Drop patches into debian/patches/ + append filenames to series. Done at
+# build time so the patches layer is its own cacheable image step (each
+# patch tweak invalidates this one ~kilobyte layer, nothing more).
+RUN set -eux; \\
+    SERIES=/ffmpeg/debian/patches/series; \\
+    test -f "\${SERIES}"; \\
+    for p in /scaleplex-patches/*.patch; do \\
+      name="\$(basename "\$p")"; \\
+      cp "\$p" /ffmpeg/debian/patches/"\$name"; \\
+      grep -qxF "\$name" "\${SERIES}" || echo "\$name" >> "\${SERIES}"; \\
+    done; \\
+    echo "--- new series tail:"; \\
+    tail -10 "\${SERIES}"
+
+# Inherited ENTRYPOINT is /docker-build.sh from the deps image. We pass
+# --build-only at run time so it skips the prepare_extra_* phase and
+# jumps straight to mk-build-deps + dpkg-buildpackage. Override here so
+# default \`docker run\` does the right thing without extra argv.
+ENTRYPOINT ["/docker-build.sh", "--build-only"]
+EOF
+
 (
   cd "$WORKDIR"
-  # Stash GitHub repo URL behind a temp token so the mass sed below
-  # doesn't rewrite our own origin pointer.
-  FILES=$(find debian builder Dockerfile.in docker-build.sh -type f 2>/dev/null)
-  # shellcheck disable=SC2086
-  sed -i 's|github.com/jellyfin/jellyfin-ffmpeg|__SCALEPLEX_JF_URL__|g' $FILES
-  # Mass rename
-  # shellcheck disable=SC2086
-  sed -i 's|jellyfin-ffmpeg|scaleplex-ffmpeg|g' $FILES
-  # Restore origin URL
-  # shellcheck disable=SC2086
-  sed -i 's|__SCALEPLEX_JF_URL__|github.com/jellyfin/jellyfin-ffmpeg|g' $FILES
-
-  # Rename the per-binary-package debian helper files. After the sed
-  # above their *content* refers to scaleplex-ffmpeg7, but the filenames
-  # still carry the jellyfin- prefix. dpkg-buildpackage looks them up
-  # by `<binary-package>.<role>` so file names must match the new name.
-  for f in debian/jellyfin-ffmpeg7.*; do
-    mv "$f" "${f/jellyfin-ffmpeg7/scaleplex-ffmpeg7}"
-  done
-)
-
-echo "==> Layering scaleplex patches into debian/patches/"
-for patch in "$PATCHES"/*.patch; do
-  name="$(basename "$patch")"
-  cp -v "$patch" "$WORKDIR/debian/patches/$name"
-  echo "$name" >> "$WORKDIR/debian/patches/series"
-done
-echo "--- new series tail:"
-tail -10 "$WORKDIR/debian/patches/series"
-
-echo "==> Generating Dockerfile + building deb"
-(
-  cd "$WORKDIR"
-  make -f Dockerfile.make Dockerfile
-  # podman won't resolve bare distro names without a TTY prompt; rewrite
-  # `FROM noble` (templated from Dockerfile.in's `FROM DISTRO`) to a
-  # fully-qualified reference. Harmless on real Docker.
-  sed -i 's|^FROM noble$|FROM docker.io/library/ubuntu:noble|' Dockerfile
-  # Use buildx + GHA layer cache when available (CI). Locally we fall
-  # back to plain `docker build` against podman, which has no buildx
-  # but caches layers natively in its own graphroot.
   IMG="scaleplex-ffmpeg-builder:$TAG"
   if [[ "${BUILDX:-}" == "1" ]] && docker buildx version >/dev/null 2>&1; then
     docker buildx build \
@@ -107,9 +130,7 @@ echo "==> Generating Dockerfile + building deb"
     docker build -t "$IMG" .
   fi
   mkdir -p ./dist
-  # `:z` tells podman to relabel the host bind-mount with a shared
-  # container SELinux context so the in-container artifact write
-  # doesn't get blocked by host-side `unlabeled_t`. No-op on plain Docker.
+  # `:z` relabels the host bind for podman SELinux; no-op on Docker.
   docker run --rm -v "$PWD/dist:/dist:z" "$IMG"
 )
 
