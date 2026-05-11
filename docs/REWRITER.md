@@ -193,8 +193,9 @@ Plex Transcoder).
 ### HDR tonemap (HDR source → SDR output)
 
 `tonemap_vaapi` is **not in Plex's ffmpeg build** (they keep
-`tonemap_cuda` and `tonemap_opencl` only). Workers run jellyfin-ffmpeg7
-which has `tonemap_vaapi`.
+`tonemap_cuda` and `tonemap_opencl` only). Workers run scaleplex-ffmpeg7
+(jellyfin-ffmpeg + a small Plex-backport patch layer — see
+[`scaleplex-ffmpeg/`](../scaleplex-ffmpeg/)) which has `tonemap_vaapi`.
 
 When the rewriter sees an HDR source (color_transfer=smpte2084 etc. via
 ffprobe) targeting SDR output, it injects:
