@@ -17,9 +17,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 TAG="${1:-$(tr -d '[:space:]' < VERSION)}"
-WORKDIR="$(pwd)/.build"
+# Workdir lives outside the source tree by default so the heavy
+# checkout + build artifacts don't pollute git. Override with
+# WORKDIR_BASE to keep it adjacent to the source.
+WORKDIR_BASE="${WORKDIR_BASE:-/build/scaleplex-ffmpeg-build}"
+WORKDIR="${WORKDIR_BASE}/.build"
 DIST="$(pwd)/dist"
 PATCHES="$(pwd)/patches"
+mkdir -p "$WORKDIR_BASE"
 
 if [[ ! -d "$PATCHES" ]] || ! ls "$PATCHES"/*.patch >/dev/null 2>&1; then
   echo "no patches in $PATCHES — nothing to do" >&2
@@ -78,9 +83,24 @@ echo "==> Generating Dockerfile + building deb"
   # `FROM noble` (templated from Dockerfile.in's `FROM DISTRO`) to a
   # fully-qualified reference. Harmless on real Docker.
   sed -i 's|^FROM noble$|FROM docker.io/library/ubuntu:noble|' Dockerfile
-  docker build -t scaleplex-ffmpeg-builder:"$TAG" .
+  # Use buildx + GHA layer cache when available (CI). Locally we fall
+  # back to plain `docker build` against podman, which has no buildx
+  # but caches layers natively in its own graphroot.
+  IMG="scaleplex-ffmpeg-builder:$TAG"
+  if [[ "${BUILDX:-}" == "1" ]] && docker buildx version >/dev/null 2>&1; then
+    docker buildx build \
+      --load \
+      --cache-from="${BUILDX_CACHE_FROM:-type=gha,scope=ffmpeg-builder}" \
+      --cache-to="${BUILDX_CACHE_TO:-type=gha,mode=max,scope=ffmpeg-builder}" \
+      -t "$IMG" .
+  else
+    docker build -t "$IMG" .
+  fi
   mkdir -p ./dist
-  docker run --rm -v "$PWD/dist:/dist" scaleplex-ffmpeg-builder:"$TAG"
+  # `:z` tells podman to relabel the host bind-mount with a shared
+  # container SELinux context so the in-container artifact write
+  # doesn't get blocked by host-side `unlabeled_t`. No-op on plain Docker.
+  docker run --rm -v "$PWD/dist:/dist:z" "$IMG"
 )
 
 echo "==> Copying artifacts to $DIST/"

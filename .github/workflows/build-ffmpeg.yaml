@@ -40,6 +40,8 @@ jobs:
             /usr/local/share/boost
           df -h
       - name: build deb
+        env:
+          BUILDX: "1"
         run: ./scaleplex-ffmpeg/build.sh
       - name: list output
         run: ls -lh scaleplex-ffmpeg/dist/
