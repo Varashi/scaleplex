@@ -1,10 +1,18 @@
 name: build-ffmpeg
 
-# Builds scaleplex-ffmpeg7 (= jellyfin-ffmpeg + our patches) into a deb
-# artifact. Triggered on changes under scaleplex-ffmpeg/ or this workflow
-# file. Output deb is uploaded as a workflow artifact for now — once the
-# patch set stabilises we'll publish to GHCR for direct consumption by
-# the worker image build.
+# Builds scaleplex-ffmpeg7 = jellyfin-ffmpeg + our patches into a deb
+# artifact. Uses the prebuilt deps base image
+# (ghcr.io/varashi/scaleplex-ffmpeg-deps:<jellyfin-tag>) so per-iteration
+# rebuilds skip the ~25-40 min bundled-deps compile and only do the
+# ffmpeg link + dpkg-buildpackage (~5-10 min).
+#
+# The deps image is rebuilt by .github/workflows/build-ffmpeg-deps.yaml
+# whenever scaleplex-ffmpeg/VERSION (pinned jellyfin tag) changes. If
+# the deps tag for the current VERSION is missing from GHCR, this build
+# fails fast with a clear error — manually run build-ffmpeg-deps first.
+#
+# Output deb is uploaded as a workflow artifact for now. build-worker
+# downloads it via cross-workflow artifact fetch (see build-worker.yaml).
 
 on:
   push:
@@ -20,20 +28,26 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
   deb:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        # Read-only login so docker pull on the private/internal GHCR
+        # deps image works. packages: write isn't needed here.
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: free runner disk
-        # jellyfin-ffmpeg's bundled-deps build needs ~6 GB transient. GHA
-        # ubuntu-24.04 ships with ~14 GB free — fine, but the runner also
-        # has ~30 GB of preinstalled tooling we can drop to give ffmpeg
-        # plenty of headroom.
+        # Per-iteration build no longer needs the giant transient — deps
+        # are pre-baked into the FROM base. Still drop preinstalled junk
+        # to keep headroom for the deb build + artifact upload.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
             /opt/ghc /opt/hostedtoolcache/CodeQL \
