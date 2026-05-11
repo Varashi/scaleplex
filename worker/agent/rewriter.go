@@ -54,16 +54,6 @@ type RewriteResult struct {
 	// `/header` for ~120s. The reporter sends one PUT per ffmpeg
 	// progress block instead.
 	ProgressURL string
-	// ManifestURL — when non-empty, the agent must POST the DASH
-	// manifest body to this URL whenever ffmpeg's output `dash` file
-	// is updated. Plex's ffmpeg fork drives this from a full-URL
-	// `-manifest_name`, but mainline dashenc.c doesn't recognise an
-	// HTTP `manifest_name` and writes manifest to a local file
-	// instead. Without the POST, PMS waits SegmentedTranscoderTimeout
-	// (~125s) on `/header` before falling back to disk-probing
-	// init-stream0.m4s. Captured + rewritten the same way as
-	// ProgressURL.
-	ManifestURL string
 	// SkipToSegment — value captured from Plex's `-skip_to_segment N`
 	// argv on a seek transcode session. Plex's ffmpeg fork starts the
 	// dash muxer's segment index at N so chunk-stream0-NNNNN.m4s aligns
@@ -873,25 +863,21 @@ func dropEAEPrefixFlags(args []string) ([]string, []string) {
 	return args, dropped
 }
 
-// captureManifestName rewrites `-manifest_name <url>` in-place: the
+// rewriteManifestName rewrites `-manifest_name <url>` in-place: the
 // loopback URL (which workers can't reach) becomes the relay's base
 // URL, with X_PLEX_TOKEN appended. ffmpeg then PUTs the manifest body
-// to that URL natively via dashenc's HTTP protocol handler — no
-// worker-side publisher needed (scaleplex-ffmpeg7 backports Plex's
-// -manifest_name extension, libavformat/dashenc.c).
+// to that URL natively via dashenc's HTTP protocol handler
+// (scaleplex-ffmpeg7 backports Plex's -manifest_name extension —
+// libavformat/dashenc.c patch 0095).
 //
-// Returns (updated args, empty string, change tags). The empty string
-// preserves the prior helper signature (RewriteResult.ManifestURL is
-// still wired through call sites and consumed by manifest_publish.go,
-// but the publisher is now a no-op when ManifestURL is empty).
-//
-// If the URL doesn't look like a PMS loopback or no SCALEPLEX_PMS_BASE_URL
-// is set we strip the flag entirely — stock dashenc would write the
-// manifest into a file literally named `http:` otherwise.
-func captureManifestName(args []string, inputEnv map[string]string) ([]string, string, []string) {
+// If the URL doesn't look like a PMS loopback or no
+// SCALEPLEX_PMS_BASE_URL is set, the flag is stripped — stock dashenc
+// would otherwise write the manifest into a file literally named
+// `http:`.
+func rewriteManifestName(args []string, inputEnv map[string]string) ([]string, []string) {
 	i := indexOfArg(args, "-manifest_name", 0)
 	if i < 0 || i+1 >= len(args) {
-		return args, "", nil
+		return args, nil
 	}
 	base := envOr("SCALEPLEX_PMS_BASE_URL", "")
 	if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
@@ -908,10 +894,10 @@ func captureManifestName(args []string, inputEnv map[string]string) ([]string, s
 			}
 		}
 		args[i+1] = rewritten
-		return args, "", []string{"manifest_name:rewrite-to-relay"}
+		return args, []string{"manifest_name:rewrite-to-relay"}
 	}
 	args = removeArgs(args, i, 2)
-	return args, "", []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
+	return args, []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
 }
 
 // capturePMSProgressURL strips `-progressurl <url>` from args, rewrites
@@ -1167,12 +1153,11 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 		}
 	}
 
-	// Capture -manifest_name URL so manifest_publish.go can POST the
-	// .mpd body to the relay on every chunk flush. Without this, PMS
-	// 404's on /header chunks (it gates them on the first manifest POST).
-	var manifestURL string
+	// Rewrite -manifest_name URL to point at the relay; ffmpeg's
+	// dashenc PUTs the manifest body there natively (scaleplex-ffmpeg7
+	// patch 0095). No worker-side publisher.
 	var manifestChanges []string
-	out, manifestURL, manifestChanges = captureManifestName(out, inputEnv)
+	out, manifestChanges = rewriteManifestName(out, inputEnv)
 	changes = append(changes, manifestChanges...)
 
 	for {
@@ -1221,7 +1206,6 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 		Applied:     true,
 		Changes:     changes,
 		ProgressURL: progressURL,
-		ManifestURL: manifestURL,
 	}, true
 }
 
@@ -2444,16 +2428,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest body
-	// to this URL whenever the .mpd is regenerated; PMS gates `/header`
-	// on the first such POST. Stock ffmpeg's dashenc treats manifest_name
-	// as a filename, not a URL, so we strip it from the argv (otherwise
-	// it would be written verbatim into a local file) and surface the
-	// rewritten URL on RewriteResult so the agent can POST the manifest
-	// itself. See manifest_publish.go.
-	var manifestURL string
+	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest
+	// body to this URL whenever the .mpd is regenerated; PMS gates
+	// `/header` on the first such POST. scaleplex-ffmpeg7 backports
+	// the URL-aware `-manifest_name` (patch 0095), so we only need to
+	// rewrite the loopback host to the relay base; ffmpeg PUTs the
+	// body natively via dashenc's HTTP protocol handler.
 	var manifestChanges []string
-	args, manifestURL, manifestChanges = captureManifestName(args, inputEnv)
+	args, manifestChanges = rewriteManifestName(args, inputEnv)
 	changes = append(changes, manifestChanges...)
 
 	// PTS handling — keep Plex's `-copyts -start_at_zero
@@ -2527,7 +2509,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		Applied:           true,
 		Changes:           changes,
 		ProgressURL:       progressURL,
-		ManifestURL:       manifestURL,
 		SkipToSegment:     skipToSegment,
 		SeekOffsetSeconds: seekOffsetSeconds,
 		SubtitleExtract:   subExtract,

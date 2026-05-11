@@ -45,7 +45,6 @@ func TestCheckpoint_ReturnsCapturedState(t *testing.T) {
 		cwd:         "/transcode/sess1",
 		sourcePath:  "/media/m.mkv",
 		progressURL: "http://pms.local:32400/progress",
-		manifestURL: "http://pms.local:32400/manifest",
 		seekOffsetS: 12.5,
 		startedAt:   now,
 	}
@@ -68,8 +67,8 @@ func TestCheckpoint_ReturnsCapturedState(t *testing.T) {
 	if cp.SourcePath != "/media/m.mkv" || cp.SeekOffsetSeconds != 12.5 {
 		t.Fatalf("source=%q seek=%v", cp.SourcePath, cp.SeekOffsetSeconds)
 	}
-	if cp.ProgressURL == "" || cp.ManifestURL == "" || cp.Cwd == "" {
-		t.Fatalf("urls/cwd missing in checkpoint: %+v", cp)
+	if cp.ProgressURL == "" || cp.Cwd == "" {
+		t.Fatalf("progressURL/cwd missing in checkpoint: %+v", cp)
 	}
 	if len(cp.Args) != 4 || cp.Args[0] != "-i" {
 		t.Fatalf("args malformed: %v", cp.Args)
