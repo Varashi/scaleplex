@@ -873,6 +873,42 @@ func dropEAEPrefixFlags(args []string) ([]string, []string) {
 	return args, dropped
 }
 
+// captureManifestName strips `-manifest_name <url>` from args, rewrites
+// the loopback URL to SCALEPLEX_PMS_BASE_URL (so the agent can POST the
+// manifest body to the relay), and appends X_PLEX_TOKEN. Returns
+// updated args, the rewritten URL (empty when capture failed), and the
+// change tags to record.
+//
+// Stock ffmpeg's dashenc treats -manifest_name as a filename and would
+// happily write into a file called `http:` — so we must always strip
+// it. Plex's fork POSTs the manifest body to the URL on every chunk
+// flush; we approximate by stripping here and posting from the agent
+// after each chunk write (see manifest_publish.go).
+func captureManifestName(args []string, inputEnv map[string]string) ([]string, string, []string) {
+	i := indexOfArg(args, "-manifest_name", 0)
+	if i < 0 || i+1 >= len(args) {
+		return args, "", nil
+	}
+	base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+	if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+		base = envBase
+	}
+	origURL := args[i+1]
+	args = removeArgs(args, i, 2)
+	if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
+		rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
+		if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
+			if strings.Contains(rewritten, "?") {
+				rewritten += "&X-Plex-Token=" + tok
+			} else {
+				rewritten += "?X-Plex-Token=" + tok
+			}
+		}
+		return args, rewritten, []string{"manifest_name:captured-for-publisher"}
+	}
+	return args, "", []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
+}
+
 // capturePMSProgressURL strips `-progressurl <url>` from args, rewrites
 // the PMS host to SCALEPLEX_PMS_BASE_URL, and appends the per-session
 // X_PLEX_TOKEN as a query param. Returns updated args, the rewritten
@@ -1102,8 +1138,38 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	out := cloneArgs(args)
 	changes := []string{"decode:remux:" + dec, "encode:copy(passthrough)"}
 
-	// 1. Strip Plex-private flags.
-	for _, flag := range []string{"-loglevel_plex", "-delete_removed", "-strict_ts:0", "-strict_ts"} {
+	// Capture `-skip_to_segment N` before stripping — segwatch.go uses
+	// it to hardlink stock ffmpeg's 1-indexed chunk output to the
+	// N-indexed names PMS expects on seek transcode sessions. N=1
+	// (initial play) is a no-op for the renumber watcher.
+	skipToSegment := 0
+	if i := indexOfArg(out, "-skip_to_segment", 0); i >= 0 && i+1 < len(out) {
+		if n, err := strconv.Atoi(out[i+1]); err == nil && n > 0 {
+			skipToSegment = n
+		}
+	}
+
+	// 1. Strip Plex-private flags. The main rewrite path handles each
+	// of these at the right phase; for an optimize-remux session we
+	// take the fast path and strip them here.
+	//   -delete_removed, -skip_to_segment, -break_non_keyframes:
+	//     Plex's dashenc.c additions
+	//   -segment_list_{separate_stream_times,unfinished}: Plex's
+	//     segment.c additions (sub pipeline)
+	//   -strict_ts*: Plex movenc/dashenc extension
+	//   -loglevel_plex: Plex stderr level
+	// `-manifest_name <url>` is handled separately below — it must be
+	// captured (for relay POST) before stripping.
+	for _, flag := range []string{
+		"-loglevel_plex",
+		"-delete_removed",
+		"-skip_to_segment",
+		"-break_non_keyframes",
+		"-segment_list_separate_stream_times",
+		"-segment_list_unfinished",
+		"-strict_ts:0",
+		"-strict_ts",
+	} {
 		for {
 			i := indexOfArg(out, flag, 0)
 			if i < 0 || i+1 >= len(out) {
@@ -1113,6 +1179,32 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 			changes = append(changes, "drop:"+flag)
 		}
 	}
+
+	// Capture -manifest_name URL so manifest_publish.go can POST the
+	// .mpd body to the relay on every chunk flush. Without this, PMS
+	// 404's on /header chunks (it gates them on the first manifest POST).
+	var manifestURL string
+	var manifestChanges []string
+	out, manifestURL, manifestChanges = captureManifestName(out, inputEnv)
+	changes = append(changes, manifestChanges...)
+
+	// Keep every chunk on disk for the lifetime of the session. Plex's
+	// `-delete_removed false` (which we stripped above) is the upstream
+	// way; stock dashenc uses `-extra_window_size`. Inject a very large
+	// value so old chunks survive the sliding manifest window. Without
+	// this, ffmpeg deletes chunk-stream0-00004 once chunk 14 is written
+	// (default window=5+5=10), PMS 404's on rewinds and early-chunk
+	// fetches, and the player spinners after ~15s of playback.
+	if indexOfArg(out, "-extra_window_size", 0) < 0 {
+		for k := 0; k+1 < len(out); k++ {
+			if out[k] == "-f" && out[k+1] == "dash" {
+				out = spliceArgs(out, k, "-extra_window_size", "999999")
+				changes = append(changes, "inject:-extra_window_size=999999")
+				break
+			}
+		}
+	}
+
 	for {
 		i := indexOfArg(out, "-xioerror", 0)
 		if i < 0 {
@@ -1159,6 +1251,7 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 		Applied:     true,
 		Changes:     changes,
 		ProgressURL: progressURL,
+		ManifestURL: manifestURL,
 	}, true
 }
 
@@ -2403,29 +2496,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// it would be written verbatim into a local file) and surface the
 	// rewritten URL on RewriteResult so the agent can POST the manifest
 	// itself. See manifest_publish.go.
-	manifestURL := ""
-	if i := indexOfArg(args, "-manifest_name", 0); i >= 0 && i+1 < len(args) {
-		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
-		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
-			base = envBase
-		}
-		origURL := args[i+1]
-		args = removeArgs(args, i, 2)
-		if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
-			rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
-			if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
-				if strings.Contains(rewritten, "?") {
-					rewritten += "&X-Plex-Token=" + tok
-				} else {
-					rewritten += "?X-Plex-Token=" + tok
-				}
-			}
-			manifestURL = rewritten
-			changes = append(changes, "manifest_name:captured-for-publisher")
-		} else {
-			changes = append(changes, "drop:-manifest_name(no-pms-base-or-non-loopback)")
-		}
-	}
+	var manifestURL string
+	var manifestChanges []string
+	args, manifestURL, manifestChanges = captureManifestName(args, inputEnv)
+	changes = append(changes, manifestChanges...)
 
 	// PTS handling — keep Plex's `-copyts -start_at_zero
 	// -avoid_negative_ts disabled` exactly as PMS sends them.

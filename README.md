@@ -13,7 +13,8 @@ running Plex's bundled `Plex Transcoder`: musl ffmpeg blocks Intel NEO OpenCL,
 the Plex build excludes `tonemap_vaapi`, the `inlineass` filter is
 Plex-private, and `LOCAL_RELAY` adds an HTTP hop on every segment. scaleplex
 keeps the distributed-transcode shape but swaps workers to **stock ffmpeg**
-(jellyfin-ffmpeg7) with full VAAPI HW filters.
+(scaleplex-ffmpeg7 — jellyfin-ffmpeg + a small Plex-backport patch layer in
+[`scaleplex-ffmpeg/`](scaleplex-ffmpeg/)) with full VAAPI HW filters.
 
 Concretely this unlocks:
 
@@ -85,7 +86,7 @@ Image tag tracked in `worker/deploy/worker.yaml` and the
  │Worker 1│ │Worker 2│ │Worker 3│   DaemonSet on gpu-worker nodes
  │        │ │        │ │        │
  │ scaleplex-agent (Go)         │   - Ubuntu 24.04
- │  - rewrites Plex argv → VAAPI│   - jellyfin-ffmpeg7
+ │  - rewrites Plex argv → VAAPI│   - scaleplex-ffmpeg7
  │  - spawns ffmpeg              │   - intel-media-va-driver-non-free
  │  - watches segments, posts    │   - libass, fonts (DejaVu, Noto)
  │    progress + manifest        │   - render group access (568)
@@ -118,9 +119,10 @@ loopback-equivalent endpoint to call back on (workers can't reach PMS's
 | `shim/Dockerfile` | DOCKER_MOD image: drops shim into `/usr/lib/plexmediaserver/` + relay as s6-v3 longrun. |
 | `orchestrator/` | Slim Go HTTP server. DNS-discovers workers, picks least-loaded. |
 | `worker/agent/` | Worker-side daemon. Rewrites argv, spawns ffmpeg, posts progress, watches segments. |
-| `worker/Dockerfile` | Ubuntu 24.04 + jellyfin-ffmpeg7 + iHD VAAPI + agent. |
+| `worker/Dockerfile` | Ubuntu 24.04 + scaleplex-ffmpeg7 + iHD VAAPI + agent. |
 | `worker/deploy/` | DaemonSet + namespace YAML. |
 | `orchestrator/deploy/` | Deployment YAML. |
+| `scaleplex-ffmpeg/` | Patch layer + Debian build pipeline for `scaleplex-ffmpeg7` (jellyfin-ffmpeg + Plex backports). |
 | `charts/scaleplex/` | Helm chart (placeholder; deploy via raw YAML for now). |
 | `docs/` | Architecture, rewriter, seek, latency, lessons. |
 
