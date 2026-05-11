@@ -2281,6 +2281,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				if segTime != "" {
 					appendQuery("scaleplex_seg_time=" + segTime)
 				}
+				// Pass the session's -ss as scaleplex_mkv_offset_ms so the
+				// relay can patch each chunk's Cluster.Timecode in-line
+				// with the CSV forward to PMS. Required for matroska-
+				// segment output (Plex Windows): mpv anchors its timeline
+				// to the first Cluster.Timecode it sees, and worker-side
+				// fsnotify patching loses the race against PMS's read of
+				// chunk-0. Setting this for HLS-mpegts shape is a no-op
+				// (chunk filenames are media-NNNNN.ts, don't match the
+				// relay's mkvChunkFilenameRE).
+				if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
+					if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
+						appendQuery(fmt.Sprintf("scaleplex_mkv_offset_ms=%d", uint64(v*1000)))
+					}
+				}
 				args[i+1] = rewritten
 				changes = append(changes, "hls:segment_list:rewrite-to-relay")
 			}

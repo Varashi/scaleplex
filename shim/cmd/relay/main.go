@@ -94,21 +94,53 @@ func main() {
 		var contentLen int64 = r.ContentLength
 		query := r.URL.Query()
 		segTimeStr := query.Get("scaleplex_seg_time")
-		if segTimeStr != "" {
+		mkvOffsetMsStr := query.Get("scaleplex_mkv_offset_ms")
+		if segTimeStr != "" || mkvOffsetMsStr != "" {
 			query.Del("scaleplex_seg_time")
+			query.Del("scaleplex_mkv_offset_ms")
 			u.RawQuery = query.Encode()
 		} else {
 			u.RawQuery = r.URL.RawQuery
 		}
-		if r.Method == http.MethodPost && segTimeStr != "" && manifestPathRE.MatchString(r.URL.Path) {
-			segTime, err := strconv.ParseFloat(segTimeStr, 64)
-			if err == nil && segTime > 0 {
-				body, err := io.ReadAll(r.Body)
-				if err == nil {
-					rewritten := rewriteSegmentListCSV(body, segTime)
-					bodyReader = bytes.NewReader(rewritten)
-					contentLen = int64(len(rewritten))
+		if r.Method == http.MethodPost && manifestPathRE.MatchString(r.URL.Path) {
+			// Read body once; we may both patch chunks AND rewrite rows.
+			body, err := io.ReadAll(r.Body)
+			if err == nil {
+				// Matroska chunk patching: shift every Cluster.Timecode
+				// by the session's -ss offset BEFORE PMS announces these
+				// chunks to mpv. mpv anchors its timeline to the first
+				// Cluster.Timecode it parses out of /transcode/universal/
+				// start, so if chunk-0 has Timecode=0 the entire stream
+				// reads as starting at 0, breaking absolute position
+				// tracking, audio-track-swap continuation, and triggering
+				// audio sync drift. Worker-side fsnotify patching loses
+				// this race (chunk-0 patched ~1s after creation, but PMS
+				// reads it via the CSV POST that happens BEFORE the next
+				// chunk's CREATE event fires). Doing it here, in-line
+				// with the CSV forward, gives synchronous ordering.
+				if mkvOffsetMsStr != "" {
+					if offsetMs, err := strconv.ParseUint(mkvOffsetMsStr, 10, 64); err == nil && offsetMs > 0 {
+						dir := sessionDirFromManifestURL(r.URL.Path)
+						names := chunkFilenamesFromCSV(body)
+						if dir != "" && len(names) > 0 {
+							n, perr := patchSessionMatroskaChunks(dir, names, offsetMs)
+							if perr != nil {
+								log.Printf("relay mkv-patch %s: %v (patched=%d/%d)", dir, perr, n, len(names))
+							} else if n > 0 {
+								log.Printf("relay mkv-patch %s: %d chunk(s) +%dms", dir, n, offsetMs)
+							}
+						}
+					}
 				}
+				// HLS-mpegts CSV row rewrite (existing behaviour).
+				if segTimeStr != "" {
+					segTime, err := strconv.ParseFloat(segTimeStr, 64)
+					if err == nil && segTime > 0 {
+						body = rewriteSegmentListCSV(body, segTime)
+					}
+				}
+				bodyReader = bytes.NewReader(body)
+				contentLen = int64(len(body))
 			}
 		}
 
