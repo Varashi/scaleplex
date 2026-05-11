@@ -1,18 +1,16 @@
 # scaleplex worker image
 #
-# Ubuntu 24.04 + jellyfin-ffmpeg7 + Intel iHD VAAPI driver + fonts.
-# We use jellyfin-ffmpeg (instead of stock Ubuntu ffmpeg) for:
-#   - subtitles=...:sub2video=1 → renders only sub pixels with alpha,
-#     no 4K canvas allocation per frame (drops the bandwidth wall we hit
-#     in the 2026-05-05 sub-burn bench)
-#   - alpha_format option on overlay_vaapi (no separate format=bgra)
-#   - PGS HW overlay support (not used today but free)
-#   - vaapi scaler default to "fast"
-#   - tonemapx SIMD CPU tonemap as a soft-fallback
+# Ubuntu 24.04 + scaleplex-ffmpeg7 + Intel iHD VAAPI driver + fonts.
+# scaleplex-ffmpeg7 = jellyfin-ffmpeg + a small Plex-backport patch
+# layer (see ../scaleplex-ffmpeg/). Same upstream lineage as
+# jellyfin-ffmpeg, same featureset (VAAPI HW tonemap, overlay_vaapi,
+# sub2video etc.), plus four DASH muxer extensions that let the worker
+# rewriter drop a lot of seek-resume scaffolding.
 #
-# Pinned to the version channel (no per-version tag in the apt repo —
-# they ship rolling updates inside `noble main`); CI captures the
-# resolved version in the image SHA.
+# The deb is built by ../scaleplex-ffmpeg/build.sh (or the
+# build-ffmpeg GHA workflow) and placed in ../scaleplex-ffmpeg/dist/
+# before docker build. Build context root must be the scaleplex repo
+# root (matches existing `worker/...` paths).
 
 FROM golang:1.23-bookworm AS agent-build
 WORKDIR /src
@@ -24,30 +22,24 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
 
 FROM ubuntu:24.04
 LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
-LABEL org.opencontainers.image.description="scaleplex worker — jellyfin-ffmpeg + Intel iHD VAAPI + Go agent"
+LABEL org.opencontainers.image.description="scaleplex worker — scaleplex-ffmpeg + Intel iHD VAAPI + Go agent"
 LABEL org.opencontainers.image.licenses=MIT
 
-# multiverse for intel-media-va-driver-non-free; jellyfin-ffmpeg expects
-# libva to come from the system (it doesn't bundle the VAAPI userspace).
+# multiverse for intel-media-va-driver-non-free; scaleplex-ffmpeg
+# expects libva to come from the system (it doesn't bundle the VAAPI
+# userspace, same as jellyfin-ffmpeg).
+COPY scaleplex-ffmpeg/dist/scaleplex-ffmpeg7_*.deb /tmp/
 RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|' \
       /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      curl gpg ca-certificates && \
-    install -d -m 0755 /etc/apt/keyrings && \
-    curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
-      | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg] https://repo.jellyfin.org/ubuntu noble main" \
-      > /etc/apt/sources.list.d/jellyfin.list && \
-    apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      jellyfin-ffmpeg7 \
+      /tmp/scaleplex-ffmpeg7_*.deb \
       intel-media-va-driver-non-free \
       libva2 libva-drm2 \
       vainfo \
       fontconfig fonts-dejavu-core \
       tini && \
-    apt-get purge -y --auto-remove gpg && \
+    rm /tmp/scaleplex-ffmpeg7_*.deb && \
     rm -rf /var/lib/apt/lists/*
 
 # Slim fontconfig config — restricts the font search universe to the
@@ -63,10 +55,10 @@ RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|'
 RUN install -d -m 0755 /opt/scaleplex
 COPY worker/fonts.conf /opt/scaleplex/fonts.conf
 
-# /usr/lib/jellyfin-ffmpeg/{ffmpeg,ffprobe} is the install path; symlink
-# into /usr/bin so the agent's hardcoded paths keep working.
-RUN ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg  /usr/bin/ffmpeg && \
-    ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/bin/ffprobe
+# /usr/lib/scaleplex-ffmpeg/{ffmpeg,ffprobe} is the install path;
+# symlink into /usr/bin so the agent's hardcoded paths keep working.
+RUN ln -sf /usr/lib/scaleplex-ffmpeg/ffmpeg  /usr/bin/ffmpeg && \
+    ln -sf /usr/lib/scaleplex-ffmpeg/ffprobe /usr/bin/ffprobe
 
 # render group (568) so container UID 1000 can open /dev/dri/renderD*
 RUN groupadd -g 568 render2 || true && \
