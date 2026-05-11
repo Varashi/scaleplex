@@ -375,6 +375,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	manifestURL := ""
 	skipToSegment := 0
 	seekOffsetSeconds := 0.0
+	isMatroskaSegment := false
 	if req.Rewrite {
 		// Env-gated argv capture for debugging new PMS argv shapes
 		// (HW-decode mode, Plex version bumps, etc.). Off by default to
@@ -400,6 +401,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			manifestURL = res.ManifestURL
 			skipToSegment = res.SkipToSegment
 			seekOffsetSeconds = res.SeekOffsetSeconds
+			isMatroskaSegment = res.IsMatroskaSegment
 			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 			// Extract embedded subtitle stream to disk before spawning
@@ -537,6 +539,9 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq, seekOffsetSeconds, &task.lastSeq)
 		if manifestURL != "" {
 			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID, startSeq)
+		}
+		if isMatroskaSegment {
+			go watchAndPatchMatroskaChunks(ctx, req.Cwd, req.SessionID, seekOffsetSeconds, &task.lastSeq)
 		}
 	}
 
