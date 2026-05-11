@@ -1,0 +1,51 @@
+name: build-ffmpeg
+
+# Builds scaleplex-ffmpeg7 (= jellyfin-ffmpeg + our patches) into a deb
+# artifact. Triggered on changes under scaleplex-ffmpeg/ or this workflow
+# file. Output deb is uploaded as a workflow artifact for now — once the
+# patch set stabilises we'll publish to GHCR for direct consumption by
+# the worker image build.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scaleplex-ffmpeg/**"
+      - ".github/workflows/build-ffmpeg.yaml"
+  pull_request:
+    paths:
+      - "scaleplex-ffmpeg/**"
+      - ".github/workflows/build-ffmpeg.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: free runner disk
+        # jellyfin-ffmpeg's bundled-deps build needs ~6 GB transient. GHA
+        # ubuntu-24.04 ships with ~14 GB free — fine, but the runner also
+        # has ~30 GB of preinstalled tooling we can drop to give ffmpeg
+        # plenty of headroom.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
+          df -h
+      - name: build deb
+        run: ./scaleplex-ffmpeg/build.sh
+      - name: list output
+        run: ls -lh scaleplex-ffmpeg/dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scaleplex-ffmpeg7-deb
+          path: scaleplex-ffmpeg/dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
