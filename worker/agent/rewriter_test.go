@@ -1016,9 +1016,6 @@ func TestRewriter_ManifestURL_CapturedAndStripped(t *testing.T) {
 	if out.Args[mnIdx+1] != wantURL {
 		t.Fatalf("-manifest_name value=%q want %q", out.Args[mnIdx+1], wantURL)
 	}
-	if out.ManifestURL != "" {
-		t.Fatalf("ManifestURL=%q want empty (rewritten in-place, no publisher)", out.ManifestURL)
-	}
 	if !containsString(out.Changes, "manifest_name:rewrite-to-relay") {
 		t.Fatalf("missing rewrite change: %v", out.Changes)
 	}
@@ -1036,9 +1033,6 @@ func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
 	// HTTP protocol handler cannot reach 127.0.0.1:32400 from the worker.
 	if containsString(out.Args, "-manifest_name") {
 		t.Fatal("-manifest_name must be stripped from argv when no relay base")
-	}
-	if out.ManifestURL != "" {
-		t.Fatalf("ManifestURL=%q want empty when no base", out.ManifestURL)
 	}
 	if !containsString(out.Changes, "drop:-manifest_name(no-pms-base-or-non-loopback)") {
 		t.Fatalf("missing drop change: %v", out.Changes)

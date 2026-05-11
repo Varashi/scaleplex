@@ -29,7 +29,6 @@ type checkpoint struct {
 	Cwd               string            `json:"cwd,omitempty"`
 	SourcePath        string            `json:"source_path,omitempty"`
 	ProgressURL       string            `json:"progress_url,omitempty"`
-	ManifestURL       string            `json:"manifest_url,omitempty"`
 	SeekOffsetSeconds float64           `json:"seek_offset_seconds"`
 	LastSegmentSeq    int64             `json:"last_segment_seq"`
 	StartedAt         time.Time         `json:"started_at"`
@@ -49,7 +48,6 @@ func handleCheckpoint(w http.ResponseWriter, sessionID string) {
 		Cwd:               t.cwd,
 		SourcePath:        t.sourcePath,
 		ProgressURL:       t.progressURL,
-		ManifestURL:       t.manifestURL,
 		SeekOffsetSeconds: t.seekOffsetS,
 		LastSegmentSeq:    t.lastSeq.Load(),
 		StartedAt:         t.startedAt,
