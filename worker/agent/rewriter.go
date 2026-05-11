@@ -1326,11 +1326,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	// Detect output format up-front so format-specific rewrites can branch.
 	// Plex's argv ends with one of:
-	//   -f dash           — DASH (Plex Web, Chrome on desktop, DASH-capable apps)
+	//   -f dash           — DASH (Plex Web Chrome via dashenc, mp4 chunks)
 	//   -f ssegment       — Plex's stream-segmenter, used for HLS-style output
 	//                       to mobile clients (iOS/Android). Stock ffmpeg
-	//                       doesn't have ssegment; we translate to `-f segment`
-	//                       with `-segment_format mpegts`.
+	//                       doesn't have ssegment; we translate to `-f segment`.
+	//   -f segment        — Plex Windows desktop (segmented matroska, live=1).
+	//                       Already-stock muxer; same chunk-list shape as HLS
+	//                       so we treat them identically below: rewrite
+	//                       -segment_list URL to relay, drop -copyts so
+	//                       splits actually fire.
 	outputFormat := ""
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == "-f" {
@@ -1338,7 +1342,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			break
 		}
 	}
-	isHLS := outputFormat == "ssegment"
+	isHLS := outputFormat == "ssegment" || outputFormat == "segment"
 
 	for i := 0; i < len(args); i++ {
 		if args[i] != "-filter_complex" {
