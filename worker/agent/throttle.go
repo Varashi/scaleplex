@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -62,22 +63,22 @@ var (
 // — that's the only path by which canThrottle can be cleared, so we
 // must not silence it even on the most aggressive tier.
 //
-// Tier rationale (validated 2026-05-10, escalation tightened 2026-05-11):
-// Plex's `TranscoderThrottleBuffer` pref is intended as a HARD CAP via
-// pause-and-resume — Plex-native ffmpeg fully sleeps the encode loop on
-// canThrottle. Stock ffmpeg keeps running, so we approximate via
-// SIGSTOP/SIGCONT pulses; the lighter the duty cycle, the closer we
-// approximate a true pause. Escalate fast so the buffer stops growing
-// quickly after the first canThrottle signal lands.
-//   - <2s:    brief warmup before slamming hard; avoids spurious
-//             pause-resume churn on transient signals.
-//   - 2-15s:  moderate throttle (~5%) for typical buffer-ahead.
-//   - 15s+:   aggressive (~1%) for sustained throttle — buffer drains.
+// Tier rationale (validated 2026-05-10, reverted to wider tiers
+// 2026-05-11 after LG webOS buffering on clusterplex with the
+// 2/15s tightening — slow-buffering clients hit the heavy tier
+// within seconds and ffmpeg goes ~1% throughput, undershooting their
+// buffer. With scaleplex-ffmpeg7 a future Phase 4 patch will port
+// Plex's internal canThrottle usleep parser so we can delete this
+// external pulse entirely; until then the wider tiers keep normal
+// playback in the light tier and only abandoned tabs in heavy.
+//   - <30s:    light pause (~80%) for normal buffer-ahead.
+//   - 30-120s: moderate (~5%) for parked sessions.
+//   - 120s+:   aggressive (~1%) for sustained throttle.
 func dutyCycle(depth time.Duration) (stop, cont time.Duration) {
 	switch {
-	case depth < 2*time.Second:
+	case depth < 30*time.Second:
 		return 200 * time.Millisecond, 50 * time.Millisecond
-	case depth < 15*time.Second:
+	case depth < 120*time.Second:
 		return 1000 * time.Millisecond, 50 * time.Millisecond
 	default:
 		return 5000 * time.Millisecond, 50 * time.Millisecond
@@ -112,6 +113,16 @@ func (s *throttleSignal) on() bool { return s.v.Load() == 1 }
 // On signal failure (process already gone), exits silently. A spurious
 // SIGCONT on a non-existent pid returns ESRCH — non-fatal.
 func throttleController(ctx context.Context, sessionID string, pid int, sig *throttleSignal) {
+	// SCALEPLEX_DISABLE_THROTTLE — temporary kill-switch. When set the
+	// controller exits and ffmpeg runs unthrottled. Mitigation for
+	// slow-buffering clients (LG webOS 2026-05-11) where the external
+	// SIGSTOP/SIGCONT pulse approximation stalls the GPU. Will be
+	// retired once Phase 4 ports Plex's internal canThrottle parser to
+	// scaleplex-ffmpeg7 (see project_scaleplex_throttle_buffer.md).
+	if os.Getenv("SCALEPLEX_DISABLE_THROTTLE") != "" {
+		log.Printf("session %s: throttle controller disabled via env", sessionID)
+		return
+	}
 	pgid := -pid // syscall.Kill semantics: negative = process group
 	wasOn := false
 	throttledStart := time.Now() // only meaningful while wasOn=true

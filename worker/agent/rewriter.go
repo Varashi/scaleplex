@@ -905,6 +905,13 @@ func rewriteManifestName(args []string, inputEnv map[string]string) ([]string, [
 // X_PLEX_TOKEN as a query param. Returns updated args, the rewritten
 // URL (empty when capture failed for any reason), and the change tags
 // to record.
+//
+// Also injects `-canthrottleurl <rewritten-url>` so scaleplex-ffmpeg7's
+// in-binary canThrottle handler (patch 0097) can do its own one-shot
+// PUT and apply per-input-packet `av_usleep` natively. Worker still
+// reads progress via `-progress pipe:N` (substituted by main.go after
+// spawn) for metrics + checkpoint; both consume the same response
+// body, the per-packet sleep just becomes ffmpeg-internal.
 func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string, string, []string) {
 	i := indexOfArg(args, "-progressurl", 0)
 	if i < 0 || i+1 >= len(args) {
@@ -930,6 +937,14 @@ func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string,
 		changes = append(changes, "progress:append-X-Plex-Token")
 	}
 	changes = append(changes, "progressurl:captured-for-reporter")
+	// Inject -canthrottleurl pointing at the same relay endpoint.
+	// Splice at index 0 so it lands in global-scope (before -i),
+	// matching ffmpeg's option-context rules. Skip if the option is
+	// somehow already present (shouldn't happen, but be defensive).
+	if indexOfArg(args, "-canthrottleurl", 0) < 0 {
+		args = spliceArgs(args, 0, "-canthrottleurl", rewritten)
+		changes = append(changes, "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)")
+	}
 	return args, rewritten, changes
 }
 
@@ -2066,11 +2081,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	// `-segment_list_separate_stream_times` + `-segment_list_unfinished`
-	// are accepted natively by scaleplex-ffmpeg7's segment muxer (patch
-	// 0096-segment-plex-fork-options-stub — registered as no-op AVOptions
-	// today; full per-stream end-time tracking + #-prefix CSV emit
-	// scheduled for Phase 2b). PMS sends both on HLS and on the
-	// embedded subtitle pipeline; passthrough is harmless until 2b.
+	// pass through to scaleplex-ffmpeg7 natively (patch 0096 registers
+	// them as no-op AVOptions, full per-stream end-time tracking + CSV
+	// unfinished prefix scheduled for Phase 2b).
 	//
 	// `-strict_ts*` (any stream specifier suffix) — Plex movenc/dashenc
 	// extension, no equivalent in our fork yet, must still strip.
@@ -2178,6 +2191,23 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if i := indexOfArg(args, "-f", 0); i >= 0 && i+1 < len(args) && args[i+1] == "ssegment" {
 			args[i+1] = "segment"
 			changes = append(changes, "hls:f=ssegment->segment")
+		}
+
+		// Plex's `-segment_list_size 5` keeps only 5 entries in the CSV
+		// manifest. With ffmpeg outpacing playback (any speed > 1×) the
+		// rolling window drops older chunks from the CSV, so when the
+		// client falls 5+ chunks behind PMS no longer has CSV rows for
+		// them and serves 0-byte chunks. Bump to 99999 so the CSV
+		// retains every chunk for the lifetime of the session — files
+		// stay on disk anyway (segment muxer doesn't auto-delete like
+		// dashenc). Observed 2026-05-11 on LG webOS BH6 4K HEVC HDR
+		// HLS — 200ms 0-byte chunk serves correlating with rolling-
+		// window drops while ffmpeg ran ~2.7× unthrottled.
+		if i := indexOfArg(args, "-segment_list_size", 0); i >= 0 && i+1 < len(args) {
+			if args[i+1] != "99999" {
+				args[i+1] = "99999"
+				changes = append(changes, "hls:segment_list_size:5->99999")
+			}
 		}
 		// (-segment_list_separate_stream_times / -segment_list_unfinished
 		// are stripped globally above for both HLS and the DASH+subs
