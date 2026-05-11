@@ -1542,8 +1542,9 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		"audio:eac3_eae->eac3",
 		"drop:-eae_prefix:1",
 		"drop:-loglevel_plex",
-		"drop:-segment_list_separate_stream_times",
-		"drop:-segment_list_unfinished",
+		// scaleplex-ffmpeg7 (Phase 2a patch 0096) accepts
+		// -segment_list_{separate_stream_times,unfinished} natively as
+		// no-op AVOptions, so the rewriter no longer needs to strip them.
 		"hls:f=ssegment->segment",
 		"hls:drop:-copyts",
 		"hls:segment_list:rewrite-to-relay",

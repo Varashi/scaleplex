@@ -1,0 +1,68 @@
+Description: segment: accept Plex's -segment_list_{unfinished,separate_stream_times} options
+ Plex's ffmpeg fork adds three behaviour extensions to libavformat/
+ segment.c:
+
+   -segment_list_unfinished 1            CSV rows for in-progress
+                                         segments get a `#` prefix
+                                         so PMS can skip-read them
+                                         until they're closed.
+
+   -segment_list_separate_stream_times 1 CSV rows gain extra columns
+                                         carrying per-stream end times
+                                         (audio + video) so PMS can
+                                         sync to actual stream end on
+                                         multi-stream outputs.
+
+   -break_non_keyframes                  already in upstream (since
+                                         FFmpeg 4.x), no port needed.
+
+ scaleplex's worker rewriter currently strips both options before
+ spawning ffmpeg because stock segment.c rejects them with
+ "Unrecognized option" → exit 8. Functionally the rewriter + relay
+ sidecar already handle the correctness paths these options enable:
+ - The relay rewrites every CSV row's start/end times to global
+   timeline values (`scaleplex_seg_time=N` query hint).
+ - PMS reads the CSV size, not the `#` prefix, to gate chunk serving.
+
+ This patch (Phase 2a) registers the two options + the matching
+ SegmentContext fields, accepted as no-ops so stock dashenc's argv
+ parser stops rejecting them. Behaviour is unchanged — the relay
+ keeps doing the heavy lifting. A follow-up Phase 2b port will wire
+ the full per-stream end-time tracking + `#`-prefix CSV emit logic
+ from Plex's fork, at which point the relay's CSV rewrite path can
+ also be deleted.
+
+ Net effect today: the worker rewriter can drop two strip-list
+ entries; the captured argv reaches ffmpeg verbatim.
+
+Origin: backport (minimal), https://github.com/plexinc/plex-media-server-ffmpeg-gpl
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-11
+---
+--- a/libavformat/segment.c
++++ b/libavformat/segment.c
+@@ -127,6 +127,11 @@ typedef struct SegmentContext {
+     SegmentListEntry cur_entry;
+     SegmentListEntry *segment_list_entries;
+     SegmentListEntry *segment_list_entries_end;
++    // scaleplex/PLEX: Plex fork additions, registered + accepted as
++    // no-ops in Phase 2a. Functional emit logic comes in Phase 2b.
++    int list_unfinished;
++    int list_separate_times;
++    int cur_list_size;
+ } SegmentContext;
+
+ static void print_csv_escaped_str(AVIOContext *ctx, const char *str)
+@@ -1075,6 +1080,11 @@ static const AVOption options[] = {
+     { "reset_timestamps", "reset timestamps at the beginning of each segment", OFFSET(reset_timestamps), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
+     { "initial_offset", "set initial timestamp offset", OFFSET(initial_offset), AV_OPT_TYPE_DURATION, {.i64 = 0}, -INT64_MAX, INT64_MAX, E },
+     { "write_empty_segments", "allow writing empty 'filler' segments", OFFSET(write_empty), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
++    // scaleplex/PLEX backport (minimal — Phase 2a, no-op).
++    { "segment_list_unfinished", "list in-progress segments with a leading # (no-op stub)",
++        OFFSET(list_unfinished), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
++    { "segment_list_separate_stream_times", "include per-stream end times in segment list (no-op stub)",
++        OFFSET(list_separate_times), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
+     { NULL },
+ };
+
