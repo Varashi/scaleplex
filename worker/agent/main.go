@@ -541,7 +541,13 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID, startSeq)
 		}
 		if isMatroskaSegment {
-			go watchAndPatchMatroskaChunks(ctx, req.Cwd, req.SessionID, seekOffsetSeconds, &task.lastSeq)
+			// Worker patcher no longer applies the Cluster.Timecode
+			// shift — the relay does that in-line with each CSV POST
+			// to PMS (only synchronous way to win the race against
+			// mpv parsing chunk-0). Watcher stays only to bump
+			// task.lastSeq for /task/<id>/checkpoint reporting; pass
+			// offsetMs=0 so patching is skipped.
+			go watchAndPatchMatroskaChunks(ctx, req.Cwd, req.SessionID, 0, &task.lastSeq)
 		}
 	}
 
