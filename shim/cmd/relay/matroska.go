@@ -10,14 +10,13 @@ import (
 	"strings"
 )
 
-// chunk-NNNNN filename in the matroska segment_list CSV. Plex Windows
-// shape uses no extension; HLS-mpegts uses `media-NNNNN.ts` (handled by
-// csvRowRE separately).
+// chunk-NNNNN filename — Plex Windows segmented-mkv shape (no extension).
+// HLS-mpegts uses `media-NNNNN.ts` (handled by csvRowRE separately).
 var mkvChunkFilenameRE = regexp.MustCompile(`^chunk-(\d+)$`)
 
 // chunkFilenamesFromCSV scans the segment_list CSV body for chunk-NNNNN
-// filenames. Used by the relay to determine which chunks to patch before
-// forwarding the CSV to PMS.
+// filenames. Used by the relay to determine which chunks to patch
+// in-place before forwarding the CSV to PMS.
 func chunkFilenamesFromCSV(body []byte) []string {
 	var out []string
 	for _, line := range bytes.Split(body, []byte("\n")) {
@@ -58,26 +57,26 @@ func sessionDirFromManifestURL(urlPath string) string {
 
 // patchSessionMatroskaChunks reads each chunk file in `dir`, patches
 // every Cluster's Timecode element by `offsetMs`, and writes the file
-// back. Used by the relay when forwarding a segment_list CSV POST to
-// PMS — patches must happen BEFORE the CSV announces chunks to PMS so
-// mpv reads consistent timecodes from the first byte (mpv anchors the
-// timeline to the first Cluster.Timecode it parses; if chunk-0 has
-// Timecode=0 the entire stream timeline reads as starting at 0,
-// breaking absolute position tracking and audio-track-swap).
+// back. Patching is idempotent (8-byte Timecode marker detection) so
+// segment_list_size=5 sliding-window POSTs that re-include the same
+// chunk multiple times don't stack the offset.
+//
+// PMS may read a chunk from the filesystem before our patcher runs
+// (race against ffmpeg's CSV POST), so on Plex Windows audio-track-
+// swap the FIRST chunk-0 sometimes lands on mpv with Timecode=0 and
+// the playhead resets to the front. Known minor UX issue — slider can
+// be re-clicked, no playback breakage.
 func patchSessionMatroskaChunks(dir string, names []string, offsetMs uint64) (int, error) {
 	if offsetMs == 0 || len(names) == 0 {
 		return 0, nil
 	}
 	patched := 0
 	for _, name := range names {
-		// Defence in depth: don't allow path traversal.
 		if strings.ContainsAny(name, "/\\") {
 			continue
 		}
 		p := path.Join(dir, name)
 		if err := patchMatroskaClusterTimecode(p, offsetMs); err != nil {
-			// Log but continue; a single bad chunk shouldn't block
-			// the rest of the CSV.
 			return patched, fmt.Errorf("patch %s: %w", name, err)
 		}
 		patched++

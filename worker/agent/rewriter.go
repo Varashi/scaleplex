@@ -2162,16 +2162,36 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// are stripped globally above for both HLS and the DASH+subs
 		// embedded-subtitle output. Don't duplicate the strip here.)
 
-		// Strip `-copyts` for HLS. Verified locally: with `-ss <off>` and
-		// `-copyts`, stock ffmpeg's segment muxer never emits a split — it
-		// writes one giant first segment containing the entire remaining
-		// runtime (observed: media-00173.ts grew to 222 MB / 23 min before
-		// finally splitting on Balls Up). Drop only `-copyts` and the splits
-		// resume at every keyframe past `-segment_time`. `-start_at_zero`
-		// stays in for AAC encoder priming (removing it caused 199-byte
-		// empty audio chunks earlier on DASH); `-avoid_negative_ts disabled`
-		// is also harmless on its own. Plex's ssegment fork apparently
-		// special-cases the copyts+seek path so they ship all three together.
+		// Strip `-copyts` for **mpegts-based** segmented output (HLS to
+		// mobile). With `-ss <off>` + `-copyts` and mpegts segments, stock
+		// ssegment fork special-cases it but stock segment muxer with
+		// mpegts emits one giant first segment containing the entire
+		// remaining runtime (observed: media-00173.ts grew to 222 MB /
+		// 23 min on Balls Up). Drop and splits resume at every keyframe.
+		//
+		// For **matroska-based** segmented output (Plex Windows desktop),
+		// KEEP `-copyts`. FFmpeg 7.1.3 has the upstream
+		// `reference_stream_first_pts` offset in libavformat/segment.c
+		// (lines 904-914) so the split logic accounts for non-zero start
+		// PTS. With -copyts kept, the matroska Cluster.Timecode is
+		// written directly as absolute (= -ss + local) — no need for our
+		// relay-side post-patching. mpv reads correct absolute timeline
+		// from byte 0, the audio-track-swap re-spawn passes the right
+		// offset back. Verified empirically 2026-05-11 on jellyfin-ffmpeg
+		// 7.1.3 with Burn Notice -ss 100: 20 chunks produced in 20s,
+		// chunk-0 PTS=100.017, chunk-5 PTS=205.038.
+		// Strip `-copyts` for all segmented output. Stock ffmpeg's
+		// segment muxer with `-copyts -start_at_zero -ss <off>` is
+		// inconsistent across `-ss` values on jellyfin-ffmpeg 7.1.3:
+		// for small `-ss` (initial play -ss 4) it splits at keyframes,
+		// but for large `-ss` (seek -ss 4801) the encoder processes
+		// frames (frame= advancing) yet zero chunks land on disk —
+		// verified 2026-05-11 with Big Hero 6 hevc_vaapi. Likely
+		// interaction between -start_at_zero's PTS rebase and VAAPI
+		// encoder GOP state post deep-seek. Stripping -copyts rebases
+		// packet PTS to 0; segment muxer splits reliably, and the
+		// relay's Cluster.Timecode patcher restores the absolute
+		// timeline for mpv.
 		if i := indexOfArg(args, "-copyts", 0); i >= 0 {
 			args = removeArgs(args, i, 1)
 			changes = append(changes, "hls:drop:-copyts")
@@ -2223,6 +2243,21 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 			break
 		}
+
+		// Stage-rename pattern attempted (rewriter swap to `chunk-%05d
+		// .tmp` + relay-side patch-and-rename to final chunk-N) —
+		// reverted 2026-05-11. ffmpeg's segment muxer occasionally
+		// produces 0-byte chunk files (verified live: chunks 00000,
+		// 00006, 00050 all 0 bytes amid populated neighbours); before
+		// stage-rename PMS tolerated these (CSV row + 0-byte file →
+		// player skipped). With stage-rename, the patcher dutifully
+		// renamed 0-byte .tmp files to final chunk-N names, making
+		// them indistinguishable from valid chunks. mpv read empty
+		// chunks → video corruption + audio desync. Reverted to keep
+		// chunks named chunk-N from ffmpeg's pen; relay patches in
+		// place (audio-track-swap playhead-reset remains a known
+		// minor UX issue).
+
 
 		// Matroska seek playhead-reset: known cosmetic issue 2026-05-11.
 		// On Plex Windows seek, the new transcode session produces chunks
@@ -2284,12 +2319,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// Pass the session's -ss as scaleplex_mkv_offset_ms so the
 				// relay can patch each chunk's Cluster.Timecode in-line
 				// with the CSV forward to PMS. Required for matroska-
-				// segment output (Plex Windows): mpv anchors its timeline
-				// to the first Cluster.Timecode it sees, and worker-side
-				// fsnotify patching loses the race against PMS's read of
-				// chunk-0. Setting this for HLS-mpegts shape is a no-op
-				// (chunk filenames are media-NNNNN.ts, don't match the
-				// relay's mkvChunkFilenameRE).
+				// segment output (Plex Windows): -copyts is stripped
+				// above so chunks have local 0-based PTS; the relay
+				// shifts Cluster.Timecode to absolute before PMS reads.
 				if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
 					if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
 						appendQuery(fmt.Sprintf("scaleplex_mkv_offset_ms=%d", uint64(v*1000)))

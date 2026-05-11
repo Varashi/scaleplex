@@ -75,12 +75,24 @@ func TestRewriter_PlexWindows_SegmentMkv_RewritesURL(t *testing.T) {
 	if !containsString(out.Changes, "hls:segment_list:rewrite-to-relay") {
 		t.Errorf("expected hls:segment_list:rewrite-to-relay tag: %v", out.Changes)
 	}
-	// -copyts dropped (stock segment muxer with -copyts + -ss won't split).
+	// -copyts stripped (segment muxer in FFmpeg 7.1.3 misbehaves with
+	// -copyts + -ss <large>: produces zero chunks despite frames
+	// flowing through the encoder, verified 2026-05-11 -ss 4801).
+	// Relay restores absolute Cluster.Timecode via the stage-rename
+	// patcher below.
 	if containsString(out.Args, "-copyts") {
-		t.Errorf("-copyts must be stripped: %v", out.Args)
+		t.Errorf("-copyts must be stripped for matroska segment shape: %v", out.Args)
 	}
 	if !containsString(out.Changes, "hls:drop:-copyts") {
 		t.Errorf("expected hls:drop:-copyts tag: %v", out.Changes)
+	}
+	// Output filename pattern stays `chunk-%05d` (no .tmp suffix).
+	// Stage-rename was tried + reverted 2026-05-11 — ffmpeg's 0-byte
+	// chunks broke the assumption that .tmp files always have content.
+	for _, a := range out.Args {
+		if a == "chunk-%05d.tmp" {
+			t.Errorf("output filename must NOT be chunk-%%05d.tmp: %v", out.Args)
+		}
 	}
 	// DASH-specific flags must NOT be injected on this shape.
 	if containsString(out.Args, "-extra_window_size") {
