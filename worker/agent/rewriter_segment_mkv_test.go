@@ -97,7 +97,17 @@ func TestRewriter_PlexWindows_SegmentMkv_RewritesURL(t *testing.T) {
 			t.Errorf("live=1 must be rewritten to live=0: %v", out.Args)
 		}
 	}
-	if !containsString(out.Changes, "hls:segment_format_options:live=1->live=0") {
-		t.Errorf("expected live=1->live=0 tag: %v", out.Changes)
+	if !containsString(out.Changes, "hls:segment_format_options:live=1->live=0+per-frame-clusters") {
+		t.Errorf("expected live=1->live=0+per-frame-clusters tag: %v", out.Changes)
+	}
+	// Check the actual options string is now the combined form.
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-segment_format_options" {
+			want := "live=0:cluster_time_limit=1000:cluster_size_limit=32768"
+			if out.Args[i+1] != want {
+				t.Errorf("segment_format_options: got %q want %q", out.Args[i+1], want)
+			}
+			break
+		}
 	}
 }
