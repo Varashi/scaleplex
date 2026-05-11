@@ -23,15 +23,15 @@ import (
 // when the client buffer dips again.
 func TestDutyCycle_EscalatesWithDepth(t *testing.T) {
 	cases := []struct {
-		depth     time.Duration
-		wantStop  time.Duration
-		wantCont  time.Duration
+		depth    time.Duration
+		wantStop time.Duration
+		wantCont time.Duration
 	}{
 		{0, 200 * time.Millisecond, 50 * time.Millisecond},
-		{29 * time.Second, 200 * time.Millisecond, 50 * time.Millisecond},
-		{30 * time.Second, 1000 * time.Millisecond, 50 * time.Millisecond},
-		{119 * time.Second, 1000 * time.Millisecond, 50 * time.Millisecond},
-		{120 * time.Second, 5000 * time.Millisecond, 50 * time.Millisecond},
+		{1 * time.Second, 200 * time.Millisecond, 50 * time.Millisecond},
+		{2 * time.Second, 1000 * time.Millisecond, 50 * time.Millisecond},
+		{14 * time.Second, 1000 * time.Millisecond, 50 * time.Millisecond},
+		{15 * time.Second, 5000 * time.Millisecond, 50 * time.Millisecond},
 		{1 * time.Hour, 5000 * time.Millisecond, 50 * time.Millisecond},
 	}
 	for _, tc := range cases {
