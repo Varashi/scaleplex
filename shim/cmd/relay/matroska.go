@@ -146,6 +146,16 @@ func patchClusterBody(body []byte, offsetMs uint64) ([]byte, bool) {
 	if !ok || szBytes == 0 {
 		return body, false
 	}
+	// Idempotence: stock matroska writes Timecode at minimum byte
+	// width — 1 byte for values 0..255, 2 bytes for 256..65535, etc.
+	// Our patcher always writes 8-byte fixed width (size byte 0x88).
+	// If the cluster's Timecode size byte is already 0x88, the
+	// cluster has been patched on a prior pass (segment_list_size=5
+	// sliding window POSTs the same chunk up to 5 times) — skip
+	// re-patching to avoid stacking the offset N times.
+	if body[pos+1] == 0x88 && szValue == 8 {
+		return body, false
+	}
 	valStart := pos + 1 + szBytes
 	valEnd := valStart + int(szValue)
 	if valEnd > len(body) {

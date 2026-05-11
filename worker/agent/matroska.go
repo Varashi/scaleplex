@@ -196,6 +196,12 @@ func patchClusterBody(body []byte, offsetMs uint64) ([]byte, bool) {
 	if !ok || szBytes == 0 {
 		return body, false
 	}
+	// Idempotence guard: see relay/matroska.go for full reasoning.
+	// Stock matroska writes minimum-width Timecode; our 8-byte 0x88
+	// marker means already patched.
+	if body[pos+1] == 0x88 && szValue == 8 {
+		return body, false
+	}
 	valStart := pos + 1 + szBytes
 	valEnd := valStart + int(szValue)
 	if valEnd > len(body) {
