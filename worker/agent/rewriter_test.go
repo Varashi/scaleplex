@@ -1005,15 +1005,22 @@ func TestRewriter_ManifestURL_CapturedAndStripped(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if containsString(out.Args, "-manifest_name") {
-		t.Fatal("-manifest_name must be stripped from argv")
-	}
+	// scaleplex-ffmpeg7 honours -manifest_name natively; the rewriter
+	// rewrites the URL in-place (loopback → relay base) instead of
+	// stripping and surfacing on ManifestURL.
 	wantURL := "http://relay.svc:32499/.../manifest?X-Plex-Http-Pipeline=infinite&X-Plex-Token=secret"
-	if out.ManifestURL != wantURL {
-		t.Fatalf("ManifestURL=%q want %q", out.ManifestURL, wantURL)
+	mnIdx := indexOfArg(out.Args, "-manifest_name", 0)
+	if mnIdx < 0 || mnIdx+1 >= len(out.Args) {
+		t.Fatal("-manifest_name must remain in argv (rewritten in-place)")
 	}
-	if !containsString(out.Changes, "manifest_name:captured-for-publisher") {
-		t.Fatalf("missing capture change: %v", out.Changes)
+	if out.Args[mnIdx+1] != wantURL {
+		t.Fatalf("-manifest_name value=%q want %q", out.Args[mnIdx+1], wantURL)
+	}
+	if out.ManifestURL != "" {
+		t.Fatalf("ManifestURL=%q want empty (rewritten in-place, no publisher)", out.ManifestURL)
+	}
+	if !containsString(out.Changes, "manifest_name:rewrite-to-relay") {
+		t.Fatalf("missing rewrite change: %v", out.Changes)
 	}
 }
 
@@ -1025,8 +1032,10 @@ func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
+	// Without SCALEPLEX_PMS_BASE_URL we still must strip the flag — ffmpeg's
+	// HTTP protocol handler cannot reach 127.0.0.1:32400 from the worker.
 	if containsString(out.Args, "-manifest_name") {
-		t.Fatal("-manifest_name must be stripped from argv")
+		t.Fatal("-manifest_name must be stripped from argv when no relay base")
 	}
 	if out.ManifestURL != "" {
 		t.Fatalf("ManifestURL=%q want empty when no base", out.ManifestURL)
@@ -1060,8 +1069,12 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	if out.SkipToSegment != 522 {
 		t.Fatalf("SkipToSegment=%d want 522", out.SkipToSegment)
 	}
-	if containsString(out.Args, "-skip_to_segment") {
-		t.Fatal("-skip_to_segment must be stripped from argv")
+	// scaleplex-ffmpeg7 honours -skip_to_segment natively; the rewriter
+	// captures the value (for checkpoint / metrics) but leaves the
+	// flag intact so dashenc starts numbering at N.
+	stsIdx := indexOfArg(out.Args, "-skip_to_segment", 0)
+	if stsIdx < 0 || out.Args[stsIdx+1] != "522" {
+		t.Fatal("-skip_to_segment must pass through to ffmpeg (value=522)")
 	}
 	// On seek, capture the seek offset for the renumber watcher's tfdt
 	// patch (stock dashenc writes tfdt=0 regardless of -ss/-copyts).
@@ -1088,8 +1101,10 @@ func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	if out.SkipToSegment != 1 {
 		t.Fatalf("SkipToSegment=%d want 1", out.SkipToSegment)
 	}
-	if containsString(out.Args, "-skip_to_segment") {
-		t.Fatal("-skip_to_segment must be stripped from argv")
+	// Passes through to ffmpeg (no strip) — scaleplex-ffmpeg7 honours it.
+	stsIdx := indexOfArg(out.Args, "-skip_to_segment", 0)
+	if stsIdx < 0 || out.Args[stsIdx+1] != "1" {
+		t.Fatal("-skip_to_segment must pass through to ffmpeg")
 	}
 	if containsString(out.Args, "-output_ts_offset") {
 		t.Errorf("must NOT inject -output_ts_offset on initial play (no -ss)")

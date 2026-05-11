@@ -873,17 +873,21 @@ func dropEAEPrefixFlags(args []string) ([]string, []string) {
 	return args, dropped
 }
 
-// captureManifestName strips `-manifest_name <url>` from args, rewrites
-// the loopback URL to SCALEPLEX_PMS_BASE_URL (so the agent can POST the
-// manifest body to the relay), and appends X_PLEX_TOKEN. Returns
-// updated args, the rewritten URL (empty when capture failed), and the
-// change tags to record.
+// captureManifestName rewrites `-manifest_name <url>` in-place: the
+// loopback URL (which workers can't reach) becomes the relay's base
+// URL, with X_PLEX_TOKEN appended. ffmpeg then PUTs the manifest body
+// to that URL natively via dashenc's HTTP protocol handler — no
+// worker-side publisher needed (scaleplex-ffmpeg7 backports Plex's
+// -manifest_name extension, libavformat/dashenc.c).
 //
-// Stock ffmpeg's dashenc treats -manifest_name as a filename and would
-// happily write into a file called `http:` — so we must always strip
-// it. Plex's fork POSTs the manifest body to the URL on every chunk
-// flush; we approximate by stripping here and posting from the agent
-// after each chunk write (see manifest_publish.go).
+// Returns (updated args, empty string, change tags). The empty string
+// preserves the prior helper signature (RewriteResult.ManifestURL is
+// still wired through call sites and consumed by manifest_publish.go,
+// but the publisher is now a no-op when ManifestURL is empty).
+//
+// If the URL doesn't look like a PMS loopback or no SCALEPLEX_PMS_BASE_URL
+// is set we strip the flag entirely — stock dashenc would write the
+// manifest into a file literally named `http:` otherwise.
 func captureManifestName(args []string, inputEnv map[string]string) ([]string, string, []string) {
 	i := indexOfArg(args, "-manifest_name", 0)
 	if i < 0 || i+1 >= len(args) {
@@ -894,7 +898,6 @@ func captureManifestName(args []string, inputEnv map[string]string) ([]string, s
 		base = envBase
 	}
 	origURL := args[i+1]
-	args = removeArgs(args, i, 2)
 	if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
 		rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
 		if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
@@ -904,8 +907,10 @@ func captureManifestName(args []string, inputEnv map[string]string) ([]string, s
 				rewritten += "?X-Plex-Token=" + tok
 			}
 		}
-		return args, rewritten, []string{"manifest_name:captured-for-publisher"}
+		args[i+1] = rewritten
+		return args, "", []string{"manifest_name:rewrite-to-relay"}
 	}
+	args = removeArgs(args, i, 2)
 	return args, "", []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
 }
 
@@ -1138,24 +1143,17 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	out := cloneArgs(args)
 	changes := []string{"decode:remux:" + dec, "encode:copy(passthrough)"}
 
-	// 1. Strip Plex-private flags. The main rewrite path handles each
-	// of these at the right phase; for an optimize-remux session we
-	// take the fast path and strip them here.
-	//   -delete_removed, -skip_to_segment, -break_non_keyframes:
-	//     Plex's dashenc.c additions
-	//   -segment_list_{separate_stream_times,unfinished}: Plex's
-	//     segment.c additions (sub pipeline)
-	//   -strict_ts*: Plex movenc/dashenc extension
-	//   -loglevel_plex: Plex stderr level
-	// `-manifest_name <url>` is handled separately below — it must be
-	// captured (for relay POST) before stripping.
+	// 1. Strip Plex-private flags. scaleplex-ffmpeg7 natively supports
+	// the dashenc additions (`-delete_removed`, `-skip_to_segment`,
+	// `-break_non_keyframes`, `-manifest_name`) and segment.c
+	// additions (`-segment_list_*`), so those pass through unchanged.
+	// Only the truly Plex-runtime-only flags remain on the strip-list.
+	//   -strict_ts*: Plex movenc extension (not in our fork)
+	//   -loglevel_plex: Plex stderr level alias
+	// `-manifest_name <url>` URL gets rewritten in-place below so the
+	// HTTP PUT lands on the relay instead of the worker's loopback.
 	for _, flag := range []string{
 		"-loglevel_plex",
-		"-delete_removed",
-		"-skip_to_segment",
-		"-break_non_keyframes",
-		"-segment_list_separate_stream_times",
-		"-segment_list_unfinished",
 		"-strict_ts:0",
 		"-strict_ts",
 	} {
@@ -1176,23 +1174,6 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	var manifestChanges []string
 	out, manifestURL, manifestChanges = captureManifestName(out, inputEnv)
 	changes = append(changes, manifestChanges...)
-
-	// Keep every chunk on disk for the lifetime of the session. Plex's
-	// `-delete_removed false` (which we stripped above) is the upstream
-	// way; stock dashenc uses `-extra_window_size`. Inject a very large
-	// value so old chunks survive the sliding manifest window. Without
-	// this, ffmpeg deletes chunk-stream0-00004 once chunk 14 is written
-	// (default window=5+5=10), PMS 404's on rewinds and early-chunk
-	// fetches, and the player spinners after ~15s of playback.
-	if indexOfArg(out, "-extra_window_size", 0) < 0 {
-		for k := 0; k+1 < len(out); k++ {
-			if out[k] == "-f" && out[k+1] == "dash" {
-				out = spliceArgs(out, k, "-extra_window_size", "999999")
-				changes = append(changes, "inject:-extra_window_size=999999")
-				break
-			}
-		}
-	}
 
 	for {
 		i := indexOfArg(out, "-xioerror", 0)
@@ -1330,7 +1311,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// every such session 8'd out, blocking PMS marker generation.
 	scrubPlexFlagsOnBail := func(args []string) ([]string, []string) {
 		var bailChanges []string
-		for _, flag := range []string{"-loglevel_plex", "-progressurl", "-delete_removed"} {
+		for _, flag := range []string{"-loglevel_plex", "-progressurl"} {
 			for {
 				i := indexOfArg(args, flag, 0)
 				if i < 0 || i+1 >= len(args) {
@@ -2093,7 +2074,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	//                              we strip Plex's flag and inject a huge
 	//                              extra_window_size below to keep
 	//                              everything around.
-	for _, flag := range []string{"-loglevel_plex", "-delete_removed"} {
+	for _, flag := range []string{"-loglevel_plex"} {
 		if i := indexOfArg(args, flag, 0); i >= 0 {
 			args = removeArgs(args, i, 2)
 			changes = append(changes, "drop:"+flag)
@@ -2136,38 +2117,23 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	// `-skip_to_segment N` — Plex DASH muxer extension that starts the
-	// dash muxer's segment_index at N. Used on seek transcode sessions
-	// (with a matching `-ss <offset>`) so chunk-stream0-NNNNN.m4s
-	// aligns with PMS's expected URL `.../0/(N-1).m4s`. Stock dashenc
-	// always counts from 1, so we capture N for the chunk-renumber
-	// watcher (segwatch.go) to hardlink ffmpeg's 1-indexed output to
-	// the N-indexed names PMS expects. Zero = initial-play session.
+	// dash muxer's segment_index at N. scaleplex-ffmpeg7 backports this
+	// natively (libavformat/dashenc.c patch 0095) so the flag flows
+	// straight through and ffmpeg emits chunk-stream0-NNNNN.m4s with
+	// N matching PMS's URL expectation. Capture the value only so
+	// segwatch / checkpoint can record it; do NOT strip the flag.
 	skipToSegment := 0
 	if i := indexOfArg(args, "-skip_to_segment", 0); i >= 0 && i+1 < len(args) {
 		if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
 			skipToSegment = n
-			changes = append(changes, "skip_to_segment:captured="+args[i+1])
+			changes = append(changes, "skip_to_segment:passthrough="+args[i+1])
 		}
-		args = removeArgs(args, i, 2)
 	}
 
-	// Keep every chunk on disk for the lifetime of the session. Stock
-	// dashenc deletes segments once they fall `extra_window_size` past
-	// the manifest's sliding window (default 5 + 5 = 10 newest); PMS's
-	// universal serve-chunk handler 404s the client when it asks for
-	// chunk 3 and ffmpeg already deleted it. Inject a very large
-	// extra_window_size so segments stick around. (We can't use 0 —
-	// that means "extra zero", same as deletion-on-rotate.) DASH-only:
-	// stock segment muxer for HLS retains all .ts files by default.
-	if !isHLS && indexOfArg(args, "-extra_window_size", 0) < 0 {
-		for k := 0; k+1 < len(args); k++ {
-			if args[k] == "-f" && args[k+1] == "dash" {
-				args = spliceArgs(args, k, "-extra_window_size", "999999")
-				changes = append(changes, "inject:-extra_window_size=999999")
-				break
-			}
-		}
-	}
+	// `-delete_removed false` (Plex DASH extension, also backported)
+	// keeps chunks on disk past the sliding manifest window — PMS
+	// serves rewind / early-fetch via direct file read. No more need
+	// for our previous `-extra_window_size 999999` injection hack.
 
 	// Force CMAF-style segments (moof+mdat only, no per-segment moov).
 	//
