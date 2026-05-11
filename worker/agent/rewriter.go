@@ -2202,45 +2202,23 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			break
 		}
 
-		// Inject `-output_ts_offset <seek_offset>` for matroska-shape
-		// segment output on seek sessions. We stripped `-copyts` above
-		// (segment muxer with -copyts + -ss won't split). With copyts
-		// gone, packet PTS rebases to 0 after -ss. For mpegts segments
-		// (Plex Android HLS) this is fine: relay rewrites the CSV
-		// timestamps to global, mpegts container has discontinuity
-		// markers, and Plex reads playback position from playlist
-		// metadata. For matroska segments (Plex Windows desktop), PMS
-		// serves header+chunks concatenated via /transcode/universal/
-		// start and the client tracks playback position FROM matroska
-		// Cluster Timecode, which is set directly from packet PTS. With
-		// PTS rebased to 0, the player shows position=0 even after a
-		// seek to 4900s — slider position is correct (manifest has full
-		// Duration) but the playhead circle resets to the front of the
-		// timeline on every seek (live repro 2026-05-11 Big Hero 6).
+		// Matroska seek playhead-reset: known cosmetic issue 2026-05-11.
+		// On Plex Windows seek, the new transcode session produces chunks
+		// with locally-rebased PTS (-copyts stripped so segment muxer
+		// can split). Matroska Cluster Timecode starts at 0, Plex
+		// Windows client interprets that as playback position 0 and
+		// resets the slider thumb to the front — even though `Duration`
+		// in the header is correct and seeking continues to function.
 		//
-		// `-output_ts_offset N` shifts every output packet PTS by +N
-		// before muxing, restoring global-timeline matroska Cluster
-		// Timecodes without breaking the segment muxer's split logic.
-		// Limit to matroska only — adding the offset to mpegts shape
-		// would interact with the relay's CSV rewrite (which already
-		// produces global times via the regex+seg_time math) and
-		// produce double-shifted timestamps.
-		segFormat := ""
-		if i := indexOfArg(args, "-segment_format", 0); i >= 0 && i+1 < len(args) {
-			segFormat = args[i+1]
-		}
-		if segFormat == "matroska" && indexOfArg(args, "-output_ts_offset", 0) < 0 {
-			if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
-				if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
-					// Insert before -f segment so it lands in output
-					// option scope.
-					if fIdx := indexOfArg(args, "-f", 0); fIdx >= 0 {
-						args = spliceArgs(args, fIdx, "-output_ts_offset", args[ssIdx+1])
-						changes = append(changes, fmt.Sprintf("hls:inject:-output_ts_offset=%.3fs", v))
-					}
-				}
-			}
-		}
+		// Tried injecting `-output_ts_offset <seek>` to shift output
+		// PTS back to global. Verified live 2026-05-11 Big Hero 6: it
+		// breaks segment splits exactly like `-copyts` does (single
+		// ~90s chunk instead of 90 1s chunks → playback freezes).
+		// Stock segment muxer doesn't support non-zero start PTS for
+		// its split logic. Plex's fork patches libavformat/segment.c
+		// to offset `end_pts` by `reference_stream_first_pts` so the
+		// threshold tracks correctly; we can't replicate without a
+		// custom ffmpeg build. Park as accepted cosmetic issue.
 
 		// Rewrite -segment_list URL to the relay address. Plex points it
 		// at 127.0.0.1:32400 (PMS's loopback) which the worker pod can't
