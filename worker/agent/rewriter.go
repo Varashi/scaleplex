@@ -2065,26 +2065,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Plex-private segment-muxer / fork-only flags. Strip globally —
-	// they appear on HLS argv (the primary output) AND on the embedded
-	// subtitle pipeline that Plex appends as a second `-f segment` on
-	// DASH transcodes when the source has embedded ASS subs. Stock
-	// ffmpeg's segment muxer rejects each with "Unrecognized option
-	// '<flag>'. Error splitting the argument list" — observed:
-	//   - 2026-05-06 LG WebOS HLS Balls Up: -segment_list_unfinished
-	//   - 2026-05-06 Chrome DASH Superman: -strict_ts:0,
-	//     -segment_list_separate_stream_times (on subtitle output)
-	for _, flag := range []string{"-segment_list_separate_stream_times", "-segment_list_unfinished"} {
-		for {
-			i := indexOfArg(args, flag, 0)
-			if i < 0 || i+1 >= len(args) {
-				break
-			}
-			args = removeArgs(args, i, 2)
-			changes = append(changes, "drop:"+flag)
-		}
-	}
-	// `-strict_ts*` (any stream specifier suffix) — same family.
+	// `-segment_list_separate_stream_times` + `-segment_list_unfinished`
+	// are accepted natively by scaleplex-ffmpeg7's segment muxer (patch
+	// 0096-segment-plex-fork-options-stub — registered as no-op AVOptions
+	// today; full per-stream end-time tracking + #-prefix CSV emit
+	// scheduled for Phase 2b). PMS sends both on HLS and on the
+	// embedded subtitle pipeline; passthrough is harmless until 2b.
+	//
+	// `-strict_ts*` (any stream specifier suffix) — Plex movenc/dashenc
+	// extension, no equivalent in our fork yet, must still strip.
 	for {
 		i := -1
 		for j := 0; j < len(args); j++ {
