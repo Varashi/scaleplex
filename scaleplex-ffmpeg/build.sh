@@ -17,10 +17,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 TAG="${1:-$(tr -d '[:space:]' < VERSION)}"
-# Workdir lives outside the source tree by default so the heavy
-# checkout + build artifacts don't pollute git. Override with
-# WORKDIR_BASE to keep it adjacent to the source.
-WORKDIR_BASE="${WORKDIR_BASE:-/build/scaleplex-ffmpeg-build}"
+# Workdir picks the first writable location available:
+#   1. $WORKDIR_BASE (explicit override)
+#   2. /build/scaleplex-ffmpeg-build (local fast-disk mount, if present)
+#   3. $RUNNER_TEMP/scaleplex-ffmpeg-build (GHA hosted runner)
+#   4. ./.build adjacent to this script (final fallback — gitignored)
+if [[ -n "${WORKDIR_BASE:-}" ]]; then
+  :
+elif [[ -d /build && -w /build ]]; then
+  WORKDIR_BASE=/build/scaleplex-ffmpeg-build
+elif [[ -n "${RUNNER_TEMP:-}" ]]; then
+  WORKDIR_BASE="${RUNNER_TEMP}/scaleplex-ffmpeg-build"
+else
+  WORKDIR_BASE="$(pwd)"
+fi
 WORKDIR="${WORKDIR_BASE}/.build"
 DIST="$(pwd)/dist"
 PATCHES="$(pwd)/patches"
