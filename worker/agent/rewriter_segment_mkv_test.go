@@ -86,4 +86,18 @@ func TestRewriter_PlexWindows_SegmentMkv_RewritesURL(t *testing.T) {
 	if containsString(out.Args, "-extra_window_size") {
 		t.Errorf("-extra_window_size must not be injected for -f segment: %v", out.Args)
 	}
+	// segment_format_options: live=1 must be rewritten to live=0 so
+	// the stock matroska muxer writes Duration from -metadata into the
+	// header. Plex's fork patches matroskaenc.c to always write
+	// Duration regardless of live mode; stock honours is_live and
+	// skips. Without the rewrite, Plex Windows client sees an
+	// unknown-duration matroska stream and shows a growing slider.
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-segment_format_options" && out.Args[i+1] == "live=1" {
+			t.Errorf("live=1 must be rewritten to live=0: %v", out.Args)
+		}
+	}
+	if !containsString(out.Changes, "hls:segment_format_options:live=1->live=0") {
+		t.Errorf("expected live=1->live=0 tag: %v", out.Changes)
+	}
 }

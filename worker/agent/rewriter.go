@@ -2171,6 +2171,37 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			changes = append(changes, "hls:drop:-copyts")
 		}
 
+		// Rewrite `-segment_format_options live=1` → `live=0` (Plex Windows
+		// segmented-matroska shape). Plex's matroska muxer fork patches
+		// matroskaenc.c at line 2561 to ALWAYS write the Matroska Duration
+		// element from `-metadata duration=` even in live mode (`!is_live
+		// || 1`). Stock matroska honours `is_live`: with live=1 the Duration
+		// element is skipped entirely, so the segment_header file lands on
+		// disk without Duration. The Plex Windows client reads the
+		// concatenated header+chunks via `/transcode/universal/start`, sees
+		// no Duration in the matroska header, and falls back to inferring
+		// duration from received bytes — slider shows 5 min, growing as
+		// transcode produces chunks (verified live 2026-05-11 Big Hero 6
+		// 8 Mbps 1080p, user couldn't seek past "current produced" mark).
+		//
+		// Setting live=0 makes stock write Duration from -metadata into
+		// the header file. Side effects (SeekHead writing + end-of-stream
+		// seek-back to update Duration) are no-ops here: segment muxer
+		// captures only header bytes up to first Cluster, so later
+		// seek-backs land in chunk files and don't touch the already-
+		// written header. Empirically validated 2026-05-11 with testsrc2:
+		// live=0 header has 0x4489 Duration = 6112352ms; live=1 doesn't.
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] != "-segment_format_options" {
+				continue
+			}
+			if args[i+1] == "live=1" {
+				args[i+1] = "live=0"
+				changes = append(changes, "hls:segment_format_options:live=1->live=0")
+			}
+			break
+		}
+
 		// Rewrite -segment_list URL to the relay address. Plex points it
 		// at 127.0.0.1:32400 (PMS's loopback) which the worker pod can't
 		// reach. Same pattern as -progressurl / -manifest_name. Stock
