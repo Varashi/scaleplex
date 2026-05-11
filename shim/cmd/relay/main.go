@@ -107,18 +107,11 @@ func main() {
 			// Read body once; we may both patch chunks AND rewrite rows.
 			body, err := io.ReadAll(r.Body)
 			if err == nil {
-				// Matroska chunk patching: shift every Cluster.Timecode
-				// by the session's -ss offset BEFORE PMS announces these
-				// chunks to mpv. mpv anchors its timeline to the first
-				// Cluster.Timecode it parses out of /transcode/universal/
-				// start, so if chunk-0 has Timecode=0 the entire stream
-				// reads as starting at 0, breaking absolute position
-				// tracking, audio-track-swap continuation, and triggering
-				// audio sync drift. Worker-side fsnotify patching loses
-				// this race (chunk-0 patched ~1s after creation, but PMS
-				// reads it via the CSV POST that happens BEFORE the next
-				// chunk's CREATE event fires). Doing it here, in-line
-				// with the CSV forward, gives synchronous ordering.
+				// Matroska chunk in-place patching. Shifts every Cluster's
+				// Timecode element by the session's -ss offset so mpv
+				// anchors its timeline to the right absolute position.
+				// Idempotent — segment_list_size=5 sliding-window POSTs
+				// that re-mention older chunks don't stack the offset.
 				if mkvOffsetMsStr != "" {
 					if offsetMs, err := strconv.ParseUint(mkvOffsetMsStr, 10, 64); err == nil && offsetMs > 0 {
 						dir := sessionDirFromManifestURL(r.URL.Path)
