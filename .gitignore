@@ -7,6 +7,7 @@ node_modules/
 dist/
 build/
 target/
+scaleplex-ffmpeg/.build/
 
 # Go build artifacts
 worker/agent/agent

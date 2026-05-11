@@ -1,0 +1,42 @@
+Description: matroskaenc: always write Duration in header
+ Stock matroska muxer skips the Duration field in the header when
+ `is_live=1`. Plex's segment muxer drives matroskaenc with `live=1`
+ (each chunk is a self-contained matroska stream that begins/ends
+ without seeking the IO), but Plex clients (Plex for Windows in
+ particular — mpv-based) need Duration to position the slider and
+ enable seek before the trailing chunks arrive.
+
+ Plex's own ffmpeg fork uses the same short-circuit (`|| 1`) — port
+ verbatim. The rest of the is_live semantics (no SeekHead, no Cues)
+ stay intact.
+
+ The Duration value comes from `s->duration` (recording time) or
+ `get_metadata_duration()` (container metadata). In scaleplex's case,
+ PMS sets `-metadata duration=<microseconds>` on the encoder cmdline,
+ so metadata_duration is populated and lands in the header.
+
+ Without this patch scaleplex must use `live=0` for matroska-segmented
+ output (Plex Windows shape) and compensate via per-frame clusters,
+ which produces 14-byte Cluster headers per video frame and bloats
+ the chunk stream. With this patch we keep `live=1` + default cluster
+ cadence.
+Origin: backport, https://github.com/plexinc/plex-media-server-ffmpeg-gpl
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-11
+---
+--- a/libavformat/matroskaenc.c
++++ b/libavformat/matroskaenc.c
+@@ -2570,7 +2570,11 @@ static int mkv_write_info(AVFormatContex
+     // reserve space for the duration
+     mkv->duration = 0;
+     mkv->duration_offset = avio_tell(pb);
+-    if (!mkv->is_live) {
++    // scaleplex: always write Duration regardless of is_live. Plex's
++    // Windows desktop client (mpv) reads Duration from the header to
++    // position the slider; without it the slider grows incrementally
++    // and seek-to-position is broken until all chunks arrive.
++    if (!mkv->is_live || 1) {
+         int64_t metadata_duration = get_metadata_duration(s);
+
+         if (s->duration > 0) {
