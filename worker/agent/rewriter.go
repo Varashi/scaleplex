@@ -2202,8 +2202,24 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				continue
 			}
 			if args[i+1] == "live=1" {
-				args[i+1] = "live=0"
-				changes = append(changes, "hls:segment_format_options:live=1->live=0")
+				// live=0: stock writes matroska Duration from -metadata
+				//   into the segment_header file (Plex Windows client uses
+				//   it to fill the seekbar with full source duration).
+				// cluster_time_limit=1000 + cluster_size_limit=32768:
+				//   force per-frame clusters. With live=0, stock's defaults
+				//   are 5s/5MB → one cluster per ~5s chunk. Plex Windows
+				//   tracks playback position (and the offset it sends to
+				//   PMS on audio-track-switch / quality-change / re-spawn)
+				//   from Cluster.Timecode. Per-frame clusters match what
+				//   Plex-native matroskaenc.c produces under live=1
+				//   defaults; verified 2026-05-11 against production PMS
+				//   chunk 5 — 25 clusters per 1s chunk at 8 Mbps. Without
+				//   per-frame clusters the client falls back to elapsed-
+				//   since-stream-start, so audio-swap re-spawns the
+				//   transcode at offset=elapsed → playback restarts from
+				//   the front.
+				args[i+1] = "live=0:cluster_time_limit=1000:cluster_size_limit=32768"
+				changes = append(changes, "hls:segment_format_options:live=1->live=0+per-frame-clusters")
 			}
 			break
 		}
