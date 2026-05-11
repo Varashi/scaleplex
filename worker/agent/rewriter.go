@@ -82,6 +82,12 @@ type RewriteResult struct {
 	// own timescale` to each tfdt baseMediaDecodeTime + sidx
 	// earliest_presentation_time after rename. Zero on initial play.
 	SeekOffsetSeconds float64
+	// IsMatroskaSegment — true when output shape is `-f segment
+	// -segment_format matroska` (Plex Windows desktop, segmented
+	// matroska delivered via /transcode/universal/start byte stream).
+	// The agent uses this to start `watchAndPatchMatroskaChunks`
+	// instead of the DASH-style chunk-renumber watcher.
+	IsMatroskaSegment bool
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -2417,6 +2423,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	env = setWorkerHomeEnv(env)
 	changes = append(changes, "env:HOME")
 
+	isMatroskaSegment := false
+	if outputFormat == "segment" {
+		if i := indexOfArg(args, "-segment_format", 0); i >= 0 && i+1 < len(args) && args[i+1] == "matroska" {
+			isMatroskaSegment = true
+		}
+	}
+
 	return RewriteResult{
 		Args:              args,
 		Env:               env,
@@ -2427,6 +2440,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		SkipToSegment:     skipToSegment,
 		SeekOffsetSeconds: seekOffsetSeconds,
 		SubtitleExtract:   subExtract,
+		IsMatroskaSegment: isMatroskaSegment,
 	}
 }
 
