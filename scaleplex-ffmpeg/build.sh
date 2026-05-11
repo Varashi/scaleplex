@@ -94,6 +94,12 @@ cat > "$WORKDIR/Dockerfile" <<EOF
 # quilt during dpkg-buildpackage's source-prep — no need to apply here.
 FROM ${DEPS_REF}
 
+# The deps image cleans /var/lib/apt/lists/* in its final RUN to keep
+# size down. mk-build-deps needs a populated apt cache to verify the
+# Build-Depends from debian/control are present. Refresh lists once
+# here — cheap and lets the build-only phase resolve packages.
+RUN apt-get update
+
 COPY patches/ /scaleplex-patches/
 
 # Drop patches into debian/patches/ + append filenames to series. Done at
