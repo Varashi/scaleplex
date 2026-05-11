@@ -1138,17 +1138,6 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	out := cloneArgs(args)
 	changes := []string{"decode:remux:" + dec, "encode:copy(passthrough)"}
 
-	// Capture `-skip_to_segment N` before stripping — segwatch.go uses
-	// it to hardlink stock ffmpeg's 1-indexed chunk output to the
-	// N-indexed names PMS expects on seek transcode sessions. N=1
-	// (initial play) is a no-op for the renumber watcher.
-	skipToSegment := 0
-	if i := indexOfArg(out, "-skip_to_segment", 0); i >= 0 && i+1 < len(out) {
-		if n, err := strconv.Atoi(out[i+1]); err == nil && n > 0 {
-			skipToSegment = n
-		}
-	}
-
 	// 1. Strip Plex-private flags. The main rewrite path handles each
 	// of these at the right phase; for an optimize-remux session we
 	// take the fast path and strip them here.
