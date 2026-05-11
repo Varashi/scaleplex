@@ -62,18 +62,22 @@ var (
 // — that's the only path by which canThrottle can be cleared, so we
 // must not silence it even on the most aggressive tier.
 //
-// Tier rationale (validated against typical PMS behaviour 2026-05-10):
-//   - <30s:   normal client buffer-ahead, expect frequent on/off churn.
-//             Light pause keeps GPU mostly fed.
-//   - 30-120s: client has stopped consuming; might be paused / tab
-//             backgrounded. Burn ~5% GPU.
-//   - 120s+:   almost certainly abandoned tab, PMS hasn't yet timed
-//             out the session. Burn ~1% GPU until PMS releases.
+// Tier rationale (validated 2026-05-10, escalation tightened 2026-05-11):
+// Plex's `TranscoderThrottleBuffer` pref is intended as a HARD CAP via
+// pause-and-resume — Plex-native ffmpeg fully sleeps the encode loop on
+// canThrottle. Stock ffmpeg keeps running, so we approximate via
+// SIGSTOP/SIGCONT pulses; the lighter the duty cycle, the closer we
+// approximate a true pause. Escalate fast so the buffer stops growing
+// quickly after the first canThrottle signal lands.
+//   - <2s:    brief warmup before slamming hard; avoids spurious
+//             pause-resume churn on transient signals.
+//   - 2-15s:  moderate throttle (~5%) for typical buffer-ahead.
+//   - 15s+:   aggressive (~1%) for sustained throttle — buffer drains.
 func dutyCycle(depth time.Duration) (stop, cont time.Duration) {
 	switch {
-	case depth < 30*time.Second:
+	case depth < 2*time.Second:
 		return 200 * time.Millisecond, 50 * time.Millisecond
-	case depth < 120*time.Second:
+	case depth < 15*time.Second:
 		return 1000 * time.Millisecond, 50 * time.Millisecond
 	default:
 		return 5000 * time.Millisecond, 50 * time.Millisecond
@@ -111,13 +115,22 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 	pgid := -pid // syscall.Kill semantics: negative = process group
 	wasOn := false
 	throttledStart := time.Now() // only meaningful while wasOn=true
+	lastOff := time.Time{}       // time of last ON→OFF transition
 	gauge := metricThrottleState.WithLabelValues(sessionID)
 	counter := metricThrottleSeconds.WithLabelValues(sessionID)
 	depthGauge := metricThrottleDepthSeconds.WithLabelValues(sessionID)
 
+	// Sticky depth window: PMS's canThrottle signal flaps ON/OFF every
+	// few seconds as the client buffer hovers near the
+	// TranscoderThrottleBuffer threshold. Without hysteresis, depth
+	// resets on every OFF and we stay stuck at the lightest tier
+	// (200/50, ~20% throughput at 15x realtime = +20s buffer per second
+	// of wall — buffer climbs to 10+ min in minutes). With sticky depth
+	// across brief OFFs (<10s gap), we accumulate enough cumulative ON
+	// time to escalate to the heavier tiers (~1% at 15s+).
+	const stickyOffGrace = 10 * time.Second
+
 	flush := func() {
-		// Final SIGCONT on shutdown so the parent's cmd.Wait isn't
-		// staring at a stopped child. ESRCH is fine.
 		_ = syscall.Kill(pgid, syscall.SIGCONT)
 		if wasOn {
 			counter.Add(time.Since(throttledStart).Seconds())
@@ -135,8 +148,15 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 
 		if on != wasOn {
 			if on {
-				log.Printf("session %s: throttle ON (PMS canThrottle)", sessionID)
-				throttledStart = time.Now()
+				if !lastOff.IsZero() && time.Since(lastOff) < stickyOffGrace {
+					// Brief OFF — keep prior depth so we escalate
+					// across flaps instead of restarting at light tier.
+					log.Printf("session %s: throttle ON (resumed after %.1fs gap, depth %.1fs)",
+						sessionID, time.Since(lastOff).Seconds(), time.Since(throttledStart).Seconds())
+				} else {
+					log.Printf("session %s: throttle ON (PMS canThrottle)", sessionID)
+					throttledStart = time.Now()
+				}
 				gauge.Set(1)
 			} else {
 				depth := time.Since(throttledStart)
@@ -144,6 +164,7 @@ func throttleController(ctx context.Context, sessionID string, pid int, sig *thr
 				counter.Add(depth.Seconds())
 				gauge.Set(0)
 				depthGauge.Set(0)
+				lastOff = time.Now()
 				if err := syscall.Kill(pgid, syscall.SIGCONT); err != nil && err != syscall.ESRCH {
 					log.Printf("session %s: SIGCONT pgid=%d: %v", sessionID, pgid, err)
 				}
