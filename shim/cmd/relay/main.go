@@ -34,6 +34,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -144,10 +145,27 @@ func main() {
 			}
 		}
 
-		out, err := http.NewRequestWithContext(r.Context(), method, u.String(), bodyReader)
+		// Detach from r.Context() for manifest POSTs: ffmpeg's segment
+		// muxer fire-and-forgets the body then closes its end of the
+		// connection, which cancels r.Context() before we can finish
+		// reading the body, patching chunks, and forwarding to PMS.
+		// `client.Do` sees the canceled context and the forward never
+		// reaches PMS. Use a fresh context with a generous timeout so
+		// the forward survives ffmpeg's eager close.
+		forwardCtx := r.Context()
+		if manifestPathRE.MatchString(r.URL.Path) {
+			var cancel context.CancelFunc
+			forwardCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+		}
+		out, err := http.NewRequestWithContext(forwardCtx, method, u.String(), bodyReader)
 		if err != nil {
+			log.Printf("relay forward NewRequest %s %s: %v", method, u.String(), err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+		if manifestPathRE.MatchString(r.URL.Path) {
+			log.Printf("relay forward %s %s contentLen=%d", method, u.Path, contentLen)
 		}
 		if contentLen >= 0 && bodyReader != r.Body {
 			out.ContentLength = contentLen
@@ -167,8 +185,12 @@ func main() {
 
 		resp, err := client.Do(out)
 		if err != nil {
+			log.Printf("relay forward client.Do %s %s: %v", method, u.Path, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+		if manifestPathRE.MatchString(r.URL.Path) {
+			log.Printf("relay forward done %s %s -> %d", method, u.Path, resp.StatusCode)
 		}
 		defer resp.Body.Close()
 
