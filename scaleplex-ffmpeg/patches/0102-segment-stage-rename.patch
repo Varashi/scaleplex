@@ -1,0 +1,96 @@
+Description: segment: stage-rename HLS chunks (scaleplex)
+ ffmpeg's ssegment muxer writes chunks directly to their canonical
+ filename and POSTs the segment_list CSV row to the URL handler as
+ soon as the segment closes. When PMS reads the chunk over the same
+ NFS mount the worker writes to (scaleplex's setup), it can open
+ the file mid-write and serve a 0-byte or partial response. Plex
+ clients treat the empty segment as a gap and jump forward,
+ surfacing as "video forwarded multiple seconds" skips.
+ .
+ This patch mirrors Plex Transcoder's libavformat/segment.c stage-
+ rename pattern. Each chunk is written to <final>.tmp; immediately
+ after av_write_trailer (and BEFORE the segment_list CSV row is
+ POSTed) the .tmp file is rename()'d to the final canonical name.
+ PMS only ever opens the canonical filename, and only after the
+ atomic rename — so it always sees a complete chunk. Plex's
+ version gates on `!seg->list`; ours always fires because our
+ seg->list is the URL handler that informs PMS, so the race
+ between row POST and PMS open is exactly what stage-rename
+ closes.
+ .
+ No new option; no opt-in. The added work per chunk is one
+ rename() syscall (microseconds). avio_close has already flushed
+ ffmpeg's userspace buffer to the kernel before this rename, so
+ the file's contents are complete; rename atomicity guarantees
+ PMS never observes a partial canonical name.
+ .
+ Earlier iteration of this patch added an `-segment_fsync` option
+ to force an NFS COMMIT before the rename. Live testing on Big
+ Hero 6 4K HDR HEVC + PGS overlay confirmed rename-only is the
+ actual fix — kernel page-cache coherence between writer (worker
+ pod) and reader (PMS pod) on the same NFS mount makes the
+ server-side commit irrelevant for the consistency we need.
+ Stage-rename eliminates the skip; fsync was over-engineering at
+ a ~20% encoder pace cost.
+Origin: backport (minimal), https://github.com/Diagonactic/plex-new-transcoder
+        plex-ffmpeg-source/NewPlexTranscoder/libavformat/segment.c
+        (stage-rename pattern; Plex gates on !seg->list, ours always fires)
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-12
+---
+--- a/libavformat/segment.c	2026-05-12 19:26:10.459932320 +0200
++++ b/libavformat/segment.c	2026-05-12 20:28:26.487799177 +0200
+@@ -231,6 +231,27 @@
+              seg->entry_prefix ? seg->entry_prefix : "",
+              av_basename(oc->url));
+ 
++    /* scaleplex: stage-rename. Write chunk to <final>.tmp; rename to
++     * final in segment_end before the segment_list CSV row gets
++     * POSTed. The CSV row (cur_entry.filename above) stays as the
++     * FINAL name so PMS receives the canonical filename and only
++     * ever opens it after the atomic rename — never mid-write.
++     * Without this, ffmpeg writes directly to the canonical filename
++     * which PMS may open mid-write via the shared NFS mount and
++     * serve as 0 bytes / partial → Plex client treats the segment
++     * as a gap and jumps forward. Mirrors Plex Transcoder's pattern
++     * in libavformat/segment.c (their version is gated on
++     * `!seg->list`; we always need it because seg->list is the URL
++     * handler that informs PMS). */
++    {
++        size_t tmp_size = strlen(oc->url) + 5; /* + ".tmp\0" */
++        char *tmp_url = av_malloc(tmp_size);
++        if (!tmp_url)
++            return AVERROR(ENOMEM);
++        snprintf(tmp_url, tmp_size, "%s.tmp", oc->url);
++        ff_format_set_url(oc, tmp_url);
++    }
++
+     return 0;
+ }
+ 
+@@ -372,6 +393,24 @@
+         av_log(s, AV_LOG_ERROR, "Failure occurred when ending segment '%s'\n",
+                oc->url);
+ 
++    /* scaleplex: stage-rename .tmp → final BEFORE the segment_list
++     * CSV row is POSTed below. See set_segment_filename for the
++     * matching .tmp suffix on chunk open. */
++    if (oc->url) {
++        size_t url_len = strlen(oc->url);
++        if (url_len > 4 && !strcmp(oc->url + url_len - 4, ".tmp")) {
++            char *final_url = av_strdup(oc->url);
++            if (final_url) {
++                final_url[url_len - 4] = '\0';
++                if (rename(oc->url, final_url) < 0)
++                    av_log(s, AV_LOG_WARNING,
++                           "scaleplex: rename('%s' -> '%s') failed: %s\n",
++                           oc->url, final_url, av_err2str(AVERROR(errno)));
++                ff_format_set_url(oc, final_url);
++            }
++        }
++    }
++
+     if (seg->list) {
+         if (seg->list_size || seg->list_type == LIST_TYPE_M3U8) {
+             SegmentListEntry *entry = av_mallocz(sizeof(*entry));
