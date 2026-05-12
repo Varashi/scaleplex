@@ -1712,7 +1712,7 @@ func TestStripPlexInlineassFilterArgs(t *testing.T) {
 }
 
 func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
-	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	// pass-through is hardcoded since B6 (PR #4); no env knob
 	args := []string{
 		"-loglevel", "quiet",
 		"-codec:0", "libdav1d",
@@ -1787,7 +1787,7 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 }
 
 func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
-	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	// pass-through is hardcoded since B6 (PR #4); no env knob
 	args := []string{
 		"-loglevel", "quiet",
 		"-init_hw_device", "vaapi=vaapi:",
