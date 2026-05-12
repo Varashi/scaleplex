@@ -389,25 +389,24 @@ type subtitleSource struct {
 //  1. Embedded text (SRT/ASS in mkv):
 //     -i source.mkv
 //     -map_inlineass 0:3              (codec=subrip|ass|...)
-//     → text path, agent extracts to <sessionDir>/scaleplex-extract.srt
+//     → text path, fork's scaleplex_inlineass reads the stream directly.
 //
-//  2. External text sidecar (Plex pre-stages):
+//  2. External text sidecar (Plex pre-stages temp-0.srt):
 //     -i source.mkv
 //     -i /transcode/.../temp-0.srt
 //     -map_inlineass 1:s:0            (codec=subrip|ass|...)
-//     → text path, use staged file directly, drop second -i
+//     → text path, fork's scaleplex_inlineass reads input 1.
 //
 //  3. Embedded bitmap (PGS/VobSub/DVDSub):
 //     -i source.mkv
 //     -map_inlineass 0:3              (codec=hdmv_pgs_subtitle|...)
-//     → bitmap path, no extraction; filter graph references
-//     [0:3] as a stream and overlays it via overlay_vaapi
+//     → bitmap path, filter graph references [0:3] via overlay_vaapi.
 //
 //  4. External bitmap sidecar (rare; .sup files):
 //     -i source.mkv
 //     -i sidecar.sup
 //     -map_inlineass 1:s:0            (codec=hdmv_pgs_subtitle|...)
-//     → bitmap path, KEEP second -i (filter pulls the stream from it)
+//     → bitmap path, KEEP second -i (filter pulls the stream from it).
 //
 // When opts.ProbeSubtitleCodec is non-nil, the codec probe runs and
 // Kind is populated. Without it, Kind defaults to "text" — the
