@@ -218,7 +218,7 @@ var (
 	//   PMS reads HardwareDevicePath + iHD driver from its own probe.
 	// In either case the rewriter overwrites with HW_RENDER_DEVICE +
 	// HW_VAAPI_DRIVER defaults so the worker pod's device wins.
-	reInitHW   = regexp.MustCompile(`^vaapi=vaapi:(?:/dev/dri/[A-Za-z0-9_]+(?:,driver=[A-Za-z0-9_]+)?)?$`)
+	reInitHW = regexp.MustCompile(`^vaapi=vaapi:(?:/dev/dri/[A-Za-z0-9_]+(?:,driver=[A-Za-z0-9_]+)?)?$`)
 )
 
 func envBool(k string) bool { return os.Getenv(k) == "true" }
@@ -386,28 +386,28 @@ type subtitleSource struct {
 //
 // Plex emits four shapes:
 //
-//   1. Embedded text (SRT/ASS in mkv):
-//        -i source.mkv
-//        -map_inlineass 0:3              (codec=subrip|ass|...)
-//      → text path, agent extracts to <sessionDir>/scaleplex-extract.srt
+//  1. Embedded text (SRT/ASS in mkv):
+//     -i source.mkv
+//     -map_inlineass 0:3              (codec=subrip|ass|...)
+//     → text path, agent extracts to <sessionDir>/scaleplex-extract.srt
 //
-//   2. External text sidecar (Plex pre-stages):
-//        -i source.mkv
-//        -i /transcode/.../temp-0.srt
-//        -map_inlineass 1:s:0            (codec=subrip|ass|...)
-//      → text path, use staged file directly, drop second -i
+//  2. External text sidecar (Plex pre-stages):
+//     -i source.mkv
+//     -i /transcode/.../temp-0.srt
+//     -map_inlineass 1:s:0            (codec=subrip|ass|...)
+//     → text path, use staged file directly, drop second -i
 //
-//   3. Embedded bitmap (PGS/VobSub/DVDSub):
-//        -i source.mkv
-//        -map_inlineass 0:3              (codec=hdmv_pgs_subtitle|...)
-//      → bitmap path, no extraction; filter graph references
-//        [0:3] as a stream and overlays it via overlay_vaapi
+//  3. Embedded bitmap (PGS/VobSub/DVDSub):
+//     -i source.mkv
+//     -map_inlineass 0:3              (codec=hdmv_pgs_subtitle|...)
+//     → bitmap path, no extraction; filter graph references
+//     [0:3] as a stream and overlays it via overlay_vaapi
 //
-//   4. External bitmap sidecar (rare; .sup files):
-//        -i source.mkv
-//        -i sidecar.sup
-//        -map_inlineass 1:s:0            (codec=hdmv_pgs_subtitle|...)
-//      → bitmap path, KEEP second -i (filter pulls the stream from it)
+//  4. External bitmap sidecar (rare; .sup files):
+//     -i source.mkv
+//     -i sidecar.sup
+//     -map_inlineass 1:s:0            (codec=hdmv_pgs_subtitle|...)
+//     → bitmap path, KEEP second -i (filter pulls the stream from it)
 //
 // When opts.ProbeSubtitleCodec is non-nil, the codec probe runs and
 // Kind is populated. Without it, Kind defaults to "text" — the
@@ -652,12 +652,14 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 // memory copies, no OpenCL ICD dependency, no platform-detect race.
 //
 // Pattern matched (label numbers vary):
-//   [X]hwmap=derive_device=opencl[A];
-//   [A]tonemap_opencl=tonemap=<algo>:format=<pixfmt>:m=<mtx>:p=<prim>:r=<rng>[B];
-//   [B]hwmap=derive_device=vaapi:reverse=1[C]
+//
+//	[X]hwmap=derive_device=opencl[A];
+//	[A]tonemap_opencl=tonemap=<algo>:format=<pixfmt>:m=<mtx>:p=<prim>:r=<rng>[B];
+//	[B]hwmap=derive_device=vaapi:reverse=1[C]
 //
 // Substituted with:
-//   [X]tonemap_vaapi=transfer=bt709:matrix=<mtx>:primaries=<prim>:format=<pixfmt>[C]
+//
+//	[X]tonemap_vaapi=transfer=bt709:matrix=<mtx>:primaries=<prim>:format=<pixfmt>[C]
 //
 // The tonemap algorithm Plex sends (hable / mobius / reinhard / etc.,
 // from the PMS `TranscoderTonemapAlgorithm` pref) is DISCARDED — iHD
@@ -1020,8 +1022,10 @@ func stripEAEEnvVars(env map[string]string) (map[string]string, []string) {
 // inputDecoderHintFlag returns true when arg s is an input-side
 // decoder-codec flag. Matches all ffmpeg stream-specifier shapes
 // per ffmpeg-all(1):
-//   -codec:STREAMSPEC, -c:STREAMSPEC
-//   -c:v / -c:a / -c:s / -c:d / -c:t  (type-only shorthand)
+//
+//	-codec:STREAMSPEC, -c:STREAMSPEC
+//	-c:v / -c:a / -c:s / -c:d / -c:t  (type-only shorthand)
+//
 // where STREAMSPEC is anything: digit ("1"), type+index ("a:0"),
 // stream-id ("#0x02" — Plex Transcoder's preferred form), program,
 // metadata pattern, etc. We don't validate; whatever PMS sends, the
@@ -1096,7 +1100,7 @@ func dropInputAudioDecoderHints(args []string) ([]string, []string) {
 // shape PMS emits when targeting an 8-bit encoder (h264_vaapi, or
 // hevc_vaapi default Main profile):
 //
-//   [0:0]hwupload[A];[A]scale_vaapi=w=W:h=H:format=nv12[B];[B]hwupload[C]
+//	[0:0]hwupload[A];[A]scale_vaapi=w=W:h=H:format=nv12[B];[B]hwupload[C]
 //
 // Backreferences aren't supported in RE2; we capture all six tokens
 // and validate label-pair equality in injectHWPassthroughTonemap.
@@ -1114,7 +1118,7 @@ var reHWPassthroughSDRChain = regexp.MustCompile(
 // conversion. The result has the same final output label so PMS's
 // `-map [<final>]` keeps resolving:
 //
-//   [0:0]hwupload[a];[a]scale_vaapi=...:format=p010[b];[b]tonemap_vaapi=transfer=bt709:format=nv12[final]
+//	[0:0]hwupload[a];[a]scale_vaapi=...:format=p010[b];[b]tonemap_vaapi=transfer=bt709:format=nv12[final]
 //
 // (Drops the redundant trailing hwupload — tonemap_vaapi outputs to
 // a VAAPI surface already.)
@@ -2086,7 +2090,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// chunks named chunk-N from ffmpeg's pen; relay patches in
 		// place (audio-track-swap playhead-reset remains a known
 		// minor UX issue).
-
 
 		// Matroska seek playhead-reset: known cosmetic issue 2026-05-11.
 		// On Plex Windows seek, the new transcode session produces chunks

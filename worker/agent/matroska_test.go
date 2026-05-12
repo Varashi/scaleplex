@@ -11,14 +11,15 @@ import (
 // matroska segment chunk (Burn Notice + segment_format=matroska +
 // segment_format_options=live=0). Header layout:
 //
-//   Chunk 0: 1F 43 B6 75 | 5C 19            | BF 84 <CRC32:4>      | E7 81 00 | <rest>
-//            Cluster ID  | Size=0x1C19=7193 | CRC32 element        | TC=0     | body
-//   Chunk 1: 1F 43 B6 75 | 59 C3            | BF 84 <CRC32:4>      | E7 82 03 E9 | <rest>
-//            Cluster ID  | Size=0x19C3=6595 | CRC32 element        | TC=1001ms   | body
+//	Chunk 0: 1F 43 B6 75 | 5C 19            | BF 84 <CRC32:4>      | E7 81 00 | <rest>
+//	         Cluster ID  | Size=0x1C19=7193 | CRC32 element        | TC=0     | body
+//	Chunk 1: 1F 43 B6 75 | 59 C3            | BF 84 <CRC32:4>      | E7 82 03 E9 | <rest>
+//	         Cluster ID  | Size=0x19C3=6595 | CRC32 element        | TC=1001ms   | body
 //
 // After patching with offsetMs=4000:
-//   Chunk 0: 1F 43 B6 75 | <new size>       | E7 88 <8-byte=4000>  | <rest>
-//   Chunk 1: 1F 43 B6 75 | <new size>       | E7 88 <8-byte=5001>  | <rest>
+//
+//	Chunk 0: 1F 43 B6 75 | <new size>       | E7 88 <8-byte=4000>  | <rest>
+//	Chunk 1: 1F 43 B6 75 | <new size>       | E7 88 <8-byte=5001>  | <rest>
 func TestPatchClusterBody_StripsCRC_ShiftsTimecode(t *testing.T) {
 	// Synthesize chunk 0 body: CRC32(BF 84 AA AA AA AA) + Timecode(E7 81 00) + filler.
 	body := []byte{0xBF, 0x84, 0xAA, 0xAA, 0xAA, 0xAA, 0xE7, 0x81, 0x00, 0xA3, 0x5A, 0x6F, 0x81, 0x00}
@@ -113,15 +114,15 @@ func TestPatchMatroskaClusterTimecode_ZeroOffset_NoOp(t *testing.T) {
 
 func TestReadEBMLSize(t *testing.T) {
 	cases := []struct {
-		in       []byte
-		wantW    int
-		wantVal  uint64
-		wantOK   bool
+		in      []byte
+		wantW   int
+		wantVal uint64
+		wantOK  bool
 	}{
-		{[]byte{0x81}, 1, 1, true},                // 1-byte: value 1
-		{[]byte{0x80}, 1, 0, true},                // 1-byte: value 0
-		{[]byte{0x40, 0x10}, 2, 0x10, true},       // 2-byte: value 16
-		{[]byte{0x5C, 0x19}, 2, 0x1C19, true},     // chunk 0 size
+		{[]byte{0x81}, 1, 1, true},                  // 1-byte: value 1
+		{[]byte{0x80}, 1, 0, true},                  // 1-byte: value 0
+		{[]byte{0x40, 0x10}, 2, 0x10, true},         // 2-byte: value 16
+		{[]byte{0x5C, 0x19}, 2, 0x1C19, true},       // chunk 0 size
 		{[]byte{0x20, 0x9A, 0x22}, 3, 0x9A22, true}, // 3-byte
 		{[]byte{}, 0, 0, false},
 		{[]byte{0x00}, 0, 0, false},

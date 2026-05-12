@@ -78,13 +78,13 @@ type runningTask struct {
 	// recovering worker enough context to pick up where this one left
 	// off without re-running the rewriter. argv/env are POST-REWRITE
 	// (what we actually exec'd).
-	argv         []string
-	env          map[string]string
-	cwd          string
-	sourcePath   string
-	progressURL  string
-	seekOffsetS  float64
-	startedAt    time.Time
+	argv        []string
+	env         map[string]string
+	cwd         string
+	sourcePath  string
+	progressURL string
+	seekOffsetS float64
+	startedAt   time.Time
 
 	// Live counter. segwatch's chunk renumberer bumps this on each
 	// successful rename so the checkpoint reports the highest segment
