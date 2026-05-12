@@ -12,27 +12,28 @@
 //
 // Build-tagged so it doesn't run on every `go test`. Two ways to use:
 //
-//   1. Inside a worker pod (full validation against real ffmpeg +
-//      VAAPI + iHD + libass, same versions as production):
+//  1. Inside a worker pod (full validation against real ffmpeg +
+//     VAAPI + iHD + libass, same versions as production):
 //
-//        go test -tags=replay -c -o /tmp/replay.test ./worker/agent
-//        POD=$(kubectl -n clusterplex get pod -l app.kubernetes.io/controller=worker -o jsonpath='{.items[0].metadata.name}')
-//        kubectl -n clusterplex cp /tmp/replay.test "$POD:/tmp/replay.test"
-//        kubectl -n clusterplex exec "$POD" -- /tmp/replay.test \
-//          -test.v -test.run TestReplayCorpus -test.timeout 30m
+//     go test -tags=replay -c -o /tmp/replay.test ./worker/agent
+//     POD=$(kubectl -n clusterplex get pod -l app.kubernetes.io/controller=worker -o jsonpath='{.items[0].metadata.name}')
+//     kubectl -n clusterplex cp /tmp/replay.test "$POD:/tmp/replay.test"
+//     kubectl -n clusterplex exec "$POD" -- /tmp/replay.test \
+//     -test.v -test.run TestReplayCorpus -test.timeout 30m
 //
-//   2. Locally (rewriter-only validation, skips ffmpeg execution):
+//  2. Locally (rewriter-only validation, skips ffmpeg execution):
 //
-//        REPLAY_NO_FFMPEG=1 go test -tags=replay -v -run TestReplayCorpus
+//     REPLAY_NO_FFMPEG=1 go test -tags=replay -v -run TestReplayCorpus
 //
 // Per-cell classification:
-//   PASS         — rewriter applied, ffmpeg ran ≥0.05s without error
-//   FAIL bail    — rewriter bailed (skip:<reason> in changes)
-//   FAIL argv    — ffmpeg exited <0.5s with non-zero (argv parse / filter
-//                  graph build / encoder open failure)
-//   FAIL run     — ffmpeg ran but exited non-zero after >0.5s
-//   TIMEOUT      — ffmpeg ran past replay timeout (10s default)
-//   SKIP         — corpus entry missing argv or source file
+//
+//	PASS         — rewriter applied, ffmpeg ran ≥0.05s without error
+//	FAIL bail    — rewriter bailed (skip:<reason> in changes)
+//	FAIL argv    — ffmpeg exited <0.5s with non-zero (argv parse / filter
+//	               graph build / encoder open failure)
+//	FAIL run     — ffmpeg ran but exited non-zero after >0.5s
+//	TIMEOUT      — ffmpeg ran past replay timeout (10s default)
+//	SKIP         — corpus entry missing argv or source file
 package main
 
 import (

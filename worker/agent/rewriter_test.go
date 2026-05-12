@@ -121,7 +121,7 @@ func findFilterComplex(args []string, prefix string) int {
 }
 
 func TestRewriter_AV1H264_AppliedAndChanges(t *testing.T) {
-out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
+	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
 		t.Fatalf("expected applied=true, changes=%v", out.Changes)
 	}
@@ -147,7 +147,7 @@ out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 }
 
 func TestRewriter_AV1H264_DecoderFollowedByHwaccel(t *testing.T) {
-out := Rewrite(swArgsAV1H264, nil, nil)
+	out := Rewrite(swArgsAV1H264, nil, nil)
 	decIdx := indexOfArg(out.Args, "-codec:0", 0)
 	if out.Args[decIdx+1] != "av1" {
 		t.Fatalf("decoder=%s want av1", out.Args[decIdx+1])
@@ -166,7 +166,7 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 }
 
 func TestRewriter_AV1H264_InitHwDeviceGetsRenderDeviceAndDriver(t *testing.T) {
-out := Rewrite(swArgsAV1H264, nil, nil)
+	out := Rewrite(swArgsAV1H264, nil, nil)
 	i := indexOfArg(out.Args, "-init_hw_device", 0)
 	if got := out.Args[i+1]; got != "vaapi=vaapi:/dev/dri/renderD128,driver=iHD" {
 		t.Fatalf("init_hw_device=%q", got)
@@ -174,7 +174,7 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 }
 
 func TestRewriter_AV1H264_FilterIsVaapiPlain(t *testing.T) {
-out := Rewrite(swArgsAV1H264, nil, nil)
+	out := Rewrite(swArgsAV1H264, nil, nil)
 	idx := findFilterComplex(out.Args, "[0:0]")
 	want := "[0:0]hwupload[0];[0]scale_vaapi=w=2276:h=1280:format=nv12[1];[1]hwupload[2]"
 	if out.Args[idx] != want {
@@ -183,7 +183,7 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 }
 
 func TestRewriter_AV1H264_MapLabelUpdated(t *testing.T) {
-out := Rewrite(swArgsAV1H264, nil, nil)
+	out := Rewrite(swArgsAV1H264, nil, nil)
 	idx := findFilterComplex(out.Args, "[0:0]")
 	for i := idx + 1; i < len(out.Args); i++ {
 		if out.Args[i] == "-map" {
@@ -197,7 +197,7 @@ out := Rewrite(swArgsAV1H264, nil, nil)
 }
 
 func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
-out := Rewrite(swArgsAV1H264, nil, nil)
+	out := Rewrite(swArgsAV1H264, nil, nil)
 	if containsString(out.Args, "-preset:0") {
 		t.Error("preset:0 not consumed (should translate to -compression_level:v)")
 	}
@@ -298,7 +298,7 @@ func TestRewriter_RateControl_CRFOnly_KeepsCQP(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_EnvLIBVA_DefaultsAreImageResident(t *testing.T) {
-out := Rewrite(swArgsAV1H264, map[string]string{"TZ": "Europe/Brussels"}, nil)
+	out := Rewrite(swArgsAV1H264, map[string]string{"TZ": "Europe/Brussels"}, nil)
 	// Default scaleplex worker doesn't override LIBVA_DRIVERS_PATH —
 	// libva auto-discovers iHD under /usr/lib/x86_64-linux-gnu/dri.
 	if _, ok := out.Env["LIBVA_DRIVERS_PATH"]; ok {
@@ -313,7 +313,7 @@ out := Rewrite(swArgsAV1H264, map[string]string{"TZ": "Europe/Brussels"}, nil)
 }
 
 func TestRewriter_LIBVADriversPath_OverrideHonored(t *testing.T) {
-t.Setenv("HW_LIBVA_DRIVERS_PATH", "/opt/some/cache/dri")
+	t.Setenv("HW_LIBVA_DRIVERS_PATH", "/opt/some/cache/dri")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	if out.Env["LIBVA_DRIVERS_PATH"] != "/opt/some/cache/dri" {
 		t.Fatalf("LIBVA_DRIVERS_PATH=%q", out.Env["LIBVA_DRIVERS_PATH"])
@@ -321,7 +321,7 @@ t.Setenv("HW_LIBVA_DRIVERS_PATH", "/opt/some/cache/dri")
 }
 
 func TestRewriter_AV1H264_ReturnsCopy(t *testing.T) {
-before := strings.Join(swArgsAV1H264, "\x00")
+	before := strings.Join(swArgsAV1H264, "\x00")
 	Rewrite(swArgsAV1H264, nil, nil)
 	after := strings.Join(swArgsAV1H264, "\x00")
 	if before != after {
@@ -330,7 +330,7 @@ before := strings.Join(swArgsAV1H264, "\x00")
 }
 
 func TestRewriter_InitHwDevice_Inject(t *testing.T) {
-args := []string{
+	args := []string{
 		"-codec:0", "libdav1d",
 		"-i", "/media/m.mkv",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
@@ -445,7 +445,7 @@ func containsAnyWithPrefix(slice []string, prefix string) bool {
 // /tmp path so the agent still has a place to extract to.
 
 func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
-args := []string{
+	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[v];[v]subtitles=f.srt[0]",
@@ -465,8 +465,8 @@ args := []string{
 // matcher is intentionally flexible (zscale + tonemap + final nv12 label).
 func TestRewriter_PresetMapping(t *testing.T) {
 	cases := []struct {
-		x264   string
-		vaapi  string
+		x264  string
+		vaapi string
 	}{
 		{"ultrafast", "7"},
 		{"superfast", "7"},
@@ -478,7 +478,7 @@ func TestRewriter_PresetMapping(t *testing.T) {
 		{"slower", "2"},
 		{"veryslow", "1"},
 		{"placebo", "1"},
-		{"VeryFast", "6"}, // case-insensitive
+		{"VeryFast", "6"},   // case-insensitive
 		{"unknownish", "7"}, // unknown → fastest
 	}
 	for _, c := range cases {
@@ -534,7 +534,7 @@ func TestRewriter_NoPresetEmitted_DefaultsFastest(t *testing.T) {
 }
 
 func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
-args := []string{
+	args := []string{
 		"-codec:0", "libdav1d",
 		"-i", "/media/m.mkv",
 		"-filter_complex",
@@ -574,7 +574,7 @@ args := []string{
 }
 
 func TestRewriter_Bail_UnknownDecoder(t *testing.T) {
-args := []string{
+	args := []string{
 		"-codec:0", "librav1e", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
@@ -804,7 +804,7 @@ func TestRewriter_Bail_StripsPlexPrivateFlags(t *testing.T) {
 }
 
 func TestRewriter_Bail_FilterMismatch_NoCorruption(t *testing.T) {
-args := []string{
+	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]some_unsupported_filter[1]",
@@ -926,14 +926,13 @@ func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
 	}
 }
 
-// `-skip_to_segment N` must be captured into RewriteResult.SkipToSegment
-// and stripped from the argv. The chunk-renumber watcher uses N as the
-// starting sequence so chunk-stream0-NNNNN.m4s names align with PMS's
-// expected URL `.../0/(N-1).m4s`. PTS-handling flags
-// (-copyts/-start_at_zero/-avoid_negative_ts disabled) MUST be left
-// alone — stripping them rebased the AAC encoder's PTS to 0 with no
-// primer samples and produced empty (199-byte) first audio segments
-// after every seek, which DASH players hang on indefinitely.
+// `-skip_to_segment N` passes through to ffmpeg untouched (dashenc
+// fork patch 0095 honours it natively). Diagnostic change-tag is
+// emitted. PTS-handling flags (-copyts/-start_at_zero/-avoid_negative_ts
+// disabled) MUST be left alone — stripping them rebased the AAC
+// encoder's PTS to 0 with no primer samples and produced empty
+// (199-byte) first audio segments after every seek, which DASH players
+// hang on indefinitely.
 func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	args := append([]string(nil), swArgsAV1H264...)
 	for i := 0; i+1 < len(args); i++ {
@@ -947,12 +946,9 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if out.SkipToSegment != 522 {
-		t.Fatalf("SkipToSegment=%d want 522", out.SkipToSegment)
+	if !containsString(out.Changes, "skip_to_segment:passthrough=522") {
+		t.Fatalf("missing skip_to_segment:passthrough=522 tag: %v", out.Changes)
 	}
-	// scaleplex-ffmpeg7 honours -skip_to_segment natively; the rewriter
-	// captures the value (for checkpoint / metrics) but leaves the
-	// flag intact so dashenc starts numbering at N.
 	stsIdx := indexOfArg(out.Args, "-skip_to_segment", 0)
 	if stsIdx < 0 || out.Args[stsIdx+1] != "522" {
 		t.Fatal("-skip_to_segment must pass through to ffmpeg (value=522)")
@@ -970,19 +966,17 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	}
 }
 
-// Initial-play session (`-skip_to_segment 1`, no `-ss`) captures
-// SkipToSegment=1 and renumber starts at 1 (no-op rename since names
-// match). PTS flags pass through untouched. No -ss → no
+// Initial-play session (`-skip_to_segment 1`, no `-ss`) — flag passes
+// through untouched. Diagnostic tag emitted. No -ss → no
 // -output_ts_offset injection.
 func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if out.SkipToSegment != 1 {
-		t.Fatalf("SkipToSegment=%d want 1", out.SkipToSegment)
+	if !containsString(out.Changes, "skip_to_segment:passthrough=1") {
+		t.Fatalf("missing skip_to_segment:passthrough=1 tag: %v", out.Changes)
 	}
-	// Passes through to ffmpeg (no strip) — scaleplex-ffmpeg7 honours it.
 	stsIdx := indexOfArg(out.Args, "-skip_to_segment", 0)
 	if stsIdx < 0 || out.Args[stsIdx+1] != "1" {
 		t.Fatal("-skip_to_segment must pass through to ffmpeg")
@@ -1127,8 +1121,6 @@ func TestRewriter_ForceKeyFrames_NoSeekUnchanged(t *testing.T) {
 // track and the original probe missed it, falling through to the
 // hybrid bail and breaking LG WebOS sub-burn).
 
-
-
 // Plain `<base>.<lang>.srt` (the historical case) must still work.
 
 // Bitmap embedded burn-in (PGS in a Blu-ray remux). Filter graph must:
@@ -1136,6 +1128,7 @@ func TestRewriter_ForceKeyFrames_NoSeekUnchanged(t *testing.T) {
 //   - convert PGS bitmap → bgra (libavcodec renders the bitmap)
 //   - hwupload the rendered surface to GPU
 //   - overlay_vaapi composite onto the scaled main video
+//
 // And: NO extraction (the stream stays in -i 0).
 func TestRewriter_OverlayVAAPI_BitmapEmbedded_PGS(t *testing.T) {
 	probe := func(source, spec string) string {
@@ -1527,7 +1520,6 @@ var hwDecodeArgsAV1HEVCSubBurn = []string{
 	"nullfile",
 }
 
-
 // PMS HW-decode + force-burn + SEEK. Captured live 2026-05-08 from
 // clusterplex-worker-sjsp4 session 6783, Plex Android, The Accountant
 // AV1 4K HDR10+, Original Quality, seek to 1816s. PMS places `-ss 1816`
@@ -1879,4 +1871,3 @@ func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
 		t.Errorf("missing hw-decode:filter:inlineass-passthrough tag: %v", out.Changes)
 	}
 }
-
