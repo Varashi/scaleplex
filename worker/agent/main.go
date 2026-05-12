@@ -571,15 +571,17 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		throttle := &throttleSignal{}
+		// throttleSignal mirrors PMS's canThrottle decision into the
+		// progress reporter so it can suppress &speed= while throttled.
+		// In-binary scaleplex-ffmpeg7 (patch 0097) handles the actual
+		// usleep pacing; nothing here pulses SIGSTOP anymore.
 		rc := reportContext{
 			URL:       progressURL,
 			SessionID: req.SessionID,
 			Streams:   streams,
 			DurationS: probeDurationSeconds(ctx, inputPath),
-			Throttle:  throttle,
+			Throttle:  &throttleSignal{},
 		}
-		go throttleController(ctx, req.SessionID, cmd.Process.Pid, throttle)
 		// Fire the one-shot prelude PUTs (duration + streamDetail +
 		// dimensions) before starting the periodic reporter. PMS uses
 		// these to fill in codec metadata so /header can return without

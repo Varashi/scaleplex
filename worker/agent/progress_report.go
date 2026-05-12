@@ -39,11 +39,31 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+// throttleSignal tracks whether PMS asserted canThrottle on this session.
+// Used only to suppress &speed= on progress PUTs (Plex Transcoder
+// behaviour: "Only pass back speed if we're not throttled" — PMS uses
+// speed to estimate buffer-fill and would never clear canThrottle if we
+// reported a fast rate while throttled). The actual usleep pacing is
+// done inside scaleplex-ffmpeg7 itself (Phase 4 patch 0097); this flag
+// only mirrors the same response-body parse the in-binary handler does.
+type throttleSignal struct{ v atomic.Int32 }
+
+func (s *throttleSignal) set(on bool) {
+	if on {
+		s.v.Store(1)
+	} else {
+		s.v.Store(0)
+	}
+}
+
+func (s *throttleSignal) on() bool { return s.v.Load() == 1 }
 
 var metricProgressPUT = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "scaleplex_worker_progress_put_total",
