@@ -370,25 +370,6 @@ args := []string{
 // with "Filter not found" (LG WebOS sub-burn 2026-05-06). Bailing
 // surfaces the failure in the rewriter's change list instead of
 // pretending success and exploding mid-transcode.
-func TestRewriter_InlineAss_NoSidecar_Bails(t *testing.T) {
-	out := Rewrite(swArgsWithSubs, nil, &RewriteOpts{FSExists: func(string) bool { return false }})
-	if out.Applied {
-		t.Fatalf("expected bail when no sidecar; applied=true: %v", out.Changes)
-	}
-	if !containsString(out.Changes, "skip:filter-pattern:") {
-		// Find any change starting with skip:filter-pattern:
-		found := false
-		for _, c := range out.Changes {
-			if strings.HasPrefix(c, "skip:filter-pattern:") {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("expected skip:filter-pattern bail: %v", out.Changes)
-		}
-	}
-}
 
 // PMS picks libx265 when its prefs + client caps both ask for HEVC.
 // Worker must follow that signal and emit hevc_vaapi (manifest's
@@ -454,108 +435,14 @@ func containsAnyWithPrefix(slice []string, prefix string) bool {
 //     no use for the input mapping after we replace the filter)
 //   - strip `-map_inlineass`
 //   - leave SubtitleExtract == nil (no extraction needed)
-func TestRewriter_OverlayVAAPI_Sidecar(t *testing.T) {
-	out := Rewrite(swArgsWithSubsRealSidecar, nil, nil)
-	if !out.Applied {
-		t.Fatalf("not applied: %v", out.Changes)
-	}
-	if !containsAnyWithPrefix(out.Changes, "filter:overlay-vaapi") {
-		t.Fatalf("missing overlay-vaapi: %v", out.Changes)
-	}
-	if !containsString(out.Changes, "subtitle:sidecar-staged") {
-		t.Fatalf("missing subtitle:sidecar-staged: %v", out.Changes)
-	}
-	if !containsString(out.Changes, "drop:-map_inlineass") {
-		t.Fatalf("missing drop:-map_inlineass: %v", out.Changes)
-	}
-	if !containsString(out.Changes, "drop:-i(sidecar-input)") {
-		t.Fatalf("expected the second -i to be dropped: %v", out.Changes)
-	}
-	if containsString(out.Args, "-map_inlineass") {
-		t.Fatal("-map_inlineass not dropped")
-	}
-	if out.SubtitleExtract != nil {
-		t.Fatalf("sidecar path should NOT request extraction: %+v", out.SubtitleExtract)
-	}
-	// Only one -i should remain (the source mkv).
-	iCount := 0
-	for _, a := range out.Args {
-		if a == "-i" {
-			iCount++
-		}
-	}
-	if iCount != 1 {
-		t.Errorf("expected 1 remaining -i, got %d", iCount)
-	}
-	idx := findFilterComplex(out.Args, "[0:0]")
-	f := out.Args[idx]
-	// Native libass roundtrip at output resolution (the 1080split
-	// experiment was reverted — slower on iHD/Arc at every res).
-	for _, must := range []string{
-		"[0:0]hwupload[10]",
-		"[11]hwdownload[12]",
-		"subtitles=filename='/transcode/Transcode/Sessions/plex-transcode-q5orqh9o-c7edac0f/temp-0.srt'",
-		"fontsdir=/usr/share/fonts/truetype/dejavu",
-		"[14]hwupload[15]",
-	} {
-		if !strings.Contains(f, must) {
-			t.Errorf("filter missing %q\n%s", must, f)
-		}
-	}
-}
 
 // Embedded burn-in. PMS uses `-map_inlineass 0:3` against the source's
 // own subtitle stream, no second `-i`. Stock `subtitles=` can't read
 // by stream index, so the rewriter must request that the agent extract
 // the stream to a file before spawning the main encoder.
-func TestRewriter_OverlayVAAPI_EmbeddedExtract(t *testing.T) {
-	out := Rewrite(swArgsWithSubsSidecar, nil, &RewriteOpts{SessionDir: "/transcode/Transcode/Sessions/test-sid-job"})
-	if !out.Applied {
-		t.Fatalf("not applied: %v", out.Changes)
-	}
-	if !containsAnyWithPrefix(out.Changes, "filter:overlay-vaapi") {
-		t.Fatalf("missing overlay-vaapi: %v", out.Changes)
-	}
-	if !containsString(out.Changes, "subtitle:embedded-extract:0:3") {
-		t.Fatalf("expected embedded-extract change with stream 0:3: %v", out.Changes)
-	}
-	if !containsString(out.Changes, "drop:-map_inlineass") {
-		t.Fatalf("missing drop:-map_inlineass: %v", out.Changes)
-	}
-	if out.SubtitleExtract == nil {
-		t.Fatal("expected SubtitleExtract to be populated for embedded sub")
-	}
-	want := SubtitleExtract{
-		SourceFile: "/media/Movies/Superman (2025)/Superman (2025).mkv",
-		StreamSpec: "0:3",
-		OutputFile: "/transcode/Transcode/Sessions/test-sid-job/scaleplex-extract.srt",
-		Format:     "srt",
-	}
-	if *out.SubtitleExtract != want {
-		t.Errorf("SubtitleExtract = %+v\nwant %+v", *out.SubtitleExtract, want)
-	}
-	idx := findFilterComplex(out.Args, "[0:0]")
-	f := out.Args[idx]
-	if !strings.Contains(f, "subtitles=filename='"+want.OutputFile+"'") {
-		t.Errorf("filter must point at extraction target:\n%s", f)
-	}
-}
 
 // SessionDir empty (test/local case) → fall back to a deterministic
 // /tmp path so the agent still has a place to extract to.
-func TestRewriter_OverlayVAAPI_EmbeddedExtract_DefaultDir(t *testing.T) {
-	out := Rewrite(swArgsWithSubsSidecar, nil, nil)
-	if !out.Applied {
-		t.Fatalf("not applied: %v", out.Changes)
-	}
-	if out.SubtitleExtract == nil {
-		t.Fatal("expected SubtitleExtract")
-	}
-	if out.SubtitleExtract.OutputFile != "/tmp/scaleplex/scaleplex-extract.srt" {
-		t.Errorf("OutputFile = %q want /tmp/scaleplex/scaleplex-extract.srt",
-			out.SubtitleExtract.OutputFile)
-	}
-}
 
 func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
 args := []string{
@@ -1239,45 +1126,10 @@ func TestRewriter_ForceKeyFrames_NoSeekUnchanged(t *testing.T) {
 // (Balls Up sidecar 2026-05-06: `.en.hi.srt` was the only English
 // track and the original probe missed it, falling through to the
 // hybrid bail and breaking LG WebOS sub-burn).
-func TestFindSidecarSubtitle_HearingImpaired(t *testing.T) {
-	media := "/media/Movies/Balls Up/Balls Up.mkv"
-	want := "/media/Movies/Balls Up/Balls Up.en.hi.srt"
-	fs := func(p string) bool { return p == want }
-	got := findSidecarSubtitle(media, "en", fs)
-	if got != want {
-		t.Errorf("got=%q want=%q", got, want)
-	}
-}
 
-func TestFindSidecarSubtitle_SDH(t *testing.T) {
-	media := "/media/Movies/X/X.mkv"
-	want := "/media/Movies/X/X.en.sdh.srt"
-	fs := func(p string) bool { return p == want }
-	if got := findSidecarSubtitle(media, "en", fs); got != want {
-		t.Errorf("got=%q want=%q", got, want)
-	}
-}
 
-func TestFindSidecarSubtitle_AltOrdering(t *testing.T) {
-	// Some renamers emit `<base>.<flag>.<lang>.srt` rather than
-	// `<base>.<lang>.<flag>.srt`. Probe both.
-	media := "/media/Movies/X/X.mkv"
-	want := "/media/Movies/X/X.forced.en.srt"
-	fs := func(p string) bool { return p == want }
-	if got := findSidecarSubtitle(media, "en", fs); got != want {
-		t.Errorf("got=%q want=%q", got, want)
-	}
-}
 
 // Plain `<base>.<lang>.srt` (the historical case) must still work.
-func TestFindSidecarSubtitle_BasicLang(t *testing.T) {
-	media := "/media/Movies/X/X.mkv"
-	want := "/media/Movies/X/X.en.srt"
-	fs := func(p string) bool { return p == want }
-	if got := findSidecarSubtitle(media, "en", fs); got != want {
-		t.Errorf("got=%q want=%q", got, want)
-	}
-}
 
 // Bitmap embedded burn-in (PGS in a Blu-ray remux). Filter graph must:
 //   - reference the subtitle stream by its specifier ([0:3])
@@ -1302,9 +1154,6 @@ func TestRewriter_OverlayVAAPI_BitmapEmbedded_PGS(t *testing.T) {
 	}
 	if !containsString(out.Changes, "filter:overlay-vaapi-bitmap") {
 		t.Fatalf("expected overlay-vaapi-bitmap mode: %v", out.Changes)
-	}
-	if out.SubtitleExtract != nil {
-		t.Errorf("bitmap path must NOT request extraction: %+v", out.SubtitleExtract)
 	}
 	if !containsString(out.Changes, "drop:-map_inlineass") {
 		t.Errorf("missing drop:-map_inlineass: %v", out.Changes)
@@ -1678,95 +1527,6 @@ var hwDecodeArgsAV1HEVCSubBurn = []string{
 	"nullfile",
 }
 
-func TestRewriter_HWDecode_SubtitleBurnIn(t *testing.T) {
-	probe := func(_, _ string) string { return "subrip" }
-	out := Rewrite(hwDecodeArgsAV1HEVCSubBurn, map[string]string{
-		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
-		"X_PLEX_TOKEN":           "tok123",
-	}, &RewriteOpts{
-		SessionDir:         "/transcode/sess",
-		ProbeSubtitleCodec: probe,
-	})
-	if !out.Applied {
-		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
-	}
-
-	mustContain := []string{
-		"decode:hw-passthrough:av1",
-		"encode:hw-passthrough:hevc_vaapi",
-		"hw-decode:filter:inlineass->subtitles",
-		"subtitle:sidecar-staged",
-		"sidecar:/transcode/sess/temp-0.srt",
-		"drop:-i(sidecar-input)",
-		"drop:-map_inlineass",
-		"drop:null-sub-output",
-		"audio:eac3_eae->eac3",
-	}
-	for _, want := range mustContain {
-		if !containsString(out.Changes, want) {
-			t.Errorf("missing change %q; got %v", want, out.Changes)
-		}
-	}
-
-	// Filter chain must mention subtitles= and not inlineass=.
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-filter_complex" && strings.HasPrefix(out.Args[i+1], "[0:0]") {
-			f := out.Args[i+1]
-			if strings.Contains(f, "inlineass=") {
-				t.Fatalf("filter still contains inlineass=: %q", f)
-			}
-			if !strings.Contains(f, "subtitles=filename='/transcode/sess/temp-0.srt'") {
-				t.Fatalf("filter missing subtitles= for staged SRT: %q", f)
-			}
-			// Output label must remain [4] so the existing -map [4] works
-			if !strings.HasSuffix(f, "[3]hwupload[4]") {
-				t.Fatalf("filter chain must end at [4]: %q", f)
-			}
-			break
-		}
-	}
-
-	// Only one -i should remain (source mkv); sidecar -i dropped
-	iCount := 0
-	for i := 0; i < len(out.Args); i++ {
-		if out.Args[i] == "-i" {
-			iCount++
-		}
-	}
-	if iCount != 1 {
-		t.Fatalf("want 1 remaining -i, got %d", iCount)
-	}
-
-	// `-map_inlineass` must be gone
-	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
-		t.Fatalf("-map_inlineass not stripped")
-	}
-
-	// Null sub output (`-map 1:s:0 -f null -codec ass nullfile`) gone
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-f" && out.Args[i+1] == "null" {
-			t.Fatalf("-f null (null sub output) not stripped: %v", out.Args[i:])
-		}
-	}
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-codec" && out.Args[i+1] == "ass" {
-			t.Fatalf("-codec ass (null sub output tail) not stripped")
-		}
-	}
-
-	// `-map [4]` for the video must still be there (output label
-	// preserved).
-	foundMap4 := false
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-map" && out.Args[i+1] == "[4]" {
-			foundMap4 = true
-			break
-		}
-	}
-	if !foundMap4 {
-		t.Fatalf("video -map [4] missing after rewrite")
-	}
-}
 
 // PMS HW-decode + force-burn + SEEK. Captured live 2026-05-08 from
 // clusterplex-worker-sjsp4 session 6783, Plex Android, The Accountant
@@ -1778,119 +1538,6 @@ func TestRewriter_HWDecode_SubtitleBurnIn(t *testing.T) {
 // every encoded frame whose PTS < 1816 (output PTS starts at 0 with
 // -copyts stripped on HLS, never reaches 1816), the segment muxer
 // waits indefinitely, Plex Android shows "Connection error".
-func TestRewriter_HWDecode_SubBurn_SeekDropsSecondInputSs(t *testing.T) {
-	probe := func(_, _ string) string { return "subrip" }
-	args := []string{
-		"-codec:0", "av1",
-		"-hwaccel:0", "vaapi",
-		"-hwaccel_output_format:0", "vaapi",
-		"-hwaccel_device:0", "vaapi",
-		"-codec:1", "eac3_eae",
-		"-eae_prefix:1", "tok_",
-		"-ss", "1816",
-		"-analyzeduration", "20000000",
-		"-probesize", "20000000",
-		"-i", "/media/Movies/The Accountant.mkv",
-		"-ss", "1816",
-		"-analyzeduration", "20000000",
-		"-probesize", "20000000",
-		"-i", "/transcode/sess/temp-0.srt",
-		"-start_at_zero",
-		"-copyts",
-		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
-		"-filter_hw_device", "vaapi",
-		"-y", "-nostats", "-loglevel", "quiet",
-		"-loglevel_plex", "error",
-		"-progressurl", "http://127.0.0.1:32400/sess/job/progress",
-		"-map_inlineass", "1:s:0",
-		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=3840:h=2160:format=p010[1];[1]hwdownload,format=p010[2];[2]inlineass=font_size=54[3];[3]hwupload[4]",
-		"-map", "[4]",
-		"-codec:0", "hevc_vaapi", "-qp:0", "15",
-		"-maxrate:0", "20121k", "-bufsize:0", "40242k",
-		"-r:0", "23.975",
-		"-sei:0", "-a53_cc",
-		"-force_key_frames:0", "expr:gte(t,n_forced*1)",
-		"-filter_complex", "[0:1] aresample=async=1:ochl='5.1':osr=48000[5]",
-		"-map", "[5]",
-		"-codec:1", "aac", "-b:1", "774k",
-		"-segment_format", "matroska", "-f", "ssegment",
-		"-individual_header_trailer", "0",
-		"-segment_header_filename", "header",
-		"-segment_time", "1",
-		"-segment_start_number", "1816",
-		"-segment_time_delta", "0.0625",
-		"-segment_list", "http://127.0.0.1:32400/sess/job/manifest?X-Plex-Http-Pipeline=infinite",
-		"-segment_list_type", "csv",
-		"-segment_list_size", "5",
-		"-segment_list_separate_stream_times", "1",
-		"-segment_list_unfinished", "1",
-		"-segment_format_options", "output_ts_offset=10",
-		"-max_delay", "5000000",
-		"-avoid_negative_ts", "disabled",
-		"-map_metadata", "-1",
-		"-map_chapters", "-1",
-		"media-%05d.ts",
-		"-map", "1:s:0",
-		"-f", "null",
-		"-codec", "ass",
-		"nullfile",
-	}
-	out := Rewrite(args, map[string]string{
-		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
-		"X_PLEX_TOKEN":           "tok123",
-	}, &RewriteOpts{
-		SessionDir:         "/transcode/sess",
-		ProbeSubtitleCodec: probe,
-	})
-	if !out.Applied {
-		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
-	}
-
-	// Count remaining `-ss` flags. The input-0 -ss must survive (real
-	// input seek). The input-1 -ss must be GONE (would dangle as
-	// output seek otherwise).
-	ssCount := 0
-	for i := 0; i < len(out.Args); i++ {
-		if out.Args[i] == "-ss" {
-			ssCount++
-		}
-	}
-	if ssCount != 1 {
-		t.Fatalf("want exactly 1 remaining -ss (the input-0 seek), got %d. args=%v", ssCount, out.Args)
-	}
-
-	// And the surviving -ss must be BEFORE the (only) -i — i.e. it's
-	// an input option, not a positional output option.
-	iIdx := indexOfArg(out.Args, "-i", 0)
-	ssIdx := indexOfArg(out.Args, "-ss", 0)
-	if ssIdx < 0 {
-		t.Fatal("missing -ss after rewrite")
-	}
-	if ssIdx > iIdx {
-		t.Fatalf("-ss landed AFTER -i (would be output seek); ssIdx=%d iIdx=%d", ssIdx, iIdx)
-	}
-
-	// Sanity: only one -i remains
-	iCount := 0
-	for i := 0; i < len(out.Args); i++ {
-		if out.Args[i] == "-i" {
-			iCount++
-		}
-	}
-	if iCount != 1 {
-		t.Fatalf("want 1 remaining -i (source), got %d", iCount)
-	}
-
-	// Seek-offset captured for diagnostics
-	if !containsString(out.Changes, "seek-offset:captured=1816.000s") {
-		t.Errorf("seek-offset not captured: %v", out.Changes)
-	}
-	// HLS-specific seek + force_key_frames untouched (Plex's expr
-	// is correct on HLS without -copyts)
-	if containsString(out.Changes, "force_key_frames:offset-by-seek") {
-		t.Errorf("HLS+seek must NOT rewrite force_key_frames")
-	}
-}
 
 // SW-decode + HDR + text-sidecar sub-burn. PMS argv places
 // per-input options before each -i, so dropSidecarInput removes a
@@ -1962,14 +1609,14 @@ func TestRewriter_SWDecode_HDR_SubBurn_MapLabelUpdated(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("rewriter NOT applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:overlay-vaapi-hdr") {
-		t.Fatalf("expected filter:overlay-vaapi-hdr; got %v", out.Changes)
+	if !containsString(out.Changes, "filter:passthrough-inlineass-hdr") {
+		t.Fatalf("expected filter:passthrough-inlineass-hdr; got %v", out.Changes)
 	}
 	if !containsString(out.Changes, "map-label-update") {
 		t.Fatalf("MAP NOT UPDATED — this is the bug. changes=%v", out.Changes)
 	}
-	// `-map [2]` (the OldLabel from filter rewrite) must be GONE;
-	// in its place must be `-map [15]` (the NewLabel for overlay-vaapi).
+	// `-map [2]` (the OldLabel) must be replaced with `-map [15]` (the
+	// NewLabel for passthrough-inlineass).
 	for i := 0; i+1 < len(out.Args); i++ {
 		if out.Args[i] == "-map" && out.Args[i+1] == "[2]" {
 			t.Fatalf("stale -map [2] survived rewrite at idx=%d", i)
@@ -1983,15 +1630,15 @@ func TestRewriter_SWDecode_HDR_SubBurn_MapLabelUpdated(t *testing.T) {
 		}
 	}
 	if !found15 {
-		t.Fatalf("expected -map [15] (NewLabel for overlay-vaapi); not found. args=%v", out.Args)
+		t.Fatalf("expected -map [15] (NewLabel for passthrough-inlineass); not found. args=%v", out.Args)
 	}
-	// Sidecar drop applied
-	if !containsString(out.Changes, "drop:-i(sidecar-input)") {
-		t.Errorf("expected drop:-i(sidecar-input); got %v", out.Changes)
+	// Pass-through mode keeps -map_inlineass + the sidecar -i. The fork
+	// reads sub packets via that side-channel; we must NOT strip them.
+	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
+		t.Errorf("-map_inlineass should be kept in pass-through mode")
 	}
-	// `-map_inlineass` Plex-only flag stripped
-	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
-		t.Errorf("-map_inlineass not stripped")
+	if containsString(out.Changes, "drop:-i(sidecar-input)") {
+		t.Errorf("sidecar -i must NOT be dropped in pass-through mode: %v", out.Changes)
 	}
 }
 
@@ -2233,44 +1880,3 @@ func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
 	}
 }
 
-func TestRewriter_InlineassPassthrough_OFF_SwapsToSubtitles(t *testing.T) {
-	// Without the flag set, current swap-to-subtitles= behaviour stays.
-	// Asserts the off-default keeps bit-identical legacy semantics.
-	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "")
-	args := []string{
-		"-loglevel", "quiet",
-		"-codec:0", "libdav1d",
-		"-i", "/media/x.mkv",
-		"-ss", "0",
-		"-codec:1", "subrip",
-		"-i", "/transcode/Sub/temp-0.srt",
-		"-map_inlineass", "1:s:0",
-		"-filter_complex", "[0:0]scale=w=1280:h=720:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];[1]inlineass=font_scale=1.0:font_path=/x:language=en:font_size=54[2]",
-		"-map", "[2]",
-		"-codec:0", "libx264",
-		"-f", "matroska", "/transcode/out.mkv",
-		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
-	}
-	out := Rewrite(args, nil, &RewriteOpts{
-		FSExists: func(string) bool { return true },
-		ProbeSubtitleCodec: func(string, string) string {
-			return "subrip"
-		},
-	})
-	if !out.Applied {
-		t.Fatalf("expected rewrite; changes=%v", out.Changes)
-	}
-	// Legacy: -map_inlineass dropped, sidecar -i dropped (1 -i remaining).
-	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
-		t.Errorf("-map_inlineass should be dropped in legacy mode")
-	}
-	iCount := 0
-	for _, a := range out.Args {
-		if a == "-i" {
-			iCount++
-		}
-	}
-	if iCount != 1 {
-		t.Errorf("expected 1 -i in legacy mode (sidecar dropped), got %d", iCount)
-	}
-}
