@@ -532,13 +532,23 @@ func detectSubtitleSource(args []string, sessionDir string, probe func(source, s
 			if sessionDir == "" {
 				sessionDir = "/tmp/scaleplex"
 			}
-			outputFile := filepath.Join(sessionDir, "scaleplex-extract.srt")
+			// Preserve ASS styling (fonts, colour, position, karaoke)
+			// for anime + custom-styled fansubs: extract as .ass when
+			// source codec is ass/ssa, srt otherwise. libass renders
+			// both natively via the subtitles= filter (extension picks
+			// the format). SRT-only extract loses ASS overrides — fine
+			// for plain caption tracks, regression for stylised tracks.
+			extractFmt, extractExt := "srt", "srt"
+			if codec == "ass" || codec == "ssa" {
+				extractFmt, extractExt = "ass", "ass"
+			}
+			outputFile := filepath.Join(sessionDir, "scaleplex-extract."+extractExt)
 			res.FilePath = outputFile
 			res.Extract = &SubtitleExtract{
 				SourceFile: args[inputArgIdxs[0]+1],
 				StreamSpec: streamSpec,
 				OutputFile: outputFile,
-				Format:     "srt",
+				Format:     extractFmt,
 			}
 		}
 		// Bitmap: nothing to extract; filter graph references the
