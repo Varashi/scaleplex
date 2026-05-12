@@ -113,12 +113,16 @@ func extractSubtitleStream(ctx context.Context, ex *SubtitleExtract) error {
 		codec = "srt"
 	}
 
+	// Format choice is set by the rewriter based on probed source codec:
+	//   - source ass/ssa  → extract as `ass` (preserves karaoke styling,
+	//     colour, position; matches Plex's inlineass rendering fidelity)
+	//   - everything else → `srt` (SubRip; round-trips cleanly from any
+	//     text-sub source)
+	//
 	// `-c:s copy` would be faster but only works when source codec is
 	// already the target container's accepted format. SRT/SubRip tracks
-	// re-mux freely; ASS/SSA needs `-c:s ass`; mov_text needs
-	// conversion. Start simple: convert everything to srt. This loses
-	// ASS styling (bold, colour, position) but gains compatibility —
-	// most Plex sub-burn requests are SRT anyway.
+	// re-mux freely; ASS/SSA needs `-c:s ass`; mov_text needs conversion.
+	// The codec arg below carries whichever the rewriter picked.
 	//
 	// -probesize / -analyzeduration capped to 1 MB / 1 s. ffmpeg's
 	// defaults (5 MB / 5 s) are tuned for unknown formats; on a 30+ GB
