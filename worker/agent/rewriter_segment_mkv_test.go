@@ -83,8 +83,8 @@ func TestRewriter_PlexWindows_SegmentMkv_RewritesURL(t *testing.T) {
 	if containsString(out.Args, "-copyts") {
 		t.Errorf("-copyts must be stripped for matroska segment shape: %v", out.Args)
 	}
-	if !containsString(out.Changes, "hls:drop:-copyts") {
-		t.Errorf("expected hls:drop:-copyts tag: %v", out.Changes)
+	if !containsString(out.Changes, "hls:drop:-copyts(seek)") {
+		t.Errorf("expected hls:drop:-copyts(seek) tag: %v", out.Changes)
 	}
 	// Output filename pattern stays `chunk-%05d` (no .tmp suffix).
 	// Stage-rename was tried + reverted 2026-05-11 — ffmpeg's 0-byte
