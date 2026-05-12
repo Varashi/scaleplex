@@ -2033,3 +2033,244 @@ func TestIsHDRTransfer(t *testing.T) {
 		}
 	}
 }
+
+func TestStripPlexInlineassFilterArgs(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{
+			name: "no inlineass",
+			in:   "[0:0]scale=w=1280:h=720[v]",
+			want: "[0:0]scale=w=1280:h=720[v]",
+		},
+		{
+			name: "minimal 6-key — unchanged",
+			in:   "inlineass=font_scale=1.0:font_path=/x:font_size=54[3]",
+			want: "inlineass=font_scale=1.0:font_path=/x:font_size=54[3]",
+		},
+		{
+			name: "full Plex 10-key — strip 4",
+			in:   "[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Foo,Bold=500:outline=2.6:shadow=1.7:font_size=54[2]",
+			want: "[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:font_size=54[2]",
+		},
+		{
+			name: "overrides with embedded comma + ampersand value (real Plex)",
+			in:   "[1]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Noto Sans Medium,Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000:outline=2.6:shadow=1.7:font_size=54[2]",
+			want: "[1]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:font_size=54[2]",
+		},
+		{
+			name: "language at start (no leading colon)",
+			in:   "[1]inlineass=language=en:font_size=54[2]",
+			want: "[1]inlineass=font_size=54[2]",
+		},
+		{
+			name: "all 4 strip-keys at end",
+			in:   "[1]inlineass=font_scale=1.0:language=en:overrides=foo:outline=2.6:shadow=1.7[2]",
+			want: "[1]inlineass=font_scale=1.0[2]",
+		},
+		{
+			name: "idempotent — second pass is no-op",
+			in:   "[1]inlineass=font_scale=1.0:font_size=54[2]",
+			want: "[1]inlineass=font_scale=1.0:font_size=54[2]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripPlexInlineassFilterArgs(tc.in)
+			if got != tc.want {
+				t.Errorf("got:\n  %s\nwant:\n  %s", got, tc.want)
+			}
+			// Idempotency
+			got2 := stripPlexInlineassFilterArgs(got)
+			if got2 != got {
+				t.Errorf("not idempotent: %q → %q", got, got2)
+			}
+		})
+	}
+}
+
+func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
+	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	args := []string{
+		"-loglevel", "quiet",
+		"-codec:0", "libdav1d",
+		"-i", "/media/x.mkv",
+		"-ss", "0",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]scale=w=1280:h=720:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:language=en:overrides=foo:outline=2.6:shadow=1.7:font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists: func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string {
+			return "subrip"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	// 1. inlineass= filter retained, Plex-only keys stripped.
+	vfIdx := -1
+	for i, a := range out.Args {
+		if a == "-filter_complex" {
+			vfIdx = i + 1
+			break
+		}
+	}
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex in output")
+	}
+	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
+		t.Errorf("inlineass= dropped from filter: %s", out.Args[vfIdx])
+	}
+	for _, key := range []string{":language=", ":overrides=", ":outline=", ":shadow="} {
+		if strings.Contains(out.Args[vfIdx], key) {
+			t.Errorf("Plex-only key %q not stripped: %s", key, out.Args[vfIdx])
+		}
+	}
+	// 2. -map_inlineass kept.
+	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
+		t.Errorf("-map_inlineass dropped (should pass through)")
+	}
+	// 3. Sidecar -i kept (count of -i flags).
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 2 {
+		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
+	}
+	// 4. Null-sub output kept.
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Errorf("null-sub output dropped (should pass through)")
+	}
+	// 5. Mode tag.
+	gotPassthroughTag := false
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "filter:passthrough-inlineass") {
+			gotPassthroughTag = true
+			break
+		}
+	}
+	if !gotPassthroughTag {
+		t.Errorf("missing passthrough-inlineass change tag: %v", out.Changes)
+	}
+}
+
+func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
+	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	args := []string{
+		"-loglevel", "quiet",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi",
+		"-codec:0", "hevc",
+		"-i", "/media/x.mkv",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=p010[1];[1]hwdownload,format=p010[2];[2]inlineass=font_scale=1.0:font_path=/x:language=en:overrides=foo:outline=2:shadow=1:font_size=54[3];[3]hwupload[4]",
+		"-map", "[4]",
+		"-codec:0", "hevc_vaapi",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists: func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string {
+			return "subrip"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	vfIdx := -1
+	for i, a := range out.Args {
+		if a == "-filter_complex" {
+			vfIdx = i + 1
+			break
+		}
+	}
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex")
+	}
+	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
+		t.Errorf("inlineass dropped: %s", out.Args[vfIdx])
+	}
+	for _, k := range []string{":language=", ":overrides=", ":outline=", ":shadow="} {
+		if strings.Contains(out.Args[vfIdx], k) {
+			t.Errorf("Plex key %q not stripped: %s", k, out.Args[vfIdx])
+		}
+	}
+	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
+		t.Errorf("-map_inlineass dropped (should pass through)")
+	}
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 2 {
+		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
+	}
+	gotTag := false
+	for _, c := range out.Changes {
+		if c == "hw-decode:filter:inlineass-passthrough" {
+			gotTag = true
+			break
+		}
+	}
+	if !gotTag {
+		t.Errorf("missing hw-decode:filter:inlineass-passthrough tag: %v", out.Changes)
+	}
+}
+
+func TestRewriter_InlineassPassthrough_OFF_SwapsToSubtitles(t *testing.T) {
+	// Without the flag set, current swap-to-subtitles= behaviour stays.
+	// Asserts the off-default keeps bit-identical legacy semantics.
+	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "")
+	args := []string{
+		"-loglevel", "quiet",
+		"-codec:0", "libdav1d",
+		"-i", "/media/x.mkv",
+		"-ss", "0",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]scale=w=1280:h=720:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];[1]inlineass=font_scale=1.0:font_path=/x:language=en:font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists: func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string {
+			return "subrip"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	// Legacy: -map_inlineass dropped, sidecar -i dropped (1 -i remaining).
+	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
+		t.Errorf("-map_inlineass should be dropped in legacy mode")
+	}
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 1 {
+		t.Errorf("expected 1 -i in legacy mode (sidecar dropped), got %d", iCount)
+	}
+}
