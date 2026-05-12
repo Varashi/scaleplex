@@ -98,28 +98,28 @@ func TestRewriter_PlexWindows_SegmentMkv_RewritesURL(t *testing.T) {
 	if containsString(out.Args, "-extra_window_size") {
 		t.Errorf("-extra_window_size must not be injected for -f segment: %v", out.Args)
 	}
-	// segment_format_options: live=1 must be rewritten to live=0 so
-	// the stock matroska muxer writes Duration from -metadata into the
-	// header. Plex's fork patches matroskaenc.c to always write
-	// Duration regardless of live mode; stock honours is_live and
-	// skips. Without the rewrite, Plex Windows client sees an
-	// unknown-duration matroska stream and shows a growing slider.
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-segment_format_options" && out.Args[i+1] == "live=1" {
-			t.Errorf("live=1 must be rewritten to live=0: %v", out.Args)
-		}
-	}
-	if !containsString(out.Changes, "hls:segment_format_options:live=1->live=0+per-frame-clusters") {
-		t.Errorf("expected live=1->live=0+per-frame-clusters tag: %v", out.Changes)
-	}
-	// Check the actual options string is now the combined form.
+	// segment_format_options live=1 now passes through unchanged.
+	// scaleplex-ffmpeg7 patch 0094 makes matroskaenc.c always write
+	// Duration from -metadata regardless of is_live; jellyfin's
+	// `IS_SEEKABLE = pb seekable && !is_live` falls to the
+	// cluster-defaults else-branch at live=1 → 1000 ms / 32 KB ≈
+	// per-frame clusters that Plex Windows needs. Both behaviours the
+	// previous rewrite forced now come from the fork + stock defaults.
+	foundLive1 := false
 	for i := 0; i+1 < len(out.Args); i++ {
 		if out.Args[i] == "-segment_format_options" {
-			want := "live=0:cluster_time_limit=1000:cluster_size_limit=32768"
-			if out.Args[i+1] != want {
-				t.Errorf("segment_format_options: got %q want %q", out.Args[i+1], want)
+			if out.Args[i+1] != "live=1" {
+				t.Errorf("segment_format_options: got %q, want live=1 (unchanged)", out.Args[i+1])
+			} else {
+				foundLive1 = true
 			}
 			break
 		}
+	}
+	if !foundLive1 {
+		t.Errorf("-segment_format_options live=1 missing from output: %v", out.Args)
+	}
+	if containsString(out.Changes, "hls:segment_format_options:live=1->live=0+per-frame-clusters") {
+		t.Errorf("live=1 rewrite should be gone post-audit: %v", out.Changes)
 	}
 }

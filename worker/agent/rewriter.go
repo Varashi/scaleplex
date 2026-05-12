@@ -151,13 +151,57 @@ var x264PresetToVAAPI = map[string]string{
 	"placebo":   "1",
 }
 
+// mapX264PresetToVAAPI maps Plex's libx264 -preset name onto iHD's
+// VAAPI TargetUsage scale (1..7, 7 = fastest). Looks up
+// `SCALEPLEX_PRESET_MAP` env first for per-deployment overrides, then
+// falls back to the on-cluster-tuned defaults above.
+//
+// Env format: comma-separated `name=N` pairs (case-insensitive), e.g.
+//
+//	SCALEPLEX_PRESET_MAP=veryfast=5,fast=3,medium=2
+//
+// Missing names keep their default mapping; entries with unparsable
+// values are silently ignored.
 func mapX264PresetToVAAPI(preset string) string {
-	if v, ok := x264PresetToVAAPI[strings.ToLower(preset)]; ok {
+	key := strings.ToLower(preset)
+	if v, ok := parsePresetMapEnv()[key]; ok {
+		return v
+	}
+	if v, ok := x264PresetToVAAPI[key]; ok {
 		return v
 	}
 	// Unknown preset → fastest. Worker only runs when called by orch;
 	// playback latency wins over an unfamiliar quality knob.
 	return "7"
+}
+
+// parsePresetMapEnv reads `SCALEPLEX_PRESET_MAP` and returns the
+// overrides as a lowercased map. Parsed per call (env reads are cheap
+// and rewriting is rare). Returns nil when env is empty so callers can
+// skip lookups.
+func parsePresetMapEnv() map[string]string {
+	v := os.Getenv("SCALEPLEX_PRESET_MAP")
+	if v == "" {
+		return nil
+	}
+	out := map[string]string{}
+	for _, pair := range strings.Split(v, ",") {
+		eq := strings.IndexByte(pair, '=')
+		if eq < 1 {
+			continue
+		}
+		name := strings.TrimSpace(strings.ToLower(pair[:eq]))
+		val := strings.TrimSpace(pair[eq+1:])
+		if name == "" || val == "" {
+			continue
+		}
+		// Validate val is 1..7 — VAAPI TargetUsage range.
+		if n, err := strconv.Atoi(val); err != nil || n < 1 || n > 7 {
+			continue
+		}
+		out[name] = val
+	}
+	return out
 }
 
 // encoderMap routes PMS's chosen software encoder to its VAAPI
@@ -1037,12 +1081,18 @@ func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string,
 }
 
 // upgradeLoglevelFromQuiet rewrites `-loglevel quiet|panic|fatal` to
-// `info`. PMS's JobRunner expects "Stream mapping:" lines on stderr to
-// detect transcoder readiness; quiet stalls /header for ~125s.
+// the value of `SCALEPLEX_FFMPEG_LOGLEVEL` env (default "info").
+// PMS's JobRunner expects "Stream mapping:" lines on stderr to detect
+// transcoder readiness; quiet stalls /header for ~125s.
+//
+// SCALEPLEX_FFMPEG_LOGLEVEL=debug exposes the per-cycle
+// `scaleplex/ct: PUT/avio_read/body` diagnostics emitted by patch
+// 0097's canThrottle handler. The state-transition `throttle ON|OFF`
+// lines are AV_LOG_INFO so they show at the default level.
 func upgradeLoglevelFromQuiet(args []string) ([]string, bool) {
 	if i := indexOfArg(args, "-loglevel", 0); i >= 0 && i+1 < len(args) {
 		if v := args[i+1]; v == "quiet" || v == "panic" || v == "fatal" {
-			args[i+1] = "info"
+			args[i+1] = envOr("SCALEPLEX_FFMPEG_LOGLEVEL", "info")
 			return args, true
 		}
 	}
@@ -2325,52 +2375,22 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 		}
 
-		// Rewrite `-segment_format_options live=1` → `live=0` (Plex Windows
-		// segmented-matroska shape). Plex's matroska muxer fork patches
-		// matroskaenc.c at line 2561 to ALWAYS write the Matroska Duration
-		// element from `-metadata duration=` even in live mode (`!is_live
-		// || 1`). Stock matroska honours `is_live`: with live=1 the Duration
-		// element is skipped entirely, so the segment_header file lands on
-		// disk without Duration. The Plex Windows client reads the
-		// concatenated header+chunks via `/transcode/universal/start`, sees
-		// no Duration in the matroska header, and falls back to inferring
-		// duration from received bytes — slider shows 5 min, growing as
-		// transcode produces chunks (verified live 2026-05-11 Big Hero 6
-		// 8 Mbps 1080p, user couldn't seek past "current produced" mark).
+		// `-segment_format_options live=1` passes through. scaleplex-
+		// ffmpeg7 patch 0094 makes matroskaenc.c always write Duration
+		// regardless of is_live, and jellyfin 7.x's `IS_SEEKABLE = pb
+		// seekable && !is_live` naturally falls to the cluster-defaults
+		// else-branch at live=1 → 1000 ms / 32 KB defaults ≈ per-frame
+		// clusters at typical bitrates. Both behaviours the previous
+		// rewrite forced (Duration in header + per-frame clusters) are
+		// now patch-0094-plus-stock-defaults.
 		//
-		// Setting live=0 makes stock write Duration from -metadata into
-		// the header file. Side effects (SeekHead writing + end-of-stream
-		// seek-back to update Duration) are no-ops here: segment muxer
-		// captures only header bytes up to first Cluster, so later
-		// seek-backs land in chunk files and don't touch the already-
-		// written header. Empirically validated 2026-05-11 with testsrc2:
-		// live=0 header has 0x4489 Duration = 6112352ms; live=1 doesn't.
-		for i := 0; i+1 < len(args); i++ {
-			if args[i] != "-segment_format_options" {
-				continue
-			}
-			if args[i+1] == "live=1" {
-				// live=0: stock writes matroska Duration from -metadata
-				//   into the segment_header file (Plex Windows client uses
-				//   it to fill the seekbar with full source duration).
-				// cluster_time_limit=1000 + cluster_size_limit=32768:
-				//   force per-frame clusters. With live=0, stock's defaults
-				//   are 5s/5MB → one cluster per ~5s chunk. Plex Windows
-				//   tracks playback position (and the offset it sends to
-				//   PMS on audio-track-switch / quality-change / re-spawn)
-				//   from Cluster.Timecode. Per-frame clusters match what
-				//   Plex-native matroskaenc.c produces under live=1
-				//   defaults; verified 2026-05-11 against production PMS
-				//   chunk 5 — 25 clusters per 1s chunk at 8 Mbps. Without
-				//   per-frame clusters the client falls back to elapsed-
-				//   since-stream-start, so audio-swap re-spawns the
-				//   transcode at offset=elapsed → playback restarts from
-				//   the front.
-				args[i+1] = "live=0:cluster_time_limit=1000:cluster_size_limit=32768"
-				changes = append(changes, "hls:segment_format_options:live=1->live=0+per-frame-clusters")
-			}
-			break
-		}
+		// Previous rewrite (deleted 2026-05-12 audit pass) replaced
+		// `live=1` with `live=0:cluster_time_limit=1000:cluster_size_limit=32768`.
+		// Real PMS argvs for Plex Android use `output_ts_offset=10` and
+		// never trigger the live=1 match, so the rewrite was dead code
+		// for current production traffic. Plex Windows shape would emit
+		// live=1 — needs revalidation when hw becomes available, but
+		// patch 0094 + IS_SEEKABLE semantics give the same end state.
 
 		// Stage-rename pattern attempted (rewriter swap to `chunk-%05d
 		// .tmp` + relay-side patch-and-rename to final chunk-N) —
