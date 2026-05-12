@@ -90,11 +90,11 @@ type outputStream struct {
 
 // reportContext holds the per-session state the reporter needs.
 type reportContext struct {
-	URL        string
-	Streams    []outputStream
-	DurationS  float64 // total source duration in seconds (0 = unknown)
-	SessionID  string
-	Throttle   *throttleSignal // updated from progress PUT response bodies
+	URL       string
+	Streams   []outputStream
+	DurationS float64 // total source duration in seconds (0 = unknown)
+	SessionID string
+	Throttle  *throttleSignal // updated from progress PUT response bodies
 }
 
 // runProgressReporter consumes ffmpeg -progress output from r and PUTs
@@ -137,7 +137,6 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 		log.Printf("session %s: progress reporter scan: %v", rc.SessionID, err)
 	}
 }
-
 
 // putProgressTick translates one ffmpeg progress block into the
 // Plex-shaped query-string PUT.

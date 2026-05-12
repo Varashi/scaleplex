@@ -108,11 +108,11 @@ func TestParseEventConfig(t *testing.T) {
 	}{
 		{"config=0x4", 4, true},
 		{"config=0x600100000", 0x600100000, true},
-		{"config=42", 42, true},                  // no 0x prefix → decimal
-		{"event=0xa,config=0x10", 0x10, true},    // skip non-config keys
-		{"  config=0x1  ", 1, true},              // whitespace tolerance
-		{"config=0xZZ", 0, false},                // bogus hex
-		{"event=0xa", 0, false},                  // no config key
+		{"config=42", 42, true},               // no 0x prefix → decimal
+		{"event=0xa,config=0x10", 0x10, true}, // skip non-config keys
+		{"  config=0x1  ", 1, true},           // whitespace tolerance
+		{"config=0xZZ", 0, false},             // bogus hex
+		{"event=0xa", 0, false},               // no config key
 		{"", 0, false},
 	}
 	for _, tc := range cases {

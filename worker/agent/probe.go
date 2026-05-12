@@ -52,11 +52,12 @@ func probeVideoColor(source string) (transfer, primaries, space string) {
 
 // probeSubtitleCodec runs ffprobe synchronously to learn the codec_name
 // of the subtitle stream Plex's `-map_inlineass` references. The
-// rewriter uses this to pick text vs bitmap burn-in chains.
+// rewriter uses this to pick text (inlineass pass-through) vs bitmap
+// (overlay_vaapi) burn-in chains.
 //
 // Cheap (~30-100 ms — ffprobe just reads container headers, no decode).
-// Returns "" on probe failure; the rewriter treats unknown as text and
-// the agent's extraction step will fail loud on bitmap inputs.
+// Returns "" on probe failure; the rewriter treats unknown as text
+// (the common case — bitmap streams are rarer).
 func probeSubtitleCodec(source, streamSpec string) string {
 	if source == "" || streamSpec == "" {
 		return ""
@@ -77,4 +78,3 @@ func probeSubtitleCodec(source, streamSpec string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
-
