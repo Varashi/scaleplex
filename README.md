@@ -19,8 +19,9 @@ keeps the distributed-transcode shape but swaps workers to **stock ffmpeg**
 Concretely this unlocks:
 
 - HW HDR→SDR tonemap (`tonemap_vaapi`)
-- HW subtitle burn-in (`overlay_vaapi` + stock `subtitles=` filter, replacing
-  Plex's `inlineass`)
+- HW subtitle burn-in: bitmap subs via `overlay_vaapi`, text subs via a
+  fork-native port of Plex's `inlineass` filter (scaleplex-ffmpeg7 patches
+  0099-0101)
 - HDR Main10 passthrough where the client supports it
 - Direct NFS segment writes — no `LOCAL_RELAY` HTTP hop
 - First-frame latency as a first-class design goal (see [docs/LATENCY.md](docs/LATENCY.md))
@@ -43,8 +44,9 @@ bookkeeping is unchanged.
 | Plex Optimize (remux shape: bare decoder + `-codec:0 copy`) | ✓ | n/a | n/a | covered by `tryOptimizeRemux` fast-path; preserves multi-input sidecar SRTs |
 | PMS Detection / ML pre-pass (intro / credits / voice activity markers) | ✓ | n/a | n/a | bail-path scrub strips Plex-private flags + input audio decoder hints (any stream-spec form) so ffmpeg auto-detects the right decoder |
 
-**Source matrix tested:** AV1 + HEVC + H264 sources; SDR + HDR10; SRT sidecar
-subs (burn-in via `subtitles=` filter chained through `overlay_vaapi`).
+**Source matrix tested:** AV1 + HEVC + H264 sources; SDR + HDR10; embedded
++ sidecar SRT / ASS text subs (burn-in via fork-native `inlineass=` filter);
+embedded PGS bitmap subs (overlay_vaapi).
 
 **Untested / pending:** LG WebOS, PS4, Apple TV, iOS clients;
 sustained-load and concurrent-session benchmarks; full production cutover
