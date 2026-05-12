@@ -31,25 +31,33 @@ bookkeeping is unchanged.
 
 ## Status
 
-**Working end-to-end as of 2026-05-06** on the test PMS pod
+**Working end-to-end as of 2026-05-12** on the test PMS pod
 (`clusterplex-pms-*` with shim swapped via `DOCKER_MODS`):
 
 | Streaming format | Initial play | Seek | Quality change | Notes |
 |---|:-:|:-:|:-:|---|
 | DASH (Plex Web Chrome) | ✓ | ✓ | ✓ | Real-time + Optimize jobs |
 | HLS / mpegts (Plex Android) | ✓ | ✓ | — | |
-| HLS / matroska (Plex Android, 4K HDR + 5.1 EAC3) | ✓ | ✓ | ✓ | mkv-in-.ts triggered when codec/audio combo can't fit mpegts |
+| HLS / matroska (Plex Android, 4K HEVC HDR + 5.1 EAC3) | ✓ | ✓ | ✓ | mkv-in-.ts triggered when codec/audio combo can't fit mpegts. Throttle equilibrium ~1.3× sustained, verified smooth 2026-05-12. |
+| HLS / matroska (Plex Windows, 1080p + 5.1 EAC3) | ✓ | ✓ | — | mpv-based client. Verified up to 2026-05-11; needs retest on `phase4-trim` after dropping the rewriter's `live=1`→`live=0+per-frame-clusters` translation (now relies on patch 0094 + jellyfin's `IS_SEEKABLE` natural fallthrough). |
 | Plex Optimize (HW-decode shape: `-hwaccel:0 vaapi`) | ✓ | n/a | n/a | hevc_vaapi mp4 + faststart, multi-track audio + sub-sidecar copy |
 | Plex Optimize (remux shape: bare decoder + `-codec:0 copy`) | ✓ | n/a | n/a | covered by `tryOptimizeRemux` fast-path; preserves multi-input sidecar SRTs |
 | PMS Detection / ML pre-pass (intro / credits / voice activity markers) | ✓ | n/a | n/a | bail-path scrub strips Plex-private flags + input audio decoder hints (any stream-spec form) so ffmpeg auto-detects the right decoder |
 
-**Source matrix tested:** AV1 + HEVC + H264 sources; SDR + HDR10; SRT sidecar
-subs (burn-in via `subtitles=` filter chained through `overlay_vaapi`).
+**Source matrix tested:** AV1 + HEVC + H264 sources; SDR + HDR10; TrueHD
++ EAC3 + AC3 audio (5.1 / 7.1); SRT sidecar subs (burn-in via
+`subtitles=` filter chained through `overlay_vaapi`).
 
-**Untested / pending:** LG WebOS, PS4, Apple TV, iOS clients;
-sustained-load and concurrent-session benchmarks; full production cutover
-(currently only the test PMS pod runs the shim, clusterplex on
-production PMS is untouched).
+**Known client-side limit (not scaleplex):** TrueHD audio passthrough on
+Plex Android = `Decoder init failed`. Reproduces identically on prod
+Plex Transcoder; force EAC3 transcode (Plex audio quality setting) to
+work around. See memory `reference_plex_android_truehd_decoder_init.md`.
+
+**Untested / pending:** LG webOS retest on `phase4-trim` image; PS4 with
+the throttle-thread fix; Apple TV, iOS clients; sustained-load and
+concurrent-session benchmarks; full production cutover (currently only
+the test PMS pod runs the shim, clusterplex on production PMS is
+untouched).
 
 Image tag tracked in `worker/deploy/worker.yaml` and the
 `scaleplex_pms_dockermod` GHCR repo. Builds are sha-pinned (CI publishes
