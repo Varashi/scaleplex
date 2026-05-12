@@ -1,0 +1,83 @@
+Description: ffmpeg + segment: accept Plex-specific CLI compat options
+ Two tiny compatibility nudges that let the worker rewriter stop
+ translating Plex's argv on the way to scaleplex-ffmpeg7:
+
+   -loglevel_plex <name>   Plex's fork adds a secondary log level
+                           (messages tagged for PMS). Stock ffmpeg
+                           doesn't know the option and exits with
+                           "Unrecognized option". Register it as an
+                           OPT_TYPE_STRING sink — accepted, value
+                           discarded. Stock's regular -loglevel still
+                           governs what's emitted.
+
+   -f ssegment             ff_stream_segment_muxer already exposes
+                           the "ssegment" alias upstream, but it
+                           lacks AVFMT_GLOBALHEADER on its flags
+                           field. Plex's argv combines `-flags
+                           +global_header` (encoder writes SPS/PPS
+                           to extradata) with `-segment_header_filename
+                           header` (muxer dumps extradata to a
+                           separate header file). Without
+                           AVFMT_GLOBALHEADER on the muxer the
+                           encoder is never asked to emit a global
+                           header, the segment muxer writes an empty
+                           header file, and Plex clients 404 on
+                           /header forever. segment.c is shared
+                           between ff_segment_muxer (has the flag)
+                           and ff_stream_segment_muxer (doesn't), so
+                           harmonising the flag is the natural fix.
+
+ The worker rewriter can now drop two more translation entries
+ (`drop:-loglevel_plex`, `hls:f=ssegment->segment`).
+Origin: backport (minimal), scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-12
+---
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -730,6 +730,7 @@
+ // scaleplex/PLEX: canThrottle feedback loop.
+ extern char *canthrottle_url;
+ extern _Atomic int scaleplex_throttle_delay_us;
++extern char *plex_loglevel_sink;
+ extern float max_error_rate;
+ 
+ extern char *filter_nbthreads;
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -103,6 +103,8 @@
+ // scaleplex/PLEX: canThrottle feedback (see ffmpeg.h)
+ char *canthrottle_url = NULL;
+ _Atomic int scaleplex_throttle_delay_us = 0;
++// scaleplex/PLEX: stub sink for `-loglevel_plex` (Plex CLI compat).
++char *plex_loglevel_sink = NULL;
+ 
+ InputFile   **input_files   = NULL;
+ int        nb_input_files   = 0;
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -1576,6 +1576,9 @@
+       "add timings for each task" },
+     { "canthrottleurl",         OPT_TYPE_STRING, OPT_EXPERT, { &canthrottle_url },
+         "URL to PUT (one-shot per progress report) for Plex-style canThrottle feedback", "url" },
++    // scaleplex/PLEX: accept Plex's -loglevel_plex <name> as a stub.
++    { "loglevel_plex",          OPT_TYPE_STRING, OPT_EXPERT, { &plex_loglevel_sink },
++        "Plex-style secondary log level (no-op stub for CLI compat)", "level" },
+     { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+         { .func_arg = opt_progress },
+       "write program-readable progress information", "url" },
+--- a/libavformat/segment.c
++++ b/libavformat/segment.c
+@@ -1105,7 +1105,10 @@
+ const FFOutputFormat ff_stream_segment_muxer = {
+     .p.name          = "stream_segment,ssegment",
+     .p.long_name     = NULL_IF_CONFIG_SMALL("streaming segment muxer"),
+-    .p.flags         = AVFMT_NOFILE,
++    // scaleplex/PLEX: add AVFMT_GLOBALHEADER so `-f ssegment` matches
++    // `-f segment` for Plex's matroska-in-ts shape (encoder writes
++    // SPS/PPS to extradata, segment muxer dumps it to header_filename).
++    .p.flags         = AVFMT_NOFILE | AVFMT_GLOBALHEADER,
+     .p.priv_class    = &seg_class,
+     .priv_data_size  = sizeof(SegmentContext),
+     .init           = seg_init,

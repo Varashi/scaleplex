@@ -1,0 +1,57 @@
+name: build-ffmpeg-deps
+
+# Builds the scaleplex-ffmpeg DEPS base image — the slow-changing piece
+# of the ffmpeg pipeline. Bundles every libxxx-dev jellyfin compiles
+# from source (libass, dav1d, SVT-AV1, libdrm, libva, libplacebo, intel
+# media-driver, oneVPL, NVENC headers, etc.) into
+# /usr/lib/scaleplex-ffmpeg/ so the fast patches+deb build (build-ffmpeg)
+# can FROM this and skip the ~25-40 min dep compile every iteration.
+#
+# Only re-built when VERSION (pinned jellyfin tag) changes, or on manual
+# dispatch. Image size ~3-5 GB — pulls aren't cheap but each rebuild
+# unlocks ~30 min per worker iteration.
+#
+# Publishes to ghcr.io/varashi/scaleplex-ffmpeg-deps:<jellyfin-tag>.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scaleplex-ffmpeg/VERSION"
+      - "scaleplex-ffmpeg/build-deps.sh"
+      - "scaleplex-ffmpeg/lib/**"
+      - ".github/workflows/build-ffmpeg-deps.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: free runner disk
+        # Same ~6 GB transient + ~5 GB final image. Drop preinstalled
+        # tooling to give the bundled-deps compile plenty of headroom.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
+          df -h
+      - name: build + push deps image
+        env:
+          BUILDX: "1"
+          PUSH: "1"
+        run: ./scaleplex-ffmpeg/build-deps.sh
+      - name: show tag
+        run: |
+          echo "Pushed ghcr.io/varashi/scaleplex-ffmpeg-deps:$(tr -d '[:space:]' < scaleplex-ffmpeg/VERSION)"

@@ -1,0 +1,695 @@
+Description: fftools: wire `-map_inlineass` option to vf_inlineass (Phase 2)
+ Phase 1 (patch 0099) shipped vf_inlineass.c + .h registered and visible
+ in `ffmpeg -filters`, but with no fftools-side wiring the filter is
+ dormant — the public helpers (`avfilter_inlineass_append_data`,
+ `avfilter_inlineass_set_storage_size`, `avfilter_inlineass_add_attachment`,
+ `avfilter_inlineass_set_fonts`) are never called.
+ .
+ This patch lands the wiring. Backport of Plex Transcoder 1.12.3's
+ fftools/plex.c subtitle hooks, adapted to jellyfin-ffmpeg 7.1.3's
+ split demuxer/scheduler/decoder/filter threading model.
+ .
+ New surface:
+ .
+   - `-map_inlineass FILE:STREAM_SPEC`. Per-file output option (matches
+     Plex's signature: OPT_PERFILE | OPT_OUTPUT | OPT_EXPERT). Records
+     a binding {file_idx, stream_spec, ist}. Stream specifier is
+     resolved against the named input file at option-parse time
+     (inputs are open by the time output options run).
+ .
+ New file: fftools/scaleplex_inlineass.c (+ .h). Holds the global
+ binding registry and three runtime hooks invoked from fftools:
+ .
+   - scaleplex_inlineass_opt        — option handler (above)
+   - scaleplex_inlineass_link_graph — called from configure_filtergraph
+     after avfilter_graph_config succeeds. Scans the filter graph for
+     filters named "inlineass", binds each to the next unbound entry
+     in the registry, attaches matching font streams via
+     avfilter_inlineass_add_attachment, calls set_fonts, and pushes
+     the buffersink output dims via set_storage_size.
+   - scaleplex_inlineass_handle_subtitle — called from transcode_subtitles
+     in ffmpeg_dec.c after avcodec_decode_subtitle2 succeeds. Looks up
+     the binding by AVCodecContext* and forwards the decoded subtitle
+     to avfilter_inlineass_append_data.
+ .
+ Helper added to ffmpeg_dec.c: dec_get_avctx(Decoder *) returns the
+ internal AVCodecContext. Needed because the public Decoder struct
+ in ffmpeg.h does not expose dec_ctx, and scaleplex_inlineass.c needs
+ it to populate (and later look up) the dec_ctx → AVFilterContext map.
+ .
+ Threading model — process-wide libass lock:
+ .
+   Plex 6.x runs the transcode loop single-threaded, so libass calls
+   never race. Jellyfin 7.x splits demuxer / decoder / filter / encoder
+   into separate threads connected by a bounded scheduler queue.
+   Three libass entry-point classes now run on different threads:
+ .
+     - decoder thread:  avfilter_inlineass_append_data → process_header
+                        (ass_process_codec_private, ass_alloc_style)
+                        + ass_process_chunk
+     - filter thread:   filter_frame → ass_render_frame
+                        + overlay_ass_image (reads renderer-owned
+                          memory the next render call would invalidate)
+     - main thread at configure_filtergraph time:
+                        scaleplex_inlineass_link_graph →
+                        avfilter_inlineass_{set_storage_size,
+                        add_attachment, set_fonts}
+ .
+   libass's contract is that ASS_Library / ASS_Renderer / ASS_Track
+   must each be touched from one thread at a time. A per-filter mutex
+   satisfies that on paper, but in practice libass also touches
+   process-wide shared state (fontconfig, FreeType cache, font
+   provider) that isn't reentrant. The prior per-filter approach
+   segfaulted on the filter thread the moment ass_render_frame ran
+   while ass_process_chunk on the decoder thread had just driven
+   fontconfig.
+ .
+   This patch promotes the mutex to one file-scope
+   pthread_mutex_t inlineass_lock = PTHREAD_MUTEX_INITIALIZER and
+   wraps EVERY libass entry into vf_inlineass.c. Mirrors Plex 6.x's
+   effective single-thread behaviour without forcing
+   --disable-fontconfig or per-filter private fontconfig contexts.
+   Lock contention is negligible at homelab session counts (1-3
+   concurrent) because libass calls are sparse and short.
+ .
+ AVOption table unchanged from Phase 1. Plex's argv emits
+ inlineass=...:language=...:overrides=...:outline=...:shadow=...
+ beyond the 6 options vf_inlineass parses. The rewriter is responsible
+ for stripping those four keys before passing the filter argv through
+ — keeps the filter's AVOption table identical to Phase 1, sidesteps
+ the LTO/AVFILTER_DEFINE_CLASS table-truncation mystery seen on the
+ prior attempt to add stubs.
+ .
+ Worker rewriter cleanup after this lands: drop findSidecarSubtitle
+ (~30 LOC), drop the hybrid-inlineass filter rewrite mode (~50 LOC),
+ drop the HLS+seek PTS-shift bracket, drop the side-ffmpeg subtitle
+ extract step (~150 LOC of subtitle_extract.go + rewriter glue),
+ add a 4-line regex to strip the Plex-only filter args.
+Origin: backport, https://github.com/Diagonactic/plex-new-transcoder
+        (Plex Transcoder 1.12.3.4973), fftools/plex.c hooks
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-12
+---
+--- a/libavfilter/vf_inlineass.c	2026-05-12 14:58:13.061002705 +0200
++++ b/libavfilter/vf_inlineass.c	2026-05-12 14:59:50.331911222 +0200
+@@ -20,9 +20,11 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <inttypes.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <ctype.h>
++#include <pthread.h>
+ #include <ass/ass.h>
+ #include "libavcodec/avcodec.h"
+ #include "libavfilter/avfilter.h"
+@@ -58,6 +60,18 @@
+     float vs2rgb[3][4];
+ } AssContext;
+ 
++/* scaleplex: process-wide libass lock. libass is not reentrant across
++ * its shared state (fontconfig, FreeType cache, font provider). In
++ * jellyfin-ffmpeg 7.x the decoder, filter, and main threads can each
++ * call libass entry points concurrently. A per-filter mutex isn't
++ * enough — Plex 6.x runs the transcode loop single-threaded so the
++ * shared-state contention never surfaces. One file-scope mutex covers
++ * every libass call site below. Contention is negligible at homelab
++ * session counts because libass calls are sparse: process_header once
++ * per stream, append_data on each subtitle packet (few per second),
++ * render_frame on each video frame for ~hundreds of microseconds. */
++static pthread_mutex_t inlineass_lock = PTHREAD_MUTEX_INITIALIZER;
++
+ #define OFFSET(x) offsetof(AssContext, x)
+ #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+ 
+@@ -547,9 +561,12 @@
+         calculate_mangle_table(ass, picref);
+     }
+ 
++    pthread_mutex_lock(&inlineass_lock);
+     image = ass_render_frame(ass->renderer, ass->track, time_ms, NULL);
+-
++    /* libass-owned bitmap pointers in `image` reference renderer state
++     * the next render call would overwrite — hold the lock through overlay. */
+     overlay_ass_image(ass, picref, image);
++    pthread_mutex_unlock(&inlineass_lock);
+ 
+     return ff_filter_frame(outlink, picref);
+ }
+@@ -574,7 +591,9 @@
+ void avfilter_inlineass_set_storage_size(AVFilterContext *context, int w, int h)
+ {
+     AssContext *ass = (AssContext *)context->priv;
++    pthread_mutex_lock(&inlineass_lock);
+     ass_set_storage_size(ass->renderer, w, h);
++    pthread_mutex_unlock(&inlineass_lock);
+ }
+ 
+ void avfilter_inlineass_add_attachment(AVFilterContext *context, AVStream *st)
+@@ -595,43 +614,63 @@
+         !av_strcasecmp( ext, ".otf" ) ||
+         !av_strcasecmp( ext, ".ttc" )
+     ) {
++        pthread_mutex_lock(&inlineass_lock);
+         ass_add_font(assContext->library, filename,
+                      st->codecpar->extradata, st->codecpar->extradata_size);
++        pthread_mutex_unlock(&inlineass_lock);
+     }
+ }
+ 
+ void avfilter_inlineass_set_fonts(AVFilterContext *context)
+ {
+     AssContext* ass = context->priv;
++    pthread_mutex_lock(&inlineass_lock);
+     ass_set_fonts(ass->renderer, ass->font_path, "DejaVu Sans", 1, ass->fc_file, 1);
++    pthread_mutex_unlock(&inlineass_lock);
+ }
+ 
++/* Caller (avfilter_inlineass_append_data) holds inlineass_lock — every
++ * libass call below runs under that lock. */
+ static void process_header(AVFilterContext *link, AVCodecContext *dec_ctx)
+ {
+     AssContext *ass = link->priv;
+     ASS_Track *track = ass->track;
+     enum AVCodecID codecID = dec_ctx->codec_id;
++    ASS_Style *style = NULL;
++    int sid = 0;
++
++    av_log(link, AV_LOG_VERBOSE,
++           "scaleplex_inlineass: process_header codec_id=%d sub_header_size=%d track=%p\n",
++           (int)codecID, dec_ctx ? dec_ctx->subtitle_header_size : -1, (void*)track);
+ 
+     if (!track)
+         return;
+ 
+-    if (codecID == AV_CODEC_ID_ASS) {
++    if (codecID == AV_CODEC_ID_ASS && dec_ctx->extradata_size > 0 && dec_ctx->extradata) {
+         ass_process_codec_private(track, dec_ctx->extradata,
+                                   dec_ctx->extradata_size);
+     } else {
+-        ASS_Style *style = NULL;
+-        int sid = 0;
+-
+         /* Decode subtitles and push them into the renderer (libass) */
+-        if (dec_ctx->subtitle_header)
++        if (dec_ctx->subtitle_header && dec_ctx->subtitle_header_size > 0)
+             ass_process_codec_private(track,
+                                       dec_ctx->subtitle_header,
+                                       dec_ctx->subtitle_header_size);
+ 
+-        style = &ass->track->styles[sid];
+-        if (!ass->track->n_styles) {
++        /* scaleplex: alloc a default style FIRST if codec_private didn't
++         * populate one. Plex's original 6.x code accessed styles[0] before
++         * the alloc check, which segfaulted when libass returned a track
++         * with styles=NULL+n_styles=0 (e.g. SRT decoder when its
++         * subtitle_header parse didn't create a [V4+ Styles] block). */
++        if (!track->n_styles || !track->styles) {
+             sid = ass_alloc_style(track);
+-            style = &ass->track->styles[sid];
++            if (sid < 0 || !track->styles) {
++                av_log(link, AV_LOG_WARNING,
++                       "scaleplex_inlineass: ass_alloc_style failed (sid=%d styles=%p) — skipping header init\n",
++                       sid, (void*)track->styles);
++                ass->got_header = 1;
++                return;
++            }
++            style = &track->styles[sid];
+             style->Name             = strdup("Default");
+             style->PrimaryColour    = 0xffffff00;
+             style->SecondaryColour  = 0x00ffff00;
+@@ -645,11 +684,15 @@
+             style->Outline          = 2;
+             style->Shadow           = 3;
+             style->Alignment        = 2;
++        } else {
++            style = &track->styles[sid];
+         }
+ 
+-        style->FontName         = strdup("DejaVu Sans");
+-        style->FontSize         = ass->font_size;
+-        style->MarginL = style->MarginR = style->MarginV = ass->margin;
++        if (style) {
++            style->FontName         = strdup("DejaVu Sans");
++            style->FontSize         = ass->font_size;
++            style->MarginL = style->MarginR = style->MarginV = ass->margin;
++        }
+ 
+         track->default_style = sid;
+     }
+@@ -660,21 +703,60 @@
+ void avfilter_inlineass_append_data(AVFilterContext *link, AVCodecContext *dec_ctx,
+                                     AVSubtitle *sub)
+ {
+-    AssContext *ass = link->priv;
++    AssContext *ass;
+     int i;
+ 
+-    if (!ass->got_header)
++    if (!link || !link->priv || !sub) {
++        av_log(NULL, AV_LOG_WARNING,
++               "scaleplex_inlineass: append_data called with NULL link/priv/sub (link=%p sub=%p)\n",
++               (void*)link, (void*)sub);
++        return;
++    }
++    ass = link->priv;
++
++    pthread_mutex_lock(&inlineass_lock);
++
++    av_log(link, AV_LOG_VERBOSE,
++           "scaleplex_inlineass: append_data num_rects=%d pts=%" PRId64 " got_header=%d track=%p\n",
++           sub->num_rects, sub->pts, ass->got_header, (void*)ass->track);
++
++    if (!ass->got_header && dec_ctx)
+         process_header(link, dec_ctx);
+ 
++    if (!ass->track) {
++        av_log(link, AV_LOG_WARNING, "scaleplex_inlineass: track NULL after header\n");
++        pthread_mutex_unlock(&inlineass_lock);
++        return;
++    }
++
++    if (!sub->rects) {
++        av_log(link, AV_LOG_VERBOSE, "scaleplex_inlineass: sub->rects NULL, nothing to append\n");
++        pthread_mutex_unlock(&inlineass_lock);
++        return;
++    }
++
+     for (i = 0; i < sub->num_rects; i++) {
+-        int64_t duration = sub->end_display_time - sub->start_display_time;
+-        int64_t start = av_rescale_q(sub->pts, AV_TIME_BASE_Q, ASS_TIME_BASE);
+-        start        += sub->start_display_time;
+-        char *ass_line = sub->rects[i]->ass;
++        int64_t duration, start;
++        char *ass_line;
++        AVSubtitleRect *rect = sub->rects[i];
++        if (!rect) {
++            av_log(link, AV_LOG_VERBOSE,
++                   "scaleplex_inlineass: rect[%d] NULL, skipping\n", i);
++            continue;
++        }
++        ass_line = rect->ass;
+         if (!ass_line)
+             break;
++        duration = sub->end_display_time - sub->start_display_time;
++        start    = av_rescale_q(sub->pts, AV_TIME_BASE_Q, ASS_TIME_BASE);
++        start   += sub->start_display_time;
++        av_log(link, AV_LOG_VERBOSE,
++               "scaleplex_inlineass: process_chunk[%d] start=%" PRId64 " dur=%" PRId64 " line=\"%.60s\"\n",
++               i, start, duration, ass_line);
+         ass_process_chunk(ass->track, ass_line, strlen(ass_line), start, duration);
+     }
++
++    pthread_mutex_unlock(&inlineass_lock);
+ }
+ 
+ static const AVOption inlineass_options[] = {
+--- a/fftools/Makefile	2026-05-12 13:29:53.455499921 +0200
++++ b/fftools/Makefile	2026-05-12 13:30:37.472496585 +0200
+@@ -20,6 +20,7 @@
+     fftools/ffmpeg_opt.o        \
+     fftools/ffmpeg_sched.o      \
+     fftools/objpool.o           \
++    fftools/scaleplex_inlineass.o \
+     fftools/sync_queue.o        \
+     fftools/thread_queue.o      \
+ 
+--- a/fftools/ffmpeg.h	2026-05-12 13:29:53.456499921 +0200
++++ b/fftools/ffmpeg.h	2026-05-12 13:30:51.256495545 +0200
+@@ -837,6 +837,13 @@
+ void dec_free(Decoder **pdec);
+ 
+ /*
++ * scaleplex: expose decoder's AVCodecContext for vf_inlineass plumbing.
++ * Used by fftools/scaleplex_inlineass.c to bind decoded subtitle output
++ * to its bound inlineass filter context.
++ */
++AVCodecContext *dec_get_avctx(Decoder *dec);
++
++/*
+  * Called by filters to connect decoder's output to given filtergraph input.
+  *
+  * @param opts filtergraph input options, to be filled by this function
+--- a/fftools/ffmpeg_dec.c	2026-05-12 13:29:53.456499921 +0200
++++ b/fftools/ffmpeg_dec.c	2026-05-12 13:31:15.015493743 +0200
+@@ -35,6 +35,7 @@
+ #include "libavcodec/codec.h"
+ 
+ #include "ffmpeg.h"
++#include "scaleplex_inlineass.h"
+ 
+ typedef struct DecoderPriv {
+     Decoder             dec;
+@@ -109,6 +110,13 @@
+     return (DecoderPriv*)d;
+ }
+ 
++/* scaleplex: surfaced for scaleplex_inlineass.c so the binding registry
++ * can map a decoder's AVCodecContext* to its bound inlineass filter. */
++AVCodecContext *dec_get_avctx(Decoder *dec)
++{
++    return dp_from_dec(dec)->dec_ctx;
++}
++
+ // data that is local to the decoder thread and not visible outside of it
+ typedef struct DecThreadContext {
+     AVFrame         *frame;
+@@ -678,6 +686,11 @@
+ 
+     dp->dec.frames_decoded++;
+ 
++    /* scaleplex: feed inlineass filter (no-op when no -map_inlineass binding
++     * matches this decoder's AVCodecContext*). Called BEFORE subtitle_wrap_frame
++     * because that moves the subtitle ownership into an AVBufferRef. */
++    scaleplex_inlineass_handle_subtitle(dp->dec_ctx, &subtitle);
++
+     // XXX the queue for transferring data to consumers runs
+     // on AVFrames, so we wrap AVSubtitle in an AVBufferRef and put that
+     // inside the frame
+--- a/fftools/ffmpeg_filter.c	2026-05-12 13:29:53.457499921 +0200
++++ b/fftools/ffmpeg_filter.c	2026-05-12 13:31:35.602492180 +0200
+@@ -21,6 +21,7 @@
+ #include <stdint.h>
+ 
+ #include "ffmpeg.h"
++#include "scaleplex_inlineass.h"
+ 
+ #include "libavfilter/avfilter.h"
+ #include "libavfilter/buffersink.h"
+@@ -1956,6 +1957,11 @@
+     if ((ret = avfilter_graph_config(fgt->graph, NULL)) < 0)
+         goto fail;
+ 
++    /* scaleplex: bind any inlineass filters in this graph to their
++     * decoder + font attachments. No-op when -map_inlineass not used
++     * or graph has no inlineass filters. */
++    scaleplex_inlineass_link_graph(fgt->graph);
++
+     fgp->is_meta = graph_is_meta(fgt->graph);
+ 
+     /* limit the lists of allowed formats to the ones selected, to
+--- a/fftools/ffmpeg_opt.c	2026-05-12 13:29:53.457499921 +0200
++++ b/fftools/ffmpeg_opt.c	2026-05-12 13:31:58.423490452 +0200
+@@ -31,6 +31,7 @@
+ #include "ffmpeg_sched.h"
+ #include "cmdutils.h"
+ #include "opt_common.h"
++#include "scaleplex_inlineass.h"
+ 
+ #include "libavformat/avformat.h"
+ 
+@@ -1513,6 +1514,10 @@
+         { .func_arg = opt_map },
+         "set input stream mapping",
+         "[-]input_file_id[:stream_specifier][,sync_file_id[:stream_specifier]]" },
++    { "map_inlineass",          OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT | OPT_PERFILE | OPT_OUTPUT,
++        { .func_arg = scaleplex_inlineass_opt },
++        "bind an embedded subtitle stream to an inlineass filter",
++        "input_file_id:stream_specifier" },
+     { "map_metadata",           OPT_TYPE_STRING, OPT_SPEC | OPT_OUTPUT | OPT_EXPERT,
+         { .off       = OFFSET(metadata_map) },
+         "set metadata information of outfile from infile",
+--- a/fftools/scaleplex_inlineass.h	1970-01-01 01:00:00.000000000 +0100
++++ b/fftools/scaleplex_inlineass.h	2026-05-12 13:32:09.680489601 +0200
+@@ -0,0 +1,53 @@
++/*
++ * scaleplex: fftools-side wiring for vf_inlineass.
++ *
++ * Backport of Plex Transcoder's fftools/plex.c subtitle hooks for
++ * jellyfin-ffmpeg 7.1.3. Provides:
++ *   - the -map_inlineass option handler
++ *   - a registry mapping (input_file, stream_spec) bindings to
++ *     AVFilterContext* once filter graphs are configured
++ *   - the per-subtitle-packet feed that forwards decoded data to
++ *     vf_inlineass via its public side-channel helpers
++ *
++ * This file is part of scaleplex / FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef FFTOOLS_SCALEPLEX_INLINEASS_H
++#define FFTOOLS_SCALEPLEX_INLINEASS_H
++
++#include "libavcodec/avcodec.h"
++
++struct AVFilterGraph;
++
++/* Option handler for `-map_inlineass FILE:STREAM_SPEC`.
++ * Called during argv parse. Resolves the stream specifier against
++ * the named input file (which is already open at this point) and
++ * queues a binding entry. Returns 0 on success, AVERROR on failure. */
++int scaleplex_inlineass_opt(void *optctx, const char *opt, const char *arg);
++
++/* Called from configure_filtergraph() in ffmpeg_filter.c after
++ * avfilter_graph_config() succeeds. Walks the graph's filters for
++ * any whose AVFilter->name is "inlineass", and binds each to the
++ * next unbound registry entry. For each bound filter, attaches the
++ * input file's font streams and pushes the buffersink dims. */
++void scaleplex_inlineass_link_graph(struct AVFilterGraph *graph);
++
++/* Called from transcode_subtitles() in ffmpeg_dec.c each time a
++ * subtitle packet decodes successfully. Looks up the binding by
++ * AVCodecContext* and (if found) forwards the AVSubtitle to
++ * vf_inlineass via avfilter_inlineass_append_data. No-op when no
++ * binding matches the decoder. */
++void scaleplex_inlineass_handle_subtitle(AVCodecContext *dec_ctx,
++                                         AVSubtitle *sub);
++
++/* Frees the binding registry. Currently unused (the registry lives
++ * for the lifetime of ffmpeg) but useful in case ffmpeg.c gains an
++ * explicit shutdown path that wants to assert no leaks. */
++void scaleplex_inlineass_uninit(void);
++
++#endif /* FFTOOLS_SCALEPLEX_INLINEASS_H */
+--- a/fftools/scaleplex_inlineass.c	1970-01-01 01:00:00.000000000 +0100
++++ b/fftools/scaleplex_inlineass.c	2026-05-12 13:52:38.395290266 +0200
+@@ -0,0 +1,223 @@
++/*
++ * scaleplex: fftools-side wiring for vf_inlineass.
++ *
++ * See scaleplex_inlineass.h for the API contract and the cover
++ * letter of patch 0100-fftools-map-inlineass.patch for design
++ * notes (the 6.x→7.x threading translation in particular).
++ *
++ * This file is part of scaleplex / FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "scaleplex_inlineass.h"
++
++#include <pthread.h>
++#include <string.h>
++
++#include "cmdutils.h"
++#include "ffmpeg.h"
++#include "libavfilter/avfilter.h"
++#include "libavfilter/vf_inlineass.h"
++#include "libavformat/avformat.h"
++#include "libavutil/avstring.h"
++#include "libavutil/error.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++
++typedef struct InlineAssBinding {
++    int               file_idx;
++    char             *stream_spec;
++    InputStream      *ist;          /* resolved at option-parse time */
++    AVCodecContext   *dec_ctx;      /* resolved at link-graph time   */
++    AVFilterContext  *flt_ctx;      /* resolved at link-graph time   */
++} InlineAssBinding;
++
++static InlineAssBinding *bindings;
++static int               nb_bindings;
++static pthread_mutex_t   bindings_lock = PTHREAD_MUTEX_INITIALIZER;
++
++int scaleplex_inlineass_opt(void *optctx, const char *opt, const char *arg)
++{
++    char *endptr = NULL;
++    long  file_idx;
++    const char *spec;
++    InputFile   *f;
++    InputStream *match = NULL;
++    InlineAssBinding *nb;
++    int ret;
++
++    (void)optctx;
++    (void)opt;
++
++    if (!arg || !*arg) {
++        av_log(NULL, AV_LOG_FATAL,
++               "-map_inlineass: empty argument (expected FILE:STREAM_SPEC)\n");
++        return AVERROR(EINVAL);
++    }
++
++    file_idx = strtol(arg, &endptr, 0);
++    if (endptr == arg || file_idx < 0 || file_idx >= nb_input_files) {
++        av_log(NULL, AV_LOG_FATAL,
++               "-map_inlineass: invalid input file index in '%s' (nb_input_files=%d)\n",
++               arg, nb_input_files);
++        return AVERROR(EINVAL);
++    }
++    if (*endptr != ':') {
++        av_log(NULL, AV_LOG_FATAL,
++               "-map_inlineass: expected ':' after file index in '%s'\n", arg);
++        return AVERROR(EINVAL);
++    }
++    spec = endptr + 1;
++    if (!*spec) {
++        av_log(NULL, AV_LOG_FATAL,
++               "-map_inlineass: empty stream specifier in '%s'\n", arg);
++        return AVERROR(EINVAL);
++    }
++
++    f = input_files[file_idx];
++    for (int i = 0; i < f->nb_streams; i++) {
++        ret = check_stream_specifier(f->ctx, f->streams[i]->st, spec);
++        if (ret < 0) {
++            av_log(NULL, AV_LOG_FATAL,
++                   "-map_inlineass: stream specifier '%s' rejected: %s\n",
++                   spec, av_err2str(ret));
++            return ret;
++        }
++        if (ret == 1) {
++            match = f->streams[i];
++            break;
++        }
++    }
++    if (!match) {
++        av_log(NULL, AV_LOG_FATAL,
++               "-map_inlineass: no stream in input #%ld matches '%s'\n",
++               file_idx, spec);
++        return AVERROR(EINVAL);
++    }
++
++    pthread_mutex_lock(&bindings_lock);
++    nb = av_realloc_array(bindings, nb_bindings + 1, sizeof(*bindings));
++    if (!nb) {
++        pthread_mutex_unlock(&bindings_lock);
++        return AVERROR(ENOMEM);
++    }
++    bindings = nb;
++    InlineAssBinding *b = &bindings[nb_bindings++];
++    memset(b, 0, sizeof(*b));
++    b->file_idx    = (int)file_idx;
++    b->stream_spec = av_strdup(spec);
++    b->ist         = match;
++    pthread_mutex_unlock(&bindings_lock);
++
++    av_log(NULL, AV_LOG_VERBOSE,
++           "scaleplex_inlineass: queued binding #%d for input #%ld:%s\n",
++           nb_bindings - 1, file_idx, spec);
++    return 0;
++}
++
++void scaleplex_inlineass_link_graph(struct AVFilterGraph *graph)
++{
++    int cursor = 0;
++
++    if (!graph)
++        return;
++
++    pthread_mutex_lock(&bindings_lock);
++    if (!nb_bindings) {
++        pthread_mutex_unlock(&bindings_lock);
++        return;
++    }
++
++    /* configure_filtergraph may be invoked multiple times for the same
++     * session (probe pass + live pass, or on reconfigure). Each invocation
++     * builds a fresh AVFilterGraph and previous filter contexts are freed.
++     * Reset all flt_ctx/dec_ctx pointers before binding to this graph's
++     * filter instances — otherwise handle_subtitle would dereference a
++     * freed AVFilterContext from a previous graph. */
++    for (int i = 0; i < nb_bindings; i++) {
++        bindings[i].flt_ctx = NULL;
++        bindings[i].dec_ctx = NULL;
++    }
++
++    for (unsigned i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *fc = graph->filters[i];
++        InlineAssBinding *b = NULL;
++        InputFile *src;
++
++        if (!fc || !fc->filter || !fc->filter->name ||
++            strcmp(fc->filter->name, "inlineass") != 0)
++            continue;
++
++        /* Find next unbound entry. */
++        while (cursor < nb_bindings) {
++            if (!bindings[cursor].flt_ctx) {
++                b = &bindings[cursor];
++                cursor++;
++                break;
++            }
++            cursor++;
++        }
++        if (!b) {
++            av_log(NULL, AV_LOG_WARNING,
++                   "scaleplex_inlineass: graph has more inlineass filters than -map_inlineass bindings; extras left unbound\n");
++            break;
++        }
++
++        b->flt_ctx = fc;
++        b->dec_ctx = b->ist && b->ist->decoder ? dec_get_avctx(b->ist->decoder) : NULL;
++
++        /* Push font attachments from the same input file. */
++        src = input_files[b->file_idx];
++        for (int j = 0; j < src->nb_streams; j++) {
++            AVStream *st = src->streams[j]->st;
++            if (st->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT)
++                avfilter_inlineass_add_attachment(fc, st);
++        }
++        avfilter_inlineass_set_fonts(fc);
++
++        /* Push output dims so libass scales relative to the canvas. */
++        if (fc->nb_outputs > 0 && fc->outputs[0]) {
++            int w = fc->outputs[0]->w;
++            int h = fc->outputs[0]->h;
++            if (w > 0 && h > 0)
++                avfilter_inlineass_set_storage_size(fc, w, h);
++        }
++
++        av_log(NULL, AV_LOG_VERBOSE,
++               "scaleplex_inlineass: bound filter to input #%d:%s (dec_ctx=%p)\n",
++               b->file_idx, b->stream_spec, (void*)b->dec_ctx);
++    }
++    pthread_mutex_unlock(&bindings_lock);
++}
++
++void scaleplex_inlineass_handle_subtitle(AVCodecContext *dec_ctx, AVSubtitle *sub)
++{
++    if (!dec_ctx || !sub)
++        return;
++
++    pthread_mutex_lock(&bindings_lock);
++    for (int i = 0; i < nb_bindings; i++) {
++        if (bindings[i].dec_ctx == dec_ctx && bindings[i].flt_ctx) {
++            av_log(NULL, AV_LOG_VERBOSE,
++                   "scaleplex_inlineass: handle_subtitle bind#%d dec_ctx=%p flt_ctx=%p rects=%d\n",
++                   i, (void*)dec_ctx, (void*)bindings[i].flt_ctx, sub->num_rects);
++            avfilter_inlineass_append_data(bindings[i].flt_ctx, dec_ctx, sub);
++            break;
++        }
++    }
++    pthread_mutex_unlock(&bindings_lock);
++}
++
++void scaleplex_inlineass_uninit(void)
++{
++    pthread_mutex_lock(&bindings_lock);
++    for (int i = 0; i < nb_bindings; i++)
++        av_freep(&bindings[i].stream_spec);
++    av_freep(&bindings);
++    nb_bindings = 0;
++    pthread_mutex_unlock(&bindings_lock);
++}

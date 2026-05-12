@@ -1016,9 +1016,6 @@ func TestRewriter_ManifestURL_CapturedAndStripped(t *testing.T) {
 	if out.Args[mnIdx+1] != wantURL {
 		t.Fatalf("-manifest_name value=%q want %q", out.Args[mnIdx+1], wantURL)
 	}
-	if out.ManifestURL != "" {
-		t.Fatalf("ManifestURL=%q want empty (rewritten in-place, no publisher)", out.ManifestURL)
-	}
 	if !containsString(out.Changes, "manifest_name:rewrite-to-relay") {
 		t.Fatalf("missing rewrite change: %v", out.Changes)
 	}
@@ -1036,9 +1033,6 @@ func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
 	// HTTP protocol handler cannot reach 127.0.0.1:32400 from the worker.
 	if containsString(out.Args, "-manifest_name") {
 		t.Fatal("-manifest_name must be stripped from argv when no relay base")
-	}
-	if out.ManifestURL != "" {
-		t.Fatalf("ManifestURL=%q want empty when no base", out.ManifestURL)
 	}
 	if !containsString(out.Changes, "drop:-manifest_name(no-pms-base-or-non-loopback)") {
 		t.Fatalf("missing drop change: %v", out.Changes)
@@ -1169,8 +1163,8 @@ func TestRewriter_HLS_CopytsStripped(t *testing.T) {
 	if containsString(out.Args, "-copyts") {
 		t.Errorf("HLS argv must NOT contain -copyts (segment muxer can't split with it)")
 	}
-	if !containsString(out.Changes, "hls:drop:-copyts") {
-		t.Errorf("expected hls:drop:-copyts in changes, got %v", out.Changes)
+	if !containsString(out.Changes, "hls:drop:-copyts(seek)") {
+		t.Errorf("expected hls:drop:-copyts(seek) in changes, got %v", out.Changes)
 	}
 	// AAC priming flag must survive — removing it caused 199-byte empty
 	// audio chunks on DASH and we don't want the same on HLS.
@@ -1547,11 +1541,12 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		"encode:hw-passthrough:hevc_vaapi",
 		"audio:eac3_eae->eac3",
 		"drop:-eae_prefix:1",
-		"drop:-loglevel_plex",
-		"drop:-segment_list_separate_stream_times",
-		"drop:-segment_list_unfinished",
-		"hls:f=ssegment->segment",
-		"hls:drop:-copyts",
+		// `-loglevel_plex` + `-f ssegment` pass through natively now
+		// (scaleplex-ffmpeg7 patch 0098: option sink + segment-muxer
+		// AVFMT_GLOBALHEADER); rewriter no longer touches them.
+		// -copyts only stripped on seek sessions
+		// (`hls:drop:-copyts(seek)`); kept on initial play so chunk PTS
+		// rebases via segment.c's reference_stream_first_pts.
 		"hls:segment_list:rewrite-to-relay",
 		"progressurl:captured-for-reporter",
 		"progress:append-X-Plex-Token",
@@ -1584,19 +1579,16 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		t.Fatalf("encoder must remain hevc_vaapi; got args near %d: %v", encIdx, out.Args[encIdx:min(encIdx+4, len(out.Args))])
 	}
 
-	// HLS: -f ssegment must be translated to -f segment
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-f" && out.Args[i+1] == "ssegment" {
-			t.Fatalf("-f ssegment not translated")
-		}
+	// HLS: -f ssegment passes through (patch 0098 + ff_stream_segment_muxer
+	// with AVFMT_GLOBALHEADER). Don't expect it to be rewritten.
+	// -copyts must REMAIN on initial play (no -ss). Stripping caused a
+	// 10s in-chunk PTS offset on PS4 BH6 (chunk-0-loop bug 2026-05-12).
+	if indexOfArg(out.Args, "-copyts", 0) < 0 {
+		t.Fatalf("-copyts must remain on initial-play HLS argv")
 	}
-	// -copyts must be gone (HLS path)
-	if indexOfArg(out.Args, "-copyts", 0) >= 0 {
-		t.Fatalf("-copyts not stripped from HLS argv")
-	}
-	// -loglevel_plex must be gone
-	if indexOfArg(out.Args, "-loglevel_plex", 0) >= 0 {
-		t.Fatalf("-loglevel_plex not stripped")
+	// -loglevel_plex passes through (patch 0098 stub).
+	if indexOfArg(out.Args, "-loglevel_plex", 0) < 0 {
+		t.Fatalf("-loglevel_plex must passthrough post-0098 stub; argv: %v", out.Args)
 	}
 	// -progressurl must be gone (captured into RewriteResult instead)
 	if indexOfArg(out.Args, "-progressurl", 0) >= 0 {
@@ -1709,7 +1701,6 @@ func TestRewriter_HWDecode_SubtitleBurnIn(t *testing.T) {
 		"drop:-map_inlineass",
 		"drop:null-sub-output",
 		"audio:eac3_eae->eac3",
-		"hls:f=ssegment->segment",
 	}
 	for _, want := range mustContain {
 		if !containsString(out.Changes, want) {
@@ -2040,5 +2031,246 @@ func TestIsHDRTransfer(t *testing.T) {
 		if got := isHDRTransfer(transfer); got != want {
 			t.Errorf("isHDRTransfer(%q) = %v want %v", transfer, got, want)
 		}
+	}
+}
+
+func TestStripPlexInlineassFilterArgs(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{
+			name: "no inlineass",
+			in:   "[0:0]scale=w=1280:h=720[v]",
+			want: "[0:0]scale=w=1280:h=720[v]",
+		},
+		{
+			name: "minimal 6-key — unchanged",
+			in:   "inlineass=font_scale=1.0:font_path=/x:font_size=54[3]",
+			want: "inlineass=font_scale=1.0:font_path=/x:font_size=54[3]",
+		},
+		{
+			name: "full Plex 10-key — strip 4",
+			in:   "[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Foo,Bold=500:outline=2.6:shadow=1.7:font_size=54[2]",
+			want: "[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:font_size=54[2]",
+		},
+		{
+			name: "overrides with embedded comma + ampersand value (real Plex)",
+			in:   "[1]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Noto Sans Medium,Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000:outline=2.6:shadow=1.7:font_size=54[2]",
+			want: "[1]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:font_size=54[2]",
+		},
+		{
+			name: "language at start (no leading colon)",
+			in:   "[1]inlineass=language=en:font_size=54[2]",
+			want: "[1]inlineass=font_size=54[2]",
+		},
+		{
+			name: "all 4 strip-keys at end",
+			in:   "[1]inlineass=font_scale=1.0:language=en:overrides=foo:outline=2.6:shadow=1.7[2]",
+			want: "[1]inlineass=font_scale=1.0[2]",
+		},
+		{
+			name: "idempotent — second pass is no-op",
+			in:   "[1]inlineass=font_scale=1.0:font_size=54[2]",
+			want: "[1]inlineass=font_scale=1.0:font_size=54[2]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripPlexInlineassFilterArgs(tc.in)
+			if got != tc.want {
+				t.Errorf("got:\n  %s\nwant:\n  %s", got, tc.want)
+			}
+			// Idempotency
+			got2 := stripPlexInlineassFilterArgs(got)
+			if got2 != got {
+				t.Errorf("not idempotent: %q → %q", got, got2)
+			}
+		})
+	}
+}
+
+func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
+	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	args := []string{
+		"-loglevel", "quiet",
+		"-codec:0", "libdav1d",
+		"-i", "/media/x.mkv",
+		"-ss", "0",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]scale=w=1280:h=720:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:language=en:overrides=foo:outline=2.6:shadow=1.7:font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists: func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string {
+			return "subrip"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	// 1. inlineass= filter retained, Plex-only keys stripped.
+	vfIdx := -1
+	for i, a := range out.Args {
+		if a == "-filter_complex" {
+			vfIdx = i + 1
+			break
+		}
+	}
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex in output")
+	}
+	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
+		t.Errorf("inlineass= dropped from filter: %s", out.Args[vfIdx])
+	}
+	for _, key := range []string{":language=", ":overrides=", ":outline=", ":shadow="} {
+		if strings.Contains(out.Args[vfIdx], key) {
+			t.Errorf("Plex-only key %q not stripped: %s", key, out.Args[vfIdx])
+		}
+	}
+	// 2. -map_inlineass kept.
+	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
+		t.Errorf("-map_inlineass dropped (should pass through)")
+	}
+	// 3. Sidecar -i kept (count of -i flags).
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 2 {
+		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
+	}
+	// 4. Null-sub output kept.
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Errorf("null-sub output dropped (should pass through)")
+	}
+	// 5. Mode tag.
+	gotPassthroughTag := false
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "filter:passthrough-inlineass") {
+			gotPassthroughTag = true
+			break
+		}
+	}
+	if !gotPassthroughTag {
+		t.Errorf("missing passthrough-inlineass change tag: %v", out.Changes)
+	}
+}
+
+func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
+	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	args := []string{
+		"-loglevel", "quiet",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi",
+		"-codec:0", "hevc",
+		"-i", "/media/x.mkv",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=p010[1];[1]hwdownload,format=p010[2];[2]inlineass=font_scale=1.0:font_path=/x:language=en:overrides=foo:outline=2:shadow=1:font_size=54[3];[3]hwupload[4]",
+		"-map", "[4]",
+		"-codec:0", "hevc_vaapi",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists: func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string {
+			return "subrip"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	vfIdx := -1
+	for i, a := range out.Args {
+		if a == "-filter_complex" {
+			vfIdx = i + 1
+			break
+		}
+	}
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex")
+	}
+	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
+		t.Errorf("inlineass dropped: %s", out.Args[vfIdx])
+	}
+	for _, k := range []string{":language=", ":overrides=", ":outline=", ":shadow="} {
+		if strings.Contains(out.Args[vfIdx], k) {
+			t.Errorf("Plex key %q not stripped: %s", k, out.Args[vfIdx])
+		}
+	}
+	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
+		t.Errorf("-map_inlineass dropped (should pass through)")
+	}
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 2 {
+		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
+	}
+	gotTag := false
+	for _, c := range out.Changes {
+		if c == "hw-decode:filter:inlineass-passthrough" {
+			gotTag = true
+			break
+		}
+	}
+	if !gotTag {
+		t.Errorf("missing hw-decode:filter:inlineass-passthrough tag: %v", out.Changes)
+	}
+}
+
+func TestRewriter_InlineassPassthrough_OFF_SwapsToSubtitles(t *testing.T) {
+	// Without the flag set, current swap-to-subtitles= behaviour stays.
+	// Asserts the off-default keeps bit-identical legacy semantics.
+	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "")
+	args := []string{
+		"-loglevel", "quiet",
+		"-codec:0", "libdav1d",
+		"-i", "/media/x.mkv",
+		"-ss", "0",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]scale=w=1280:h=720:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];[1]inlineass=font_scale=1.0:font_path=/x:language=en:font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists: func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string {
+			return "subrip"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	// Legacy: -map_inlineass dropped, sidecar -i dropped (1 -i remaining).
+	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
+		t.Errorf("-map_inlineass should be dropped in legacy mode")
+	}
+	iCount := 0
+	for _, a := range out.Args {
+		if a == "-i" {
+			iCount++
+		}
+	}
+	if iCount != 1 {
+		t.Errorf("expected 1 -i in legacy mode (sidecar dropped), got %d", iCount)
 	}
 }

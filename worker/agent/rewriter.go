@@ -54,16 +54,6 @@ type RewriteResult struct {
 	// `/header` for ~120s. The reporter sends one PUT per ffmpeg
 	// progress block instead.
 	ProgressURL string
-	// ManifestURL — when non-empty, the agent must POST the DASH
-	// manifest body to this URL whenever ffmpeg's output `dash` file
-	// is updated. Plex's ffmpeg fork drives this from a full-URL
-	// `-manifest_name`, but mainline dashenc.c doesn't recognise an
-	// HTTP `manifest_name` and writes manifest to a local file
-	// instead. Without the POST, PMS waits SegmentedTranscoderTimeout
-	// (~125s) on `/header` before falling back to disk-probing
-	// init-stream0.m4s. Captured + rewritten the same way as
-	// ProgressURL.
-	ManifestURL string
 	// SkipToSegment — value captured from Plex's `-skip_to_segment N`
 	// argv on a seek transcode session. Plex's ffmpeg fork starts the
 	// dash muxer's segment index at N so chunk-stream0-NNNNN.m4s aligns
@@ -161,13 +151,57 @@ var x264PresetToVAAPI = map[string]string{
 	"placebo":   "1",
 }
 
+// mapX264PresetToVAAPI maps Plex's libx264 -preset name onto iHD's
+// VAAPI TargetUsage scale (1..7, 7 = fastest). Looks up
+// `SCALEPLEX_PRESET_MAP` env first for per-deployment overrides, then
+// falls back to the on-cluster-tuned defaults above.
+//
+// Env format: comma-separated `name=N` pairs (case-insensitive), e.g.
+//
+//	SCALEPLEX_PRESET_MAP=veryfast=5,fast=3,medium=2
+//
+// Missing names keep their default mapping; entries with unparsable
+// values are silently ignored.
 func mapX264PresetToVAAPI(preset string) string {
-	if v, ok := x264PresetToVAAPI[strings.ToLower(preset)]; ok {
+	key := strings.ToLower(preset)
+	if v, ok := parsePresetMapEnv()[key]; ok {
+		return v
+	}
+	if v, ok := x264PresetToVAAPI[key]; ok {
 		return v
 	}
 	// Unknown preset → fastest. Worker only runs when called by orch;
 	// playback latency wins over an unfamiliar quality knob.
 	return "7"
+}
+
+// parsePresetMapEnv reads `SCALEPLEX_PRESET_MAP` and returns the
+// overrides as a lowercased map. Parsed per call (env reads are cheap
+// and rewriting is rare). Returns nil when env is empty so callers can
+// skip lookups.
+func parsePresetMapEnv() map[string]string {
+	v := os.Getenv("SCALEPLEX_PRESET_MAP")
+	if v == "" {
+		return nil
+	}
+	out := map[string]string{}
+	for _, pair := range strings.Split(v, ",") {
+		eq := strings.IndexByte(pair, '=')
+		if eq < 1 {
+			continue
+		}
+		name := strings.TrimSpace(strings.ToLower(pair[:eq]))
+		val := strings.TrimSpace(pair[eq+1:])
+		if name == "" || val == "" {
+			continue
+		}
+		// Validate val is 1..7 — VAAPI TargetUsage range.
+		if n, err := strconv.Atoi(val); err != nil || n < 1 || n > 7 {
+			continue
+		}
+		out[name] = val
+	}
+	return out
 }
 
 // encoderMap routes PMS's chosen software encoder to its VAAPI
@@ -238,6 +272,73 @@ func subtitlesForceStyle() string {
 		return ""
 	}
 	return ":force_style='" + v + "'"
+}
+
+// stripPlexInlineassFilterArgs removes the 4 AVOption keys that Plex's
+// argv emits on its `inlineass=` filter but scaleplex-ffmpeg7's
+// vf_inlineass does not parse: `language`, `overrides`, `outline`,
+// `shadow`. Operates on a full -filter_complex graph string and is
+// idempotent + leaves graphs without `inlineass=` untouched.
+//
+// Without this strip, the fork's AVOption parser rejects Plex's filter
+// argv at filter init time. We omitted the stub options in patch 0100
+// to sidestep an unexplained LTO/AVFILTER_DEFINE_CLASS table-truncation
+// (see project_scaleplex_inlineass_port.md). The strip is the
+// rewriter's half of that bargain.
+//
+// Plex's argv shape inside the filter graph:
+//
+//	[1]inlineass=font_scale=1.0:font_path=...:fontconfig_file=...:
+//	  language=en:overrides=ScaledBorderAndShadow=yes,FontName=...,...:
+//	  outline=2.6:shadow=1.7:font_size=54[2]
+//
+// Top-level pairs are `:`-separated. The `overrides=` value contains
+// `,` and `=` but never a top-level `:` (verified across argv corpus
+// 2026-05-12 — 6 PMS-emitted inlineass= argv samples, none have
+// embedded `:` inside any of the 4 keys).
+func stripPlexInlineassFilterArgs(filterStr string) string {
+	if !strings.Contains(filterStr, "inlineass=") {
+		return filterStr
+	}
+	stripKeys := map[string]bool{
+		"language":  true,
+		"overrides": true,
+		"outline":   true,
+		"shadow":    true,
+	}
+	var out strings.Builder
+	i := 0
+	for {
+		j := strings.Index(filterStr[i:], "inlineass=")
+		if j < 0 {
+			out.WriteString(filterStr[i:])
+			break
+		}
+		j += i
+		out.WriteString(filterStr[i : j+len("inlineass=")])
+		k := j + len("inlineass=")
+		// Segment ends at next graph terminator: `[` (label), `;`, or
+		// end of string. Output labels like [2] always follow the
+		// filter args.
+		end := strings.IndexAny(filterStr[k:], "[;")
+		segEnd := len(filterStr)
+		if end >= 0 {
+			segEnd = k + end
+		}
+		segment := filterStr[k:segEnd]
+		pairs := strings.Split(segment, ":")
+		kept := pairs[:0]
+		for _, p := range pairs {
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) == 2 && stripKeys[kv[0]] {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		out.WriteString(strings.Join(kept, ":"))
+		i = segEnd
+	}
+	return out.String()
 }
 
 // subtitlesSeekShift returns (pre, post) setpts pieces to bracket a stock
@@ -498,13 +599,23 @@ func detectSubtitleSource(args []string, sessionDir string, probe func(source, s
 			if sessionDir == "" {
 				sessionDir = "/tmp/scaleplex"
 			}
-			outputFile := filepath.Join(sessionDir, "scaleplex-extract.srt")
+			// Preserve ASS styling (fonts, colour, position, karaoke)
+			// for anime + custom-styled fansubs: extract as .ass when
+			// source codec is ass/ssa, srt otherwise. libass renders
+			// both natively via the subtitles= filter (extension picks
+			// the format). SRT-only extract loses ASS overrides — fine
+			// for plain caption tracks, regression for stylised tracks.
+			extractFmt, extractExt := "srt", "srt"
+			if codec == "ass" || codec == "ssa" {
+				extractFmt, extractExt = "ass", "ass"
+			}
+			outputFile := filepath.Join(sessionDir, "scaleplex-extract."+extractExt)
 			res.FilePath = outputFile
 			res.Extract = &SubtitleExtract{
 				SourceFile: args[inputArgIdxs[0]+1],
 				StreamSpec: streamSpec,
 				OutputFile: outputFile,
-				Format:     "srt",
+				Format:     extractFmt,
 			}
 		}
 		// Bitmap: nothing to extract; filter graph references the
@@ -550,7 +661,7 @@ type filterRewrite struct {
 // Falls back to the legacy fs-probe (findSidecarSubtitle) when no
 // PMS-staged source is present — defensive for older PMS argv shapes
 // and tests that don't wire -map_inlineass through.
-func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled, sourceIsHDR bool, seekShiftSeconds float64) *filterRewrite {
+func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled, sourceIsHDR, inlineassPassthrough bool, seekShiftSeconds float64) *filterRewrite {
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
 		w, h, assParams := m[1], m[2], m[3]
 		_ = assParams
@@ -616,6 +727,36 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 
 		// Text subs (SRT/ASS/MOV_TEXT/...): libass renders the file
 		// into a CPU frame, hwupload back to GPU for the encoder.
+		//
+		// Pass-through mode: keep Plex's inlineass= filter (strip the 4
+		// unknown AVOption keys) instead of swapping to subtitles=. The
+		// scaleplex-ffmpeg7 fork's scaleplex_inlineass binding receives
+		// the sub packets via the -map_inlineass side-channel (sub
+		// stream stays in the input(s), not the filter graph), so no
+		// sidecar path is needed. Same scale/hwdownload/hwupload
+		// scaffolding around the libass step — vf_inlineass operates
+		// on CPU nv12 frames identically.
+		if inlineassPassthrough && subSrc != nil && subSrc.Kind == "text" {
+			mode := "passthrough-inlineass"
+			if sourceIsHDR {
+				mode = "passthrough-inlineass-hdr"
+			}
+			strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
+			strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+			return &filterRewrite{
+				Filter: fmt.Sprintf(
+					"[0:0]hwupload[10];"+
+						"[10]%s[11];"+
+						"[11]hwdownload[12];"+
+						"[12]format=pix_fmts=nv12[13];"+
+						"[13]inlineass=%s[14];"+
+						"[14]hwupload[15]",
+					scaleStep, strippedAss),
+				OldLabel: "[2]",
+				NewLabel: "[15]",
+				Mode:     mode,
+			}
+		}
 		sidecar := ""
 		if subSrc != nil && subSrc.Kind == "text" {
 			sidecar = subSrc.FilePath
@@ -712,6 +853,94 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 		}
 	}
 	return nil
+}
+
+// substituteOpenCLTonemap rewrites Plex's OpenCL-based HW tonemap filter
+// chain in -filter_complex to use VAAPI tonemap directly. PMS with the
+// `Use hardware-accelerated tone mapping` pref ON emits a chain that
+// hwmaps VAAPI → OpenCL, runs tonemap_opencl, hwmaps OpenCL → VAAPI,
+// then hwuploads. scaleplex-ffmpeg7 (jellyfin base) has tonemap_vaapi
+// which does the same job without leaving the VAAPI device — fewer
+// memory copies, no OpenCL ICD dependency, no platform-detect race.
+//
+// Pattern matched (label numbers vary):
+//   [X]hwmap=derive_device=opencl[A];
+//   [A]tonemap_opencl=tonemap=<algo>:format=<pixfmt>:m=<mtx>:p=<prim>:r=<rng>[B];
+//   [B]hwmap=derive_device=vaapi:reverse=1[C]
+//
+// Substituted with:
+//   [X]tonemap_vaapi=transfer=bt709:matrix=<mtx>:primaries=<prim>:format=<pixfmt>[C]
+//
+// The tonemap algorithm Plex sends (hable / mobius / reinhard / etc.,
+// from the PMS `TranscoderTonemapAlgorithm` pref) is DISCARDED — iHD
+// VAAPI's tonemap path uses a fixed BT.2390 EETF curve internally and
+// doesn't expose per-algorithm tuning. Visual result is comparable to
+// hable for HDR10 sources. For finer algorithm control the user would
+// need to fall back to a SW tonemap chain (slow) or wait for iHD to
+// expose tunables.
+//
+// Matrix / primaries / range from Plex's chain ARE preserved when
+// present.
+//
+// Returns updated args + true if a substitution was applied.
+var openclTonemapRE = regexp.MustCompile(
+	`\[(\d+)\]hwmap=derive_device=opencl\[\d+\];` +
+		`\[\d+\]tonemap_opencl=(?P<opts>[^[]+)\[\d+\];` +
+		`\[\d+\]hwmap=derive_device=vaapi:reverse=1\[(\d+)\]`)
+var tonemapOptRE = regexp.MustCompile(`(?:^|:)(format|m|p|r)=([a-z0-9-]+)`)
+
+func substituteOpenCLTonemap(args []string) ([]string, bool) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-filter_complex" {
+			continue
+		}
+		orig := args[i+1]
+		if !strings.Contains(orig, "tonemap_opencl") {
+			continue
+		}
+		m := openclTonemapRE.FindStringSubmatchIndex(orig)
+		if m == nil {
+			continue
+		}
+		startLabel := orig[m[2]:m[3]]
+		opts := orig[m[4]:m[5]]
+		endLabel := orig[m[6]:m[7]]
+		// Parse k=v pairs from the opencl filter opts. We preserve
+		// format/m/p/r; tonemap (algorithm) is discarded — iHD VAAPI
+		// tonemap_vaapi has a fixed internal curve.
+		var pixFmt, matrix, primaries string
+		for _, kv := range tonemapOptRE.FindAllStringSubmatch(opts, -1) {
+			switch kv[1] {
+			case "format":
+				pixFmt = kv[2]
+			case "m":
+				matrix = kv[2]
+			case "p":
+				primaries = kv[2]
+				// "r" (range) has no tonemap_vaapi equivalent option —
+				// VAAPI sets range based on the surrounding pipeline.
+			}
+		}
+		if pixFmt == "" {
+			pixFmt = "nv12"
+		}
+		// Build tonemap_vaapi options. transfer=bt709 is the standard
+		// SDR target (we don't expose other transfers — iHD only goes
+		// HDR10 → SDR-bt709 in this filter).
+		vaapiOpts := "transfer=bt709"
+		if matrix != "" {
+			vaapiOpts += ":matrix=" + matrix
+		}
+		if primaries != "" {
+			vaapiOpts += ":primaries=" + primaries
+		}
+		vaapiOpts += ":format=" + pixFmt
+		replacement := fmt.Sprintf("[%s]tonemap_vaapi=%s[%s]",
+			startLabel, vaapiOpts, endLabel)
+		args[i+1] = orig[:m[0]] + replacement + orig[m[1]:]
+		return args, true
+	}
+	return args, false
 }
 
 func cloneArgs(in []string) []string {
@@ -873,25 +1102,21 @@ func dropEAEPrefixFlags(args []string) ([]string, []string) {
 	return args, dropped
 }
 
-// captureManifestName rewrites `-manifest_name <url>` in-place: the
+// rewriteManifestName rewrites `-manifest_name <url>` in-place: the
 // loopback URL (which workers can't reach) becomes the relay's base
 // URL, with X_PLEX_TOKEN appended. ffmpeg then PUTs the manifest body
-// to that URL natively via dashenc's HTTP protocol handler — no
-// worker-side publisher needed (scaleplex-ffmpeg7 backports Plex's
-// -manifest_name extension, libavformat/dashenc.c).
+// to that URL natively via dashenc's HTTP protocol handler
+// (scaleplex-ffmpeg7 backports Plex's -manifest_name extension —
+// libavformat/dashenc.c patch 0095).
 //
-// Returns (updated args, empty string, change tags). The empty string
-// preserves the prior helper signature (RewriteResult.ManifestURL is
-// still wired through call sites and consumed by manifest_publish.go,
-// but the publisher is now a no-op when ManifestURL is empty).
-//
-// If the URL doesn't look like a PMS loopback or no SCALEPLEX_PMS_BASE_URL
-// is set we strip the flag entirely — stock dashenc would write the
-// manifest into a file literally named `http:` otherwise.
-func captureManifestName(args []string, inputEnv map[string]string) ([]string, string, []string) {
+// If the URL doesn't look like a PMS loopback or no
+// SCALEPLEX_PMS_BASE_URL is set, the flag is stripped — stock dashenc
+// would otherwise write the manifest into a file literally named
+// `http:`.
+func rewriteManifestName(args []string, inputEnv map[string]string) ([]string, []string) {
 	i := indexOfArg(args, "-manifest_name", 0)
 	if i < 0 || i+1 >= len(args) {
-		return args, "", nil
+		return args, nil
 	}
 	base := envOr("SCALEPLEX_PMS_BASE_URL", "")
 	if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
@@ -908,10 +1133,10 @@ func captureManifestName(args []string, inputEnv map[string]string) ([]string, s
 			}
 		}
 		args[i+1] = rewritten
-		return args, "", []string{"manifest_name:rewrite-to-relay"}
+		return args, []string{"manifest_name:rewrite-to-relay"}
 	}
 	args = removeArgs(args, i, 2)
-	return args, "", []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
+	return args, []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
 }
 
 // capturePMSProgressURL strips `-progressurl <url>` from args, rewrites
@@ -919,6 +1144,13 @@ func captureManifestName(args []string, inputEnv map[string]string) ([]string, s
 // X_PLEX_TOKEN as a query param. Returns updated args, the rewritten
 // URL (empty when capture failed for any reason), and the change tags
 // to record.
+//
+// Also injects `-canthrottleurl <rewritten-url>` so scaleplex-ffmpeg7's
+// in-binary canThrottle handler (patch 0097) can do its own one-shot
+// PUT and apply per-input-packet `av_usleep` natively. Worker still
+// reads progress via `-progress pipe:N` (substituted by main.go after
+// spawn) for metrics + checkpoint; both consume the same response
+// body, the per-packet sleep just becomes ffmpeg-internal.
 func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string, string, []string) {
 	i := indexOfArg(args, "-progressurl", 0)
 	if i < 0 || i+1 >= len(args) {
@@ -944,16 +1176,30 @@ func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string,
 		changes = append(changes, "progress:append-X-Plex-Token")
 	}
 	changes = append(changes, "progressurl:captured-for-reporter")
+	// Inject -canthrottleurl pointing at the same relay endpoint.
+	// Splice at index 0 so it lands in global-scope (before -i),
+	// matching ffmpeg's option-context rules. Skip if the option is
+	// somehow already present (shouldn't happen, but be defensive).
+	if indexOfArg(args, "-canthrottleurl", 0) < 0 {
+		args = spliceArgs(args, 0, "-canthrottleurl", rewritten)
+		changes = append(changes, "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)")
+	}
 	return args, rewritten, changes
 }
 
 // upgradeLoglevelFromQuiet rewrites `-loglevel quiet|panic|fatal` to
-// `info`. PMS's JobRunner expects "Stream mapping:" lines on stderr to
-// detect transcoder readiness; quiet stalls /header for ~125s.
+// the value of `SCALEPLEX_FFMPEG_LOGLEVEL` env (default "info").
+// PMS's JobRunner expects "Stream mapping:" lines on stderr to detect
+// transcoder readiness; quiet stalls /header for ~125s.
+//
+// SCALEPLEX_FFMPEG_LOGLEVEL=debug exposes the per-cycle
+// `scaleplex/ct: PUT/avio_read/body` diagnostics emitted by patch
+// 0097's canThrottle handler. The state-transition `throttle ON|OFF`
+// lines are AV_LOG_INFO so they show at the default level.
 func upgradeLoglevelFromQuiet(args []string) ([]string, bool) {
 	if i := indexOfArg(args, "-loglevel", 0); i >= 0 && i+1 < len(args) {
 		if v := args[i+1]; v == "quiet" || v == "panic" || v == "fatal" {
-			args[i+1] = "info"
+			args[i+1] = envOr("SCALEPLEX_FFMPEG_LOGLEVEL", "info")
 			return args, true
 		}
 	}
@@ -1167,12 +1413,11 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 		}
 	}
 
-	// Capture -manifest_name URL so manifest_publish.go can POST the
-	// .mpd body to the relay on every chunk flush. Without this, PMS
-	// 404's on /header chunks (it gates them on the first manifest POST).
-	var manifestURL string
+	// Rewrite -manifest_name URL to point at the relay; ffmpeg's
+	// dashenc PUTs the manifest body there natively (scaleplex-ffmpeg7
+	// patch 0095). No worker-side publisher.
 	var manifestChanges []string
-	out, manifestURL, manifestChanges = captureManifestName(out, inputEnv)
+	out, manifestChanges = rewriteManifestName(out, inputEnv)
 	changes = append(changes, manifestChanges...)
 
 	for {
@@ -1221,7 +1466,6 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 		Applied:     true,
 		Changes:     changes,
 		ProgressURL: progressURL,
-		ManifestURL: manifestURL,
 	}, true
 }
 
@@ -1302,6 +1546,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	libvaDriversPath := os.Getenv("HW_LIBVA_DRIVERS_PATH")
 
 	changes := []string{}
+
 	// On bail we don't run the full rewriter, but Plex-private flags
 	// MUST still come off — stock ffmpeg exits status 8 on the first
 	// unrecognised one ("Unrecognized option 'loglevel_plex'"). PMS
@@ -1371,6 +1616,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	args := cloneArgs(inputArgs)
 	env := cloneEnv(inputEnv)
+
+	// Substitute Plex's OpenCL HW-tonemap filter chain with tonemap_vaapi.
+	// PMS with `Use hardware-accelerated tone mapping` ON emits a
+	// hwmap=opencl → tonemap_opencl → hwmap=vaapi-reverse chain. We
+	// collapse to a single tonemap_vaapi (scaleplex-ffmpeg7/jellyfin has
+	// the VAAPI filter, fewer copies, no OpenCL ICD dependency). Runs
+	// before phase 1 so any later filter-chain inspection sees the
+	// already-substituted form.
+	if newArgs, did := substituteOpenCLTonemap(args); did {
+		args = newArgs
+		changes = append(changes, "filter:tonemap_opencl->tonemap_vaapi")
+	}
 
 	// Plex Optimize remux fast-path. PMS emits a bare `-codec:0 h264`
 	// (or hevc/av1/vp9) input decoder — no `-hwaccel:0` — paired with
@@ -1456,6 +1713,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		return bail("no-decoder")
 	}
 	swDecoder := args[decCodecIdx+1]
+	// SCALEPLEX_INLINEASS_PASSTHROUGH (default off) keeps Plex's
+	// `-map_inlineass` + `inlineass=` filter argv in flight to the
+	// scaleplex-ffmpeg7 fork instead of swapping it for stock
+	// `subtitles=filename=...` on a staged sidecar. Strips the 4
+	// AVOption keys the fork doesn't parse (language/overrides/
+	// outline/shadow) and skips dropSidecarInput / stripNullSubOutput
+	// / -map_inlineass removal so the fork sees the full argv. Path
+	// matters only for text subs; bitmap subs still route through
+	// overlay_vaapi. Off-by-default until corpus + live cluster soak
+	// confirm parity with the swap-to-subtitles= path.
+	inlineassPassthrough := envBool("SCALEPLEX_INLINEASS_PASSTHROUGH")
+
 	isHWDecode := false
 	if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
 		if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
@@ -1518,7 +1787,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			probe = opts.ProbeSubtitleCodec
 		}
 		earlySubSrc = detectSubtitleSource(args, sessionDir, probe)
-		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 {
+		// In pass-through mode the scaleplex-ffmpeg7 fork's
+		// scaleplex_inlineass binding owns the sidecar -i + the trailing
+		// null-sub output; both must stay. Skip the drop.
+		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 &&
+			!(inlineassPassthrough && earlySubSrc.Kind == "text") {
 			if newArgs, dropped := dropSidecarInput(args, earlySubSrc.SecondInputArgIdx); dropped {
 				args = newArgs
 				if removed := stripNullSubOutput(&args); removed {
@@ -1654,8 +1927,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if isHLS {
 			seekShift = captureSeekSeconds(args)
 		}
-		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR, seekShift)
-		if rewritten != nil && seekShift > 0 && subSrc != nil && subSrc.Kind == "text" {
+		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR, inlineassPassthrough, seekShift)
+		if rewritten != nil && seekShift > 0 && subSrc != nil && subSrc.Kind == "text" &&
+			!strings.HasPrefix(rewritten.Mode, "passthrough-inlineass") {
+			// Pass-through mode skips the setpts PTS-shift bracket — the
+			// fork's vf_inlineass takes sub PTS via its side-channel
+			// feed (already absolute time), not via frame PTS.
 			changes = append(changes, fmt.Sprintf("subtitle:pts-shift=%.3fs", seekShift))
 		}
 		if rewritten == nil {
@@ -1693,7 +1970,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// init_hw_device injection). Just emit the change-tag here so
 		// the rewriter changelog still reflects what we did. The
 		// sub-source detection ran twice; reconcile via earlySubSrc.
-		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 {
+		// In pass-through mode phase 1.5 skipped the drop — don't
+		// pretend it ran.
+		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 &&
+			!(inlineassPassthrough && earlySubSrc.Kind == "text") {
 			changes = append(changes, "drop:-i(sidecar-input)")
 			// Did stripNullSubOutput actually remove anything? It runs
 			// in phase 1.5; we re-search to confirm before tagging.
@@ -1837,12 +2117,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
 				}
 				w, h := m[1], m[2]
-				sidecarPath := subSrc.FilePath
-				if sidecarPath == "" {
-					return bail("hw-decode-sub:no-sidecar")
+				// Pass-through mode: skip the sidecar-staging probe + bail;
+				// the fork doesn't need a sidecarPath. HDR detection still
+				// runs below so scaleStep adds tonemap_vaapi when needed.
+				var sidecarPath, subPath, fontsDir string
+				if !inlineassPassthrough {
+					sidecarPath = subSrc.FilePath
+					if sidecarPath == "" {
+						return bail("hw-decode-sub:no-sidecar")
+					}
+					subPath = escapeFilterPath(sidecarPath)
+					fontsDir = envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 				}
-				subPath := escapeFilterPath(sidecarPath)
-				fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 				// Force nv12 across the libass step. PMS's chain keeps
 				// p010 end-to-end (Plex's bundled inlineass reads 10-bit
 				// fine), but stock `subtitles=` on p010 has caused the
@@ -1870,6 +2156,28 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					scaleStep = fmt.Sprintf(
 						"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
 						w, h)
+				}
+				if inlineassPassthrough {
+					// Keep Plex's inlineass= filter; strip the 4 Plex-only
+					// AVOption keys vf_inlineass doesn't parse. Sidecar -i,
+					// -map_inlineass, and null-sub output all stay — fork's
+					// scaleplex_inlineass binding owns those.
+					assParams := m[5]
+					strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
+					strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+					args[vfIdx] = fmt.Sprintf(
+						"[0:0]hwupload[0];"+
+							"[0]%s[1];"+
+							"[1]hwdownload,format=nv12[2];"+
+							"[2]inlineass=%s[3];"+
+							"[3]hwupload[4]",
+						scaleStep, strippedAss,
+					)
+					changes = append(changes, "hw-decode:filter:inlineass-passthrough")
+					// Indices unchanged — no args spliced.
+					newInputIdx = indexOfArg(args, "-i", 0)
+					encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+					break
 				}
 				preShift, postShift := "", ""
 				if isHLS {
@@ -2057,50 +2365,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Drop Plex-Transcoder-only flags that stock ffmpeg rejects with
-	// "Unrecognized option". Each is two-token (`flag value`).
-	//   -loglevel_plex <level>   — custom Plex log verbosity, no analog
-	//   -delete_removed <bool>   — Plex DASH muxer extension. Plex passes
-	//                              `false` to mean "never delete old
-	//                              segments". Stock dashenc has no
-	//                              equivalent flag; chunk preservation is
-	//                              instead controlled by extra_window_size
-	//                              (default 5 — segments are unlinked from
-	//                              disk after they fall extra_window_size
-	//                              past the manifest window). PMS's
-	//                              universal handler serves chunks by
-	//                              number from disk and 404s the client if
-	//                              early chunks were already deleted, so
-	//                              we strip Plex's flag and inject a huge
-	//                              extra_window_size below to keep
-	//                              everything around.
-	for _, flag := range []string{"-loglevel_plex"} {
-		if i := indexOfArg(args, flag, 0); i >= 0 {
-			args = removeArgs(args, i, 2)
-			changes = append(changes, "drop:"+flag)
-		}
-	}
+	// `-loglevel_plex` passthrough: scaleplex-ffmpeg7 patch 0098
+	// registers `-loglevel_plex <name>` as an OPT_TYPE_STRING sink
+	// (accepted + discarded). Previously rewriter stripped this 2-token
+	// flag because stock ffmpeg rejected the unknown option.
 
-	// Plex-private segment-muxer / fork-only flags. Strip globally —
-	// they appear on HLS argv (the primary output) AND on the embedded
-	// subtitle pipeline that Plex appends as a second `-f segment` on
-	// DASH transcodes when the source has embedded ASS subs. Stock
-	// ffmpeg's segment muxer rejects each with "Unrecognized option
-	// '<flag>'. Error splitting the argument list" — observed:
-	//   - 2026-05-06 LG WebOS HLS Balls Up: -segment_list_unfinished
-	//   - 2026-05-06 Chrome DASH Superman: -strict_ts:0,
-	//     -segment_list_separate_stream_times (on subtitle output)
-	for _, flag := range []string{"-segment_list_separate_stream_times", "-segment_list_unfinished"} {
-		for {
-			i := indexOfArg(args, flag, 0)
-			if i < 0 || i+1 >= len(args) {
-				break
-			}
-			args = removeArgs(args, i, 2)
-			changes = append(changes, "drop:"+flag)
-		}
-	}
-	// `-strict_ts*` (any stream specifier suffix) — same family.
+	// `-segment_list_separate_stream_times` + `-segment_list_unfinished`
+	// pass through to scaleplex-ffmpeg7 natively (patch 0096 registers
+	// them as no-op AVOptions, full per-stream end-time tracking + CSV
+	// unfinished prefix scheduled for Phase 2b).
+	//
+	// `-strict_ts*` (any stream specifier suffix) — Plex movenc/dashenc
+	// extension, no equivalent in our fork yet, must still strip.
 	for {
 		i := -1
 		for j := 0; j < len(args); j++ {
@@ -2188,23 +2464,30 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// to that URL natively (CSV with -segment_list_type csv). PMS reads
 	// the CSV and synthesises the m3u8 it serves to clients.
 	if isHLS {
-		// `-f ssegment` is Plex's name for the stream-segmenter muxer;
-		// stock ffmpeg has `-f segment` which is API-compatible for the
-		// options Plex actually uses. Verified against `ffmpeg -h
-		// muxer=segment` (jellyfin-ffmpeg7): -segment_format,
-		// -segment_header_filename, -individual_header_trailer,
-		// -segment_format_options, -segment_time, -segment_list,
-		// -segment_list_type are all native. Plex's argv keeps using
-		// matroska-in-.ts for HLS to multi-channel-audio clients (Plex
-		// signals this in the public manifest as container=mkv); the
-		// client then fetches /base/header to grab the matroska codec
-		// init and treats each .ts as a continuation. Stripping
-		// -segment_header_filename caused 4K-HDR + 5.1-audio playback
-		// on Plex Android to 404 on /base/header for ~120s before the
-		// app gave up.
-		if i := indexOfArg(args, "-f", 0); i >= 0 && i+1 < len(args) && args[i+1] == "ssegment" {
-			args[i+1] = "segment"
-			changes = append(changes, "hls:f=ssegment->segment")
+		// `-f ssegment` passthrough: scaleplex-ffmpeg7 patch 0098 adds
+		// AVFMT_GLOBALHEADER to ff_stream_segment_muxer so it accepts
+		// Plex's `-flags +global_header` / `-segment_header_filename`
+		// combination natively. The muxer code is shared with
+		// ff_segment_muxer (`.priv_class = &seg_class`), so behaviour
+		// is identical for Plex's argv shape. Previously rewriter
+		// translated to `-f segment` because the missing flag left
+		// the header file empty + Plex Android 404'd on /base/header.
+
+		// Plex's `-segment_list_size 5` keeps only 5 entries in the CSV
+		// manifest. With ffmpeg outpacing playback (any speed > 1×) the
+		// rolling window drops older chunks from the CSV, so when the
+		// client falls 5+ chunks behind PMS no longer has CSV rows for
+		// them and serves 0-byte chunks. Bump to 99999 so the CSV
+		// retains every chunk for the lifetime of the session — files
+		// stay on disk anyway (segment muxer doesn't auto-delete like
+		// dashenc). Observed 2026-05-11 on LG webOS BH6 4K HEVC HDR
+		// HLS — 200ms 0-byte chunk serves correlating with rolling-
+		// window drops while ffmpeg ran ~2.7× unthrottled.
+		if i := indexOfArg(args, "-segment_list_size", 0); i >= 0 && i+1 < len(args) {
+			if args[i+1] != "99999" {
+				args[i+1] = "99999"
+				changes = append(changes, "hls:segment_list_size:5->99999")
+			}
 		}
 		// (-segment_list_separate_stream_times / -segment_list_unfinished
 		// are stripped globally above for both HLS and the DASH+subs
@@ -2228,69 +2511,44 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// offset back. Verified empirically 2026-05-11 on jellyfin-ffmpeg
 		// 7.1.3 with Burn Notice -ss 100: 20 chunks produced in 20s,
 		// chunk-0 PTS=100.017, chunk-5 PTS=205.038.
-		// Strip `-copyts` for all segmented output. Stock ffmpeg's
-		// segment muxer with `-copyts -start_at_zero -ss <off>` is
-		// inconsistent across `-ss` values on jellyfin-ffmpeg 7.1.3:
-		// for small `-ss` (initial play -ss 4) it splits at keyframes,
-		// but for large `-ss` (seek -ss 4801) the encoder processes
-		// frames (frame= advancing) yet zero chunks land on disk —
-		// verified 2026-05-11 with Big Hero 6 hevc_vaapi. Likely
-		// interaction between -start_at_zero's PTS rebase and VAAPI
-		// encoder GOP state post deep-seek. Stripping -copyts rebases
-		// packet PTS to 0; segment muxer splits reliably, and the
-		// relay's Cluster.Timecode patcher restores the absolute
-		// timeline for mpv.
-		if i := indexOfArg(args, "-copyts", 0); i >= 0 {
-			args = removeArgs(args, i, 1)
-			changes = append(changes, "hls:drop:-copyts")
+		// `-copyts` handling — DELICATE.
+		//   * INITIAL PLAY (no -ss): KEEP -copyts. Stripping rebases
+		//     output PTS based on `-fps_mode cfr` decisions and can
+		//     leave a 10s offset between manifest CSV timestamps and
+		//     in-chunk PTS (observed 2026-05-12 PS4 BH6 stuck on chunk-0
+		//     loop). With -copyts, ffmpeg uses upstream's
+		//     `reference_stream_first_pts` (libavformat/segment.c) so
+		//     chunks split at keyframes AND in-chunk PTS line up with
+		//     CSV.
+		//   * SEEK (-ss > 0): STRIP -copyts. Stock 7.1.3 segment muxer
+		//     misbehaves on large `-ss` with -copyts (zero chunks land
+		//     even though encoder processes frames — verified 2026-05-11
+		//     BH6 hevc_vaapi -ss 4801). Strip rebases PTS to 0,
+		//     splits resume.
+		seekOff := captureSeekSeconds(args)
+		if seekOff > 0 {
+			if i := indexOfArg(args, "-copyts", 0); i >= 0 {
+				args = removeArgs(args, i, 1)
+				changes = append(changes, "hls:drop:-copyts(seek)")
+			}
 		}
 
-		// Rewrite `-segment_format_options live=1` → `live=0` (Plex Windows
-		// segmented-matroska shape). Plex's matroska muxer fork patches
-		// matroskaenc.c at line 2561 to ALWAYS write the Matroska Duration
-		// element from `-metadata duration=` even in live mode (`!is_live
-		// || 1`). Stock matroska honours `is_live`: with live=1 the Duration
-		// element is skipped entirely, so the segment_header file lands on
-		// disk without Duration. The Plex Windows client reads the
-		// concatenated header+chunks via `/transcode/universal/start`, sees
-		// no Duration in the matroska header, and falls back to inferring
-		// duration from received bytes — slider shows 5 min, growing as
-		// transcode produces chunks (verified live 2026-05-11 Big Hero 6
-		// 8 Mbps 1080p, user couldn't seek past "current produced" mark).
+		// `-segment_format_options live=1` passes through. scaleplex-
+		// ffmpeg7 patch 0094 makes matroskaenc.c always write Duration
+		// regardless of is_live, and jellyfin 7.x's `IS_SEEKABLE = pb
+		// seekable && !is_live` naturally falls to the cluster-defaults
+		// else-branch at live=1 → 1000 ms / 32 KB defaults ≈ per-frame
+		// clusters at typical bitrates. Both behaviours the previous
+		// rewrite forced (Duration in header + per-frame clusters) are
+		// now patch-0094-plus-stock-defaults.
 		//
-		// Setting live=0 makes stock write Duration from -metadata into
-		// the header file. Side effects (SeekHead writing + end-of-stream
-		// seek-back to update Duration) are no-ops here: segment muxer
-		// captures only header bytes up to first Cluster, so later
-		// seek-backs land in chunk files and don't touch the already-
-		// written header. Empirically validated 2026-05-11 with testsrc2:
-		// live=0 header has 0x4489 Duration = 6112352ms; live=1 doesn't.
-		for i := 0; i+1 < len(args); i++ {
-			if args[i] != "-segment_format_options" {
-				continue
-			}
-			if args[i+1] == "live=1" {
-				// live=0: stock writes matroska Duration from -metadata
-				//   into the segment_header file (Plex Windows client uses
-				//   it to fill the seekbar with full source duration).
-				// cluster_time_limit=1000 + cluster_size_limit=32768:
-				//   force per-frame clusters. With live=0, stock's defaults
-				//   are 5s/5MB → one cluster per ~5s chunk. Plex Windows
-				//   tracks playback position (and the offset it sends to
-				//   PMS on audio-track-switch / quality-change / re-spawn)
-				//   from Cluster.Timecode. Per-frame clusters match what
-				//   Plex-native matroskaenc.c produces under live=1
-				//   defaults; verified 2026-05-11 against production PMS
-				//   chunk 5 — 25 clusters per 1s chunk at 8 Mbps. Without
-				//   per-frame clusters the client falls back to elapsed-
-				//   since-stream-start, so audio-swap re-spawns the
-				//   transcode at offset=elapsed → playback restarts from
-				//   the front.
-				args[i+1] = "live=0:cluster_time_limit=1000:cluster_size_limit=32768"
-				changes = append(changes, "hls:segment_format_options:live=1->live=0+per-frame-clusters")
-			}
-			break
-		}
+		// Previous rewrite (deleted 2026-05-12 audit pass) replaced
+		// `live=1` with `live=0:cluster_time_limit=1000:cluster_size_limit=32768`.
+		// Real PMS argvs for Plex Android use `output_ts_offset=10` and
+		// never trigger the live=1 match, so the rewrite was dead code
+		// for current production traffic. Plex Windows shape would emit
+		// live=1 — needs revalidation when hw becomes available, but
+		// patch 0094 + IS_SEEKABLE semantics give the same end state.
 
 		// Stage-rename pattern attempted (rewriter swap to `chunk-%05d
 		// .tmp` + relay-side patch-and-rename to final chunk-N) —
@@ -2444,16 +2702,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest body
-	// to this URL whenever the .mpd is regenerated; PMS gates `/header`
-	// on the first such POST. Stock ffmpeg's dashenc treats manifest_name
-	// as a filename, not a URL, so we strip it from the argv (otherwise
-	// it would be written verbatim into a local file) and surface the
-	// rewritten URL on RewriteResult so the agent can POST the manifest
-	// itself. See manifest_publish.go.
-	var manifestURL string
+	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest
+	// body to this URL whenever the .mpd is regenerated; PMS gates
+	// `/header` on the first such POST. scaleplex-ffmpeg7 backports
+	// the URL-aware `-manifest_name` (patch 0095), so we only need to
+	// rewrite the loopback host to the relay base; ffmpeg PUTs the
+	// body natively via dashenc's HTTP protocol handler.
 	var manifestChanges []string
-	args, manifestURL, manifestChanges = captureManifestName(args, inputEnv)
+	args, manifestChanges = rewriteManifestName(args, inputEnv)
 	changes = append(changes, manifestChanges...)
 
 	// PTS handling — keep Plex's `-copyts -start_at_zero
@@ -2527,7 +2783,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		Applied:           true,
 		Changes:           changes,
 		ProgressURL:       progressURL,
-		ManifestURL:       manifestURL,
 		SkipToSegment:     skipToSegment,
 		SeekOffsetSeconds: seekOffsetSeconds,
 		SubtitleExtract:   subExtract,
