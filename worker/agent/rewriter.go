@@ -274,6 +274,73 @@ func subtitlesForceStyle() string {
 	return ":force_style='" + v + "'"
 }
 
+// stripPlexInlineassFilterArgs removes the 4 AVOption keys that Plex's
+// argv emits on its `inlineass=` filter but scaleplex-ffmpeg7's
+// vf_inlineass does not parse: `language`, `overrides`, `outline`,
+// `shadow`. Operates on a full -filter_complex graph string and is
+// idempotent + leaves graphs without `inlineass=` untouched.
+//
+// Without this strip, the fork's AVOption parser rejects Plex's filter
+// argv at filter init time. We omitted the stub options in patch 0100
+// to sidestep an unexplained LTO/AVFILTER_DEFINE_CLASS table-truncation
+// (see project_scaleplex_inlineass_port.md). The strip is the
+// rewriter's half of that bargain.
+//
+// Plex's argv shape inside the filter graph:
+//
+//	[1]inlineass=font_scale=1.0:font_path=...:fontconfig_file=...:
+//	  language=en:overrides=ScaledBorderAndShadow=yes,FontName=...,...:
+//	  outline=2.6:shadow=1.7:font_size=54[2]
+//
+// Top-level pairs are `:`-separated. The `overrides=` value contains
+// `,` and `=` but never a top-level `:` (verified across argv corpus
+// 2026-05-12 — 6 PMS-emitted inlineass= argv samples, none have
+// embedded `:` inside any of the 4 keys).
+func stripPlexInlineassFilterArgs(filterStr string) string {
+	if !strings.Contains(filterStr, "inlineass=") {
+		return filterStr
+	}
+	stripKeys := map[string]bool{
+		"language":  true,
+		"overrides": true,
+		"outline":   true,
+		"shadow":    true,
+	}
+	var out strings.Builder
+	i := 0
+	for {
+		j := strings.Index(filterStr[i:], "inlineass=")
+		if j < 0 {
+			out.WriteString(filterStr[i:])
+			break
+		}
+		j += i
+		out.WriteString(filterStr[i : j+len("inlineass=")])
+		k := j + len("inlineass=")
+		// Segment ends at next graph terminator: `[` (label), `;`, or
+		// end of string. Output labels like [2] always follow the
+		// filter args.
+		end := strings.IndexAny(filterStr[k:], "[;")
+		segEnd := len(filterStr)
+		if end >= 0 {
+			segEnd = k + end
+		}
+		segment := filterStr[k:segEnd]
+		pairs := strings.Split(segment, ":")
+		kept := pairs[:0]
+		for _, p := range pairs {
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) == 2 && stripKeys[kv[0]] {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		out.WriteString(strings.Join(kept, ":"))
+		i = segEnd
+	}
+	return out.String()
+}
+
 // subtitlesSeekShift returns (pre, post) setpts pieces to bracket a stock
 // `subtitles=filename=` filter when -copyts has been stripped (HLS path)
 // AND the session is seek-resumed. Without the bracket, frame PTS arrives
@@ -594,7 +661,7 @@ type filterRewrite struct {
 // Falls back to the legacy fs-probe (findSidecarSubtitle) when no
 // PMS-staged source is present — defensive for older PMS argv shapes
 // and tests that don't wire -map_inlineass through.
-func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled, sourceIsHDR bool, seekShiftSeconds float64) *filterRewrite {
+func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsExists func(string) bool, overlayEnabled, sourceIsHDR, inlineassPassthrough bool, seekShiftSeconds float64) *filterRewrite {
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
 		w, h, assParams := m[1], m[2], m[3]
 		_ = assParams
@@ -660,6 +727,36 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 
 		// Text subs (SRT/ASS/MOV_TEXT/...): libass renders the file
 		// into a CPU frame, hwupload back to GPU for the encoder.
+		//
+		// Pass-through mode: keep Plex's inlineass= filter (strip the 4
+		// unknown AVOption keys) instead of swapping to subtitles=. The
+		// scaleplex-ffmpeg7 fork's scaleplex_inlineass binding receives
+		// the sub packets via the -map_inlineass side-channel (sub
+		// stream stays in the input(s), not the filter graph), so no
+		// sidecar path is needed. Same scale/hwdownload/hwupload
+		// scaffolding around the libass step — vf_inlineass operates
+		// on CPU nv12 frames identically.
+		if inlineassPassthrough && subSrc != nil && subSrc.Kind == "text" {
+			mode := "passthrough-inlineass"
+			if sourceIsHDR {
+				mode = "passthrough-inlineass-hdr"
+			}
+			strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
+			strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+			return &filterRewrite{
+				Filter: fmt.Sprintf(
+					"[0:0]hwupload[10];"+
+						"[10]%s[11];"+
+						"[11]hwdownload[12];"+
+						"[12]format=pix_fmts=nv12[13];"+
+						"[13]inlineass=%s[14];"+
+						"[14]hwupload[15]",
+					scaleStep, strippedAss),
+				OldLabel: "[2]",
+				NewLabel: "[15]",
+				Mode:     mode,
+			}
+		}
 		sidecar := ""
 		if subSrc != nil && subSrc.Kind == "text" {
 			sidecar = subSrc.FilePath
@@ -1616,6 +1713,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		return bail("no-decoder")
 	}
 	swDecoder := args[decCodecIdx+1]
+	// SCALEPLEX_INLINEASS_PASSTHROUGH (default off) keeps Plex's
+	// `-map_inlineass` + `inlineass=` filter argv in flight to the
+	// scaleplex-ffmpeg7 fork instead of swapping it for stock
+	// `subtitles=filename=...` on a staged sidecar. Strips the 4
+	// AVOption keys the fork doesn't parse (language/overrides/
+	// outline/shadow) and skips dropSidecarInput / stripNullSubOutput
+	// / -map_inlineass removal so the fork sees the full argv. Path
+	// matters only for text subs; bitmap subs still route through
+	// overlay_vaapi. Off-by-default until corpus + live cluster soak
+	// confirm parity with the swap-to-subtitles= path.
+	inlineassPassthrough := envBool("SCALEPLEX_INLINEASS_PASSTHROUGH")
+
 	isHWDecode := false
 	if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
 		if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
@@ -1678,7 +1787,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			probe = opts.ProbeSubtitleCodec
 		}
 		earlySubSrc = detectSubtitleSource(args, sessionDir, probe)
-		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 {
+		// In pass-through mode the scaleplex-ffmpeg7 fork's
+		// scaleplex_inlineass binding owns the sidecar -i + the trailing
+		// null-sub output; both must stay. Skip the drop.
+		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 &&
+			!(inlineassPassthrough && earlySubSrc.Kind == "text") {
 			if newArgs, dropped := dropSidecarInput(args, earlySubSrc.SecondInputArgIdx); dropped {
 				args = newArgs
 				if removed := stripNullSubOutput(&args); removed {
@@ -1814,8 +1927,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if isHLS {
 			seekShift = captureSeekSeconds(args)
 		}
-		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR, seekShift)
-		if rewritten != nil && seekShift > 0 && subSrc != nil && subSrc.Kind == "text" {
+		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, fsExists, overlayEnabled, sourceIsHDR, inlineassPassthrough, seekShift)
+		if rewritten != nil && seekShift > 0 && subSrc != nil && subSrc.Kind == "text" &&
+			!strings.HasPrefix(rewritten.Mode, "passthrough-inlineass") {
+			// Pass-through mode skips the setpts PTS-shift bracket — the
+			// fork's vf_inlineass takes sub PTS via its side-channel
+			// feed (already absolute time), not via frame PTS.
 			changes = append(changes, fmt.Sprintf("subtitle:pts-shift=%.3fs", seekShift))
 		}
 		if rewritten == nil {
@@ -1853,7 +1970,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// init_hw_device injection). Just emit the change-tag here so
 		// the rewriter changelog still reflects what we did. The
 		// sub-source detection ran twice; reconcile via earlySubSrc.
-		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 {
+		// In pass-through mode phase 1.5 skipped the drop — don't
+		// pretend it ran.
+		if earlySubSrc != nil && earlySubSrc.SecondInputArgIdx > 0 &&
+			!(inlineassPassthrough && earlySubSrc.Kind == "text") {
 			changes = append(changes, "drop:-i(sidecar-input)")
 			// Did stripNullSubOutput actually remove anything? It runs
 			// in phase 1.5; we re-search to confirm before tagging.
@@ -1997,12 +2117,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
 				}
 				w, h := m[1], m[2]
-				sidecarPath := subSrc.FilePath
-				if sidecarPath == "" {
-					return bail("hw-decode-sub:no-sidecar")
+				// Pass-through mode: skip the sidecar-staging probe + bail;
+				// the fork doesn't need a sidecarPath. HDR detection still
+				// runs below so scaleStep adds tonemap_vaapi when needed.
+				var sidecarPath, subPath, fontsDir string
+				if !inlineassPassthrough {
+					sidecarPath = subSrc.FilePath
+					if sidecarPath == "" {
+						return bail("hw-decode-sub:no-sidecar")
+					}
+					subPath = escapeFilterPath(sidecarPath)
+					fontsDir = envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 				}
-				subPath := escapeFilterPath(sidecarPath)
-				fontsDir := envOr("HW_FONTS_DIR", "/usr/share/fonts/truetype/dejavu")
 				// Force nv12 across the libass step. PMS's chain keeps
 				// p010 end-to-end (Plex's bundled inlineass reads 10-bit
 				// fine), but stock `subtitles=` on p010 has caused the
@@ -2030,6 +2156,28 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					scaleStep = fmt.Sprintf(
 						"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
 						w, h)
+				}
+				if inlineassPassthrough {
+					// Keep Plex's inlineass= filter; strip the 4 Plex-only
+					// AVOption keys vf_inlineass doesn't parse. Sidecar -i,
+					// -map_inlineass, and null-sub output all stay — fork's
+					// scaleplex_inlineass binding owns those.
+					assParams := m[5]
+					strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
+					strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+					args[vfIdx] = fmt.Sprintf(
+						"[0:0]hwupload[0];"+
+							"[0]%s[1];"+
+							"[1]hwdownload,format=nv12[2];"+
+							"[2]inlineass=%s[3];"+
+							"[3]hwupload[4]",
+						scaleStep, strippedAss,
+					)
+					changes = append(changes, "hw-decode:filter:inlineass-passthrough")
+					// Indices unchanged — no args spliced.
+					newInputIdx = indexOfArg(args, "-i", 0)
+					encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+					break
 				}
 				preShift, postShift := "", ""
 				if isHLS {
