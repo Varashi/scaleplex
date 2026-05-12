@@ -926,14 +926,13 @@ func TestRewriter_ManifestURL_NoBase_Drops(t *testing.T) {
 	}
 }
 
-// `-skip_to_segment N` must be captured into RewriteResult.SkipToSegment
-// and stripped from the argv. The chunk-renumber watcher uses N as the
-// starting sequence so chunk-stream0-NNNNN.m4s names align with PMS's
-// expected URL `.../0/(N-1).m4s`. PTS-handling flags
-// (-copyts/-start_at_zero/-avoid_negative_ts disabled) MUST be left
-// alone — stripping them rebased the AAC encoder's PTS to 0 with no
-// primer samples and produced empty (199-byte) first audio segments
-// after every seek, which DASH players hang on indefinitely.
+// `-skip_to_segment N` passes through to ffmpeg untouched (dashenc
+// fork patch 0095 honours it natively). Diagnostic change-tag is
+// emitted. PTS-handling flags (-copyts/-start_at_zero/-avoid_negative_ts
+// disabled) MUST be left alone — stripping them rebased the AAC
+// encoder's PTS to 0 with no primer samples and produced empty
+// (199-byte) first audio segments after every seek, which DASH players
+// hang on indefinitely.
 func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	args := append([]string(nil), swArgsAV1H264...)
 	for i := 0; i+1 < len(args); i++ {
@@ -947,12 +946,9 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if out.SkipToSegment != 522 {
-		t.Fatalf("SkipToSegment=%d want 522", out.SkipToSegment)
+	if !containsString(out.Changes, "skip_to_segment:passthrough=522") {
+		t.Fatalf("missing skip_to_segment:passthrough=522 tag: %v", out.Changes)
 	}
-	// scaleplex-ffmpeg7 honours -skip_to_segment natively; the rewriter
-	// captures the value (for checkpoint / metrics) but leaves the
-	// flag intact so dashenc starts numbering at N.
 	stsIdx := indexOfArg(out.Args, "-skip_to_segment", 0)
 	if stsIdx < 0 || out.Args[stsIdx+1] != "522" {
 		t.Fatal("-skip_to_segment must pass through to ffmpeg (value=522)")
@@ -970,19 +966,17 @@ func TestRewriter_SkipToSegment_Seek(t *testing.T) {
 	}
 }
 
-// Initial-play session (`-skip_to_segment 1`, no `-ss`) captures
-// SkipToSegment=1 and renumber starts at 1 (no-op rename since names
-// match). PTS flags pass through untouched. No -ss → no
+// Initial-play session (`-skip_to_segment 1`, no `-ss`) — flag passes
+// through untouched. Diagnostic tag emitted. No -ss → no
 // -output_ts_offset injection.
 func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if out.SkipToSegment != 1 {
-		t.Fatalf("SkipToSegment=%d want 1", out.SkipToSegment)
+	if !containsString(out.Changes, "skip_to_segment:passthrough=1") {
+		t.Fatalf("missing skip_to_segment:passthrough=1 tag: %v", out.Changes)
 	}
-	// Passes through to ffmpeg (no strip) — scaleplex-ffmpeg7 honours it.
 	stsIdx := indexOfArg(out.Args, "-skip_to_segment", 0)
 	if stsIdx < 0 || out.Args[stsIdx+1] != "1" {
 		t.Fatal("-skip_to_segment must pass through to ffmpeg")
