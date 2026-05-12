@@ -83,7 +83,6 @@ type runningTask struct {
 	cwd          string
 	sourcePath   string
 	progressURL  string
-	manifestURL  string
 	seekOffsetS  float64
 	startedAt    time.Time
 
@@ -372,8 +371,6 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	finalArgs := req.Args
 	finalEnv := req.Env
 	progressURL := ""
-	manifestURL := ""
-	skipToSegment := 0
 	seekOffsetSeconds := 0.0
 	isMatroskaSegment := false
 	if req.Rewrite {
@@ -398,8 +395,6 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			finalArgs = res.Args
 			finalEnv = res.Env
 			progressURL = res.ProgressURL
-			manifestURL = res.ManifestURL
-			skipToSegment = res.SkipToSegment
 			seekOffsetSeconds = res.SeekOffsetSeconds
 			isMatroskaSegment = res.IsMatroskaSegment
 			metricRewriteApplied.WithLabelValues("applied").Inc()
@@ -500,7 +495,6 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		cwd:         req.Cwd,
 		sourcePath:  extractInputPath(finalArgs),
 		progressURL: progressURL,
-		manifestURL: manifestURL,
 		seekOffsetS: seekOffsetSeconds,
 		startedAt:   spawnedAt,
 	}
@@ -532,14 +526,11 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	// cwd to the per-session transcode dir.
 	if req.Cwd != "" {
 		go watchFirstSegment(ctx, req.Cwd, req.SessionID, resp, spawnedAt)
-		startSeq := 1
-		if skipToSegment > 0 {
-			startSeq = skipToSegment
-		}
-		go watchAndRenumberChunks(ctx, req.Cwd, req.SessionID, startSeq, seekOffsetSeconds, &task.lastSeq)
-		if manifestURL != "" {
-			go runManifestPublisher(ctx, req.Cwd, manifestURL, req.SessionID, startSeq)
-		}
+		// Track chunk sequence for /task/<id>/checkpoint resumption.
+		// scaleplex-ffmpeg7 handles chunk renumber + tfdt rebasing
+		// natively (dashenc patch 0095), so the watcher only observes
+		// — no renames, no in-place mp4 box surgery.
+		go watchChunkSequence(ctx, req.Cwd, req.SessionID, &task.lastSeq)
 		if isMatroskaSegment {
 			// Worker patcher no longer applies the Cluster.Timecode
 			// shift — the relay does that in-line with each CSV POST
@@ -580,15 +571,17 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		throttle := &throttleSignal{}
+		// throttleSignal mirrors PMS's canThrottle decision into the
+		// progress reporter so it can suppress &speed= while throttled.
+		// In-binary scaleplex-ffmpeg7 (patch 0097) handles the actual
+		// usleep pacing; nothing here pulses SIGSTOP anymore.
 		rc := reportContext{
 			URL:       progressURL,
 			SessionID: req.SessionID,
 			Streams:   streams,
 			DurationS: probeDurationSeconds(ctx, inputPath),
-			Throttle:  throttle,
+			Throttle:  &throttleSignal{},
 		}
-		go throttleController(ctx, req.SessionID, cmd.Process.Pid, throttle)
 		// Fire the one-shot prelude PUTs (duration + streamDetail +
 		// dimensions) before starting the periodic reporter. PMS uses
 		// these to fill in codec metadata so /header can return without

@@ -1,0 +1,174 @@
+Description: ffmpeg: backport Plex's canThrottle handler for per-packet sloth mode
+ Plex's ffmpeg fork adds a PMS feedback loop inside fftools/ffmpeg.c:
+ every progress block also fires a one-shot HTTP PUT and parses the
+ response body for the literal substring `canThrottle`. When present,
+ ffmpeg's input-packet read loop applies `usleep(100 ms)` per packet
+ (~28% throughput in equilibrium) — PMS uses this to cap the transcode
+ buffer at TranscoderThrottleBuffer.
+
+ scaleplex's worker emulates this externally via SIGSTOP/SIGCONT pulses
+ on the ffmpeg pgid (`worker/agent/throttle.go`). The external pulse
+ has high variance — when paused, ffmpeg writes nothing for hundreds of
+ milliseconds, easy to undershoot a slow-buffering client's playout
+ (LG webOS observed 2026-05-11). Plex's internal usleep is constant-
+ cadence and self-balancing because PMS keeps re-asserting / clearing
+ canThrottle at equilibrium.
+
+ Implementation (adapted from Plex's fftools/ffmpeg.c lines 1846 + 4651
+ — the official GPL tarball drops fftools entirely, canonical reference
+ is Diagonactic/plex-new-transcoder which auto-mirrors Plex's full
+ source):
+
+  - New option `-canthrottleurl <url>`. Worker rewriter injects this
+    pointing at the same relay endpoint as -progressurl. Setting it
+    leaves -progress / -progressurl untouched so the worker's progress
+    pipe (canThrottle extraction, metrics, checkpoint) keeps working
+    in parallel — both consume the response body, the per-packet sleep
+    just becomes additional from ffmpeg's side.
+
+  - print_report fires a one-shot HTTP PUT to the URL after each
+    progress block (sub-second cadence per `stats_period`), reads the
+    response body via the same AVIOContext, sets a global atomic
+    throttle_delay_us based on whether the body contains `canThrottle`.
+
+  - encoder_thread (fftools/ffmpeg_enc.c) sleeps once per encoded
+    VIDEO output frame when the atomic is set. Picking the gate
+    location requires care: Plex's 6.x base ran a single-threaded
+    transcode loop, so their sleep after process_input_packet was
+    naturally rate-limited by encoder pace (one sleep per loop iter,
+    one loop iter per fully-processed input packet). Jellyfin 7.x split
+    demuxer and encoder into separate threads connected by a bounded
+    queue; sleeping in the demuxer thread (our 2026-05-11 first cut)
+    fires at queue-drain rate, which is ~1.5× faster than encoder
+    consumption for 4K HEVC HDR pass-through, choking throughput to
+    1.17× realtime when canThrottle is asserted vs Plex's stated ~28%
+    floor (which equilibrates near realtime because canThrottle
+    oscillates as PMS sees the buffer drain). Putting the sleep in the
+    video encoder thread, after frame_encode returns, restores the
+    encoder-paced cadence: 23.976 fps × 100 ms ≈ 2.4 s sleep per
+    wall-second when asserted ≈ 28% throughput, exactly the Plex
+    documented rate. Audio + subtitle encoder threads run in parallel
+    and MUST NOT sleep — they'd compound the throttle multiplicatively.
+
+Origin: backport, https://github.com/Diagonactic/plex-new-transcoder
+        (Plex Transcoder 1.12.3.4973), fftools/ffmpeg.c L1846-L1862
+        and L4649-L4653.
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-12
+---
+--- a/fftools/ffmpeg.h	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg.h	2026-05-12 10:40:05.000000000 +0200
+@@ -727,6 +727,9 @@
+ extern int64_t stats_period;
+ extern int stdin_interaction;
+ extern AVIOContext *progress_avio;
++// scaleplex/PLEX: canThrottle feedback loop.
++extern char *canthrottle_url;
++extern _Atomic int scaleplex_throttle_delay_us;
+ extern float max_error_rate;
+ 
+ extern char *filter_nbthreads;
+--- a/fftools/ffmpeg.c	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg.c	2026-05-12 10:40:05.000000000 +0200
+@@ -100,6 +100,9 @@
+ 
+ static BenchmarkTimeStamps current_time;
+ AVIOContext *progress_avio = NULL;
++// scaleplex/PLEX: canThrottle feedback (see ffmpeg.h)
++char *canthrottle_url = NULL;
++_Atomic int scaleplex_throttle_delay_us = 0;
+ 
+ InputFile   **input_files   = NULL;
+ int        nb_input_files   = 0;
+@@ -694,6 +697,57 @@
+         }
+     }
+ 
++    // scaleplex/PLEX: canThrottle feedback. Open a one-shot PUT to
++    // canthrottle_url, read response body, parse for `canThrottle`
++    // substring. Sets atomic per-output-frame sleep accordingly.
++    // Errors fail-open. Mirrors Plex's PMS_IssueHttpRequest helper
++    // (fftools/plex.c L63-114): AVIO_FLAG_READ, avio_size() for
++    // exact byte count, then avio_read(size).
++    //
++    // Log policy: per-cycle PUT / read / body lines at AV_LOG_DEBUG
++    // (hidden by default `-loglevel info`). State-transition
++    // ON/OFF lines at AV_LOG_INFO so operators see when PMS first
++    // asserts canThrottle without bumping global loglevel. Worker
++    // can flip the cutoff via env SCALEPLEX_FFMPEG_LOGLEVEL=debug
++    // when troubleshooting.
++    if (canthrottle_url && !is_last_report) {
++        AVIOContext *ct_avio = NULL;
++        AVDictionary *opts = NULL;
++        av_dict_set(&opts, "method", "PUT", 0);
++        int ct_ret = avio_open2(&ct_avio, canthrottle_url,
++                                AVIO_FLAG_READ, NULL, &opts);
++        av_dict_free(&opts);
++        av_log(NULL, AV_LOG_DEBUG,
++               "scaleplex/ct: PUT %s -> ret=%d\n",
++               canthrottle_url, ct_ret);
++        if (ct_ret >= 0) {
++            int64_t size = avio_size(ct_avio);
++            if (size < 0 || size > 4095)
++                size = 4095;
++            if (size > 0) {
++                char resp[4096];
++                int n = avio_read(ct_avio, (unsigned char *)resp, size);
++                av_log(NULL, AV_LOG_DEBUG,
++                       "scaleplex/ct: avio_read n=%d (size=%" PRId64 ")\n",
++                       n, size);
++                if (n > 0) {
++                    resp[n] = 0;
++                    av_log(NULL, AV_LOG_DEBUG,
++                           "scaleplex/ct: body=%.200s\n", resp);
++                    int new_throttle = strstr(resp, "canThrottle") ? 100 * 1000 : 0;
++                    int prev = scaleplex_throttle_delay_us;
++                    if (new_throttle != prev) {
++                        av_log(NULL, AV_LOG_INFO,
++                               "scaleplex/ct: throttle %s\n",
++                               new_throttle ? "ON" : "OFF");
++                    }
++                    scaleplex_throttle_delay_us = new_throttle;
++                }
++            }
++            avio_closep(&ct_avio);
++        }
++    }
++
+     first_report = 0;
+ }
+ 
+--- a/fftools/ffmpeg_opt.c	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg_opt.c	2026-05-12 10:40:05.000000000 +0200
+@@ -1574,6 +1574,8 @@
+     { "benchmark_all",          OPT_TYPE_BOOL, OPT_EXPERT,
+         { &do_benchmark_all },
+       "add timings for each task" },
++    { "canthrottleurl",         OPT_TYPE_STRING, OPT_EXPERT, { &canthrottle_url },
++        "URL to PUT (one-shot per progress report) for Plex-style canThrottle feedback", "url" },
+     { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+         { .func_arg = opt_progress },
+       "write program-readable progress information", "url" },
+--- a/fftools/ffmpeg_enc.c	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg_enc.c	2026-05-12 10:40:05.000000000 +0200
+@@ -891,6 +891,19 @@
+         av_packet_unref(et.pkt);
+         av_frame_unref(et.frame);
+ 
++        // scaleplex/PLEX: per-output-frame sleep on the VIDEO encoder
++        // thread when PMS asserts canThrottle. Plex 6.x sleeps in the
++        // single-threaded transcode loop after process_input_packet,
++        // gated by encoder pace. In jellyfin 7.x demuxer/encoder run
++        // in separate threads, so the equivalent gate is here: per
++        // encoded video frame. VIDEO-ONLY because parallel audio/sub
++        // threads would compound the sleep into multi-stream over-
++        // throttle (e.g. 0.28x video x 0.28x audio = 0.08x net).
++        // 23.976 fps x 100 ms = ~28% throughput when asserted,
++        // matching Plex's documented rate.
++        if (ost->type == AVMEDIA_TYPE_VIDEO && scaleplex_throttle_delay_us > 0)
++            av_usleep(scaleplex_throttle_delay_us);
++
+         if (ret < 0) {
+             if (ret == AVERROR_EOF)
+                 av_log(ost, AV_LOG_VERBOSE, "Encoder returned EOF, finishing\n");

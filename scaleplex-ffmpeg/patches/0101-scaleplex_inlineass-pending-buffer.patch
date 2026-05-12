@@ -1,0 +1,376 @@
+Description: scaleplex_inlineass: buffer pre-graph sub chunks (Phase 2b)
+ Phase 2 (patch 0100) wired -map_inlineass through fftools. End-to-end
+ worked when the subtitle stream lives in the SAME input as the video
+ (PMS argv shape `-i source.mkv -map_inlineass 0:s:N`), because the
+ demuxer emits a single packet stream and configure_filtergraph runs
+ before the first sub packet flows.
+ .
+ It did NOT work when the subtitle stream is on a SEPARATE input
+ (`-i source.mkv -i temp-0.srt -map_inlineass 1:s:0`), because
+ jellyfin-ffmpeg 7.x's scheduler decodes the (tiny, instantly-EOF)
+ SRT input ahead of the video graph's first frame. handle_subtitle
+ fires twice with dec_ctx already valid, but every binding has
+ flt_ctx == NULL because configure_filtergraph hasn't run yet; the
+ sub packets pass through with no append target and are lost. By the
+ time the video filter graph configures and link_graph populates
+ flt_ctx, there are no more subs to feed.
+ .
+ This patch fixes the race by:
+ .
+   1. Adding a per-binding pending-chunk queue. handle_subtitle
+      decomposes the AVSubtitle into (start_ms, duration_ms, ass_line)
+      tuples and either replays them into vf_inlineass immediately
+      (binding has flt_ctx) or buffers them (binding still pre-graph).
+      Buffer is capped at INLINEASS_PENDING_MAX (4096) per binding to
+      avoid runaway; over-cap chunks log once and are dropped.
+ .
+   2. Adding eager-bind in handle_subtitle. If no binding currently
+      pins dec_ctx, look it up via ist->decoder; on match, pin
+      b->dec_ctx and accept the chunk. Lets the buffer accumulate
+      even before link_graph runs.
+ .
+   3. Adding scaleplex_inlineass_link_graph drain. After flt_ctx is
+      set and font/storage-size pushed, flush the buffered chunks via
+      a new public side-channel helper avfilter_inlineass_replay_chunk.
+      The helper bypasses AVSubtitle reconstruction (we already have
+      ASS_TIME_BASE-ready tuples) but otherwise behaves like
+      avfilter_inlineass_append_data: takes the same global libass
+      lock, calls process_header on first chunk if needed, then
+      ass_process_chunk per line.
+ .
+   4. Unifying the immediate path: handle_subtitle now also uses
+      avfilter_inlineass_replay_chunk for in-graph dispatch (instead
+      of reconstructing an AVSubtitle for avfilter_inlineass_append_data).
+      Single code path for buffered + immediate.
+ .
+ Re-bind on probe→live configure_filtergraph re-entry also calls
+ pending_free on each binding — anything queued for the now-defunct
+ graph is dropped (its flt_ctx is being freed); the live graph will
+ see fresh subs as decoding resumes.
+ .
+ Cap rationale: 2-hour movie at 3 subs/sec upper bound = ~22k chunks.
+ The pre-graph window is bounded by how long configure_filtergraph
+ takes (usually one video probe cycle, <2 s of clock time → <60 sub
+ chunks at typical rates). 4096 covers any realistic backlog with a
+ wide safety margin; beyond that we're either pathological or a bug.
+ .
+ Worker rewriter cleanup deferred to a follow-up: with this patch
+ ffmpeg handles both embedded and sidecar -map_inlineass argv
+ natively, so the rewriter's findSidecarSubtitle, subtitle_extract.go,
+ hybrid-inlineass swap mode, and HLS+seek PTS-shift bracket can all
+ be deleted — leaving only a small regex strip for the 4 Plex-only
+ filter keys (:language=, :overrides=, :outline=, :shadow=).
+Origin: scaleplex (no Plex equivalent — Plex 6.x's single-threaded
+        transcode never exposed this ordering bug)
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-12
+---
+--- a/libavfilter/vf_inlineass.h	2026-05-12 15:48:48.048392860 +0200
++++ b/libavfilter/vf_inlineass.h	2026-05-12 15:49:08.954386578 +0200
+@@ -29,6 +29,12 @@
+                                        AVCodecContext *dec_ctx);
+ void avfilter_inlineass_append_data(AVFilterContext *link, AVCodecContext *dec_ctx,
+                                     AVSubtitle *sub);
++/* scaleplex: minimal ASS-line side-channel for replay of pre-graph
++ * buffered chunks. Bypasses AVSubtitle reconstruction. start_ms +
++ * duration_ms are already in ASS_TIME_BASE (ms). */
++void avfilter_inlineass_replay_chunk(AVFilterContext *link, AVCodecContext *dec_ctx,
++                                     int64_t start_ms, int64_t duration_ms,
++                                     const char *ass_line);
+ void avfilter_inlineass_set_aspect_ratio(AVFilterContext *context, double dar);
+ void avfilter_inlineass_add_attachment(AVFilterContext *context, AVStream *st);
+ void avfilter_inlineass_set_fonts(AVFilterContext *context);
+--- a/libavfilter/vf_inlineass.c	2026-05-12 15:48:37.762395950 +0200
++++ b/libavfilter/vf_inlineass.c	2026-05-12 15:52:53.965319015 +0200
+@@ -629,6 +629,40 @@
+     pthread_mutex_unlock(&inlineass_lock);
+ }
+ 
++/* Forward decl — process_header is defined further below and is also
++ * called from avfilter_inlineass_replay_chunk just above append_data. */
++static void process_header(AVFilterContext *link, AVCodecContext *dec_ctx);
++
++/* scaleplex: side-channel replay used by scaleplex_inlineass.c to flush
++ * subtitle chunks that were buffered before configure_filtergraph set
++ * flt_ctx on the binding. Pre-decoded (start_ms, duration_ms, ass_line)
++ * tuples skip avsubtitle reconstruction; we still need dec_ctx for the
++ * first-call process_header on the track. Holds the same global lock
++ * as append_data so concurrent filter_frame on the filter thread can't
++ * race. */
++void avfilter_inlineass_replay_chunk(AVFilterContext *link, AVCodecContext *dec_ctx,
++                                     int64_t start_ms, int64_t duration_ms,
++                                     const char *ass_line)
++{
++    AssContext *ass;
++
++    if (!link || !link->priv || !ass_line)
++        return;
++    ass = link->priv;
++
++    pthread_mutex_lock(&inlineass_lock);
++    if (!ass->got_header && dec_ctx)
++        process_header(link, dec_ctx);
++    if (ass->track) {
++        av_log(link, AV_LOG_VERBOSE,
++               "scaleplex_inlineass: replay_chunk start=%" PRId64 " dur=%" PRId64 " line=\"%.60s\"\n",
++               start_ms, duration_ms, ass_line);
++        ass_process_chunk(ass->track, ass_line, strlen(ass_line),
++                          start_ms, duration_ms);
++    }
++    pthread_mutex_unlock(&inlineass_lock);
++}
++
+ /* Caller (avfilter_inlineass_append_data) holds inlineass_lock — every
+  * libass call below runs under that lock. */
+ static void process_header(AVFilterContext *link, AVCodecContext *dec_ctx)
+--- a/fftools/scaleplex_inlineass.c	2026-05-12 15:48:56.033390460 +0200
++++ b/fftools/scaleplex_inlineass.c	2026-05-12 16:01:19.383167343 +0200
+@@ -5,6 +5,12 @@
+  * letter of patch 0100-fftools-map-inlineass.patch for design
+  * notes (the 6.x→7.x threading translation in particular).
+  *
++ * Patch 0101 adds the pending-chunk buffer so sub packets that
++ * arrive before configure_filtergraph runs (sidecar -i sub.srt
++ * case — small input drained ahead of the video graph's first
++ * frame) survive long enough to be replayed once link_graph
++ * populates the binding's filter context.
++ *
+  * This file is part of scaleplex / FFmpeg.
+  *
+  * FFmpeg is free software; you can redistribute it and/or
+@@ -15,6 +21,7 @@
+ 
+ #include "scaleplex_inlineass.h"
+ 
++#include <inttypes.h>
+ #include <pthread.h>
+ #include <string.h>
+ 
+@@ -27,19 +34,118 @@
+ #include "libavutil/error.h"
+ #include "libavutil/log.h"
+ #include "libavutil/mem.h"
++#include "libavutil/rational.h"
++
++/* Cap pending-chunk queue per binding. A 2-hour movie at ~3 subs/sec
++ * upper bound = ~22k. 4096 covers any realistic pre-graph backlog
++ * (handful of seconds), well under that. Above the cap we drop +
++ * warn — subs were going to misalign anyway. */
++#define INLINEASS_PENDING_MAX 4096
++
++typedef struct PendingSubChunk {
++    int64_t start_ms;       /* ASS_TIME_BASE (1/1000)                */
++    int64_t duration_ms;    /* same                                  */
++    char   *ass_line;       /* av_strdup'd; freed in drain/uninit    */
++    struct PendingSubChunk *next;
++} PendingSubChunk;
+ 
+ typedef struct InlineAssBinding {
+     int               file_idx;
+     char             *stream_spec;
+     InputStream      *ist;          /* resolved at option-parse time */
+-    AVCodecContext   *dec_ctx;      /* resolved at link-graph time   */
++    AVCodecContext   *dec_ctx;      /* eager-set by handle_subtitle, */
++                                    /* re-set at link-graph time     */
+     AVFilterContext  *flt_ctx;      /* resolved at link-graph time   */
++    PendingSubChunk  *pending_head;
++    PendingSubChunk  *pending_tail;
++    int               pending_count;
++    int               pending_dropped;
+ } InlineAssBinding;
+ 
+ static InlineAssBinding *bindings;
+ static int               nb_bindings;
+ static pthread_mutex_t   bindings_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++/* Caller holds bindings_lock. */
++static void pending_push(InlineAssBinding *b, int64_t start_ms,
++                         int64_t duration_ms, const char *ass_line)
++{
++    PendingSubChunk *p;
++
++    if (b->pending_count >= INLINEASS_PENDING_MAX) {
++        if (!b->pending_dropped)
++            av_log(NULL, AV_LOG_WARNING,
++                   "scaleplex_inlineass: bind#%td pending queue full (>%d), "
++                   "dropping further chunks\n",
++                   b - bindings, INLINEASS_PENDING_MAX);
++        b->pending_dropped++;
++        return;
++    }
++
++    p = av_mallocz(sizeof(*p));
++    if (!p)
++        return;
++    p->start_ms    = start_ms;
++    p->duration_ms = duration_ms;
++    p->ass_line    = av_strdup(ass_line);
++    if (!p->ass_line) {
++        av_free(p);
++        return;
++    }
++    p->next = NULL;
++    if (b->pending_tail)
++        b->pending_tail->next = p;
++    else
++        b->pending_head = p;
++    b->pending_tail = p;
++    b->pending_count++;
++}
++
++/* Caller holds bindings_lock AND b->flt_ctx is set. Drains the queue
++ * into the filter via the side-channel replay helper. */
++static void pending_drain(InlineAssBinding *b)
++{
++    PendingSubChunk *p = b->pending_head;
++    int n = 0;
++
++    while (p) {
++        PendingSubChunk *next = p->next;
++        avfilter_inlineass_replay_chunk(b->flt_ctx, b->dec_ctx,
++                                        p->start_ms, p->duration_ms,
++                                        p->ass_line);
++        av_freep(&p->ass_line);
++        av_freep(&p);
++        p = next;
++        n++;
++    }
++    b->pending_head  = NULL;
++    b->pending_tail  = NULL;
++    if (n)
++        av_log(NULL, AV_LOG_VERBOSE,
++               "scaleplex_inlineass: drained %d pending chunks into bind#%td "
++               "(dropped=%d)\n",
++               n, b - bindings, b->pending_dropped);
++    b->pending_count   = 0;
++    b->pending_dropped = 0;
++}
++
++/* Caller holds bindings_lock. Used when link_graph rebinds (probe→live)
++ * or at uninit. */
++static void pending_free(InlineAssBinding *b)
++{
++    PendingSubChunk *p = b->pending_head;
++    while (p) {
++        PendingSubChunk *next = p->next;
++        av_freep(&p->ass_line);
++        av_freep(&p);
++        p = next;
++    }
++    b->pending_head  = NULL;
++    b->pending_tail  = NULL;
++    b->pending_count   = 0;
++    b->pending_dropped = 0;
++}
++
+ int scaleplex_inlineass_opt(void *optctx, const char *opt, const char *arg)
+ {
+     char *endptr = NULL;
+@@ -137,7 +243,9 @@
+      * builds a fresh AVFilterGraph and previous filter contexts are freed.
+      * Reset all flt_ctx/dec_ctx pointers before binding to this graph's
+      * filter instances — otherwise handle_subtitle would dereference a
+-     * freed AVFilterContext from a previous graph. */
++     * freed AVFilterContext from a previous graph. Keep pending chunks
++     * across the reset: anything queued before this configure call is
++     * about to be drained into the new filter below. */
+     for (int i = 0; i < nb_bindings; i++) {
+         bindings[i].flt_ctx = NULL;
+         bindings[i].dec_ctx = NULL;
+@@ -190,33 +298,89 @@
+         av_log(NULL, AV_LOG_VERBOSE,
+                "scaleplex_inlineass: bound filter to input #%d:%s (dec_ctx=%p)\n",
+                b->file_idx, b->stream_spec, (void*)b->dec_ctx);
++
++        /* Flush any pending chunks that arrived before this graph was
++         * ready — happens on the sidecar -i sub.srt path where sub
++         * decode races ahead of video filter configuration. */
++        if (b->pending_count)
++            pending_drain(b);
+     }
+     pthread_mutex_unlock(&bindings_lock);
+ }
+ 
+ void scaleplex_inlineass_handle_subtitle(AVCodecContext *dec_ctx, AVSubtitle *sub)
+ {
++    InlineAssBinding *b = NULL;
++
+     if (!dec_ctx || !sub)
+         return;
+ 
+     pthread_mutex_lock(&bindings_lock);
++
++    /* Fast path: dec_ctx already pinned to a binding. */
+     for (int i = 0; i < nb_bindings; i++) {
+-        if (bindings[i].dec_ctx == dec_ctx && bindings[i].flt_ctx) {
+-            av_log(NULL, AV_LOG_VERBOSE,
+-                   "scaleplex_inlineass: handle_subtitle bind#%d dec_ctx=%p flt_ctx=%p rects=%d\n",
+-                   i, (void*)dec_ctx, (void*)bindings[i].flt_ctx, sub->num_rects);
+-            avfilter_inlineass_append_data(bindings[i].flt_ctx, dec_ctx, sub);
++        if (bindings[i].dec_ctx == dec_ctx) {
++            b = &bindings[i];
+             break;
+         }
+     }
++
++    /* Slow path: eager-bind by looking up ist->decoder. Fires the
++     * first time handle_subtitle runs ahead of link_graph (sidecar
++     * input drained before the video graph configured). */
++    if (!b) {
++        for (int i = 0; i < nb_bindings; i++) {
++            if (bindings[i].ist && bindings[i].ist->decoder &&
++                dec_get_avctx(bindings[i].ist->decoder) == dec_ctx) {
++                bindings[i].dec_ctx = dec_ctx;
++                b = &bindings[i];
++                av_log(NULL, AV_LOG_VERBOSE,
++                       "scaleplex_inlineass: eager-bound dec_ctx=%p to bind#%td (pre-graph)\n",
++                       (void*)dec_ctx, b - bindings);
++                break;
++            }
++        }
++    }
++
++    if (!b) {
++        pthread_mutex_unlock(&bindings_lock);
++        return;
++    }
++
++    for (int i = 0; i < sub->num_rects; i++) {
++        AVSubtitleRect *rect = sub->rects[i];
++        int64_t duration_ms, start_ms;
++        if (!rect || !rect->ass)
++            continue;
++        duration_ms = sub->end_display_time - sub->start_display_time;
++        start_ms    = av_rescale_q(sub->pts, AV_TIME_BASE_Q,
++                                   av_make_q(1, 1000));
++        start_ms   += sub->start_display_time;
++
++        if (b->flt_ctx) {
++            av_log(NULL, AV_LOG_VERBOSE,
++                   "scaleplex_inlineass: handle_subtitle bind#%td dec_ctx=%p flt_ctx=%p rects=%d\n",
++                   b - bindings, (void*)dec_ctx, (void*)b->flt_ctx, sub->num_rects);
++            avfilter_inlineass_replay_chunk(b->flt_ctx, dec_ctx,
++                                            start_ms, duration_ms, rect->ass);
++        } else {
++            av_log(NULL, AV_LOG_VERBOSE,
++                   "scaleplex_inlineass: buffer chunk bind#%td start=%" PRId64 " dur=%" PRId64 " queued=%d\n",
++                   b - bindings, start_ms, duration_ms, b->pending_count);
++            pending_push(b, start_ms, duration_ms, rect->ass);
++        }
++    }
++
+     pthread_mutex_unlock(&bindings_lock);
+ }
+ 
+ void scaleplex_inlineass_uninit(void)
+ {
+     pthread_mutex_lock(&bindings_lock);
+-    for (int i = 0; i < nb_bindings; i++)
++    for (int i = 0; i < nb_bindings; i++) {
++        pending_free(&bindings[i]);
+         av_freep(&bindings[i].stream_spec);
++    }
+     av_freep(&bindings);
+     nb_bindings = 0;
+     pthread_mutex_unlock(&bindings_lock);
