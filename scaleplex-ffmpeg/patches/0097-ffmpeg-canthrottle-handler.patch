@@ -31,17 +31,31 @@ Description: ffmpeg: backport Plex's canThrottle handler for per-packet sloth mo
     response body via the same AVIOContext, sets a global atomic
     throttle_delay_us based on whether the body contains `canThrottle`.
 
-  - input_thread (fftools/ffmpeg_demux.c) checks the atomic before
-    each input_packet_process call and av_usleep's accordingly. This
-    is the same insertion point Plex uses (their 6.x base had
-    process_input_packet at the same logical position).
+  - encoder_thread (fftools/ffmpeg_enc.c) sleeps once per encoded
+    VIDEO output frame when the atomic is set. Picking the gate
+    location requires care: Plex's 6.x base ran a single-threaded
+    transcode loop, so their sleep after process_input_packet was
+    naturally rate-limited by encoder pace (one sleep per loop iter,
+    one loop iter per fully-processed input packet). Jellyfin 7.x split
+    demuxer and encoder into separate threads connected by a bounded
+    queue; sleeping in the demuxer thread (our 2026-05-11 first cut)
+    fires at queue-drain rate, which is ~1.5× faster than encoder
+    consumption for 4K HEVC HDR pass-through, choking throughput to
+    1.17× realtime when canThrottle is asserted vs Plex's stated ~28%
+    floor (which equilibrates near realtime because canThrottle
+    oscillates as PMS sees the buffer drain). Putting the sleep in the
+    video encoder thread, after frame_encode returns, restores the
+    encoder-paced cadence: 23.976 fps × 100 ms ≈ 2.4 s sleep per
+    wall-second when asserted ≈ 28% throughput, exactly the Plex
+    documented rate. Audio + subtitle encoder threads run in parallel
+    and MUST NOT sleep — they'd compound the throttle multiplicatively.
 
 Origin: backport, https://github.com/Diagonactic/plex-new-transcoder
         (Plex Transcoder 1.12.3.4973), fftools/ffmpeg.c L1846-L1862
         and L4649-L4653.
 Forwarded: not-needed
 Author: scaleplex
-Last-Update: 2026-05-11
+Last-Update: 2026-05-12
 ---
 --- a/fftools/ffmpeg.h	2026-05-11 13:58:17.160978398 +0200
 +++ b/fftools/ffmpeg.h	2026-05-11 23:53:40.688099665 +0200
@@ -120,18 +134,25 @@ Last-Update: 2026-05-11
      { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
          { .func_arg = opt_progress },
        "write program-readable progress information", "url" },
---- a/fftools/ffmpeg_demux.c	2026-05-11 13:58:17.161978423 +0200
-+++ b/fftools/ffmpeg_demux.c	2026-05-11 23:54:00.476078603 +0200
-@@ -766,6 +766,12 @@
-             }
-         }
+--- a/fftools/ffmpeg_enc.c	2026-05-11 13:58:17.161978423 +0200
++++ b/fftools/ffmpeg_enc.c	2026-05-12 06:53:45.965995617 +0200
+@@ -891,6 +891,19 @@
+         av_packet_unref(et.pkt);
+         av_frame_unref(et.frame);
  
-+
-+        // scaleplex/PLEX: per-input-packet sleep when PMS asserts
-+        // canThrottle. Matches Plex's fftools/ffmpeg.c L4651.
-+        if (scaleplex_throttle_delay_us > 0)
++        // scaleplex/PLEX: per-output-frame sleep on the VIDEO encoder
++        // thread when PMS asserts canThrottle. Plex 6.x sleeps in the
++        // single-threaded transcode loop after process_input_packet,
++        // gated by encoder pace. In jellyfin 7.x demuxer/encoder run
++        // in separate threads, so the equivalent gate is here: per
++        // encoded video frame. VIDEO-ONLY because parallel audio/sub
++        // threads would compound the sleep into multi-stream over-
++        // throttle (e.g. 0.28x video x 0.28x audio = 0.08x net).
++        // 23.976 fps x 100 ms = ~28% throughput when asserted,
++        // matching Plex's documented rate.
++        if (ost->type == AVMEDIA_TYPE_VIDEO && scaleplex_throttle_delay_us > 0)
 +            av_usleep(scaleplex_throttle_delay_us);
 +
-         ret = input_packet_process(d, dt.pkt_demux, &send_flags);
-         if (ret < 0)
-             break;
+         if (ret < 0) {
+             if (ret == AVERROR_EOF)
+                 av_log(ost, AV_LOG_VERBOSE, "Encoder returned EOF, finishing\n");

@@ -1163,8 +1163,8 @@ func TestRewriter_HLS_CopytsStripped(t *testing.T) {
 	if containsString(out.Args, "-copyts") {
 		t.Errorf("HLS argv must NOT contain -copyts (segment muxer can't split with it)")
 	}
-	if !containsString(out.Changes, "hls:drop:-copyts") {
-		t.Errorf("expected hls:drop:-copyts in changes, got %v", out.Changes)
+	if !containsString(out.Changes, "hls:drop:-copyts(seek)") {
+		t.Errorf("expected hls:drop:-copyts(seek) in changes, got %v", out.Changes)
 	}
 	// AAC priming flag must survive — removing it caused 199-byte empty
 	// audio chunks on DASH and we don't want the same on HLS.
@@ -1545,7 +1545,9 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		// patch 0096 makes ffmpeg accept these natively; rewriter no
 		// longer strips.
 		"hls:f=ssegment->segment",
-		"hls:drop:-copyts",
+		// -copyts only stripped on seek sessions
+		// (`hls:drop:-copyts(seek)`); kept on initial play so chunk PTS
+		// rebases via segment.c's reference_stream_first_pts.
 		"hls:segment_list:rewrite-to-relay",
 		"progressurl:captured-for-reporter",
 		"progress:append-X-Plex-Token",
@@ -1584,9 +1586,10 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 			t.Fatalf("-f ssegment not translated")
 		}
 	}
-	// -copyts must be gone (HLS path)
-	if indexOfArg(out.Args, "-copyts", 0) >= 0 {
-		t.Fatalf("-copyts not stripped from HLS argv")
+	// -copyts must REMAIN on initial play (no -ss). Stripping caused a
+	// 10s in-chunk PTS offset on PS4 BH6 (chunk-0-loop bug 2026-05-12).
+	if indexOfArg(out.Args, "-copyts", 0) < 0 {
+		t.Fatalf("-copyts must remain on initial-play HLS argv")
 	}
 	// -loglevel_plex must be gone
 	if indexOfArg(out.Args, "-loglevel_plex", 0) >= 0 {

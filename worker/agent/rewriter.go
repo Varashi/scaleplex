@@ -704,6 +704,94 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, fsE
 	return nil
 }
 
+// substituteOpenCLTonemap rewrites Plex's OpenCL-based HW tonemap filter
+// chain in -filter_complex to use VAAPI tonemap directly. PMS with the
+// `Use hardware-accelerated tone mapping` pref ON emits a chain that
+// hwmaps VAAPI → OpenCL, runs tonemap_opencl, hwmaps OpenCL → VAAPI,
+// then hwuploads. scaleplex-ffmpeg7 (jellyfin base) has tonemap_vaapi
+// which does the same job without leaving the VAAPI device — fewer
+// memory copies, no OpenCL ICD dependency, no platform-detect race.
+//
+// Pattern matched (label numbers vary):
+//   [X]hwmap=derive_device=opencl[A];
+//   [A]tonemap_opencl=tonemap=<algo>:format=<pixfmt>:m=<mtx>:p=<prim>:r=<rng>[B];
+//   [B]hwmap=derive_device=vaapi:reverse=1[C]
+//
+// Substituted with:
+//   [X]tonemap_vaapi=transfer=bt709:matrix=<mtx>:primaries=<prim>:format=<pixfmt>[C]
+//
+// The tonemap algorithm Plex sends (hable / mobius / reinhard / etc.,
+// from the PMS `TranscoderTonemapAlgorithm` pref) is DISCARDED — iHD
+// VAAPI's tonemap path uses a fixed BT.2390 EETF curve internally and
+// doesn't expose per-algorithm tuning. Visual result is comparable to
+// hable for HDR10 sources. For finer algorithm control the user would
+// need to fall back to a SW tonemap chain (slow) or wait for iHD to
+// expose tunables.
+//
+// Matrix / primaries / range from Plex's chain ARE preserved when
+// present.
+//
+// Returns updated args + true if a substitution was applied.
+var openclTonemapRE = regexp.MustCompile(
+	`\[(\d+)\]hwmap=derive_device=opencl\[\d+\];` +
+		`\[\d+\]tonemap_opencl=(?P<opts>[^[]+)\[\d+\];` +
+		`\[\d+\]hwmap=derive_device=vaapi:reverse=1\[(\d+)\]`)
+var tonemapOptRE = regexp.MustCompile(`(?:^|:)(format|m|p|r)=([a-z0-9-]+)`)
+
+func substituteOpenCLTonemap(args []string) ([]string, bool) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-filter_complex" {
+			continue
+		}
+		orig := args[i+1]
+		if !strings.Contains(orig, "tonemap_opencl") {
+			continue
+		}
+		m := openclTonemapRE.FindStringSubmatchIndex(orig)
+		if m == nil {
+			continue
+		}
+		startLabel := orig[m[2]:m[3]]
+		opts := orig[m[4]:m[5]]
+		endLabel := orig[m[6]:m[7]]
+		// Parse k=v pairs from the opencl filter opts. We preserve
+		// format/m/p/r; tonemap (algorithm) is discarded — iHD VAAPI
+		// tonemap_vaapi has a fixed internal curve.
+		var pixFmt, matrix, primaries string
+		for _, kv := range tonemapOptRE.FindAllStringSubmatch(opts, -1) {
+			switch kv[1] {
+			case "format":
+				pixFmt = kv[2]
+			case "m":
+				matrix = kv[2]
+			case "p":
+				primaries = kv[2]
+				// "r" (range) has no tonemap_vaapi equivalent option —
+				// VAAPI sets range based on the surrounding pipeline.
+			}
+		}
+		if pixFmt == "" {
+			pixFmt = "nv12"
+		}
+		// Build tonemap_vaapi options. transfer=bt709 is the standard
+		// SDR target (we don't expose other transfers — iHD only goes
+		// HDR10 → SDR-bt709 in this filter).
+		vaapiOpts := "transfer=bt709"
+		if matrix != "" {
+			vaapiOpts += ":matrix=" + matrix
+		}
+		if primaries != "" {
+			vaapiOpts += ":primaries=" + primaries
+		}
+		vaapiOpts += ":format=" + pixFmt
+		replacement := fmt.Sprintf("[%s]tonemap_vaapi=%s[%s]",
+			startLabel, vaapiOpts, endLabel)
+		args[i+1] = orig[:m[0]] + replacement + orig[m[1]:]
+		return args, true
+	}
+	return args, false
+}
+
 func cloneArgs(in []string) []string {
 	out := make([]string, len(in))
 	copy(out, in)
@@ -1301,6 +1389,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	libvaDriversPath := os.Getenv("HW_LIBVA_DRIVERS_PATH")
 
 	changes := []string{}
+
 	// On bail we don't run the full rewriter, but Plex-private flags
 	// MUST still come off — stock ffmpeg exits status 8 on the first
 	// unrecognised one ("Unrecognized option 'loglevel_plex'"). PMS
@@ -1370,6 +1459,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	args := cloneArgs(inputArgs)
 	env := cloneEnv(inputEnv)
+
+	// Substitute Plex's OpenCL HW-tonemap filter chain with tonemap_vaapi.
+	// PMS with `Use hardware-accelerated tone mapping` ON emits a
+	// hwmap=opencl → tonemap_opencl → hwmap=vaapi-reverse chain. We
+	// collapse to a single tonemap_vaapi (scaleplex-ffmpeg7/jellyfin has
+	// the VAAPI filter, fewer copies, no OpenCL ICD dependency). Runs
+	// before phase 1 so any later filter-chain inspection sees the
+	// already-substituted form.
+	if newArgs, did := substituteOpenCLTonemap(args); did {
+		args = newArgs
+		changes = append(changes, "filter:tonemap_opencl->tonemap_vaapi")
+	}
 
 	// Plex Optimize remux fast-path. PMS emits a bare `-codec:0 h264`
 	// (or hevc/av1/vp9) input decoder — no `-hwaccel:0` — paired with
@@ -2231,21 +2332,26 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// offset back. Verified empirically 2026-05-11 on jellyfin-ffmpeg
 		// 7.1.3 with Burn Notice -ss 100: 20 chunks produced in 20s,
 		// chunk-0 PTS=100.017, chunk-5 PTS=205.038.
-		// Strip `-copyts` for all segmented output. Stock ffmpeg's
-		// segment muxer with `-copyts -start_at_zero -ss <off>` is
-		// inconsistent across `-ss` values on jellyfin-ffmpeg 7.1.3:
-		// for small `-ss` (initial play -ss 4) it splits at keyframes,
-		// but for large `-ss` (seek -ss 4801) the encoder processes
-		// frames (frame= advancing) yet zero chunks land on disk —
-		// verified 2026-05-11 with Big Hero 6 hevc_vaapi. Likely
-		// interaction between -start_at_zero's PTS rebase and VAAPI
-		// encoder GOP state post deep-seek. Stripping -copyts rebases
-		// packet PTS to 0; segment muxer splits reliably, and the
-		// relay's Cluster.Timecode patcher restores the absolute
-		// timeline for mpv.
-		if i := indexOfArg(args, "-copyts", 0); i >= 0 {
-			args = removeArgs(args, i, 1)
-			changes = append(changes, "hls:drop:-copyts")
+		// `-copyts` handling — DELICATE.
+		//   * INITIAL PLAY (no -ss): KEEP -copyts. Stripping rebases
+		//     output PTS based on `-fps_mode cfr` decisions and can
+		//     leave a 10s offset between manifest CSV timestamps and
+		//     in-chunk PTS (observed 2026-05-12 PS4 BH6 stuck on chunk-0
+		//     loop). With -copyts, ffmpeg uses upstream's
+		//     `reference_stream_first_pts` (libavformat/segment.c) so
+		//     chunks split at keyframes AND in-chunk PTS line up with
+		//     CSV.
+		//   * SEEK (-ss > 0): STRIP -copyts. Stock 7.1.3 segment muxer
+		//     misbehaves on large `-ss` with -copyts (zero chunks land
+		//     even though encoder processes frames — verified 2026-05-11
+		//     BH6 hevc_vaapi -ss 4801). Strip rebases PTS to 0,
+		//     splits resume.
+		seekOff := captureSeekSeconds(args)
+		if seekOff > 0 {
+			if i := indexOfArg(args, "-copyts", 0); i >= 0 {
+				args = removeArgs(args, i, 1)
+				changes = append(changes, "hls:drop:-copyts(seek)")
+			}
 		}
 
 		// Rewrite `-segment_format_options live=1` → `live=0` (Plex Windows

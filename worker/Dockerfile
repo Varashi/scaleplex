@@ -35,6 +35,7 @@ RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|'
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       /tmp/scaleplex-ffmpeg7_*.deb \
       intel-media-va-driver-non-free \
+      intel-opencl-icd \
       libva2 libva-drm2 \
       vainfo \
       fontconfig fonts-dejavu-core \
