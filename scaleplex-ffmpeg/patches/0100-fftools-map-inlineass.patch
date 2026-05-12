@@ -469,7 +469,7 @@ Last-Update: 2026-05-12
 +#endif /* FFTOOLS_SCALEPLEX_INLINEASS_H */
 --- a/fftools/scaleplex_inlineass.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/fftools/scaleplex_inlineass.c	2026-05-12 13:52:38.395290266 +0200
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,235 @@
 +/*
 + * scaleplex: fftools-side wiring for vf_inlineass.
 + *
@@ -651,10 +651,22 @@ Last-Update: 2026-05-12
 +        }
 +        avfilter_inlineass_set_fonts(fc);
 +
-+        /* Push output dims so libass scales relative to the canvas. */
-+        if (fc->nb_outputs > 0 && fc->outputs[0]) {
-+            int w = fc->outputs[0]->w;
-+            int h = fc->outputs[0]->h;
++        /* Push the SUBTITLE STREAM's stored PlayResX/PlayResY (ASS
++         * script's intended canvas) so libass scales script coords
++         * to the actual render frame_size (config_input sets that
++         * to the inlink's w/h). Plex's fftools/plex.c uses the same
++         * source: ist->st->codecpar->width/height. Using fc->outputs[0]
++         * dims (the VIDEO frame size) instead would tell libass the
++         * script is authored for the frame's resolution → script
++         * MarginV / \pos coordinates land at the wrong vertical
++         * position. Live-confirmed 2026-05-12 on Plex Android
++         * (Super HxEros, embedded ASS): bottom-aligned subs clipping
++         * below the frame when storage_size was set from
++         * fc->outputs[0] (1920x1080) instead of the sub stream's
++         * codecpar (matches script PlayResY). */
++        if (b->ist && b->ist->st && b->ist->st->codecpar) {
++            int w = b->ist->st->codecpar->width;
++            int h = b->ist->st->codecpar->height;
 +            if (w > 0 && h > 0)
 +                avfilter_inlineass_set_storage_size(fc, w, h);
 +        }
