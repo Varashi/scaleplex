@@ -55,8 +55,8 @@ type worker struct {
 
 	mu             sync.Mutex
 	healthy        bool
-	activeSessions int     // last reported by /capability poll (5s stale)
-	inFlight       int32   // dispatched-here-but-not-yet-finished count
+	activeSessions int   // last reported by /capability poll (5s stale)
+	inFlight       int32 // dispatched-here-but-not-yet-finished count
 	maxSessions    int
 	gpuLoad        float64 // 0..1 mean across video engines (last reported)
 	gpuEngines     int
@@ -520,7 +520,7 @@ func proxyToWorker(w http.ResponseWriter, r *http.Request, workerURL string, bod
 //   - status    : HTTP status from upstream (0 if dial failed)
 //   - didHeader : true if we wrote PMS-facing headers this call
 //   - midStream : true if the failure happened AFTER any bytes flowed
-//                 (signals 4d crash-recovery should kick in)
+//     (signals 4d crash-recovery should kick in)
 func streamFromUpstream(
 	w http.ResponseWriter,
 	r *http.Request,
