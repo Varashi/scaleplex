@@ -149,69 +149,72 @@ The map-label update is needed because we add `hwupload` inside the
 existing chain, which can shift `[N]` labels — the rewriter walks the
 graph, increments labels mentioned later in the argv (`-map "[1]"` etc.).
 
-### Hybrid inline-ASS (sidecar SRT/ASS subtitle burn-in)
+### Text sub burn-in (Plex inlineass pass-through)
 
-Plex's `-map_inlineass 0:N` + `inlineass=...` filter is **Plex-private**.
-Stock ffmpeg only has `subtitles=` and `ass=` which expect a file path,
-not a stream index.
+Plex's `-map_inlineass 0:N` + `inlineass=...` filter is **Plex-private**
+in stock ffmpeg, but scaleplex-ffmpeg7 ports it directly
+(patches 0099-0101: `libavfilter/vf_inlineass.c`, fftools wiring, and
+the pre-graph sub-chunk buffer). The fork's `scaleplex_inlineass`
+binding consumes the sub stream via `-map_inlineass` side-channel and
+renders glyphs onto CPU NV12 frames via libass under a process-wide
+mutex.
 
-The rewriter detects this combo and:
+The rewriter keeps Plex's argv shape intact and only:
 
-1. Probes the source media's directory for a sibling SRT/ASS subtitle
-   file. Probe order: `<base>.<lang>.srt`, `<base>.<lang>.ass`,
-   `<base>.srt`, `<base>.ass`. (`findSidecarSubtitle()`).
-2. If found, rewrites the filter chain to:
+1. **Rewrites the filter chain** to insert the hwdownload→inlineass→
+   hwupload sandwich at the right place. For SW-decode (PMS sent SW
+   shape) the chain becomes:
 
    ```
-   [0:0]scale=w=W:h=H:force_divisible_by=4[0];
-   [0]format=pix_fmts=yuv420p|nv12[12];
-   [12]hwdownload,format=nv12[13];
-   [13]subtitles=filename='<sidecar>':fontsdir=/usr/share/fonts[14];
+   [0:0]hwupload[10];
+   [10]scale_vaapi=w=W:h=H:format=nv12[11];
+   [11]hwdownload[12];
+   [12]format=pix_fmts=nv12[13];
+   [13]inlineass=<stripped-params>[14];
    [14]hwupload[15]
    ```
 
-3. Drops the `-map_inlineass` arg.
+   For HW-decode (PMS already hwaccel'd) the chain is similar but
+   shorter — the source is already on the GPU.
 
-4. **HLS+seek PTS-shift bracket**: HLS path strips `-copyts` (stock
-   ssegment muxer can't split chunks with `-copyts` + seek). Without
-   the shift, fast-seek rebases frame PTS to 0, but `subtitles=`
-   filter looks up SRT cues at absolute time — every cue lookup
-   misses, subs render blank for the entire seek session. The
-   rewriter brackets `subtitles=` with two `setpts` pieces only when
-   `isHLS && seekOff > 0`:
+2. **Strips four Plex-only AVOption keys** from the `inlineass=`
+   filter args: `language`, `overrides`, `outline`, `shadow`. These
+   aren't AVOptions on `vf_inlineass` in the fork; PMS emits them but
+   the filter rejects them at init. Keeps `font_scale`, `font_path`,
+   `fontconfig_file`, `font_size`.
 
-   ```
-   [12]hwdownload,format=nv12,setpts=PTS+<T>/TB[13];   # pre: feed libass absolute time
-   [13]subtitles=filename=...[14];
-   [14]setpts=PTS-<T>/TB,hwupload[15]                  # post: restore 0-based PTS for muxer
-   ```
+3. **Keeps everything else** — sidecar `-i`, `-map_inlineass`,
+   trailing `-f null -codec ass` null-sub output. The fork's binding
+   owns those.
 
-   The post-shift restores 0-based PTS so the segment muxer cuts
-   cleanly and the relay sidecar's CSV rewrite produces the expected
-   global-timeline window. DASH path keeps `-copyts` and doesn't need
-   the shift. Plex's `inlineass` worked because Plex's fork supports
-   `-copyts` + ssegment splits simultaneously; stock can't do both.
+**Labels:** `filter:passthrough-inlineass` (SDR) /
+`filter:passthrough-inlineass-hdr` (HDR) /
+`hw-decode:filter:inlineass-passthrough` (HW-decode path),
+`map-label-update`.
 
-5. **`force_style` pin**: appended as `:force_style='FontName=DejaVu
-   Sans'` (overridable via `HW_SUBTITLE_FORCE_STYLE`). Pins the
-   primary face so libass skips fontconfig pattern matching at filter
-   init. Mirrors Plex's `inlineass` `font_path=` direct-open trick
-   within the bounds of stock ffmpeg's `subtitles=` filter (which
-   doesn't expose `font_path=`). See
-   [reference_libass_cold_start.md] in the user's auto-memory for the
-   full cold-start mitigation analysis.
+This replaced the original "hybrid inline-ASS" path (subtitles= filter
+on a staged sidecar file, with a setpts PTS-shift bracket for HLS+seek)
+in 2026-05-12 once the fork's vf_inlineass landed and was live-validated
+on Plex Android (HLS+seek + cold start) and Plex Windows direct-play.
 
-6. If no sidecar is found OR the source is `inlineass`-style (subs
-   embedded in the main video stream), bails. PGS subs always force
-   burn-in client-side; SRT-via-stream-index needs sidecar lookup to
-   work in stock ffmpeg.
+### Bitmap sub burn-in (overlay_vaapi)
 
-**Labels:** `filter:hybrid-inlineass`, `drop:-map_inlineass`,
-`subtitle:pts-shift=<T>s` (HLS+seek).
+PGS / VobSub / DVDSub streams are bitmap images; libass can't render
+them. The rewriter routes them through `overlay_vaapi` instead:
 
-This is the path that bottlenecked clusterplex (Plex's `inlineass` was
-the only filter that worked, but it forced the whole pipeline through
-Plex Transcoder).
+```
+[0:0]hwupload[10];
+[10]scale_vaapi=w=W:h=H:format=nv12[11];      # or +tonemap_vaapi for HDR
+[streamSpec]format=bgra[12];
+[12]hwupload[13];
+[11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]
+```
+
+Strips `-map_inlineass` (the fork's text-sub binding doesn't apply
+here; the bitmap stream is referenced directly via its stream spec in
+the filter graph).
+
+**Labels:** `filter:overlay-vaapi-bitmap`, `subtitle:bitmap:<spec>(<codec>)`.
 
 ### HDR tonemap (HDR source → SDR output)
 
@@ -235,11 +238,10 @@ into the VAAPI filter chain.
 The translator returns `applied=false` and the agent runs original argv
 when:
 
-- Filter graph contains a `subtitles=...` already (Plex's own SW path —
-  not our hybrid)
+- Filter graph contains a `subtitles=...` already (Plex's own SW path)
 - Decoder is unrecognised
-- Filter shape doesn't match any known mode (plain / hybrid-inlineass /
-  overlay-vaapi-sidecar / etc.)
+- Filter shape doesn't match any known mode (plain / passthrough-inlineass /
+  overlay-vaapi-bitmap / hdr-tonemap-vaapi)
 
 These are diagnostic dead-ends rather than failures: stock ffmpeg with
 the original Plex argv will fail, but the failure surface is ffmpeg's
@@ -281,10 +283,10 @@ The rewriter detects DASH via `outputFormat == "dash"`.
   segments by default (`ftyp+moov+styp+sidx+moof+mdat`) which MSE
   rejects as duplicate-init. The CMAF flags trim each chunk to
   `styp+sidx+moof+mdat`.
-- `-skip_to_segment N` captured into `RewriteResult.SkipToSegment` and
-  stripped from argv. `segwatch.watchAndRenumberChunks` uses N as the
-  starting sequence so chunk filenames align with the `.mpd`'s
-  `startNumber=`. See [SEEK.md#dash-seek](SEEK.md#dash-seek) for why.
+- `-skip_to_segment N` passes through to ffmpeg untouched. scaleplex-ffmpeg7
+  (patch 0095) starts dashenc's segment_index at N natively so
+  chunk-stream0-NNNNN.m4s aligns with PMS's `.mpd` `startNumber=`. The
+  rewriter only emits a diagnostic change-tag (`skip_to_segment:passthrough=N`).
 - `-ss <off>` captured into `RewriteResult.SeekOffsetSeconds`. The
   segwatch's `patchSeekChunkTimestamps` uses it to add
   `seekOffset*timescale` to each chunk's `tfdt.bmdt` and `sidx.ept`
@@ -419,7 +421,7 @@ in one path lands in both:
 
 Multi-input shapes (Optimize jobs reference up to 18 sub-sidecar
 inputs via `-map 1:s:0`, `-map 2:s:0`, etc. for SRT-copy outputs) pass
-through untouched — the fast-path never calls `dropSidecarInput`.
+through untouched.
 
 **Labels:** `decode:remux:<codec>`, `encode:copy(passthrough)`, plus
 the standard scrub labels.
