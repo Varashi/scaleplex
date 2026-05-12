@@ -57,8 +57,8 @@ Forwarded: not-needed
 Author: scaleplex
 Last-Update: 2026-05-12
 ---
---- a/fftools/ffmpeg.h	2026-05-11 13:58:17.160978398 +0200
-+++ b/fftools/ffmpeg.h	2026-05-11 23:53:40.688099665 +0200
+--- a/fftools/ffmpeg.h	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg.h	2026-05-12 09:55:14.000000000 +0200
 @@ -727,6 +727,9 @@
  extern int64_t stats_period;
  extern int stdin_interaction;
@@ -69,8 +69,8 @@ Last-Update: 2026-05-12
  extern float max_error_rate;
  
  extern char *filter_nbthreads;
---- a/fftools/ffmpeg.c	2026-05-11 13:58:17.160978398 +0200
-+++ b/fftools/ffmpeg.c	2026-05-11 23:54:00.400078684 +0200
+--- a/fftools/ffmpeg.c	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg.c	2026-05-12 09:55:14.000000000 +0200
 @@ -100,6 +100,9 @@
  
  static BenchmarkTimeStamps current_time;
@@ -81,39 +81,51 @@ Last-Update: 2026-05-12
  
  InputFile   **input_files   = NULL;
  int        nb_input_files   = 0;
-@@ -694,6 +697,41 @@
+@@ -694,6 +697,53 @@
          }
      }
  
 +    // scaleplex/PLEX: canThrottle feedback. Open a one-shot PUT to
-+    // canthrottle_url, read the response body, parse for the literal
-+    // `canThrottle` substring. Set the atomic per-packet sleep
-+    // accordingly. ~28% throughput in equilibrium when throttled.
-+    // Errors fail-open (treat as not-throttled) so a flapping PMS
-+    // doesn't strand the session paused.
++    // canthrottle_url, read response body, parse for `canThrottle`
++    // substring. Sets atomic per-output-frame sleep accordingly.
++    // Errors fail-open. Mirrors Plex's PMS_IssueHttpRequest helper
++    // (fftools/plex.c L63-114): AVIO_FLAG_READ, avio_size() for
++    // exact byte count, then avio_read(size) — without this, avio
++    // hangs on response with Content-Length because we'd request
++    // more bytes than the server sent.
 +    if (canthrottle_url && !is_last_report) {
 +        AVIOContext *ct_avio = NULL;
 +        AVDictionary *opts = NULL;
 +        av_dict_set(&opts, "method", "PUT", 0);
-+        av_dict_set(&opts, "post_data", "", 0);
 +        int ct_ret = avio_open2(&ct_avio, canthrottle_url,
-+                                AVIO_FLAG_READ_WRITE, &int_cb, &opts);
++                                AVIO_FLAG_READ, NULL, &opts);
 +        av_dict_free(&opts);
++        av_log(NULL, AV_LOG_INFO,
++               "scaleplex/ct: PUT %s -> ret=%d\n",
++               canthrottle_url, ct_ret);
 +        if (ct_ret >= 0) {
-+            char resp[256];
-+            int n = avio_read(ct_avio, (unsigned char *)resp, sizeof(resp) - 1);
-+            if (n > 0) {
-+                resp[n] = 0;
-+                if (strstr(resp, "canThrottle")) {
-+                    if (scaleplex_throttle_delay_us == 0)
-+                        av_log(NULL, AV_LOG_DEBUG,
-+                               "scaleplex: throttle ON (canThrottle)\n");
-+                    scaleplex_throttle_delay_us = 100 * 1000;
-+                } else {
-+                    if (scaleplex_throttle_delay_us != 0)
-+                        av_log(NULL, AV_LOG_DEBUG,
-+                               "scaleplex: throttle OFF\n");
-+                    scaleplex_throttle_delay_us = 0;
++            int64_t size = avio_size(ct_avio);
++            if (size < 0 || size > 4095)
++                size = 4095;
++            if (size > 0) {
++                char resp[4096];
++                int n = avio_read(ct_avio, (unsigned char *)resp, size);
++                av_log(NULL, AV_LOG_INFO,
++                       "scaleplex/ct: avio_read n=%d (size=%" PRId64 ")\n",
++                       n, size);
++                if (n > 0) {
++                    resp[n] = 0;
++                    av_log(NULL, AV_LOG_INFO,
++                           "scaleplex/ct: body=%.200s\n", resp);
++                    if (strstr(resp, "canThrottle")) {
++                        av_log(NULL, AV_LOG_INFO,
++                               "scaleplex/ct: throttle ON\n");
++                        scaleplex_throttle_delay_us = 100 * 1000;
++                    } else {
++                        av_log(NULL, AV_LOG_INFO,
++                               "scaleplex/ct: throttle OFF (no canThrottle in body)\n");
++                        scaleplex_throttle_delay_us = 0;
++                    }
 +                }
 +            }
 +            avio_closep(&ct_avio);
@@ -123,8 +135,8 @@ Last-Update: 2026-05-12
      first_report = 0;
  }
  
---- a/fftools/ffmpeg_opt.c	2026-05-11 13:58:17.162978447 +0200
-+++ b/fftools/ffmpeg_opt.c	2026-05-11 23:54:00.437078644 +0200
+--- a/fftools/ffmpeg_opt.c	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg_opt.c	2026-05-12 09:55:14.000000000 +0200
 @@ -1574,6 +1574,8 @@
      { "benchmark_all",          OPT_TYPE_BOOL, OPT_EXPERT,
          { &do_benchmark_all },
@@ -134,8 +146,8 @@ Last-Update: 2026-05-12
      { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
          { .func_arg = opt_progress },
        "write program-readable progress information", "url" },
---- a/fftools/ffmpeg_enc.c	2026-05-11 13:58:17.161978423 +0200
-+++ b/fftools/ffmpeg_enc.c	2026-05-12 06:53:45.965995617 +0200
+--- a/fftools/ffmpeg_enc.c	2026-05-11 13:58:17.000000000 +0200
++++ b/fftools/ffmpeg_enc.c	2026-05-12 09:55:14.000000000 +0200
 @@ -891,6 +891,19 @@
          av_packet_unref(et.pkt);
          av_frame_unref(et.frame);
