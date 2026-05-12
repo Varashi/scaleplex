@@ -1541,9 +1541,10 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		"encode:hw-passthrough:hevc_vaapi",
 		"audio:eac3_eae->eac3",
 		"drop:-eae_prefix:1",
-		// `-loglevel_plex` + `-f ssegment` now accepted natively by
-		// scaleplex-ffmpeg7 (patch 0098); rewriter no longer touches
-		// them.
+		"drop:-loglevel_plex",
+		// patch 0096 makes ffmpeg accept these natively; rewriter no
+		// longer strips.
+		"hls:f=ssegment->segment",
 		// -copyts only stripped on seek sessions
 		// (`hls:drop:-copyts(seek)`); kept on initial play so chunk PTS
 		// rebases via segment.c's reference_stream_first_pts.
@@ -1579,12 +1580,10 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		t.Fatalf("encoder must remain hevc_vaapi; got args near %d: %v", encIdx, out.Args[encIdx:min(encIdx+4, len(out.Args))])
 	}
 
-	// HLS: -f ssegment now passes through; patch 0098 gives the stock
-	// ff_stream_segment_muxer the AVFMT_GLOBALHEADER flag Plex's shape
-	// needs, so the rewriter no longer translates to -f segment.
+	// HLS: -f ssegment must be translated to -f segment
 	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-f" && out.Args[i+1] != "ssegment" {
-			t.Fatalf("-f %q: expected ssegment passthrough", out.Args[i+1])
+		if out.Args[i] == "-f" && out.Args[i+1] == "ssegment" {
+			t.Fatalf("-f ssegment not translated")
 		}
 	}
 	// -copyts must REMAIN on initial play (no -ss). Stripping caused a
@@ -1592,9 +1591,9 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 	if indexOfArg(out.Args, "-copyts", 0) < 0 {
 		t.Fatalf("-copyts must remain on initial-play HLS argv")
 	}
-	// -loglevel_plex now passes through (patch 0098 stub); not stripped.
-	if indexOfArg(out.Args, "-loglevel_plex", 0) < 0 {
-		t.Fatalf("-loglevel_plex must passthrough post-0098 stub; argv: %v", out.Args)
+	// -loglevel_plex must be gone
+	if indexOfArg(out.Args, "-loglevel_plex", 0) >= 0 {
+		t.Fatalf("-loglevel_plex not stripped")
 	}
 	// -progressurl must be gone (captured into RewriteResult instead)
 	if indexOfArg(out.Args, "-progressurl", 0) >= 0 {
@@ -1707,6 +1706,7 @@ func TestRewriter_HWDecode_SubtitleBurnIn(t *testing.T) {
 		"drop:-map_inlineass",
 		"drop:null-sub-output",
 		"audio:eac3_eae->eac3",
+		"hls:f=ssegment->segment",
 	}
 	for _, want := range mustContain {
 		if !containsString(out.Changes, want) {

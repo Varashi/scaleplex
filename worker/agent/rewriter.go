@@ -2157,10 +2157,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// (-loglevel_plex passthrough now handled in scaleplex-ffmpeg7
-	// patch 0098: registered as an OPT_TYPE_STRING sink, accepted and
-	// discarded. Previously the rewriter stripped it because stock
-	// ffmpeg rejected the unknown option.)
+	// Drop Plex-Transcoder-only flags that stock ffmpeg rejects with
+	// "Unrecognized option". Each is two-token (`flag value`).
+	//   -loglevel_plex <level>   — custom Plex log verbosity, no analog
+	//   -delete_removed <bool>   — Plex DASH muxer extension. Plex passes
+	//                              `false` to mean "never delete old
+	//                              segments". Stock dashenc has no
+	//                              equivalent flag; chunk preservation is
+	//                              instead controlled by extra_window_size
+	//                              (default 5 — segments are unlinked from
+	//                              disk after they fall extra_window_size
+	//                              past the manifest window). PMS's
+	//                              universal handler serves chunks by
+	//                              number from disk and 404s the client if
+	//                              early chunks were already deleted, so
+	//                              we strip Plex's flag and inject a huge
+	//                              extra_window_size below to keep
+	//                              everything around.
+	for _, flag := range []string{"-loglevel_plex"} {
+		if i := indexOfArg(args, flag, 0); i >= 0 {
+			args = removeArgs(args, i, 2)
+			changes = append(changes, "drop:"+flag)
+		}
+	}
 
 	// `-segment_list_separate_stream_times` + `-segment_list_unfinished`
 	// pass through to scaleplex-ffmpeg7 natively (patch 0096 registers
@@ -2256,13 +2275,24 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// to that URL natively (CSV with -segment_list_type csv). PMS reads
 	// the CSV and synthesises the m3u8 it serves to clients.
 	if isHLS {
-		// `-f ssegment` now passes through to scaleplex-ffmpeg7 verbatim.
-		// Stock ff_stream_segment_muxer already exposes the "ssegment"
-		// alias; patch 0098 adds AVFMT_GLOBALHEADER so it accepts the
-		// same -flags +global_header / -segment_header_filename combo
-		// that Plex's matroska-in-ts shape needs. Previously rewritten
-		// to -f segment because the missing flag left the header file
-		// empty.
+		// `-f ssegment` is Plex's name for the stream-segmenter muxer;
+		// stock ffmpeg has `-f segment` which is API-compatible for the
+		// options Plex actually uses. Verified against `ffmpeg -h
+		// muxer=segment` (jellyfin-ffmpeg7): -segment_format,
+		// -segment_header_filename, -individual_header_trailer,
+		// -segment_format_options, -segment_time, -segment_list,
+		// -segment_list_type are all native. Plex's argv keeps using
+		// matroska-in-.ts for HLS to multi-channel-audio clients (Plex
+		// signals this in the public manifest as container=mkv); the
+		// client then fetches /base/header to grab the matroska codec
+		// init and treats each .ts as a continuation. Stripping
+		// -segment_header_filename caused 4K-HDR + 5.1-audio playback
+		// on Plex Android to 404 on /base/header for ~120s before the
+		// app gave up.
+		if i := indexOfArg(args, "-f", 0); i >= 0 && i+1 < len(args) && args[i+1] == "ssegment" {
+			args[i+1] = "segment"
+			changes = append(changes, "hls:f=ssegment->segment")
+		}
 
 		// Plex's `-segment_list_size 5` keeps only 5 entries in the CSV
 		// manifest. With ffmpeg outpacing playback (any speed > 1×) the
@@ -2324,18 +2354,52 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 		}
 
-		// `-segment_format_options live=1` now passes through verbatim.
-		// scaleplex-ffmpeg7 patch 0094 makes matroskaenc.c always write
-		// the Duration element from -metadata duration=, so Plex Windows
-		// gets a populated header slider without us needing live=0.
-		// Cluster cadence also comes out right at live=1: jellyfin-
-		// ffmpeg 7.x has `IS_SEEKABLE(pb, mkv) = pb seekable && !is_live`,
-		// so live=1 takes the else-branch in mkv_write_header's cluster
-		// default logic → 1000 ms / 32 KB defaults → ~per-frame clusters
-		// (25/s at 8 Mbps verified in production), matching what Plex's
-		// native matroskaenc.c emits. Previous live=1→live=0+explicit
-		// cluster_time_limit/cluster_size_limit rewrite was needed only
-		// before patch 0094 landed.
+		// Rewrite `-segment_format_options live=1` → `live=0` (Plex Windows
+		// segmented-matroska shape). Plex's matroska muxer fork patches
+		// matroskaenc.c at line 2561 to ALWAYS write the Matroska Duration
+		// element from `-metadata duration=` even in live mode (`!is_live
+		// || 1`). Stock matroska honours `is_live`: with live=1 the Duration
+		// element is skipped entirely, so the segment_header file lands on
+		// disk without Duration. The Plex Windows client reads the
+		// concatenated header+chunks via `/transcode/universal/start`, sees
+		// no Duration in the matroska header, and falls back to inferring
+		// duration from received bytes — slider shows 5 min, growing as
+		// transcode produces chunks (verified live 2026-05-11 Big Hero 6
+		// 8 Mbps 1080p, user couldn't seek past "current produced" mark).
+		//
+		// Setting live=0 makes stock write Duration from -metadata into
+		// the header file. Side effects (SeekHead writing + end-of-stream
+		// seek-back to update Duration) are no-ops here: segment muxer
+		// captures only header bytes up to first Cluster, so later
+		// seek-backs land in chunk files and don't touch the already-
+		// written header. Empirically validated 2026-05-11 with testsrc2:
+		// live=0 header has 0x4489 Duration = 6112352ms; live=1 doesn't.
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] != "-segment_format_options" {
+				continue
+			}
+			if args[i+1] == "live=1" {
+				// live=0: stock writes matroska Duration from -metadata
+				//   into the segment_header file (Plex Windows client uses
+				//   it to fill the seekbar with full source duration).
+				// cluster_time_limit=1000 + cluster_size_limit=32768:
+				//   force per-frame clusters. With live=0, stock's defaults
+				//   are 5s/5MB → one cluster per ~5s chunk. Plex Windows
+				//   tracks playback position (and the offset it sends to
+				//   PMS on audio-track-switch / quality-change / re-spawn)
+				//   from Cluster.Timecode. Per-frame clusters match what
+				//   Plex-native matroskaenc.c produces under live=1
+				//   defaults; verified 2026-05-11 against production PMS
+				//   chunk 5 — 25 clusters per 1s chunk at 8 Mbps. Without
+				//   per-frame clusters the client falls back to elapsed-
+				//   since-stream-start, so audio-swap re-spawns the
+				//   transcode at offset=elapsed → playback restarts from
+				//   the front.
+				args[i+1] = "live=0:cluster_time_limit=1000:cluster_size_limit=32768"
+				changes = append(changes, "hls:segment_format_options:live=1->live=0+per-frame-clusters")
+			}
+			break
+		}
 
 		// Stage-rename pattern attempted (rewriter swap to `chunk-%05d
 		// .tmp` + relay-side patch-and-rename to final chunk-N) —
