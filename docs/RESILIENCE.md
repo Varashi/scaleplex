@@ -11,50 +11,72 @@ crash recovery. Shipped 2026-05-10.
 Plex's transcoder supervisor sets `canThrottle` in progress responses
 once the client buffer is far enough ahead of playback that further
 GPU/disk burn is wasted (skipped or abandoned segments). Plex's own
-ffmpeg fork honours this with a 100 ms-per-packet `usleep` in
-`fftools/ffmpeg.c`, but that codepath only runs on `-progressurl <http>`
-mode. The rewriter strips that and substitutes `-progress pipe:N` for
-our stdlib parser, so Plex's built-in sloth never engages on stock
-ffmpeg.
+ffmpeg fork honours this with a 100 ms-per-frame `usleep` in
+`fftools/ffmpeg.c`. The worker rewriter strips Plex's `-progressurl`
+and substitutes `-progress pipe:N` for the agent's stdlib parser,
+but re-injects `-canthrottleurl <relay-url>` pointing at the same
+endpoint so the in-binary sleep keeps working.
 
 ### How
 
-`worker/agent/throttle.go`:
+scaleplex-ffmpeg7 patch 0097 ports Plex's in-binary throttle from
+Plex Transcoder 1.12.3's `fftools/ffmpeg.c` (sourced via the
+Diagonactic mirror — the official GPL tarball omits `fftools/`).
 
-- `progress_report.go` reads up to 4 KB of each PUT response and looks
-  for the `canThrottle` substring. Match flips a per-session
-  `*throttleSignal` (atomic int).
-- `throttleController` polls the signal and pulses SIGSTOP/SIGCONT on
-  the ffmpeg process group while asserted. Pure SIGSTOP would deadlock
-  — paused ffmpeg writes nothing → no progress PUT → no body → no way
-  to learn that PMS cleared `canThrottle`. The duty cycle keeps the
-  pipe draining.
-- Depth-based escalation: the longer `canThrottle` stays asserted, the
-  more aggressive the duty:
+- New `-canthrottleurl <url>` AVOption + globals
+  `canthrottle_url` (string) and `scaleplex_throttle_delay_us`
+  (`_Atomic int`).
+- `print_report()` fires a one-shot HTTP PUT to the URL after every
+  progress block (~0.5 s cadence). The PUT body is empty; the
+  response carries Plex's `<MediaContainer>` with `canThrottle="1"`
+  attribute when the buffer is full enough.
+- Mirrors Plex's `PMS_IssueHttpRequest` helper at
+  `fftools/plex.c` L63-114: `AVIO_FLAG_READ` (the `method=PUT`
+  AVDict option triggers PUT semantics; the avio descriptor only
+  reads the response), `avio_size()` to learn Content-Length, then
+  `avio_read(ctx, buf, size)` for exactly that many bytes. Asking
+  for more bytes than the server sent blocks `avio_read` forever —
+  shipped + caught + fixed 2026-05-12.
+- Response body parsed for the literal substring `canThrottle`.
+  Hit sets the atomic to `100 * 1000` (100 ms in µs). Miss sets it
+  to 0. Errors fail-open.
+- The video encoder thread (`fftools/ffmpeg_enc.c encoder_thread`)
+  reads the atomic after each `frame_encode()` call and
+  `av_usleep`s when nonzero. Per-output-video-frame cadence, ~28%
+  throughput when asserted at 23.976 fps. AUDIO and SUB encoder
+  threads run in parallel and DO NOT sleep — gating by
+  `ost->type == AVMEDIA_TYPE_VIDEO` is load-bearing (sleeping in
+  parallel threads would compound multiplicatively: 0.28× video ×
+  0.28× audio = 0.08× net).
+- Speed reporting: worker agent's `progress_report.go` still parses
+  every progress PUT response for `canThrottle` and flips a
+  per-session `throttleSignal` (atomic int). Used only to suppress
+  `&speed=` on outbound progress PUTs while asserted — Plex
+  Transcoder protocol: "Only pass back speed if we're not
+  throttled" (PMS uses speed to estimate buffer-fill and would
+  never clear canThrottle if we reported a fast rate while
+  throttled). No SIGSTOP / SIGCONT pulsing anymore — that
+  `worker/agent/throttle.go` controller existed pre-Phase-4 and
+  was retired in commit `a23cebb` once the in-binary sleep landed.
 
-  | Depth        | STOP / CONT       | Throughput |
-  | ------------ | ----------------- | ---------- |
-  | 0–30 s       | 200 ms / 50 ms    | ~80 %      |
-  | 30 s – 2 min | 1000 ms / 50 ms   | ~5 %       |
-  | 2 min+       | 5000 ms / 50 ms   | ~1 %       |
+### Equilibrium behaviour
 
-  Tier 2 is "client paused / tab backgrounded". Tier 3 is "abandoned
-  tab; PMS hasn't timed it out yet". CONT phase stays 50 ms across
-  tiers so PUTs keep firing — PMS can clear `canThrottle` whenever
-  the buffer dips again.
-- Speed reporting: `putProgressTick` omits `&speed=` when throttled,
-  matching Plex Transcoder's behaviour ("Only pass back speed if we're
-  not throttled" comment). Stops PMS from concluding the session is
-  fast and clearing throttle prematurely.
-- Fail-open: any PUT transport / 4xx / 5xx error clears the throttle
-  so a flapping PMS doesn't strand a session paused.
+Burst ~5× for the first 30–60 s of a fresh session while PMS sees
+buffer below `TranscoderThrottleBuffer`. Then PMS asserts
+canThrottle, encoder rate drops, buffer drains, PMS clears
+canThrottle, encoder catches up, repeat. Steady state hovers
+~1.3–1.6× as PMS oscillates the flag. Validated 2026-05-12 on
+Android BH6 4K HEVC HDR (downgraded to 720x404 stereo AAC via
+indirect-connection bandwidth cap): cold start + 1:20:00 seek both
+smooth, ~720 successful PUT cycles in 2 minutes.
 
 ### Metrics
 
-- `scaleplex_worker_throttle_state{session}` — gauge 0/1
-- `scaleplex_worker_throttle_seconds_total{session}` — counter
-- `scaleplex_worker_throttle_depth_seconds{session}` — current
-  continuous-throttle depth, resets on exit
+In-binary throttle state isn't exposed as a worker metric — ffmpeg
+emits `scaleplex/ct: throttle ON|OFF` lines at AV_LOG_INFO (kept
+verbose for now; tone to DEBUG once trust earned). Read worker
+stderr (forwarded into PMS pod logs by the shim) to see state
+transitions.
 
 ## 2. Multi-engine GPU load
 

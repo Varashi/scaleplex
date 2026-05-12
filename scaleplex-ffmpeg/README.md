@@ -29,7 +29,15 @@ ffmpeg source root.
 | 0094 | `libavformat/matroskaenc.c` | 1   | Plex 6.1.3            | Always write `Duration` in matroska header (drops the `is_live` guard). Plex Windows mpv slider works from the first segment. |
 | 0095 | `libavformat/dashenc.c`     | 3   | Plex 6.1.3            | `-manifest_name <url>` PUTs the .mpd to a URL; `-skip_to_segment N` starts dash muxer at N; `-break_non_keyframes`; `-delete_removed`. |
 | 0096 | `libavformat/segment.c`     | 2a  | Plex 6.1.3 (stub)     | Accepts `-segment_list_unfinished` and `-segment_list_separate_stream_times` as no-op AVOptions so the rewriter can stop stripping them. Functional emit logic comes in Phase 2b. |
-| 0097 | `fftools/ffmpeg.c` + `ffmpeg_demux.c` + `ffmpeg_opt.c` + `ffmpeg.h` | 4 | Plex 1.12.3 mirror (Diagonactic) | New option `-canthrottleurl <url>`. One-shot PUT after each progress report, parses response body for `canThrottle`, applies per-input-packet `av_usleep(100ms)`. Replaces worker's external SIGSTOP/SIGCONT throttle. |
+| 0097 | `fftools/{ffmpeg.c, ffmpeg_enc.c, ffmpeg_opt.c, ffmpeg.h}` | 4 | Plex 1.12.3 mirror (Diagonactic) | New `-canthrottleurl <url>` option. After each progress report, one-shot PUT to the URL using Plex's `PMS_IssueHttpRequest` pattern (`AVIO_FLAG_READ`, `avio_size` + sized `avio_read` — asking for more bytes than Content-Length hangs forever). Response body is parsed for the `canThrottle` substring; if present, sets a global atomic that the video encoder thread sleeps on via `av_usleep(100 ms)` per encoded frame. VIDEO ONLY — parallel audio/sub encoder threads must NOT sleep (would compound multiplicatively). Replaces the worker's external SIGSTOP/SIGCONT throttle. |
+
+**Phase 4 thread-placement + avio gotchas (both burned us; both documented in memory):**
+
+1. **Sleep belongs in the encoder thread, not the demuxer.** Plex's 6.x base runs a single-threaded `process_input()` loop where the sleep after `process_input_packet` is naturally rate-limited by encoder pace. Jellyfin 7.x splits demuxer/encoder into separate threads connected by a bounded scheduler queue; putting the sleep in the demuxer fires at queue-drain rate, choking throughput to 0.1–0.28× sustained, never recovers, client playback skips. Encoder-thread placement (after `frame_encode()` returns in `ffmpeg_enc.c`, gated by `ost->type == AVMEDIA_TYPE_VIDEO`) restores the analogue: one sleep per encoded video frame, gated by encoder pace.
+
+2. **`avio_read` must match Content-Length exactly.** Calling `avio_read(ctx, buf, 255)` against a 99-byte response body blocks waiting for the missing 156 bytes forever. Use `avio_size()` after `avio_open2` to get exact Content-Length, then `avio_read(ctx, buf, size)`. `AVIO_FLAG_READ` (not `READ_WRITE`); the `method=PUT` AVDictionary option triggers PUT semantics, the avio descriptor itself only reads the response. No `post_data` setting needed.
+
+Both bugs landed in the original 2026-05-12 cut. (1) was fixed mid-morning by re-reading the source; (2) was fixed late morning after instrumented INFO logging caught the hang via missing `avio_read n=...` log lines after a successful `PUT ret=0`. With both fixes, Phase 4 now does what its description says.
 
 ### Patch authoring playbook
 
