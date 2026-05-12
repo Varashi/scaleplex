@@ -2157,29 +2157,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Drop Plex-Transcoder-only flags that stock ffmpeg rejects with
-	// "Unrecognized option". Each is two-token (`flag value`).
-	//   -loglevel_plex <level>   — custom Plex log verbosity, no analog
-	//   -delete_removed <bool>   — Plex DASH muxer extension. Plex passes
-	//                              `false` to mean "never delete old
-	//                              segments". Stock dashenc has no
-	//                              equivalent flag; chunk preservation is
-	//                              instead controlled by extra_window_size
-	//                              (default 5 — segments are unlinked from
-	//                              disk after they fall extra_window_size
-	//                              past the manifest window). PMS's
-	//                              universal handler serves chunks by
-	//                              number from disk and 404s the client if
-	//                              early chunks were already deleted, so
-	//                              we strip Plex's flag and inject a huge
-	//                              extra_window_size below to keep
-	//                              everything around.
-	for _, flag := range []string{"-loglevel_plex"} {
-		if i := indexOfArg(args, flag, 0); i >= 0 {
-			args = removeArgs(args, i, 2)
-			changes = append(changes, "drop:"+flag)
-		}
-	}
+	// `-loglevel_plex` passthrough: scaleplex-ffmpeg7 patch 0098
+	// registers `-loglevel_plex <name>` as an OPT_TYPE_STRING sink
+	// (accepted + discarded). Previously rewriter stripped this 2-token
+	// flag because stock ffmpeg rejected the unknown option.
 
 	// `-segment_list_separate_stream_times` + `-segment_list_unfinished`
 	// pass through to scaleplex-ffmpeg7 natively (patch 0096 registers
@@ -2275,24 +2256,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// to that URL natively (CSV with -segment_list_type csv). PMS reads
 	// the CSV and synthesises the m3u8 it serves to clients.
 	if isHLS {
-		// `-f ssegment` is Plex's name for the stream-segmenter muxer;
-		// stock ffmpeg has `-f segment` which is API-compatible for the
-		// options Plex actually uses. Verified against `ffmpeg -h
-		// muxer=segment` (jellyfin-ffmpeg7): -segment_format,
-		// -segment_header_filename, -individual_header_trailer,
-		// -segment_format_options, -segment_time, -segment_list,
-		// -segment_list_type are all native. Plex's argv keeps using
-		// matroska-in-.ts for HLS to multi-channel-audio clients (Plex
-		// signals this in the public manifest as container=mkv); the
-		// client then fetches /base/header to grab the matroska codec
-		// init and treats each .ts as a continuation. Stripping
-		// -segment_header_filename caused 4K-HDR + 5.1-audio playback
-		// on Plex Android to 404 on /base/header for ~120s before the
-		// app gave up.
-		if i := indexOfArg(args, "-f", 0); i >= 0 && i+1 < len(args) && args[i+1] == "ssegment" {
-			args[i+1] = "segment"
-			changes = append(changes, "hls:f=ssegment->segment")
-		}
+		// `-f ssegment` passthrough: scaleplex-ffmpeg7 patch 0098 adds
+		// AVFMT_GLOBALHEADER to ff_stream_segment_muxer so it accepts
+		// Plex's `-flags +global_header` / `-segment_header_filename`
+		// combination natively. The muxer code is shared with
+		// ff_segment_muxer (`.priv_class = &seg_class`), so behaviour
+		// is identical for Plex's argv shape. Previously rewriter
+		// translated to `-f segment` because the missing flag left
+		// the header file empty + Plex Android 404'd on /base/header.
 
 		// Plex's `-segment_list_size 5` keeps only 5 entries in the CSV
 		// manifest. With ffmpeg outpacing playback (any speed > 1×) the
