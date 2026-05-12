@@ -21,16 +21,39 @@ session Balls_Up...c11a7e73: rewriter applied:
   filter:plain, map-label-update, encode:libx264->h264_vaapi,
   crf->qp, preset:veryfast->compression_level:6, drop:-x264opts:0,
   inject:sei+a53_cc, audio:eac3_eae->eac3, drop:-eae_prefix:1,
-  drop:-loglevel_plex, hls:f=ssegment->segment,
-  hls:drop:-segment_list_separate_stream_times,
-  hls:drop:-segment_list_unfinished, hls:drop:-copyts,
+  hls:segment_list_size:5->99999, hls:drop:-copyts(seek),
   hls:segment_list:rewrite-to-relay, seek-offset:captured=888.000s,
   force_key_frames:offset-by-seek, progress:append-X-Plex-Token,
-  progressurl:captured-for-reporter, loglevel:->info, drop:-nostats,
+  progressurl:captured-for-reporter,
+  inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle),
+  loglevel:->info, drop:-nostats,
   env:strip:EAE_ROOT, env:strip:FFMPEG_EXTERNAL_LIBS, env:LIBVA
 ```
 
 Each label below maps to one of the transformations documented here.
+
+scaleplex-ffmpeg7 patches 0094–0098 absorb several rewrites that
+earlier versions of the worker did at argv-time. The rewriter no
+longer emits these tags (and ffmpeg accepts the originals natively):
+
+- `drop:-loglevel_plex` — patch 0098 registers the option as an
+  OPT_TYPE_STRING sink.
+- `hls:f=ssegment->segment` — patch 0098 adds `AVFMT_GLOBALHEADER`
+  to `ff_stream_segment_muxer`; Plex's `-f ssegment` shape works
+  without translation.
+- `hls:drop:-segment_list_unfinished` / `-segment_list_separate_stream_times`
+  — patch 0096 registers both as no-op `AVOptions` (Phase 2a stub;
+  functional CSV-emit logic deferred to Phase 2b).
+- `inject:-canthrottleurl` is NEW (from patch 0097) — rewriter
+  injects a relay-URL for ffmpeg's in-binary canThrottle handler.
+
+What WAS dropped from the audit but still has a rewrite path: the
+`-segment_format_options live=1 → live=0+overrides` rewrite.
+Production PMS argvs (Plex Android) carry `output_ts_offset=10`
+and never `live=1`, so the rewrite is dead code in current
+captures. But the synthetic Plex-Windows fixture exercises it,
+and Plex Windows hardware has not been re-tested since patch 0094
+landed; leaving the rewrite as a safety net.
 
 ## Codec swaps
 
@@ -291,27 +314,28 @@ Detected via `outputFormat == "ssegment"`. Plex's argv:
 
 Rewriter changes:
 
-- `-f ssegment` → `-f segment`. ssegment is Plex-private. Stock segment
-  muxer is API-compatible for the options Plex actually uses.
-  **Label:** `hls:f=ssegment->segment`.
+- `-f ssegment` passes through (patch 0098 adds `AVFMT_GLOBALHEADER`
+  to `ff_stream_segment_muxer`; behaviour identical to `-f segment`
+  for Plex's `-flags +global_header` / `-segment_header_filename`
+  combination).
 - `-segment_format matroska` and `-segment_header_filename header` are
   **kept**. Plex uses mkv-in-.ts when the codec/audio combo can't fit
   mpegts (4K HDR + 5.1 EAC3, Atmos passthrough, etc.). Stock segment
   muxer supports this — verified locally.
-- Drop Plex-only flags: `-segment_list_separate_stream_times`,
-  `-segment_list_unfinished`. **Labels:**
-  `hls:drop:-segment_list_separate_stream_times`,
-  `hls:drop:-segment_list_unfinished`.
-- **Drop `-copyts`.** This one's load-bearing — see
-  [SEEK.md#hls-seek](SEEK.md#hls-seek). Stock segment muxer with
-  `-ss <off> -copyts` never splits; first segment swallows the entire
-  remaining runtime. Without `-copyts` splits resume normally.
-  **Label:** `hls:drop:-copyts`.
+- `-segment_list_separate_stream_times` / `-segment_list_unfinished`
+  pass through (patch 0096 no-op stubs).
+- `-segment_list_size 5` → `99999`. Plex's small CSV window drops
+  older rows as ffmpeg outpaces playback; PMS then 200/0-bytes any
+  chunk request that falls outside the window. **Label:**
+  `hls:segment_list_size:5->99999`.
+- **Strip `-copyts` ONLY on seek sessions** (`-ss <off>` set).
+  Stock jellyfin 7.x segment muxer + `-ss` + `-copyts` produces
+  zero chunks even though encoder runs (verified BH6 hevc_vaapi
+  -ss 4801). Strip rebases PTS to 0, splits resume.
+  Initial-play sessions KEEP `-copyts` — stripping there caused PS4
+  chunk-0 PTS-offset loop. **Label:** `hls:drop:-copyts(seek)`.
 - Rewrite `-segment_list <PMS-loopback>` to `<relay>?...&scaleplex_seg_time=<N>`.
-  The `scaleplex_seg_time` query param tells the relay to rewrite each
-  CSV row's start_time to the global timeline. Without it, PMS would
-  serve every seek chunk as 200/0-bytes (CSV rows say chunk N starts at
-  PTS 0 instead of N×8s). **Label:** `hls:segment_list:rewrite-to-relay`.
+  **Label:** `hls:segment_list:rewrite-to-relay`.
 
 ## `-force_key_frames` rewrite (seek path)
 
@@ -334,10 +358,16 @@ The keyframe cadence then matches PMS's intent (kf at output 0, 8, 16,
 
 ## Other tweaks
 
-- `-loglevel quiet` / `-loglevel <whatever>` → `-loglevel info`. We need
-  ffmpeg's stream-mapping lines so the agent can identify input streams
-  for the progress reporter. **Label:** `loglevel:->info`.
-- `-loglevel_plex error` dropped. Plex-private flag. **Label:** `drop:-loglevel_plex`.
+- `-loglevel quiet` / `-loglevel panic|fatal` → value of env
+  `SCALEPLEX_FFMPEG_LOGLEVEL` (default `info`). We need ffmpeg's
+  stream-mapping lines for the agent's progress reporter; bump to
+  `debug` on the worker DaemonSet env to expose per-cycle
+  `scaleplex/ct: PUT/avio_read/body` diagnostics from patch 0097
+  without rebuilding ffmpeg. **Label:** `loglevel:->info` (or the
+  configured level).
+- `-loglevel_plex` passes through. scaleplex-ffmpeg7 patch 0098
+  registers it as an OPT_TYPE_STRING sink so stock ffmpeg accepts
+  + discards.
 - `-nostats` dropped — PMS doesn't actually need it, and stripping it
   gives us periodic stderr-progress lines for the reporter.
   **Label:** `drop:-nostats`.

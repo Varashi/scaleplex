@@ -72,11 +72,21 @@ smooth, ~720 successful PUT cycles in 2 minutes.
 
 ### Metrics
 
-In-binary throttle state isn't exposed as a worker metric — ffmpeg
-emits `scaleplex/ct: throttle ON|OFF` lines at AV_LOG_INFO (kept
-verbose for now; tone to DEBUG once trust earned). Read worker
-stderr (forwarded into PMS pod logs by the shim) to see state
-transitions.
+In-binary throttle state isn't exposed as a worker metric. ffmpeg
+emits:
+
+- `scaleplex/ct: throttle ON|OFF` at AV_LOG_INFO on state
+  transitions (visible at the default `-loglevel info`). Use this
+  to see when PMS first asserts canThrottle on a session.
+- `scaleplex/ct: PUT/avio_read/body` at AV_LOG_DEBUG for per-cycle
+  diagnostics (hidden by default). Bump the worker DaemonSet env
+  `SCALEPLEX_FFMPEG_LOGLEVEL=debug` to expose them; the rewriter
+  threads the value through the `-loglevel quiet → <level>` rewrite
+  it already does for ffmpeg output.
+
+Logs flow worker stderr → orchestrator stream → PMS shim → PMS pod
+log. `k logs pms -n clusterplex | grep scaleplex/ct` works as long
+as the session's worker is healthy.
 
 ## 2. Multi-engine GPU load
 
