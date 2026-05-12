@@ -29,7 +29,22 @@ ffmpeg source root.
 | 0094 | `libavformat/matroskaenc.c` | 1   | Plex 6.1.3            | Always write `Duration` in matroska header (drops the `is_live` guard). Plex Windows mpv slider works from the first segment. |
 | 0095 | `libavformat/dashenc.c`     | 3   | Plex 6.1.3            | `-manifest_name <url>` PUTs the .mpd to a URL; `-skip_to_segment N` starts dash muxer at N; `-break_non_keyframes`; `-delete_removed`. |
 | 0096 | `libavformat/segment.c`     | 2a  | Plex 6.1.3 (stub)     | Accepts `-segment_list_unfinished` and `-segment_list_separate_stream_times` as no-op AVOptions so the rewriter can stop stripping them. Functional emit logic comes in Phase 2b. |
-| 0097 | `fftools/ffmpeg.c` + `ffmpeg_demux.c` + `ffmpeg_opt.c` + `ffmpeg.h` | 4 | Plex 1.12.3 mirror (Diagonactic) | New option `-canthrottleurl <url>`. One-shot PUT after each progress report, parses response body for `canThrottle`, applies per-input-packet `av_usleep(100ms)`. Replaces worker's external SIGSTOP/SIGCONT throttle. |
+| 0097 | `fftools/{ffmpeg.c, ffmpeg_enc.c, ffmpeg_opt.c, ffmpeg.h}` | 4 | Plex 1.12.3 mirror (Diagonactic) | New `-canthrottleurl <url>` option. One-shot PUT after each progress report, parses response body for `canThrottle`, sets a global atomic. Per-encoded-video-frame `av_usleep(100ms)` in `encoder_thread()` when asserted (VIDEO stream only — parallel audio/sub encoder threads must NOT sleep). Replaces the worker's external SIGSTOP/SIGCONT throttle. |
+| 0098 | `fftools/{ffmpeg.c, ffmpeg_opt.c, ffmpeg.h}` + `libavformat/segment.c` | — | scaleplex | Plex CLI compat: register `-loglevel_plex` as an OPT_TYPE_STRING sink (accepted + discarded) so stock ffmpeg stops rejecting it; add `AVFMT_GLOBALHEADER` to `ff_stream_segment_muxer` so `-f ssegment` accepts Plex's `-flags +global_header` / `-segment_header_filename` combo. Lets the rewriter drop two more translation entries. |
+
+**Important: thread-placement gotcha for canThrottle (patch 0097).**
+The sleep MUST be in `encoder_thread()` after `frame_encode()`, NOT in
+the demuxer thread. Plex's 6.x base runs a single-threaded
+`process_input()` loop where the sleep after `process_input_packet`
+is naturally rate-limited by encoder pace. Jellyfin 7.x splits
+demuxer + encoder into separate threads connected by a bounded
+scheduler queue — putting the sleep in the demuxer fires at queue-
+drain rate (~1.5–3 × encoder consumption for 4K HEVC HDR), choking
+throughput to 0.1–0.28 × sustained, never recovers, client playback
+skips. The encoder-thread placement gives the analogue: one sleep
+per encoded frame, gated by encoder pace, equilibrium ~1.3 ×
+sustained as PMS oscillates canThrottle. Verified Android
+2026-05-12 (BH6 4K HEVC HDR + EAC3).
 
 ### Patch authoring playbook
 
