@@ -427,23 +427,6 @@ func containsAnyWithPrefix(slice []string, prefix string) bool {
 // Update the second sidecar test (already in this file) and the
 // other overlay-vaapi assertions to use the prefix matcher.
 
-// External-sidecar burn-in. PMS stages the .srt in the session's
-// transcode dir as `temp-0.srt` and references it via a second `-i` +
-// `-map_inlineass 1:s:0`. The rewriter must:
-//   - point the `subtitles=` filter at the staged temp file
-//   - drop the second `-i` (filter reads from disk; stock ffmpeg has
-//     no use for the input mapping after we replace the filter)
-//   - strip `-map_inlineass`
-//   - leave SubtitleExtract == nil (no extraction needed)
-
-// Embedded burn-in. PMS uses `-map_inlineass 0:3` against the source's
-// own subtitle stream, no second `-i`. Stock `subtitles=` can't read
-// by stream index, so the rewriter must request that the agent extract
-// the stream to a file before spawning the main encoder.
-
-// SessionDir empty (test/local case) → fall back to a deterministic
-// /tmp path so the agent still has a place to extract to.
-
 func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
 	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
@@ -1729,7 +1712,7 @@ func TestStripPlexInlineassFilterArgs(t *testing.T) {
 }
 
 func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
-	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	// pass-through is hardcoded since B6 (PR #4); no env knob
 	args := []string{
 		"-loglevel", "quiet",
 		"-codec:0", "libdav1d",
@@ -1804,7 +1787,7 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 }
 
 func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
-	t.Setenv("SCALEPLEX_INLINEASS_PASSTHROUGH", "true")
+	// pass-through is hardcoded since B6 (PR #4); no env knob
 	args := []string{
 		"-loglevel", "quiet",
 		"-init_hw_device", "vaapi=vaapi:",
