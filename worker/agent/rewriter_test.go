@@ -1541,10 +1541,9 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		"encode:hw-passthrough:hevc_vaapi",
 		"audio:eac3_eae->eac3",
 		"drop:-eae_prefix:1",
-		"drop:-loglevel_plex",
-		// patch 0096 makes ffmpeg accept these natively; rewriter no
-		// longer strips.
-		"hls:f=ssegment->segment",
+		// `-loglevel_plex` + `-f ssegment` pass through natively now
+		// (scaleplex-ffmpeg7 patch 0098: option sink + segment-muxer
+		// AVFMT_GLOBALHEADER); rewriter no longer touches them.
 		// -copyts only stripped on seek sessions
 		// (`hls:drop:-copyts(seek)`); kept on initial play so chunk PTS
 		// rebases via segment.c's reference_stream_first_pts.
@@ -1580,20 +1579,16 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 		t.Fatalf("encoder must remain hevc_vaapi; got args near %d: %v", encIdx, out.Args[encIdx:min(encIdx+4, len(out.Args))])
 	}
 
-	// HLS: -f ssegment must be translated to -f segment
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-f" && out.Args[i+1] == "ssegment" {
-			t.Fatalf("-f ssegment not translated")
-		}
-	}
+	// HLS: -f ssegment passes through (patch 0098 + ff_stream_segment_muxer
+	// with AVFMT_GLOBALHEADER). Don't expect it to be rewritten.
 	// -copyts must REMAIN on initial play (no -ss). Stripping caused a
 	// 10s in-chunk PTS offset on PS4 BH6 (chunk-0-loop bug 2026-05-12).
 	if indexOfArg(out.Args, "-copyts", 0) < 0 {
 		t.Fatalf("-copyts must remain on initial-play HLS argv")
 	}
-	// -loglevel_plex must be gone
-	if indexOfArg(out.Args, "-loglevel_plex", 0) >= 0 {
-		t.Fatalf("-loglevel_plex not stripped")
+	// -loglevel_plex passes through (patch 0098 stub).
+	if indexOfArg(out.Args, "-loglevel_plex", 0) < 0 {
+		t.Fatalf("-loglevel_plex must passthrough post-0098 stub; argv: %v", out.Args)
 	}
 	// -progressurl must be gone (captured into RewriteResult instead)
 	if indexOfArg(out.Args, "-progressurl", 0) >= 0 {
@@ -1706,7 +1701,6 @@ func TestRewriter_HWDecode_SubtitleBurnIn(t *testing.T) {
 		"drop:-map_inlineass",
 		"drop:null-sub-output",
 		"audio:eac3_eae->eac3",
-		"hls:f=ssegment->segment",
 	}
 	for _, want := range mustContain {
 		if !containsString(out.Changes, want) {
