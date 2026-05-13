@@ -1180,17 +1180,16 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	out := cloneArgs(args)
 	changes := []string{"decode:remux:" + dec, "encode:copy(passthrough)"}
 
-	// 1. Strip Plex-private flags. scaleplex-ffmpeg7 natively supports
-	// the dashenc additions (`-delete_removed`, `-skip_to_segment`,
-	// `-break_non_keyframes`, `-manifest_name`) and segment.c
-	// additions (`-segment_list_*`), so those pass through unchanged.
-	// Only the truly Plex-runtime-only flags remain on the strip-list.
-	//   -strict_ts*: Plex movenc extension (not in our fork)
-	//   -loglevel_plex: Plex stderr level alias
-	// `-manifest_name <url>` URL gets rewritten in-place below so the
-	// HTTP PUT lands on the relay instead of the worker's loopback.
+	// 1. Strip Plex-private flags. scaleplex-ffmpeg7 natively accepts
+	// `-loglevel_plex` (patch 0098 stub), dashenc additions
+	// (`-delete_removed`, `-skip_to_segment`, `-break_non_keyframes`,
+	// `-manifest_name`), and segment.c additions (`-segment_list_*`),
+	// so those pass through unchanged. Only `-strict_ts*` (Plex
+	// movenc extension, no fork equivalent) remains on the strip-list
+	// for the fast-path. `-xioerror` was never observed in the 286-entry
+	// argv corpus; if it ever surfaces, ffmpeg rejection will flag it
+	// loud and we re-add the strip.
 	for _, flag := range []string{
-		"-loglevel_plex",
 		"-strict_ts:0",
 		"-strict_ts",
 	} {
@@ -1210,15 +1209,6 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	var manifestChanges []string
 	out, manifestChanges = rewriteManifestName(out, inputEnv)
 	changes = append(changes, manifestChanges...)
-
-	for {
-		i := indexOfArg(out, "-xioerror", 0)
-		if i < 0 {
-			break
-		}
-		out = removeArgs(out, i, 1)
-		changes = append(changes, "drop:-xioerror")
-	}
 
 	// 2-6. Audio EAE swap, eae_prefix drop, progressurl capture,
 	// loglevel + nostats fix-ups, env strips. All shared with the
@@ -1276,33 +1266,21 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	changes := []string{}
 
-	// On bail we don't run the full rewriter, but Plex-private flags
-	// MUST still come off — stock ffmpeg exits status 8 on the first
-	// unrecognised one ("Unrecognized option 'loglevel_plex'"). PMS
-	// emits these on EVERY ffmpeg spawn, including audio-only Detection
-	// jobs (intro / credits / voice-activity ML pre-pass) that the
-	// rewriter bails on with skip:no-decoder. Without this scrub
-	// every such session 8'd out, blocking PMS marker generation.
+	// On bail we don't run the full rewriter, but `-progressurl` must
+	// still come off — its URL is loopback-only, ffmpeg would try to
+	// PUT and fail. PMS emits it on every spawn, including audio-only
+	// Detection jobs that bail with skip:no-decoder.
+	// `-loglevel_plex` passes through to ffmpeg natively (fork patch
+	// 0098); `-xioerror` was never observed in the 286-entry corpus.
 	scrubPlexFlagsOnBail := func(args []string) ([]string, []string) {
 		var bailChanges []string
-		for _, flag := range []string{"-loglevel_plex", "-progressurl"} {
-			for {
-				i := indexOfArg(args, flag, 0)
-				if i < 0 || i+1 >= len(args) {
-					break
-				}
-				args = removeArgs(args, i, 2)
-				bailChanges = append(bailChanges, "drop:"+flag+"(bail)")
-			}
-		}
-		// -xioerror is a Plex-private boolean flag (no value).
 		for {
-			i := indexOfArg(args, "-xioerror", 0)
-			if i < 0 {
+			i := indexOfArg(args, "-progressurl", 0)
+			if i < 0 || i+1 >= len(args) {
 				break
 			}
-			args = removeArgs(args, i, 1)
-			bailChanges = append(bailChanges, "drop:-xioerror(bail)")
+			args = removeArgs(args, i, 2)
+			bailChanges = append(bailChanges, "drop:-progressurl(bail)")
 		}
 		return args, bailChanges
 	}
@@ -1502,10 +1480,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			return bail("init_hw_device-pattern:" + args[initIdx+1])
 		}
 		args[initIdx+1] = "vaapi=vaapi:" + renderDevice + ",driver=" + vaapiDriver
-		if indexOfArg(args, "-filter_hw_device", 0) < 0 {
-			args = spliceArgs(args, initIdx+2, "-filter_hw_device", "vaapi")
-			changes = append(changes, "inject:filter_hw_device")
-		}
+		// PMS always pairs -init_hw_device with -filter_hw_device in
+		// the 286-entry argv corpus (0 mismatches). No defensive
+		// inject needed; we only patch the device path.
 		changes = append(changes, "init_hw_device")
 	} else {
 		// Inject -init_hw_device + -filter_hw_device BEFORE the first
@@ -1937,35 +1914,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// serves rewind / early-fetch via direct file read. No more need
 	// for our previous `-extra_window_size 999999` injection hack.
 
-	// Force CMAF-style segments (moof+mdat only, no per-segment moov).
-	//
-	// Stock dashenc by default emits self-contained mp4 segments — each
-	// chunk-stream<N>-NNNNN.m4s starts with `ftyp+moov` followed by the
-	// fragment. MSE source buffers reject the duplicate moov: the first
-	// chunk reinitialises the buffer, the second is treated as a new
-	// init segment too, and the player oscillates between "playing" and
-	// "buffering" without ever advancing past the first ~1s of content
-	// (observed live in the seek test, sha-019a335).
-	//
-	// Plex's ffmpeg fork omits moov from segments; on stock ffmpeg we
-	// pass `-format_options` to the inner mp4 muxer to override its
-	// movflags so segments contain only moof+mdat.
-	//
-	// Notable: NO `+frag_keyframe`. With h264_vaapi's default GOP shorter
-	// than our 3s segment, +frag_keyframe forces a new moof at every
-	// keyframe — chunks ended up with two `moof+mdat` pairs, which Plex
-	// Web's MSE could buffer but couldn't seek into cleanly. Plex Transcoder
-	// emits one fragment per segment; we match that by letting dashenc
-	// drive fragmentation (one moof per segment file).
-	if !isHLS && indexOfArg(args, "-format_options", 0) < 0 {
-		for k := 0; k+1 < len(args); k++ {
-			if args[k] == "-f" && args[k+1] == "dash" {
-				args = spliceArgs(args, k, "-format_options", "movflags=+empty_moov+default_base_moof+separate_moof+cmaf")
-				changes = append(changes, "inject:-format_options=movflags+cmaf-strict")
-				break
-			}
-		}
-	}
+	// CMAF-strict movflags now applied natively by scaleplex-ffmpeg7
+	// dashenc init (patch 0104). The inner mp4 muxer gets
+	// +empty_moov+default_base_moof+separate_moof+cmaf appended to
+	// movflags by dash_init, so each chunk emits moof+mdat only —
+	// Plex Web's Chromium MSE accepts the stream without the
+	// per-segment moov re-init that confused it pre-patch.
 
 	// HLS: Plex's `-f ssegment` is its custom stream-segmenter muxer.
 	// Stock ffmpeg's `-f segment` covers most of what's needed; translate.

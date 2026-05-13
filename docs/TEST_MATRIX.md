@@ -56,7 +56,9 @@ either rewriter bails (`applied=false`) or stock tonemap chain runs.
 | Plex Optimize · HW-decode shape (hevc_vaapi mp4 + faststart) | ✓ (earlier sessions) |
 | Plex Optimize · remux shape (bare decoder + copy) | ✓ (earlier sessions) |
 | Detection / ML pre-pass | ✓ (earlier sessions) |
-| Sub-burn · SRT sidecar (subtitles= filter via hybrid rewrite) | ✓ (earlier sessions) |
+| Sub-burn · SRT sidecar text · Plex Android HLS+seek (Accountant) | ✓ 2026-05-12 |
+| Sub-burn · SRT sidecar text · Plex Android cold-start (FMJ) | ✓ 2026-05-12 |
+| Sub-burn · SRT sidecar text · Plex Windows direct-play (FMJ) | ✓ 2026-05-12 |
 
 ### NOT yet validated on `phase4-audit2`
 
