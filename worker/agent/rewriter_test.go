@@ -613,9 +613,8 @@ func TestRewriter_OptimizeRemux_h264_EAE(t *testing.T) {
 	if dec < 0 || out.Args[dec+1] != "h264" {
 		t.Errorf("decoder slot mangled: %v", out.Args)
 	}
-	if containsString(out.Args, "-loglevel_plex") {
-		t.Errorf("-loglevel_plex still present: %v", out.Args)
-	}
+	// -loglevel_plex passes through (scaleplex-ffmpeg7 patch 0098
+	// makes it a no-op stub); we deliberately stopped stripping it.
 	if containsString(out.Args, "-progressurl") {
 		t.Errorf("-progressurl should be captured + stripped: %v", out.Args)
 	}
@@ -767,9 +766,7 @@ func TestRewriter_Bail_StripsPlexPrivateFlags(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("scrub should mark Applied=true so worker uses cleaned args; changes=%v", out.Changes)
 	}
-	if containsString(out.Args, "-loglevel_plex") {
-		t.Errorf("-loglevel_plex still present: %v", out.Args)
-	}
+	// -loglevel_plex passes through (fork patch 0098 makes it a stub).
 	if containsString(out.Args, "-progressurl") {
 		t.Errorf("-progressurl still present: %v", out.Args)
 	}
