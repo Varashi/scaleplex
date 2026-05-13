@@ -928,6 +928,80 @@ func rewriteManifestName(args []string, inputEnv map[string]string) ([]string, [
 	return args, []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
 }
 
+// rewriteSegmentList rewrites every `-segment_list <url>` occurrence
+// in args whose URL targets PMS loopback (http://127.0.0.1:32400).
+// Each is rewritten to point at SCALEPLEX_PMS_BASE_URL with
+// X-Plex-Token appended. On the HLS variant the relay also needs
+// scaleplex_seg_time (so CSV row times can be rewritten to global)
+// and scaleplex_mkv_offset_ms (so per-chunk Cluster.Timecode can be
+// patched on matroska side-output for Plex Windows seek).
+//
+// DASH sessions with text subs also use a `-segment_list` for the
+// side-channel ASS sub stream. That URL contains `?stream=subtitles`;
+// it gets the same loopback rewrite (relay proxies the CSV POST
+// to PMS, which then knows the sub-chunk-* filenames). No
+// scaleplex_seg_time / mkv_offset on the side-channel variant —
+// relay treats sub CSV rows as pass-through.
+func rewriteSegmentList(args []string, inputEnv map[string]string, segTime string, changes *[]string, variant string) {
+	base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+	if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+		base = envBase
+	}
+	if base == "" {
+		return
+	}
+	tok := inputEnv["X_PLEX_TOKEN"]
+
+	from := 0
+	for {
+		i := indexOfArg(args, "-segment_list", from)
+		if i < 0 || i+1 >= len(args) {
+			return
+		}
+		from = i + 2
+		origURL := args[i+1]
+		if !strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
+			continue
+		}
+		isSubChannel := strings.Contains(origURL, "stream=subtitles")
+		// HLS path only handles its native sub-less segment_list; the
+		// sub-channel pass picks up the stream=subtitles URL.
+		if variant == "hls" && isSubChannel {
+			continue
+		}
+		if variant == "side-channel" && !isSubChannel {
+			continue
+		}
+		rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
+		appendQuery := func(kv string) {
+			if strings.Contains(rewritten, "?") {
+				rewritten += "&" + kv
+			} else {
+				rewritten += "?" + kv
+			}
+		}
+		if tok != "" {
+			appendQuery("X-Plex-Token=" + tok)
+		}
+		if variant == "hls" {
+			if segTime != "" {
+				appendQuery("scaleplex_seg_time=" + segTime)
+			}
+			if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
+				if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
+					appendQuery(fmt.Sprintf("scaleplex_mkv_offset_ms=%d", uint64(v*1000)))
+				}
+			}
+		}
+		args[i+1] = rewritten
+		tag := "hls:segment_list:rewrite-to-relay"
+		if variant == "side-channel" {
+			tag = "subs:side-channel-segment_list:rewrite-to-relay"
+		}
+		*changes = append(*changes, tag)
+	}
+}
+
 // capturePMSProgressURL strips `-progressurl <url>` from args, rewrites
 // the PMS host to SCALEPLEX_PMS_BASE_URL, and appends the per-session
 // X_PLEX_TOKEN as a query param. Returns updated args, the rewritten
@@ -1210,6 +1284,13 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	var manifestChanges []string
 	out, manifestChanges = rewriteManifestName(out, inputEnv)
 	changes = append(changes, manifestChanges...)
+
+	// Direct-stream-video + transcode-audio DASH sessions still ship
+	// subs via a side-channel `-f segment -segment_format ass` output
+	// with its own `-segment_list` URL targeting PMS loopback.
+	// Without this rewrite the worker pod can't reach the URL, sub
+	// CSV POSTs fail silently, and Plex Web never gets the chunks.
+	rewriteSegmentList(out, inputEnv, "", &changes, "side-channel")
 
 	for {
 		i := indexOfArg(out, "-xioerror", 0)
@@ -1999,22 +2080,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// translated to `-f segment` because the missing flag left
 		// the header file empty + Plex Android 404'd on /base/header.
 
-		// Plex's `-segment_list_size 5` keeps only 5 entries in the CSV
-		// manifest. With ffmpeg outpacing playback (any speed > 1×) the
-		// rolling window drops older chunks from the CSV, so when the
-		// client falls 5+ chunks behind PMS no longer has CSV rows for
-		// them and serves 0-byte chunks. Bump to 99999 so the CSV
-		// retains every chunk for the lifetime of the session — files
-		// stay on disk anyway (segment muxer doesn't auto-delete like
-		// dashenc). Observed 2026-05-11 on LG webOS BH6 4K HEVC HDR
-		// HLS — 200ms 0-byte chunk serves correlating with rolling-
-		// window drops while ffmpeg ran ~2.7× unthrottled.
-		if i := indexOfArg(args, "-segment_list_size", 0); i >= 0 && i+1 < len(args) {
-			if args[i+1] != "99999" {
-				args[i+1] = "99999"
-				changes = append(changes, "hls:segment_list_size:5->99999")
-			}
-		}
+		// B2 TEST 2026-05-13: removed segment_list_size 5→99999 bump
+		// to see if the 0-byte chunk issue was actually fixed by
+		// patch 0102 stage-rename (NFS commit lag race) rather than
+		// the CSV rolling-window theory. PMS may aggregate rows
+		// across CSV PUTs server-side, making the bump unnecessary.
 		// (-segment_list_separate_stream_times / -segment_list_unfinished
 		// are stripped globally above for both HLS and the DASH+subs
 		// embedded-subtitle output. Don't duplicate the strip here.)
@@ -2126,43 +2196,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if i := indexOfArg(args, "-segment_time", 0); i >= 0 && i+1 < len(args) {
 			segTime = args[i+1]
 		}
-		if i := indexOfArg(args, "-segment_list", 0); i >= 0 && i+1 < len(args) {
-			base := envOr("SCALEPLEX_PMS_BASE_URL", "")
-			if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
-				base = envBase
-			}
-			origURL := args[i+1]
-			if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
-				rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
-				appendQuery := func(kv string) {
-					if strings.Contains(rewritten, "?") {
-						rewritten += "&" + kv
-					} else {
-						rewritten += "?" + kv
-					}
-				}
-				if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
-					appendQuery("X-Plex-Token=" + tok)
-				}
-				if segTime != "" {
-					appendQuery("scaleplex_seg_time=" + segTime)
-				}
-				// Pass the session's -ss as scaleplex_mkv_offset_ms so the
-				// relay can patch each chunk's Cluster.Timecode in-line
-				// with the CSV forward to PMS. Required for matroska-
-				// segment output (Plex Windows): -copyts is stripped
-				// above so chunks have local 0-based PTS; the relay
-				// shifts Cluster.Timecode to absolute before PMS reads.
-				if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
-					if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
-						appendQuery(fmt.Sprintf("scaleplex_mkv_offset_ms=%d", uint64(v*1000)))
-					}
-				}
-				args[i+1] = rewritten
-				changes = append(changes, "hls:segment_list:rewrite-to-relay")
-			}
-		}
+		rewriteSegmentList(args, inputEnv, segTime, &changes, "hls")
 	}
+
+	// DASH sessions with text subs use a SECOND output `-f segment
+	// -segment_format ass` to deliver subs as a side-channel DASH
+	// track. That output has its own `-segment_list` URL pointing
+	// at PMS loopback. Without rewriting, CSV POSTs fail silently
+	// and Plex Web's subtitle layer gets no chunks → subs never
+	// surface. Same loopback-to-relay rewrite, no scaleplex_seg_time
+	// rewrite (relay treats sub CSV rows as pass-through).
+	rewriteSegmentList(args, inputEnv, "", &changes, "side-channel")
 
 	// Capture `-ss <off>` on seek sessions for the renumber watcher's
 	// tfdt patch. Stock dashenc writes tfdt=0 in seek-session chunks
@@ -2207,25 +2251,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	//   with "Connection error" (observed live 2026-05-08 Plex
 	//   Android, 2 min wall clock, zero segments, force burn-in +
 	//   seek to 3345s).
-	if seekOffsetSeconds > 0 && !isHLS {
-		for i := 0; i+1 < len(args); i++ {
-			if !strings.HasPrefix(args[i], "-force_key_frames") {
-				continue
-			}
-			orig := args[i+1]
-			if !strings.HasPrefix(orig, "expr:") {
-				continue
-			}
-			inner := strings.TrimPrefix(orig, "expr:")
-			if !strings.Contains(inner, "(t,") && !strings.Contains(inner, "(t ,") {
-				continue
-			}
-			rewritten := strings.Replace(inner, "(t,", fmt.Sprintf("(t-%.3f,", seekOffsetSeconds), 1)
-			rewritten = strings.Replace(rewritten, "(t ,", fmt.Sprintf("(t-%.3f ,", seekOffsetSeconds), 1)
-			args[i+1] = "expr:" + rewritten
-			changes = append(changes, "force_key_frames:offset-by-seek")
-		}
-	}
+	// B1 TEST 2026-05-13: removed force_key_frames offset rewrite to
+	// see if modern jellyfin-ffmpeg 7.1 encoder handles the IDR-storm
+	// gracefully (Plex's identical FKF logic against 3.4 era didn't
+	// trip the burst we observed pre-fork).
+	_ = seekOffsetSeconds
 
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest
 	// body to this URL whenever the .mpd is regenerated; PMS gates

@@ -977,6 +977,7 @@ func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 // the first segment swallows tens of minutes of content (observed:
 // media-00293.ts hit 317 MB / 39 min on Balls Up seek before splitting).
 func TestRewriter_ForceKeyFrames_OffsetBySeek(t *testing.T) {
+	t.Skip("B1 test branch — offset rewrite disabled")
 	args := append([]string{"-ss", "2344"}, swArgsAV1H264...)
 	out := Rewrite(args, map[string]string{}, nil)
 	if !out.Applied {

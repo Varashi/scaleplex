@@ -41,7 +41,7 @@ Last-Update: 2026-05-12
 ---
 --- a/libavformat/segment.c	2026-05-12 19:26:10.459932320 +0200
 +++ b/libavformat/segment.c	2026-05-12 20:28:26.487799177 +0200
-@@ -231,6 +231,27 @@
+@@ -231,6 +231,39 @@
               seg->entry_prefix ? seg->entry_prefix : "",
               av_basename(oc->url));
  
@@ -56,8 +56,20 @@ Last-Update: 2026-05-12
 +     * as a gap and jumps forward. Mirrors Plex Transcoder's pattern
 +     * in libavformat/segment.c (their version is gated on
 +     * `!seg->list`; we always need it because seg->list is the URL
-+     * handler that informs PMS). */
-+    {
++     * handler that informs PMS).
++     *
++     * Skip text-subtitle outputs (ass / srt / webvtt). Plex's DASH
++     * sub side-channel uses `-f segment -segment_format ass` with a
++     * sparse SRT input stream, so segment_end fires infrequently —
++     * the .tmp file sits forever waiting for the next sub-cue
++     * boundary and PMS's filesystem scan (looking for sub-chunk-N
++     * with no suffix) misses it entirely. The NFS race that motivates
++     * stage-rename doesn't fire on these tiny text outputs anyway. */
++    if (!seg->format ||
++        (strcmp(seg->format, "ass") &&
++         strcmp(seg->format, "srt") &&
++         strcmp(seg->format, "subrip") &&
++         strcmp(seg->format, "webvtt"))) {
 +        size_t tmp_size = strlen(oc->url) + 5; /* + ".tmp\0" */
 +        char *tmp_url = av_malloc(tmp_size);
 +        if (!tmp_url)
@@ -69,7 +81,7 @@ Last-Update: 2026-05-12
      return 0;
  }
  
-@@ -372,6 +393,24 @@
+@@ -372,6 +405,24 @@
          av_log(s, AV_LOG_ERROR, "Failure occurred when ending segment '%s'\n",
                 oc->url);
  
