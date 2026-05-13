@@ -928,6 +928,84 @@ func rewriteManifestName(args []string, inputEnv map[string]string) ([]string, [
 	return args, []string{"drop:-manifest_name(no-pms-base-or-non-loopback)"}
 }
 
+// rewriteSegmentList rewrites every `-segment_list <url>` occurrence
+// in args whose URL targets PMS loopback (http://127.0.0.1:32400).
+// Each is rewritten to point at SCALEPLEX_PMS_BASE_URL with
+// X-Plex-Token appended. On the HLS variant the relay also needs
+// scaleplex_seg_time (so CSV row times can be rewritten to global)
+// and scaleplex_mkv_offset_ms (so per-chunk Cluster.Timecode can be
+// patched on matroska side-output for Plex Windows seek).
+//
+// DASH sessions with text subs also use a `-segment_list` for the
+// side-channel ASS sub stream. That URL contains `?stream=subtitles`;
+// it gets the same loopback rewrite (relay proxies the CSV POST
+// to PMS, which then knows the sub-chunk-* filenames). No
+// scaleplex_seg_time / mkv_offset on the side-channel variant —
+// relay treats sub CSV rows as pass-through.
+func rewriteSegmentList(args []string, inputEnv map[string]string, segTime string, changes *[]string, variant string) {
+	base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+	if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+		base = envBase
+	}
+	if base == "" {
+		return
+	}
+	tok := inputEnv["X_PLEX_TOKEN"]
+
+	from := 0
+	for {
+		i := indexOfArg(args, "-segment_list", from)
+		if i < 0 || i+1 >= len(args) {
+			return
+		}
+		from = i + 2
+		origURL := args[i+1]
+		if !strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
+			continue
+		}
+		isSubChannel := strings.Contains(origURL, "stream=subtitles")
+		// HLS path only handles its native sub-less segment_list; the
+		// sub-channel pass picks up the stream=subtitles URL.
+		if variant == "hls" && isSubChannel {
+			continue
+		}
+		if variant == "side-channel" && !isSubChannel {
+			continue
+		}
+		rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
+		appendQuery := func(kv string) {
+			if strings.Contains(rewritten, "?") {
+				rewritten += "&" + kv
+			} else {
+				rewritten += "?" + kv
+			}
+		}
+		if tok != "" {
+			appendQuery("X-Plex-Token=" + tok)
+		}
+		if variant == "hls" {
+			if segTime != "" {
+				appendQuery("scaleplex_seg_time=" + segTime)
+			}
+			// scaleplex_mkv_offset_ms retired 2026-05-13. With
+			// scaleplex-ffmpeg7 patch 0103 the segment muxer no longer
+			// rebases end_pts by reference_stream_first_pts, so
+			// `-copyts` works on matroska seek sessions. Rewriter keeps
+			// -copyts (see -copyts handling block below). Cluster.Timecode
+			// already reflects absolute source PTS — relay has nothing to
+			// patch. patchSessionMatroskaChunks stays in relay as
+			// defensive no-op for any in-flight session that lingers
+			// without the query param.
+		}
+		args[i+1] = rewritten
+		tag := "hls:segment_list:rewrite-to-relay"
+		if variant == "side-channel" {
+			tag = "subs:side-channel-segment_list:rewrite-to-relay"
+		}
+		*changes = append(*changes, tag)
+	}
+}
+
 // capturePMSProgressURL strips `-progressurl <url>` from args, rewrites
 // the PMS host to SCALEPLEX_PMS_BASE_URL, and appends the per-session
 // X_PLEX_TOKEN as a query param. Returns updated args, the rewritten
@@ -1953,16 +2031,16 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// translated to `-f segment` because the missing flag left
 		// the header file empty + Plex Android 404'd on /base/header.
 
-		// Plex's `-segment_list_size 5` keeps only 5 entries in the CSV
-		// manifest. With ffmpeg outpacing playback (any speed > 1×) the
-		// rolling window drops older chunks from the CSV, so when the
-		// client falls 5+ chunks behind PMS no longer has CSV rows for
-		// them and serves 0-byte chunks. Bump to 99999 so the CSV
-		// retains every chunk for the lifetime of the session — files
-		// stay on disk anyway (segment muxer doesn't auto-delete like
-		// dashenc). Observed 2026-05-11 on LG webOS BH6 4K HEVC HDR
-		// HLS — 200ms 0-byte chunk serves correlating with rolling-
-		// window drops while ffmpeg ran ~2.7× unthrottled.
+		// B2 RESTORED 2026-05-13: tried removing this bump, validated
+		// fine on Plex Android HLS+sub-burn @ 1.43x encoder pace, but
+		// FAILS on Plex Windows 720p @ 8.67x pace. Fast-encoder paths
+		// emit chunks faster than PMS processes CSV rows; with
+		// list_size=5 the rolling window strips older chunks before
+		// PMS aggregates them → m3u8 lacks rows → Plex Windows client
+		// can't fetch → no playback. 0102 stage-rename fixes the
+		// mid-write race separately; this fixes the rolling-window
+		// race. Bump to 99999 keeps the full CSV history for the
+		// session — files stay on disk anyway.
 		if i := indexOfArg(args, "-segment_list_size", 0); i >= 0 && i+1 < len(args) {
 			if args[i+1] != "99999" {
 				args[i+1] = "99999"
@@ -1973,43 +2051,30 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// are stripped globally above for both HLS and the DASH+subs
 		// embedded-subtitle output. Don't duplicate the strip here.)
 
-		// Strip `-copyts` for **mpegts-based** segmented output (HLS to
-		// mobile). With `-ss <off>` + `-copyts` and mpegts segments, stock
-		// ssegment fork special-cases it but stock segment muxer with
-		// mpegts emits one giant first segment containing the entire
-		// remaining runtime (observed: media-00173.ts grew to 222 MB /
-		// 23 min on Balls Up). Drop and splits resume at every keyframe.
+		// `-copyts` handling — matroska segment (Plex Windows) keeps it.
 		//
-		// For **matroska-based** segmented output (Plex Windows desktop),
-		// KEEP `-copyts`. FFmpeg 7.1.3 has the upstream
-		// `reference_stream_first_pts` offset in libavformat/segment.c
-		// (lines 904-914) so the split logic accounts for non-zero start
-		// PTS. With -copyts kept, the matroska Cluster.Timecode is
-		// written directly as absolute (= -ss + local) — no need for our
-		// relay-side post-patching. mpv reads correct absolute timeline
-		// from byte 0, the audio-track-swap re-spawn passes the right
-		// offset back. Verified empirically 2026-05-11 on jellyfin-ffmpeg
-		// 7.1.3 with Burn Notice -ss 100: 20 chunks produced in 20s,
-		// chunk-0 PTS=100.017, chunk-5 PTS=205.038.
-		// `-copyts` handling — DELICATE.
-		//   * INITIAL PLAY (no -ss): KEEP -copyts. Stripping rebases
-		//     output PTS based on `-fps_mode cfr` decisions and can
-		//     leave a 10s offset between manifest CSV timestamps and
-		//     in-chunk PTS (observed 2026-05-12 PS4 BH6 stuck on chunk-0
-		//     loop). With -copyts, ffmpeg uses upstream's
-		//     `reference_stream_first_pts` (libavformat/segment.c) so
-		//     chunks split at keyframes AND in-chunk PTS line up with
-		//     CSV.
-		//   * SEEK (-ss > 0): STRIP -copyts. Stock 7.1.3 segment muxer
-		//     misbehaves on large `-ss` with -copyts (zero chunks land
-		//     even though encoder processes frames — verified 2026-05-11
-		//     BH6 hevc_vaapi -ss 4801). Strip rebases PTS to 0,
-		//     splits resume.
+		// Scaleplex-ffmpeg7 patch 0103 (2026-05-13) drops the jellyfin
+		// `reference_stream_first_pts` end_pts adjustment that broke
+		// split cadence on `-ss + -copyts` segmented output, restoring
+		// Plex-fork split semantics: end_pts stays at `seg->time *
+		// (count+1)` and every keyframe past the first packet whose
+		// pts >= end_pts triggers a split. Cluster.Timecode in each
+		// chunk reflects absolute source PTS without relay patching.
+		//
+		// Plex's HLS-Android shape (`-f ssegment -segment_format
+		// matroska`) historically had `-copyts` stripped here because
+		// stock 7.1.3's segment muxer produced one giant chunk on
+		// `-ss + -copyts` (Balls Up media-00173.ts grew to 222 MB).
+		// Patch 0103 fixes that too, since `ssegment` and `segment`
+		// share `seg_write_packet`. Strip kept off below by default;
+		// flip `SCALEPLEX_KEEP_COPYTS_HLS_STRIP=1` to restore the old
+		// behaviour while validating the fork patch on Plex Android.
 		seekOff := captureSeekSeconds(args)
-		if seekOff > 0 {
+		stripCopytsLegacy := envOr("SCALEPLEX_KEEP_COPYTS_HLS_STRIP", "") == "1"
+		if seekOff > 0 && stripCopytsLegacy && outputFormat == "ssegment" {
 			if i := indexOfArg(args, "-copyts", 0); i >= 0 {
 				args = removeArgs(args, i, 1)
-				changes = append(changes, "hls:drop:-copyts(seek)")
+				changes = append(changes, "hls:drop:-copyts(seek-legacy)")
 			}
 		}
 
@@ -2080,43 +2145,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if i := indexOfArg(args, "-segment_time", 0); i >= 0 && i+1 < len(args) {
 			segTime = args[i+1]
 		}
-		if i := indexOfArg(args, "-segment_list", 0); i >= 0 && i+1 < len(args) {
-			base := envOr("SCALEPLEX_PMS_BASE_URL", "")
-			if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
-				base = envBase
-			}
-			origURL := args[i+1]
-			if base != "" && strings.HasPrefix(origURL, "http://127.0.0.1:32400") {
-				rewritten := strings.Replace(origURL, "http://127.0.0.1:32400", base, 1)
-				appendQuery := func(kv string) {
-					if strings.Contains(rewritten, "?") {
-						rewritten += "&" + kv
-					} else {
-						rewritten += "?" + kv
-					}
-				}
-				if tok, ok := inputEnv["X_PLEX_TOKEN"]; ok && tok != "" {
-					appendQuery("X-Plex-Token=" + tok)
-				}
-				if segTime != "" {
-					appendQuery("scaleplex_seg_time=" + segTime)
-				}
-				// Pass the session's -ss as scaleplex_mkv_offset_ms so the
-				// relay can patch each chunk's Cluster.Timecode in-line
-				// with the CSV forward to PMS. Required for matroska-
-				// segment output (Plex Windows): -copyts is stripped
-				// above so chunks have local 0-based PTS; the relay
-				// shifts Cluster.Timecode to absolute before PMS reads.
-				if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
-					if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
-						appendQuery(fmt.Sprintf("scaleplex_mkv_offset_ms=%d", uint64(v*1000)))
-					}
-				}
-				args[i+1] = rewritten
-				changes = append(changes, "hls:segment_list:rewrite-to-relay")
-			}
-		}
+		rewriteSegmentList(args, inputEnv, segTime, &changes, "hls")
 	}
+
+	// DASH sessions with text subs use a SECOND output `-f segment
+	// -segment_format ass` to deliver subs as a side-channel DASH
+	// track. That output has its own `-segment_list` URL pointing
+	// at PMS loopback. Without rewriting, CSV POSTs fail silently
+	// and Plex Web's subtitle layer gets no chunks → subs never
+	// surface. Same loopback-to-relay rewrite, no scaleplex_seg_time
+	// rewrite (relay treats sub CSV rows as pass-through).
+	rewriteSegmentList(args, inputEnv, "", &changes, "side-channel")
 
 	// Capture `-ss <off>` on seek sessions for the renumber watcher's
 	// tfdt patch. Stock dashenc writes tfdt=0 in seek-session chunks
@@ -2161,25 +2200,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	//   with "Connection error" (observed live 2026-05-08 Plex
 	//   Android, 2 min wall clock, zero segments, force burn-in +
 	//   seek to 3345s).
-	if seekOffsetSeconds > 0 && !isHLS {
-		for i := 0; i+1 < len(args); i++ {
-			if !strings.HasPrefix(args[i], "-force_key_frames") {
-				continue
-			}
-			orig := args[i+1]
-			if !strings.HasPrefix(orig, "expr:") {
-				continue
-			}
-			inner := strings.TrimPrefix(orig, "expr:")
-			if !strings.Contains(inner, "(t,") && !strings.Contains(inner, "(t ,") {
-				continue
-			}
-			rewritten := strings.Replace(inner, "(t,", fmt.Sprintf("(t-%.3f,", seekOffsetSeconds), 1)
-			rewritten = strings.Replace(rewritten, "(t ,", fmt.Sprintf("(t-%.3f ,", seekOffsetSeconds), 1)
-			args[i+1] = "expr:" + rewritten
-			changes = append(changes, "force_key_frames:offset-by-seek")
-		}
-	}
+	// B1 TEST 2026-05-13: removed force_key_frames offset rewrite to
+	// see if modern jellyfin-ffmpeg 7.1 encoder handles the IDR-storm
+	// gracefully (Plex's identical FKF logic against 3.4 era didn't
+	// trip the burst we observed pre-fork).
+	_ = seekOffsetSeconds
 
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest
 	// body to this URL whenever the .mpd is regenerated; PMS gates
