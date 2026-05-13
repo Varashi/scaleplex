@@ -1,67 +1,148 @@
-Description: segment: accept Plex's -segment_list_{unfinished,separate_stream_times} options
+Description: segment: implement Plex's -segment_list_separate_stream_times CSV emit
  Plex's ffmpeg fork adds three behaviour extensions to libavformat/
  segment.c:
-
+ .
    -segment_list_unfinished 1            CSV rows for in-progress
                                          segments get a `#` prefix
                                          so PMS can skip-read them
                                          until they're closed.
-
+ .
    -segment_list_separate_stream_times 1 CSV rows gain extra columns
                                          carrying per-stream end times
                                          (audio + video) so PMS can
                                          sync to actual stream end on
                                          multi-stream outputs.
-
+ .
    -break_non_keyframes                  already in upstream (since
                                          FFmpeg 4.x), no port needed.
-
- scaleplex's worker rewriter currently strips both options before
- spawning ffmpeg because stock segment.c rejects them with
- "Unrecognized option" → exit 8. Functionally the rewriter + relay
- sidecar already handle the correctness paths these options enable:
- - The relay rewrites every CSV row's start/end times to global
-   timeline values (`scaleplex_seg_time=N` query hint).
- - PMS reads the CSV size, not the `#` prefix, to gate chunk serving.
-
- This patch (Phase 2a) registers the two options + the matching
- SegmentContext fields, accepted as no-ops so stock dashenc's argv
- parser stops rejecting them. Behaviour is unchanged — the relay
- keeps doing the heavy lifting. A follow-up Phase 2b port will wire
- the full per-stream end-time tracking + `#`-prefix CSV emit logic
- from Plex's fork, at which point the relay's CSV rewrite path can
- also be deleted.
-
- Net effect today: the worker rewriter can drop two strip-list
- entries; the captured argv reaches ffmpeg verbatim.
-
-Origin: backport (minimal), https://github.com/plexinc/plex-media-server-ffmpeg-gpl
+ .
+ This patch (Phase 2b) ports the FUNCTIONAL list_separate_times CSV
+ emit logic from Plex's fork:
+ .
+   - SegmentListEntry gains `end_audio_time` and `end_video_time`
+     fields tracked per-chunk.
+ .
+   - seg_write_packet maintains both per audio + video packet's
+     `pts + duration` (in seconds).
+ .
+   - segment_list_print_entry emits CSV in 5-field format when
+     `list_separate_times` is set: `name,start,end,end_audio,end_video`.
+ .
+ PMS reads the 5-field CSV and aligns sub-side-channel chunks to
+ playback time correctly. Without this, PMS sees the 3-field default
+ CSV, time-based lookup fails on seek sessions, and Plex Web's
+ /transcode/universal/subtitles endpoint returns 5 bytes (empty).
+ Live regression observed 2026-05-13 on FMJ Dutch SRT side-channel.
+ .
+ The `-segment_list_unfinished` `#` prefix emit logic is NOT ported
+ here; current scaleplex relay handles unfinished gating via PMS-side
+ CSV-size checks, so unfinished remains an accepted no-op stub.
+Origin: backport, https://github.com/Diagonactic/plex-new-transcoder
+        plex-ffmpeg-source/NewPlexTranscoder/libavformat/segment.c
 Forwarded: not-needed
 Author: scaleplex
-Last-Update: 2026-05-11
+Last-Update: 2026-05-13
 ---
 --- a/libavformat/segment.c
 +++ b/libavformat/segment.c
-@@ -127,6 +127,11 @@ typedef struct SegmentContext {
+@@ -53,6 +53,8 @@ typedef struct SegmentListEntry {
+     char *filename;
+     struct SegmentListEntry *next;
+     int64_t last_duration;
++    // scaleplex/PLEX: per-stream end times for -segment_list_separate_stream_times.
++    double end_audio_time, end_video_time;
+ } SegmentListEntry;
+
+ typedef enum {
+@@ -127,6 +129,10 @@ typedef struct SegmentContext {
      SegmentListEntry cur_entry;
      SegmentListEntry *segment_list_entries;
      SegmentListEntry *segment_list_entries_end;
-+    // scaleplex/PLEX: Plex fork additions, registered + accepted as
-+    // no-ops in Phase 2a. Functional emit logic comes in Phase 2b.
++    // scaleplex/PLEX backport. list_unfinished stays no-op (relay
++    // handles unfinished gating); list_separate_times is functional.
 +    int list_unfinished;
 +    int list_separate_times;
-+    int cur_list_size;
  } SegmentContext;
 
  static void print_csv_escaped_str(AVIOContext *ctx, const char *str)
-@@ -1075,6 +1080,11 @@ static const AVOption options[] = {
+@@ -312,6 +318,7 @@ static int set_segment_filename(AVFormatContext *s)
+
+ static void segment_list_print_entry(AVIOContext      *list_ioctx,
+                                      ListType          list_type,
++                                     int               list_separate_times,
+                                      const SegmentListEntry *list_entry,
+                                      void *log_ctx)
+ {
+@@ -322,7 +329,12 @@ static void segment_list_print_entry(AVIOContext      *list_ioctx,
+     case LIST_TYPE_CSV:
+     case LIST_TYPE_EXT:
+         print_csv_escaped_str(list_ioctx, list_entry->filename);
+-        avio_printf(list_ioctx, ",%f,%f\n", list_entry->start_time, list_entry->end_time);
++        if (list_separate_times)
++            avio_printf(list_ioctx, ",%f,%f,%f,%f\n",
++                        list_entry->start_time, list_entry->end_time,
++                        list_entry->end_audio_time, list_entry->end_video_time);
++        else
++            avio_printf(list_ioctx, ",%f,%f\n", list_entry->start_time, list_entry->end_time);
+         break;
+     case LIST_TYPE_M3U8:
+         avio_printf(list_ioctx, "#EXTINF:%f,\n%s\n",
+@@ -396,14 +408,14 @@ static int segment_end(AVFormatContext *s, int write_trailer, int is_last)
+             if ((ret = segment_list_open(s)) < 0)
+                 goto end;
+             for (entry = seg->segment_list_entries; entry; entry = entry->next)
+-                segment_list_print_entry(seg->list_pb, seg->list_type, entry, s);
++                segment_list_print_entry(seg->list_pb, seg->list_type, seg->list_separate_times, entry, s);
+             if (seg->list_type == LIST_TYPE_M3U8 && is_last)
+                 avio_printf(seg->list_pb, "#EXT-X-ENDLIST\n");
+             ff_format_io_close(s, &seg->list_pb);
+             if (seg->use_rename)
+                 ff_rename(seg->temp_list_filename, seg->list, s);
+         } else {
+-            segment_list_print_entry(seg->list_pb, seg->list_type, &seg->cur_entry, s);
++            segment_list_print_entry(seg->list_pb, seg->list_type, seg->list_separate_times, &seg->cur_entry, s);
+             avio_flush(seg->list_pb);
+         }
+     }
+@@ -938,6 +950,9 @@ calc_times:
+         seg->cur_entry.start_time = (double)pkt->pts * av_q2d(st->time_base);
+         seg->cur_entry.start_pts = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
+         seg->cur_entry.end_time = seg->cur_entry.start_time;
++        // scaleplex/PLEX: reset per-stream end times at new chunk.
++        seg->cur_entry.end_audio_time = -1;
++        seg->cur_entry.end_video_time = -1;
+
+         if (seg->times || (!seg->frames && !seg->use_clocktime) && seg->write_empty)
+             goto calc_times;
+@@ -950,6 +965,19 @@ calc_times:
+         seg->cur_entry.last_duration = pkt->duration;
+     }
+
++    // scaleplex/PLEX: track per-audio + per-video end times for the
++    // -segment_list_separate_stream_times 5-field CSV. PMS uses these
++    // extra columns to align sub side-channel chunks to playback time
++    // on seek sessions.
++    {
++        enum AVMediaType codec_type = st->codecpar->codec_type;
++        double end_time = (double)(pkt->pts + pkt->duration) * av_q2d(st->time_base);
++        if (codec_type == AVMEDIA_TYPE_AUDIO)
++            seg->cur_entry.end_audio_time = FFMAX(seg->cur_entry.end_audio_time, end_time);
++        else if (codec_type == AVMEDIA_TYPE_VIDEO)
++            seg->cur_entry.end_video_time = FFMAX(seg->cur_entry.end_video_time, end_time);
++    }
++
+     if (seg->segment_frame_count == 0) {
+         av_log(s, AV_LOG_VERBOSE, "segment:'%s' starts with packet stream:%d pts:%s pts_time:%s frame:%d\n",
+                seg->avf->url, pkt->stream_index,
+@@ -1075,6 +1103,12 @@ static const AVOption options[] = {
      { "reset_timestamps", "reset timestamps at the beginning of each segment", OFFSET(reset_timestamps), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
      { "initial_offset", "set initial timestamp offset", OFFSET(initial_offset), AV_OPT_TYPE_DURATION, {.i64 = 0}, -INT64_MAX, INT64_MAX, E },
      { "write_empty_segments", "allow writing empty 'filler' segments", OFFSET(write_empty), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
-+    // scaleplex/PLEX backport (minimal — Phase 2a, no-op).
-+    { "segment_list_unfinished", "list in-progress segments with a leading # (no-op stub)",
++    // scaleplex/PLEX backport.
++    { "segment_list_unfinished", "list in-progress segments with a leading # (no-op stub; relay handles)",
 +        OFFSET(list_unfinished), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
-+    { "segment_list_separate_stream_times", "include per-stream end times in segment list (no-op stub)",
++    { "segment_list_separate_stream_times",
++        "5-field CSV: name,start,end,end_audio,end_video (Plex Web seek subtitles)",
 +        OFFSET(list_separate_times), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E },
      { NULL },
  };

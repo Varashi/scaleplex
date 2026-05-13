@@ -973,22 +973,27 @@ func TestRewriter_SkipToSegment_InitialPlayCaptured(t *testing.T) {
 // next one. The HLS segment muxer needs a keyframe to close a segment, so
 // the first segment swallows tens of minutes of content (observed:
 // media-00293.ts hit 317 MB / 39 min on Balls Up seek before splitting).
-func TestRewriter_ForceKeyFrames_OffsetBySeek(t *testing.T) {
+// B1 retired 2026-05-13: jellyfin-ffmpeg7 hevc_vaapi handles the IDR
+// storm at -copyts + seek without our offset-by-seek rewrite (validated
+// on Plex Web DASH HW transcode + seek to 4794s). The rewriter no
+// longer modifies the expr; -force_key_frames:0 passes through as-is.
+func TestRewriter_ForceKeyFrames_PassthroughOnSeek(t *testing.T) {
 	args := append([]string{"-ss", "2344"}, swArgsAV1H264...)
 	out := Rewrite(args, map[string]string{}, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "force_key_frames:offset-by-seek") {
-		t.Fatalf("expected force_key_frames:offset-by-seek, got %v", out.Changes)
+	if containsString(out.Changes, "force_key_frames:offset-by-seek") {
+		t.Fatalf("offset-by-seek rewrite should be retired: %v", out.Changes)
 	}
 	idx := indexOfArg(out.Args, "-force_key_frames:0", 0)
 	if idx < 0 || idx+1 >= len(out.Args) {
 		t.Fatal("missing -force_key_frames:0")
 	}
-	want := "expr:gte(t-2344.000,n_forced*3)"
+	// PMS-emitted expr stays intact; encoder handles the seek-time t.
+	want := "expr:gte(t,n_forced*3)"
 	if out.Args[idx+1] != want {
-		t.Errorf("force_key_frames expr=%q want %q", out.Args[idx+1], want)
+		t.Errorf("force_key_frames expr=%q want %q (passthrough)", out.Args[idx+1], want)
 	}
 }
 

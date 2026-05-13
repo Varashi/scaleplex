@@ -145,7 +145,39 @@ var ready int32
 // open()/mmap() cost.
 var renderFDs []*os.File
 
+// applyFFmpegDevOverlay — if /transcode/_dev/scaleplex-ffmpeg-lib/
+// contains *.so files (placed there by worker/iterate-ffmpeg.sh),
+// prepend the dir to LD_LIBRARY_PATH so spawned ffmpeg processes load
+// the override libavformat / libavcodec etc. Container's ENTRYPOINT
+// runs as root before dropping to ubuntu, so this is the only place
+// we can wire it in from a non-privileged uid.
+func applyFFmpegDevOverlay() {
+	const devLib = "/transcode/_dev/scaleplex-ffmpeg-lib"
+	entries, err := os.ReadDir(devLib)
+	if err != nil {
+		return
+	}
+	hasSO := false
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".so.") {
+			hasSO = true
+			break
+		}
+	}
+	if !hasSO {
+		return
+	}
+	cur := os.Getenv("LD_LIBRARY_PATH")
+	new := devLib
+	if cur != "" {
+		new = devLib + ":" + cur
+	}
+	os.Setenv("LD_LIBRARY_PATH", new)
+	log.Printf("ffmpeg dev overlay active: LD_LIBRARY_PATH=%s", new)
+}
+
 func main() {
+	applyFFmpegDevOverlay()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/readyz", handleReady)

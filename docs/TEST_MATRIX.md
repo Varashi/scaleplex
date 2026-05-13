@@ -65,9 +65,11 @@ either rewriter bails (`applied=false`) or stock tonemap chain runs.
 These need a play-through before we can promote:
 
 - Plex Windows desktop · live HLS-matroska · cold start + seek
-  (the `-segment_format_options live=1` rewrite is kept as safety
-  net; need to confirm Plex Windows still works with current ffmpeg
-  patch stack)
+  **PARTIAL 2026-05-13:** direct-play works (sha-03b2cd0 era),
+  but TRANSCODE at 720p/1080p **fails — mpv aborts demux**.
+  Tracked in `project_scaleplex_plex_windows_720p_gap.md` (memory).
+  Need prod vs scaleplex EBML diff to find the matroska byte-stream
+  delta.
 - Plex iOS · any path
 - Apple TV · any path
 - LG webOS · any path (the original bug-class hardware)
