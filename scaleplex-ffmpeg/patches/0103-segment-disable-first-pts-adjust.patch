@@ -1,0 +1,89 @@
+Description: segment: drop reference_stream_first_pts end_pts adjustment
+ Jellyfin-ffmpeg (and upstream FFmpeg 7.x) adds an automatic offset on
+ segment muxer's `end_pts` equal to the first reference-stream
+ packet's PTS. The intent: align segment split boundaries to an
+ absolute-time axis so streams with non-zero start PTS (live capture,
+ -copyts after -ss) still split at `segment_time` intervals counted
+ from the FIRST packet rather than from PTS=0.
+ .
+ In practice, on Plex Windows segmented-mkv shape (`-f segment
+ -segment_format matroska -segment_format_options live=1 -segment_time 1
+ -copyts -ss N`), this adjustment defeats segment splitting entirely:
+ with `-ss 162`, the first ref-stream packet has pts ≈ 162042000 µs,
+ so `end_pts` for segment 0 becomes `1000000 + 162042000 = 163042000`
+ µs. Empirically verified 2026-05-13 on jellyfin-ffmpeg 7.1.3 +
+ scaleplex-ffmpeg7 with HEVC VAAPI and libx264 SW: 12 seconds of
+ encoded video lands in chunk-00000 with zero splits, regardless of
+ `-force_key_frames`.
+ .
+ Plex's own ffmpeg fork (FFmpeg 6.x base) has no equivalent
+ adjustment — its `seg_write_packet` operates directly on raw
+ `end_pts = seg->time * (segment_count + 1)`. Split fires on every
+ keyframe past the first packet whose pts exceeds `end_pts -
+ time_delta`. With Plex's force-keyframe expr (`gte(t, n_forced * 1)`)
+ producing IDRs every second, that yields one chunk per second as
+ designed.
+ .
+ This patch deletes the jellyfin first-pts adjustment in the
+ scaleplex-ffmpeg fork, restoring upstream-pre-jellyfin behaviour
+ which is what Plex's transcoder relies on. The downstream effect is
+ that `chunk-NNNNN` files split at `segment_time` boundaries, and
+ Cluster.Timecode in each chunk reflects source-time absolute PTS
+ (with `-copyts` kept) without any relay-side post-patching.
+ .
+ Required follow-ups (separate commits):
+   - worker rewriter: stop stripping `-copyts` on seek for matroska
+     segment output and stop emitting `scaleplex_mkv_offset_ms` on
+     `-segment_list` URLs.
+   - shim relay: `patchSessionMatroskaChunks` becomes dead code on
+     the matroska path; left in place as a defensive no-op until
+     the rewriter side ships.
+ .
+ Reverting the adjustment in this fork is preferred over adding a
+ new opt-in flag, because every scaleplex-driven session that
+ reaches `-f segment -segment_format matroska` is a Plex Windows
+ client expecting Plex-style split cadence. There is no scenario
+ where the jellyfin behaviour is desirable for us.
+Origin: drop, https://github.com/jellyfin/jellyfin-ffmpeg
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-13
+---
+--- a/libavformat/segment.c
++++ b/libavformat/segment.c
+@@ -117,7 +117,6 @@ typedef struct SegmentContext {
+     int64_t initial_offset;    ///< initial timestamps offset, expressed in microseconds
+     char *reference_stream_specifier; ///< reference stream specifier
+     int   reference_stream_index;
+-    int64_t reference_stream_first_pts;    ///< initial timestamp, expressed in microseconds
+     int   break_non_keyframes;
+     int   write_empty;
+
+@@ -747,8 +746,6 @@ static int seg_init(AVFormatContext *s)
+            seg->reference_stream_index,
+            av_get_media_type_string(s->streams[seg->reference_stream_index]->codecpar->codec_type));
+
+-    seg->reference_stream_first_pts = AV_NOPTS_VALUE;
+-
+     seg->oformat = av_guess_format(seg->format, s->url, NULL);
+
+     if (!seg->oformat)
+@@ -901,18 +898,6 @@ calc_times:
+             pkt->flags & AV_PKT_FLAG_KEY,
+             pkt->stream_index == seg->reference_stream_index ? seg->frame_count : -1);
+
+-    if (seg->reference_stream_first_pts == AV_NOPTS_VALUE &&
+-        pkt->stream_index == seg->reference_stream_index &&
+-        pkt->pts != AV_NOPTS_VALUE) {
+-        seg->reference_stream_first_pts = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
+-    }
+-
+-    if (seg->reference_stream_first_pts != AV_NOPTS_VALUE) {
+-        end_pts += (INT64_MAX - end_pts >= seg->reference_stream_first_pts) ?
+-                    seg->reference_stream_first_pts :
+-                    INT64_MAX - end_pts;
+-    }
+-
+     if (pkt->pts != AV_NOPTS_VALUE)
+         pkt_pts_avtb = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
+

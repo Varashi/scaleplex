@@ -987,11 +987,15 @@ func rewriteSegmentList(args []string, inputEnv map[string]string, segTime strin
 			if segTime != "" {
 				appendQuery("scaleplex_seg_time=" + segTime)
 			}
-			if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
-				if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
-					appendQuery(fmt.Sprintf("scaleplex_mkv_offset_ms=%d", uint64(v*1000)))
-				}
-			}
+			// scaleplex_mkv_offset_ms retired 2026-05-13. With
+			// scaleplex-ffmpeg7 patch 0103 the segment muxer no longer
+			// rebases end_pts by reference_stream_first_pts, so
+			// `-copyts` works on matroska seek sessions. Rewriter keeps
+			// -copyts (see -copyts handling block below). Cluster.Timecode
+			// already reflects absolute source PTS — relay has nothing to
+			// patch. patchSessionMatroskaChunks stays in relay as
+			// defensive no-op for any in-flight session that lingers
+			// without the query param.
 		}
 		args[i+1] = rewritten
 		tag := "hls:segment_list:rewrite-to-relay"
@@ -2100,43 +2104,30 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// are stripped globally above for both HLS and the DASH+subs
 		// embedded-subtitle output. Don't duplicate the strip here.)
 
-		// Strip `-copyts` for **mpegts-based** segmented output (HLS to
-		// mobile). With `-ss <off>` + `-copyts` and mpegts segments, stock
-		// ssegment fork special-cases it but stock segment muxer with
-		// mpegts emits one giant first segment containing the entire
-		// remaining runtime (observed: media-00173.ts grew to 222 MB /
-		// 23 min on Balls Up). Drop and splits resume at every keyframe.
+		// `-copyts` handling — matroska segment (Plex Windows) keeps it.
 		//
-		// For **matroska-based** segmented output (Plex Windows desktop),
-		// KEEP `-copyts`. FFmpeg 7.1.3 has the upstream
-		// `reference_stream_first_pts` offset in libavformat/segment.c
-		// (lines 904-914) so the split logic accounts for non-zero start
-		// PTS. With -copyts kept, the matroska Cluster.Timecode is
-		// written directly as absolute (= -ss + local) — no need for our
-		// relay-side post-patching. mpv reads correct absolute timeline
-		// from byte 0, the audio-track-swap re-spawn passes the right
-		// offset back. Verified empirically 2026-05-11 on jellyfin-ffmpeg
-		// 7.1.3 with Burn Notice -ss 100: 20 chunks produced in 20s,
-		// chunk-0 PTS=100.017, chunk-5 PTS=205.038.
-		// `-copyts` handling — DELICATE.
-		//   * INITIAL PLAY (no -ss): KEEP -copyts. Stripping rebases
-		//     output PTS based on `-fps_mode cfr` decisions and can
-		//     leave a 10s offset between manifest CSV timestamps and
-		//     in-chunk PTS (observed 2026-05-12 PS4 BH6 stuck on chunk-0
-		//     loop). With -copyts, ffmpeg uses upstream's
-		//     `reference_stream_first_pts` (libavformat/segment.c) so
-		//     chunks split at keyframes AND in-chunk PTS line up with
-		//     CSV.
-		//   * SEEK (-ss > 0): STRIP -copyts. Stock 7.1.3 segment muxer
-		//     misbehaves on large `-ss` with -copyts (zero chunks land
-		//     even though encoder processes frames — verified 2026-05-11
-		//     BH6 hevc_vaapi -ss 4801). Strip rebases PTS to 0,
-		//     splits resume.
+		// Scaleplex-ffmpeg7 patch 0103 (2026-05-13) drops the jellyfin
+		// `reference_stream_first_pts` end_pts adjustment that broke
+		// split cadence on `-ss + -copyts` segmented output, restoring
+		// Plex-fork split semantics: end_pts stays at `seg->time *
+		// (count+1)` and every keyframe past the first packet whose
+		// pts >= end_pts triggers a split. Cluster.Timecode in each
+		// chunk reflects absolute source PTS without relay patching.
+		//
+		// Plex's HLS-Android shape (`-f ssegment -segment_format
+		// matroska`) historically had `-copyts` stripped here because
+		// stock 7.1.3's segment muxer produced one giant chunk on
+		// `-ss + -copyts` (Balls Up media-00173.ts grew to 222 MB).
+		// Patch 0103 fixes that too, since `ssegment` and `segment`
+		// share `seg_write_packet`. Strip kept off below by default;
+		// flip `SCALEPLEX_KEEP_COPYTS_HLS_STRIP=1` to restore the old
+		// behaviour while validating the fork patch on Plex Android.
 		seekOff := captureSeekSeconds(args)
-		if seekOff > 0 {
+		stripCopytsLegacy := envOr("SCALEPLEX_KEEP_COPYTS_HLS_STRIP", "") == "1"
+		if seekOff > 0 && stripCopytsLegacy && outputFormat == "ssegment" {
 			if i := indexOfArg(args, "-copyts", 0); i >= 0 {
 				args = removeArgs(args, i, 1)
-				changes = append(changes, "hls:drop:-copyts(seek)")
+				changes = append(changes, "hls:drop:-copyts(seek-legacy)")
 			}
 		}
 
