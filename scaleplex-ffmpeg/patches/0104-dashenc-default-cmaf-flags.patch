@@ -1,0 +1,49 @@
+Description: dashenc: default CMAF-strict movflags on inner mp4 muxer
+ Plex Web's Chromium MSE rejects DASH segments that re-embed a moov
+ box per chunk. Stock dashenc's `+dash` movflag does flip
+ `FF_MOV_FLAG_EMPTY_MOOV` + `FF_MOV_FLAG_DEFAULT_BASE_MOOF` in movenc,
+ so on paper the per-segment moov should already be empty. In
+ practice scaleplex still needed `+separate_moof` (audio/video in
+ distinct moof atoms — MSE source buffers track them independently)
+ and `+cmaf` (CMAF profile compliance, which adds
+ `FF_MOV_FLAG_NEGATIVE_CTS_OFFSETS` so b-frame CTS offsets stay valid
+ across fragments). Live regression observed sha-019a335 (2026-05):
+ without these, Plex Web playback oscillated between "playing" and
+ "buffering" past the first ~1s of content.
+ .
+ Worker rewriter used to inject these via
+ `-format_options movflags=+empty_moov+default_base_moof+separate_moof+cmaf`
+ spliced before `-f dash`. With this patch the dashenc init applies
+ them directly to the inner mp4 muxer options dict — the rewriter
+ inject becomes redundant and can be retired.
+ .
+ Notable: NO `+frag_keyframe`. With h264_vaapi's default GOP shorter
+ than our 3s segment, frag_keyframe forced a new moof at every
+ keyframe, producing chunks with two moof+mdat pairs which Plex
+ Web's MSE could buffer but couldn't seek into cleanly. dashenc
+ already sets `+frag_custom` so the segment muxer drives fragmentation
+ (one moof per segment file) — we don't add it here.
+Origin: scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-12
+---
+--- a/libavformat/dashenc.c
++++ b/libavformat/dashenc.c
+@@ -1649,6 +1649,16 @@ static int dash_init(AVFormatContext *s)
+             // the player resyncs its timebase on seek-resume sessions.
+             if (c->skip_to_segment > 1)
+                 av_dict_set(&opts, "movflags", "+frag_discont", AV_DICT_APPEND);
++
++            // scaleplex: CMAF-strict movflags so Plex Web's Chromium MSE
++            // accepts the segments. +cmaf preset (movenc.c) implies
++            // +empty_moov + +default_base_moof + negative_cts_offsets;
++            // +separate_moof keeps audio + video in distinct moof
++            // atoms which MSE buffers separately. Was previously
++            // injected via worker rewriter -format_options; now native.
++            av_dict_set(&opts, "movflags",
++                        "+empty_moov+default_base_moof+separate_moof+cmaf",
++                        AV_DICT_APPEND);
+             if (os->frag_type == FRAG_TYPE_EVERY_FRAME)
+                 av_dict_set(&opts, "movflags", "+frag_every_frame", AV_DICT_APPEND);
+             else
