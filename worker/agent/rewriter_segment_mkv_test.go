@@ -75,16 +75,22 @@ func TestRewriter_PlexWindows_SegmentMkv_RewritesURL(t *testing.T) {
 	if !containsString(out.Changes, "hls:segment_list:rewrite-to-relay") {
 		t.Errorf("expected hls:segment_list:rewrite-to-relay tag: %v", out.Changes)
 	}
-	// -copyts stripped (segment muxer in FFmpeg 7.1.3 misbehaves with
-	// -copyts + -ss <large>: produces zero chunks despite frames
-	// flowing through the encoder, verified 2026-05-11 -ss 4801).
-	// Relay restores absolute Cluster.Timecode via the stage-rename
-	// patcher below.
-	if containsString(out.Args, "-copyts") {
-		t.Errorf("-copyts must be stripped for matroska segment shape: %v", out.Args)
+	// -copyts must be KEPT on matroska segment seek. scaleplex-ffmpeg7
+	// patch 0103 (2026-05-13) drops the jellyfin
+	// `reference_stream_first_pts` end_pts adjustment that broke split
+	// cadence on `-ss + -copyts`, restoring Plex-fork behaviour. With
+	// -copyts kept, Cluster.Timecode lands at absolute source PTS
+	// natively — relay has nothing to patch.
+	if !containsString(out.Args, "-copyts") {
+		t.Errorf("-copyts must be kept for matroska segment shape (patch 0103): %v", out.Args)
 	}
-	if !containsString(out.Changes, "hls:drop:-copyts(seek)") {
-		t.Errorf("expected hls:drop:-copyts(seek) tag: %v", out.Changes)
+	if containsString(out.Changes, "hls:drop:-copyts(seek)") {
+		t.Errorf("hls:drop:-copyts(seek) tag must NOT appear post-patch-0103: %v", out.Changes)
+	}
+	// scaleplex_mkv_offset_ms retired with patch 0103 — relay has
+	// nothing to patch when -copyts is kept.
+	if strings.Contains(got, "scaleplex_mkv_offset_ms") {
+		t.Errorf("scaleplex_mkv_offset_ms must NOT be emitted (retired with patch 0103): %s", got)
 	}
 	// Output filename pattern stays `chunk-%05d` (no .tmp suffix).
 	// Stage-rename was tried + reverted 2026-05-11 — ffmpeg's 0-byte

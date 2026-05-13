@@ -997,12 +997,58 @@ func TestRewriter_ForceKeyFrames_PassthroughOnSeek(t *testing.T) {
 	}
 }
 
-// HLS argv must have `-copyts` stripped. Verified locally that stock
-// ffmpeg's segment muxer with `-ss <off> -copyts` never splits — it
-// writes one giant first segment containing the entire remaining runtime
-// (Balls Up: 222 MB / 23 min in media-00173.ts). DASH path keeps
-// `-copyts` because dashenc handles it correctly.
-func TestRewriter_HLS_CopytsStripped(t *testing.T) {
+// HLS-ssegment seek: post-patch-0103, `-copyts` is KEPT by default.
+// Scaleplex-ffmpeg7's segment muxer (shared with ssegment) no longer
+// rebases end_pts by reference_stream_first_pts, so split cadence
+// works with -copyts intact. Old strip behaviour remains available
+// behind the `SCALEPLEX_KEEP_COPYTS_HLS_STRIP=1` env override (covered
+// in TestRewriter_HLS_CopytsStripped_LegacyEnv below) for Plex Android
+// regression validation only.
+func TestRewriter_HLS_CopytsKept(t *testing.T) {
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-i", "/media/Movies/M.mkv",
+		"-ss", "1384",
+		"-copyts", "-start_at_zero", "-avoid_negative_ts", "disabled",
+		"-filter_complex", "[0:0]scale=w=1022:h=426:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "23",
+		"-preset:0", "veryfast",
+		"-force_key_frames:0", "expr:gte(t,n_forced*8)",
+		"-segment_format", "matroska",
+		"-f", "ssegment",
+		"-individual_header_trailer", "0",
+		"-segment_header_filename", "header",
+		"-segment_time", "8",
+		"-segment_start_number", "173",
+		"media-%05d.ts",
+	}
+	out := Rewrite(args, map[string]string{}, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Args, "-copyts") {
+		t.Errorf("HLS argv must KEEP -copyts post-patch-0103 (jellyfin first-pts adjust removed)")
+	}
+	if containsString(out.Changes, "hls:drop:-copyts(seek)") {
+		t.Errorf("hls:drop:-copyts(seek) tag must NOT appear post-patch-0103: %v", out.Changes)
+	}
+	if containsString(out.Changes, "hls:drop:-copyts(seek-legacy)") {
+		t.Errorf("legacy strip path must NOT fire without SCALEPLEX_KEEP_COPYTS_HLS_STRIP=1: %v", out.Changes)
+	}
+	// AAC priming flag must survive — removing it caused 199-byte empty
+	// audio chunks on DASH and we don't want the same on HLS.
+	if !containsString(out.Args, "-start_at_zero") {
+		t.Errorf("HLS must keep -start_at_zero for AAC encoder priming")
+	}
+}
+
+// HLS-ssegment seek with `SCALEPLEX_KEEP_COPYTS_HLS_STRIP=1`: legacy
+// strip path remains available for Plex Android regression validation
+// only. Default is `unset` (covered by TestRewriter_HLS_CopytsKept).
+func TestRewriter_HLS_CopytsStripped_LegacyEnv(t *testing.T) {
+	t.Setenv("SCALEPLEX_KEEP_COPYTS_HLS_STRIP", "1")
 	args := []string{
 		"-codec:0", "libdav1d",
 		"-i", "/media/Movies/M.mkv",
@@ -1027,15 +1073,10 @@ func TestRewriter_HLS_CopytsStripped(t *testing.T) {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
 	if containsString(out.Args, "-copyts") {
-		t.Errorf("HLS argv must NOT contain -copyts (segment muxer can't split with it)")
+		t.Errorf("legacy env should strip -copyts on HLS-ssegment: %v", out.Args)
 	}
-	if !containsString(out.Changes, "hls:drop:-copyts(seek)") {
-		t.Errorf("expected hls:drop:-copyts(seek) in changes, got %v", out.Changes)
-	}
-	// AAC priming flag must survive — removing it caused 199-byte empty
-	// audio chunks on DASH and we don't want the same on HLS.
-	if !containsString(out.Args, "-start_at_zero") {
-		t.Errorf("HLS must keep -start_at_zero for AAC encoder priming")
+	if !containsString(out.Changes, "hls:drop:-copyts(seek-legacy)") {
+		t.Errorf("expected hls:drop:-copyts(seek-legacy) tag with env set: %v", out.Changes)
 	}
 }
 
