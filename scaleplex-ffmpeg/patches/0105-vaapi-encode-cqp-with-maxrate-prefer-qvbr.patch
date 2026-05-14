@@ -1,0 +1,86 @@
+Description: vaapi_encode: prefer QVBR when -qp and -maxrate are both set
+ VAAPI hardware mutually excludes CQP (Constant QP) mode from rate
+ caps. The driver either errors or silently ignores -maxrate/-bufsize
+ in CQP mode — there is no CRF-like "quality target with bitrate
+ ceiling" semantic in CQP. Plex Media Server, however, routinely
+ emits both `-qp:N` and `-maxrate:N` on hevc_vaapi / h264_vaapi
+ sessions: PMS expresses intent as "encode at constant quality up to
+ a network-safe bitrate ceiling". Stock vaapi_encode.c sees the
+ explicit -qp first, short-circuits to CQP, and the iHD driver
+ silently drops the -maxrate. Live impact observed 2026-05-14 on a
+ 4K HEVC HDR session: PMS argv `-qp:0 15 -maxrate:0 20000k` produced
+ a measured ~200 Mbps output, exceeding LG webOS's network buffer
+ and causing playback hitches.
+ .
+ The correct VAAPI mode for "constant-quality target + bitrate
+ ceiling" is QVBR (Intelligent Constant Quality, per the Intel iHD
+ manual). QVBR is `quality=1, maxrate=1, bitrate=1, hrd=1` in the
+ vaapi_encode_rc_modes table — it uses `rc_quality` (which binds
+ from `ctx->explicit_qp` at the `rc_mode_found:` block) as the
+ target quality, `avctx->rc_max_rate` as the bitrate ceiling, and
+ `avctx->bit_rate` as the average target. Scene-adaptive: the
+ encoder spends bits on complex frames up to the ceiling, lower on
+ simple frames.
+ .
+ With this patch, when the user provides BOTH `-qp` and `-maxrate`
+ AND has not explicitly chosen an `-rc_mode`, vaapi_encode auto-
+ selects QVBR (falling through to VBR if the driver lacks QVBR
+ support, e.g. older Intel iGPUs). The downstream rc_quality binding
+ already routes `ctx->explicit_qp` through unchanged, so the quality
+ intent survives the mode switch.
+ .
+ Override:
+   * `-rc_mode cqp` — keep strict QP (historical behaviour;
+     -maxrate silently ignored by driver)
+   * `-rc_mode vbr` — pure rate-targeted VBR (loses quality intent;
+     pre-patch scaleplex rewriter behaviour)
+   * `-rc_mode cbr` — strict constant bitrate
+ .
+ If `-b:v` is unset (PMS's typical CQP-shape argv has no bit_rate),
+ default it to `rc_max_rate` so QVBR's "bitrate must be set"
+ invariant holds. The rc_quality binding ensures quality is the
+ actual driver — the bitrate fields become a budget cap, not a
+ content driver.
+ .
+ The scaleplex worker rewriter's CQP→VBR translation (rc:CQP(qp=N)
+ ->VBR(b:v=M) tag) can now be retired entirely — PMS argv passes
+ through to the encoder unchanged. The SCALEPLEX_RC_MODE env knob
+ it carried for CBR/CQP overrides is also retired; users override
+ at the argv level via `-rc_mode <mode>`.
+Origin: scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-14
+---
+--- a/libavcodec/vaapi_encode.c
++++ b/libavcodec/vaapi_encode.c
+@@ -1255,6 +1255,29 @@
+     if (ctx->explicit_rc_mode)
+         TRY_RC_MODE(ctx->explicit_rc_mode, 1);
+
++    // scaleplex/PLEX: PMS argv frequently combines -qp:N (constant-
++    // quality intent) with -maxrate:M (network-safe bitrate ceiling)
++    // on hevc_vaapi / h264_vaapi. VAAPI hardware mutually excludes
++    // CQP from rate caps — the explicit_qp short-circuit below
++    // selects CQP, the iHD driver silently ignores -maxrate, and
++    // PMS qp=15 4K HEVC HDR sessions overshoot a 20 Mbps ceiling by
++    // ~10x (observed 2026-05-14, LG webOS network buffer underruns).
++    // When both flags are present and the user has NOT explicitly
++    // chosen an rc_mode, prefer QVBR (quality target + bitrate
++    // ceiling). Falls back to VBR if the driver lacks QVBR (older
++    // Intel iGPUs). The downstream rc_quality binding at
++    // rc_mode_found: already routes ctx->explicit_qp through, so
++    // quality intent survives the mode switch. Override with
++    // `-rc_mode cqp` to keep historical strict-QP behaviour.
++    if (ctx->explicit_qp && avctx->rc_max_rate > 0) {
++        av_log(avctx, AV_LOG_INFO, "scaleplex: -qp + -maxrate both "
++               "set; selecting QVBR (use -rc_mode cqp to override).\n");
++        if (avctx->bit_rate <= 0)
++            avctx->bit_rate = avctx->rc_max_rate;
++        TRY_RC_MODE(RC_MODE_QVBR, 0);
++        TRY_RC_MODE(RC_MODE_VBR, 0);
++    }
++
+     if (ctx->explicit_qp)
+         TRY_RC_MODE(RC_MODE_CQP, 1);
+

@@ -197,9 +197,6 @@ func TestRewriter_AV1H264_MapLabelUpdated(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
-	// CRF→QP offset logic — gate VBR conversion off so -qp:0 survives
-	// for assertion. VBR behaviour covered by TestRewriter_RC_VBR_Default.
-	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	if containsString(out.Args, "-preset:0") {
 		t.Error("preset:0 not consumed (should translate to -compression_level:v)")
@@ -242,7 +239,6 @@ func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
 // HW_QP_CRF_OFFSET overrides the +6 default.
 func TestRewriter_QPOffset_EnvOverride(t *testing.T) {
 	t.Setenv("HW_QP_CRF_OFFSET", "0")
-	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
@@ -259,7 +255,6 @@ func TestRewriter_QPOffset_EnvOverride(t *testing.T) {
 // Negative or oversized result clamps to [0, 51].
 func TestRewriter_QPOffset_Clamping(t *testing.T) {
 	t.Setenv("HW_QP_CRF_OFFSET", "100")
-	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
 	if qpIdx <= 0 {
@@ -270,76 +265,33 @@ func TestRewriter_QPOffset_Clamping(t *testing.T) {
 	}
 }
 
-// Default rate-control: -qp:0 → -rc_mode VBR -b:v <maxrate>. iHD's CQP
-// mode ignores -maxrate; converting to VBR makes the encoder respect
-// PMS's intended bitrate. -maxrate / -bufsize stay as PMS sent.
-func TestRewriter_RC_VBR_Default(t *testing.T) {
+// Rewriter no longer converts CQP→VBR/CBR. scaleplex-ffmpeg7 patch 0105
+// makes vaapi_encode auto-select QVBR (preserving PMS's quality target
+// via -qp) when both -qp and -maxrate are present. PMS argv passes
+// through unchanged; the encoder picks the right mode.
+func TestRewriter_RC_PassthroughCQPandMaxrate(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	// -qp:0 must be stripped.
-	if containsString(out.Args, "-qp:0") {
-		t.Errorf("expected -qp:0 stripped under default VBR mode, got: %v", out.Args)
-	}
-	// -rc_mode VBR must be injected.
-	rcIdx := indexOfArg(out.Args, "-rc_mode", 0)
-	if rcIdx < 0 {
-		t.Fatal("expected -rc_mode injection")
-	}
-	if out.Args[rcIdx+1] != "VBR" {
-		t.Errorf("-rc_mode=%q want VBR", out.Args[rcIdx+1])
-	}
-	// -b:v must equal -maxrate value PMS sent.
-	bvIdx := indexOfArg(out.Args, "-b:v", 0)
-	if bvIdx < 0 {
-		t.Fatal("expected -b:v injection")
-	}
-	maxIdx := indexOfArg(out.Args, "-maxrate:0", 0)
-	if maxIdx < 0 {
-		t.Fatal("-maxrate:0 missing post-rewrite")
-	}
-	if out.Args[bvIdx+1] != out.Args[maxIdx+1] {
-		t.Errorf("-b:v=%q != -maxrate:0=%q (must match)", out.Args[bvIdx+1], out.Args[maxIdx+1])
-	}
-	// Change tag emitted.
-	foundRCTag := false
-	for _, c := range out.Changes {
-		if strings.HasPrefix(c, "rc:CQP(") && strings.Contains(c, "->VBR") {
-			foundRCTag = true
-			break
-		}
-	}
-	if !foundRCTag {
-		t.Errorf("missing rc:CQP->VBR tag: %v", out.Changes)
-	}
-}
-
-// SCALEPLEX_RC_MODE=CBR overrides default VBR.
-func TestRewriter_RC_CBR_EnvOverride(t *testing.T) {
-	t.Setenv("SCALEPLEX_RC_MODE", "CBR")
-	out := Rewrite(swArgsAV1H264, nil, nil)
-	rcIdx := indexOfArg(out.Args, "-rc_mode", 0)
-	if rcIdx < 0 || out.Args[rcIdx+1] != "CBR" {
-		t.Errorf("expected -rc_mode CBR, got rcIdx=%d args=%v", rcIdx, out.Args)
-	}
-}
-
-// SCALEPLEX_RC_MODE=CQP disables the conversion (legacy passthrough).
-func TestRewriter_RC_CQP_EnvOverride(t *testing.T) {
-	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
-	out := Rewrite(swArgsAV1H264, nil, nil)
 	if !containsString(out.Args, "-qp:0") {
-		t.Errorf("expected -qp:0 to survive under CQP mode, got: %v", out.Args)
+		t.Errorf("expected -qp:0 to pass through to encoder (fork patch 0105 handles RC mode), got: %v", out.Args)
+	}
+	if !containsString(out.Args, "-maxrate:0") {
+		t.Error("expected -maxrate:0 to pass through")
 	}
 	if containsString(out.Args, "-rc_mode") {
-		t.Errorf("expected NO -rc_mode injection under CQP mode")
+		t.Errorf("rewriter must not inject -rc_mode (fork picks QVBR)")
+	}
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "rc:CQP(") || strings.HasPrefix(c, "rc:") {
+			t.Errorf("unexpected rate-control rewrite tag (should have been retired with patch 0105): %q", c)
+		}
 	}
 }
 
-// Sanity test that -crf with no -maxrate also lands in CQP — same as
-// the AV1H264 path now, kept around because the encoder runs in CQP
-// regardless of whether -maxrate is present.
+// Without -maxrate, the encoder runs in CQP (fork patch 0105 only flips
+// to QVBR when both -qp AND -maxrate are present). -qp:0 must survive.
 func TestRewriter_RateControl_CRFOnly_KeepsCQP(t *testing.T) {
 	args := append([]string(nil), swArgsAV1H264...)
 	// Strip -maxrate:0 and -bufsize:0
