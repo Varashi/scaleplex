@@ -1086,6 +1086,12 @@ func rewriteSegmentList(args []string, inputEnv map[string]string, segTime strin
 			tag = "subs:side-channel-segment_list:rewrite-to-relay"
 		}
 		*changes = append(*changes, tag)
+		// -segment_list_size left untouched. scaleplex-ffmpeg7 patch 0106
+		// detects URL-handler outputs in segment_end and force-buffers
+		// the full chunk history regardless of list_size. Plex's
+		// `-segment_list_size 5` becomes inert for URL listfiles, which
+		// is the only sane semantic when PMS aggregates from every PUT
+		// body.
 	}
 }
 
@@ -2217,22 +2223,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// translated to `-f segment` because the missing flag left
 		// the header file empty + Plex Android 404'd on /base/header.
 
-		// B2 RESTORED 2026-05-13: tried removing this bump, validated
-		// fine on Plex Android HLS+sub-burn @ 1.43x encoder pace, but
-		// FAILS on Plex Windows 720p @ 8.67x pace. Fast-encoder paths
-		// emit chunks faster than PMS processes CSV rows; with
-		// list_size=5 the rolling window strips older chunks before
-		// PMS aggregates them → m3u8 lacks rows → Plex Windows client
-		// can't fetch → no playback. 0102 stage-rename fixes the
-		// mid-write race separately; this fixes the rolling-window
-		// race. Bump to 99999 keeps the full CSV history for the
-		// session — files stay on disk anyway.
-		if i := indexOfArg(args, "-segment_list_size", 0); i >= 0 && i+1 < len(args) {
-			if args[i+1] != "99999" {
-				args[i+1] = "99999"
-				changes = append(changes, "hls:segment_list_size:5->99999")
-			}
-		}
+		// -segment_list_size bump is handled inside rewriteSegmentList
+		// (per-output scope so the DASH+subs side-channel output gets
+		// the same treatment).
 		// (-segment_list_separate_stream_times / -segment_list_unfinished
 		// are stripped globally above for both HLS and the DASH+subs
 		// embedded-subtitle output. Don't duplicate the strip here.)

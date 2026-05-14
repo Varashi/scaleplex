@@ -1,0 +1,78 @@
+Description: segment: -segment_list URL handlers buffer full history, never rotate
+ ff_segment_muxer's `-segment_list` writes the listfile to a regular
+ path by default. With `-segment_list_type csv` and a URL handler
+ (http:// / https://), the listfile is HTTP-PUT-ed to the URL on
+ every segment_end. The consumer (e.g. Plex Media Server) parses the
+ CSV body to learn the chunk inventory.
+ .
+ Stock segment.c keeps a rolling window of `list_size` entries (default
+ 0 = streaming append, no buffering; >0 = buffer + rotate after N).
+ Plex's argv bakes in `-segment_list_size 5` for HLS video AND for
+ the DASH+text-subs side-channel ASS output. For URL-handler outputs,
+ the rolling window is the wrong semantic: PMS expects every PUT body
+ to contain the FULL chunk history, since it aggregates from the most
+ recent body it received. After the 5-row window slides past, PMS
+ sees a CSV missing every chunk older than 5*segment_time seconds,
+ and can no longer serve them — symptoms: m3u8 playlist missing
+ entries (HLS), text-sub side-channel returns 0 bytes for older
+ playback positions (Plex Web SRT-burn after ~5s, observed 2026-05-14
+ Plex Web Firefox FMJ 4K HDR + Dutch SRT burn).
+ .
+ The scaleplex worker rewriter previously bumped `-segment_list_size`
+ to 99999 to work around this, but only on the main HLS path — the
+ DASH+side-channel ASS output kept Plex's 5 because it lives in a
+ different rewriter branch. Each new variant of "PMS sends a URL
+ with list_size=5" reproduced the bug until the rewriter explicitly
+ caught it.
+ .
+ Fix this at the source: detect URL handlers in segment_end by
+ checking whether `seg->list` contains "://", and:
+   * Always enter the buffering branch (regardless of list_size or
+     list_type), so the listfile body contains every entry.
+   * Skip the rotation drop, regardless of list_size.
+ .
+ File-based listfiles keep their current behaviour (list_size = N
+ rotates after N entries; list_size = 0 streams single-row appends).
+ The user's `-segment_list_size N` argument becomes a hint that's
+ ignored for URL outputs — the only sane behaviour given the
+ aggregator model.
+ .
+ The scaleplex worker rewriter's `-segment_list_size:5->99999` bumps
+ become redundant and can be removed.
+Origin: scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-14
+---
+--- a/libavformat/segment.c
++++ b/libavformat/segment.c
+@@ -431,7 +431,17 @@
+     }
+
+     if (seg->list) {
+-        if (seg->list_size || seg->list_type == LIST_TYPE_M3U8) {
++        /* scaleplex/PLEX: when -segment_list points at a URL handler
++         * (http://, https://) the consumer is an aggregating server
++         * (e.g. Plex Media Server) that needs the full chunk history
++         * for each PUT, not the last N. Force buffering + skip the
++         * list_size rotation drop for URL outputs regardless of what
++         * the user passed for -segment_list_size. PMS's argv carries
++         * `-segment_list_size 5` baked in; without this, sub side-
++         * channel CSV rotates after 5 chunks and PMS can no longer
++         * map sub-chunk numbers to playback time. */
++        int seg_list_is_url = strstr(seg->list, "://") != NULL;
++        if (seg->list_size || seg->list_type == LIST_TYPE_M3U8 || seg_list_is_url) {
+             SegmentListEntry *entry = av_mallocz(sizeof(*entry));
+             if (!entry) {
+                 ret = AVERROR(ENOMEM);
+@@ -447,8 +457,8 @@
+                 seg->segment_list_entries_end->next = entry;
+             seg->segment_list_entries_end = entry;
+
+-            /* drop first item */
+-            if (seg->list_size && seg->segment_count >= seg->list_size) {
++            /* drop first item — except for URL handlers (scaleplex) */
++            if (seg->list_size && !seg_list_is_url && seg->segment_count >= seg->list_size) {
+                 entry = seg->segment_list_entries;
+                 seg->segment_list_entries = seg->segment_list_entries->next;
+                 av_freep(&entry->filename);
