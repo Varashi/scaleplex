@@ -966,11 +966,11 @@ func TestRewriter_Bail_StripsPlexPrivateFlags(t *testing.T) {
 }
 
 // PMS side-channel SRT extractor argv: subtitle pipe only, output `-codec:0
-// copy`, no decoder before `-i`. Rewriter must hit no-decoder bail AND strip
-// `-strict_ts:0` (fork rejects → exit 8) AND rewrite `-segment_list` loopback
-// URL to the relay (worker pod has no PMS on 127.0.0.1:32400 → ECONNREFUSED →
-// ffmpeg muxer task-error → exit 145). Observed 2026-05-14 on LG webOS
-// sidecar SRT.
+// copy`, no decoder before `-i`. Rewriter must hit no-decoder bail AND
+// rewrite `-segment_list` loopback URL to the relay (worker pod has no PMS
+// on 127.0.0.1:32400 → ECONNREFUSED → ffmpeg muxer task-error → exit 145).
+// `-strict_ts:0` passes through unchanged via fork patch 0107 stub.
+// Observed 2026-05-14 on LG webOS sidecar SRT.
 func TestRewriter_Bail_SubtitleSideChannel_StripsAndRewrites(t *testing.T) {
 	env := map[string]string{
 		"SCALEPLEX_PMS_BASE_URL": "http://clusterplex-pms.clusterplex.svc:32499",
@@ -995,10 +995,9 @@ func TestRewriter_Bail_SubtitleSideChannel_StripsAndRewrites(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("expected Applied=true, got changes=%v", out.Changes)
 	}
-	for i := 0; i < len(out.Args); i++ {
-		if strings.HasPrefix(out.Args[i], "-strict_ts") {
-			t.Errorf("any -strict_ts* still present at %d: %v", i, out.Args)
-		}
+	stIdx := indexOfArg(out.Args, "-strict_ts:0", 0)
+	if stIdx < 0 || stIdx+1 >= len(out.Args) || out.Args[stIdx+1] != "0" {
+		t.Errorf("-strict_ts:0 0 should pass through unchanged: %v", out.Args)
 	}
 	idx := indexOfArg(out.Args, "-segment_list", 0)
 	if idx < 0 || idx+1 >= len(out.Args) {
@@ -1014,19 +1013,20 @@ func TestRewriter_Bail_SubtitleSideChannel_StripsAndRewrites(t *testing.T) {
 	if !strings.Contains(got, "X-Plex-Token=tok123") {
 		t.Errorf("X-Plex-Token not appended: %s", got)
 	}
-	hasBail, hasDropStrict, hasRewrite := false, false, false
+	hasBail, hasRewrite := false, false
 	for _, c := range out.Changes {
 		switch c {
 		case "skip:no-decoder":
 			hasBail = true
-		case "drop:-strict_ts(bail)":
-			hasDropStrict = true
 		case "bail:segment_list:rewrite-to-relay":
 			hasRewrite = true
 		}
+		if strings.HasPrefix(c, "drop:-strict_ts") {
+			t.Errorf("strict_ts should pass through, got change %q: %v", c, out.Changes)
+		}
 	}
-	if !hasBail || !hasDropStrict || !hasRewrite {
-		t.Errorf("missing change tags (bail=%v strict=%v rewrite=%v): %v", hasBail, hasDropStrict, hasRewrite, out.Changes)
+	if !hasBail || !hasRewrite {
+		t.Errorf("missing change tags (bail=%v rewrite=%v): %v", hasBail, hasRewrite, out.Changes)
 	}
 }
 
