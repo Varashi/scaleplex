@@ -60,14 +60,14 @@ type RewriteOpts struct {
 	// ProbeSubtitleCodec — when non-nil, the rewriter calls this to
 	// learn the codec_name of the subtitle stream Plex's
 	// -map_inlineass references. The result picks between two burn-in
-	// chains: text (subrip/ass/mov_text/...) → `subtitles=filename=`
-	// libass chain; bitmap (hdmv_pgs_subtitle/dvb_subtitle/...) →
-	// `overlay_vaapi` stream-overlay chain. Args: source file path,
-	// stream specifier (e.g. "0:3", "1:s:0"). Returns lowercase codec
-	// name or "" on probe failure (treated as text by default,
-	// extraction will likely fail loud and surface the unknown
-	// codec). Production agent wires this to a synchronous ffprobe;
-	// tests inject a fake.
+	// chains: text (subrip/ass/mov_text/...) → keep Plex's `inlineass=`
+	// filter (Phase 2c hardcoded passthrough; fork's vf_inlineass
+	// binding renders via libass); bitmap (hdmv_pgs_subtitle/
+	// dvb_subtitle/...) → `overlay_vaapi` stream-overlay chain.
+	// Args: source file path, stream specifier (e.g. "0:3", "1:s:0").
+	// Returns lowercase codec name or "" on probe failure (treated as
+	// text by default). Production agent wires this to a synchronous
+	// ffprobe; tests inject a fake.
 	ProbeSubtitleCodec func(source, streamSpec string) string
 	// ProbeVideoColor — when non-nil, returns the source video's color
 	// metadata. The rewriter uses `transfer` to detect HDR sources
@@ -196,8 +196,9 @@ var (
 	// HW-decode + inlineass burn-in. PMS sends this when both
 	// HardwareAcceleratedCodecs=1 AND a force-burn subtitle target.
 	// Filter graph: GPU scale → CPU drop for libass → hwupload back.
-	// We swap `inlineass=...` for stock `subtitles=filename=...` and
-	// keep the surrounding hwupload/scale_vaapi/hwdownload chain.
+	// Phase 2c keeps Plex's `inlineass=` filter intact (fork's
+	// vf_inlineass binding renders via libass); rewriter only strips
+	// Plex-private AVOption keys vf_inlineass doesn't parse.
 	reFilterHWAss = regexp.MustCompile(
 		`^\[0:0\]hwupload\[0\];` +
 			`\[0\]scale_vaapi=w=(\d+):h=(\d+)(?::format=([A-Za-z0-9]+))?\[1\];` +
@@ -1919,11 +1920,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// Sub burn-in: PMS sends `-map_inlineass` even in HW-decode
 		// mode, with a filter graph that runs Plex's private
 		// `inlineass` filter on the CPU side of an
-		// hwdownload/hwupload sandwich. Stock ffmpeg has no
-		// inlineass; we swap it for `subtitles=filename=<staged
-		// SRT>:fontsdir=…` (libass) keeping the rest of the chain
-		// (and labels [0]–[4]) intact, so PMS's `-map [4]` still
-		// resolves and HDR p010 is preserved end-to-end.
+		// hwdownload/hwupload sandwich. Phase 2c keeps the
+		// `inlineass=` filter (fork's vf_inlineass binding renders
+		// via libass natively); rewriter strips the four Plex-private
+		// AVOption keys vf_inlineass doesn't parse and reshapes the
+		// surrounding chain (e.g. tonemap_vaapi for HDR sources)
+		// while preserving the [0]–[4] label sequence so PMS's
+		// `-map [4]` still resolves.
 		var probe func(string, string) string
 		if opts != nil && opts.ProbeSubtitleCodec != nil {
 			probe = opts.ProbeSubtitleCodec
