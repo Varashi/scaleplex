@@ -1347,28 +1347,13 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	out := cloneArgs(args)
 	changes := []string{"decode:remux:" + dec, "encode:copy(passthrough)"}
 
-	// 1. Strip Plex-private flags. scaleplex-ffmpeg7 natively accepts
-	// `-loglevel_plex` (patch 0098 stub), dashenc additions
+	// Plex-private flags pass through natively: `-loglevel_plex` +
+	// `-strict_ts:N` (patches 0098/0107 stubs); dashenc additions
 	// (`-delete_removed`, `-skip_to_segment`, `-break_non_keyframes`,
-	// `-manifest_name`), and segment.c additions (`-segment_list_*`),
-	// so those pass through unchanged. Only `-strict_ts*` (Plex
-	// movenc extension, no fork equivalent) remains on the strip-list
-	// for the fast-path. `-xioerror` was never observed in the 286-entry
-	// argv corpus; if it ever surfaces, ffmpeg rejection will flag it
-	// loud and we re-add the strip.
-	for _, flag := range []string{
-		"-strict_ts:0",
-		"-strict_ts",
-	} {
-		for {
-			i := indexOfArg(out, flag, 0)
-			if i < 0 || i+1 >= len(out) {
-				break
-			}
-			out = removeArgs(out, i, 2)
-			changes = append(changes, "drop:"+flag)
-		}
-	}
+	// `-manifest_name`) and segment.c additions (`-segment_list_*`)
+	// land via patches 0095/0096. `-xioerror` was never observed in
+	// the argv corpus; if it ever surfaces, ffmpeg rejection will
+	// flag it loud and we add a strip then.
 
 	// Rewrite -manifest_name URL to point at the relay; ffmpeg's
 	// dashenc PUTs the manifest body there natively (scaleplex-ffmpeg7
@@ -1447,8 +1432,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// still come off — its URL is loopback-only, ffmpeg would try to
 	// PUT and fail. PMS emits it on every spawn, including audio-only
 	// Detection jobs that bail with skip:no-decoder.
-	// `-loglevel_plex` passes through to ffmpeg natively (fork patch
-	// 0098); `-xioerror` was never observed in the 286-entry corpus.
+	// `-loglevel_plex` + `-strict_ts:N` pass through natively (fork
+	// patches 0098/0107). `-xioerror` was never observed in corpus.
 	scrubPlexFlagsOnBail := func(args []string) ([]string, []string) {
 		var bailChanges []string
 		for {
@@ -1458,24 +1443,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 			args = removeArgs(args, i, 2)
 			bailChanges = append(bailChanges, "drop:-progressurl(bail)")
-		}
-		// `-strict_ts*` (any stream specifier suffix) — Plex movenc/dashenc
-		// extension, no fork equivalent. Side-channel SRT/audio subtitler
-		// argvs carry it after `-codec:0 copy` and hit this bail path; if
-		// not stripped, our fork exits 8 on "Unrecognized option strict_ts".
-		for {
-			i := -1
-			for j := 0; j < len(args); j++ {
-				if strings.HasPrefix(args[j], "-strict_ts") {
-					i = j
-					break
-				}
-			}
-			if i < 0 || i+1 >= len(args) {
-				break
-			}
-			args = removeArgs(args, i, 2)
-			bailChanges = append(bailChanges, "drop:-strict_ts(bail)")
 		}
 		// `-segment_list http://127.0.0.1:32400/...` — PMS loopback URL that
 		// the segment muxer PUTs the CSV manifest to. Worker pod's loopback
@@ -2140,32 +2107,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// `-loglevel_plex` passthrough: scaleplex-ffmpeg7 patch 0098
-	// registers `-loglevel_plex <name>` as an OPT_TYPE_STRING sink
-	// (accepted + discarded). Previously rewriter stripped this 2-token
-	// flag because stock ffmpeg rejected the unknown option.
-
-	// `-segment_list_separate_stream_times` + `-segment_list_unfinished`
-	// pass through to scaleplex-ffmpeg7 natively (patch 0096 registers
-	// them as no-op AVOptions, full per-stream end-time tracking + CSV
+	// `-loglevel_plex`, `-strict_ts:N` passthrough: scaleplex-ffmpeg7
+	// patches 0098/0107 register both as OPT_TYPE_STRING sinks (accepted
+	// + discarded). `-segment_list_separate_stream_times` +
+	// `-segment_list_unfinished` pass through natively (patch 0096
+	// no-op AVOptions; full per-stream end-time tracking + CSV
 	// unfinished prefix scheduled for Phase 2b).
-	//
-	// `-strict_ts*` (any stream specifier suffix) — Plex movenc/dashenc
-	// extension, no equivalent in our fork yet, must still strip.
-	for {
-		i := -1
-		for j := 0; j < len(args); j++ {
-			if strings.HasPrefix(args[j], "-strict_ts") {
-				i = j
-				break
-			}
-		}
-		if i < 0 {
-			break
-		}
-		args = removeArgs(args, i, 2)
-		changes = append(changes, "drop:-strict_ts")
-	}
 
 	// `-skip_to_segment N` — Plex DASH muxer extension that starts the
 	// dash muxer's segment_index at N. scaleplex-ffmpeg7 backports this

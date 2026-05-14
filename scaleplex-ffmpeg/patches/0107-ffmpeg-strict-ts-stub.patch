@@ -1,0 +1,70 @@
+Description: ffmpeg: accept Plex's -strict_ts:N <int> as a no-op stub
+ Plex's transcoder fork registers a top-level CLI option
+ `-strict_ts <0|1>` (per-stream, help text "require strictly-
+ increasing timestamps") in fftools/ffmpeg_opt.c — verified by
+ grepping the literal symbol + help string out of `Plex
+ Transcoder.real` 1.12.3 (jellyfin-ffmpeg's tree has no equivalent).
+ PMS emits it on every subtitle-copy output (`-codec:N copy ...
+ -strict_ts:N 0 -f srt`) — 130 hits across our 209-entry argv
+ corpus — always with value `0` (lenient, the muxer default).
+ .
+ Stock jellyfin-ffmpeg's option parser doesn't know it and exits
+ with "Unrecognized option strict_ts". The worker rewriter has
+ historically stripped the flag (`drop:-strict_ts`, plus a copy in
+ the bail path for side-channel SRT/audio sidecar argvs) to avoid
+ the bail. The strip works because PMS's value `0` matches stock
+ ffmpeg's default lenient subtitle-PTS handling — but the strip
+ logic is rewriter bandaid B7 in `project_scaleplex_bandaid_retirement`.
+ .
+ This patch lands the same one-line OPT_TYPE_STRING sink pattern
+ that 0098 used for `-loglevel_plex`: register the option, accept
+ the value, discard it. The `:N` stream specifier is silently
+ dropped by the option parser (find_option matches up to `:`,
+ write_option without OPT_FLAG_SPEC ignores the suffix). Multiple
+ occurrences just overwrite the global sink; we never read it.
+ .
+ Net effect: the rewriter can stop translating `-strict_ts*` for
+ both the full-rewrite and bail paths, and PMS's argv passes
+ through unchanged. Runtime behaviour identical to today's strip.
+Origin: backport (minimal), scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-15
+---
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -731,6 +731,7 @@
+ extern char *canthrottle_url;
+ extern _Atomic int scaleplex_throttle_delay_us;
+ extern char *plex_loglevel_sink;
++extern char *plex_strict_ts_sink;
+ extern float max_error_rate;
+
+ extern char *filter_nbthreads;
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -105,6 +105,8 @@
+ _Atomic int scaleplex_throttle_delay_us = 0;
+ // scaleplex/PLEX: stub sink for `-loglevel_plex` (Plex CLI compat).
+ char *plex_loglevel_sink = NULL;
++// scaleplex/PLEX: stub sink for `-strict_ts:N` (Plex CLI compat).
++char *plex_strict_ts_sink = NULL;
+
+ InputFile   **input_files   = NULL;
+ int        nb_input_files   = 0;
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -1581,6 +1581,12 @@
+     // scaleplex/PLEX: accept Plex's -loglevel_plex <name> as a stub.
+     { "loglevel_plex",          OPT_TYPE_STRING, OPT_EXPERT, { &plex_loglevel_sink },
+         "Plex-style secondary log level (no-op stub for CLI compat)", "level" },
++    // scaleplex/PLEX: accept Plex's `-strict_ts:N <0|1>` as a stub.
++    // Help text from Plex Transcoder.real binary: "require strictly-
++    // increasing timestamps". PMS only ever emits value 0 (lenient,
++    // matches stock subtitle-PTS default). `:N` specifier is silently
++    // dropped by the parser; the global sink is write-only.
++    { "strict_ts",              OPT_TYPE_STRING, OPT_EXPERT, { &plex_strict_ts_sink },
++        "Plex-style strict-timestamps toggle (no-op stub for CLI compat)", "n" },
+     { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+         { .func_arg = opt_progress },
+       "write program-readable progress information", "url" },
