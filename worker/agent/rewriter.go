@@ -2406,34 +2406,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Seek + force_key_frames expr fix — DASH only.
-	//
-	// PMS sends `-force_key_frames:0 "expr:gte(t,n_forced*8)"`. The
-	// rewrite needed depends on whether `-copyts` is in play:
-	//
-	//   DASH (we keep `-copyts`): encoder `t` runs in input time, so
-	//   it starts at the seek offset (e.g. 2344s). Plex's expr is true
-	//   for every frame, ffmpeg fires ~294 forced keyframes back-to-
-	//   back, breaks the segment muxer (first segment swallows tens
-	//   of minutes). Rewrite to `gte(t-<offset>, n*8)` so keyframes
-	//   land at output times 0, 8, 16, ...
-	//
-	//   HLS (we strip `-copyts` earlier in this function): encoder
-	//   `t` already runs in output time, starts at 0. Plex's expr
-	//   `gte(t, n*8)` is correct as-is — keyframes fire at t=0, 8,
-	//   16. If we apply the (t - seek_offset) rewrite here the expr
-	//   never fires (always `false` for output-time t < seek_offset),
-	//   the muxer waits forever for a keyframe to close the first
-	//   segment, no .ts files are produced, the player times out
-	//   with "Connection error" (observed live 2026-05-08 Plex
-	//   Android, 2 min wall clock, zero segments, force burn-in +
-	//   seek to 3345s).
-	// B1 TEST 2026-05-13: removed force_key_frames offset rewrite to
-	// see if modern jellyfin-ffmpeg 7.1 encoder handles the IDR-storm
-	// gracefully (Plex's identical FKF logic against 3.4 era didn't
-	// trip the burst we observed pre-fork).
-	_ = seekOffsetSeconds
-
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest
 	// body to this URL whenever the .mpd is regenerated; PMS gates
 	// `/header` on the first such POST. scaleplex-ffmpeg7 backports
