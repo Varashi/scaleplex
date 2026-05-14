@@ -197,6 +197,9 @@ func TestRewriter_AV1H264_MapLabelUpdated(t *testing.T) {
 }
 
 func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
+	// CRF→QP offset logic — gate VBR conversion off so -qp:0 survives
+	// for assertion. VBR behaviour covered by TestRewriter_RC_VBR_Default.
+	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	if containsString(out.Args, "-preset:0") {
 		t.Error("preset:0 not consumed (should translate to -compression_level:v)")
@@ -239,6 +242,7 @@ func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
 // HW_QP_CRF_OFFSET overrides the +6 default.
 func TestRewriter_QPOffset_EnvOverride(t *testing.T) {
 	t.Setenv("HW_QP_CRF_OFFSET", "0")
+	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
@@ -255,6 +259,7 @@ func TestRewriter_QPOffset_EnvOverride(t *testing.T) {
 // Negative or oversized result clamps to [0, 51].
 func TestRewriter_QPOffset_Clamping(t *testing.T) {
 	t.Setenv("HW_QP_CRF_OFFSET", "100")
+	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
 	if qpIdx <= 0 {
@@ -262,6 +267,73 @@ func TestRewriter_QPOffset_Clamping(t *testing.T) {
 	}
 	if out.Args[qpIdx+1] != "51" {
 		t.Errorf("qp=%q want 51 (clamped)", out.Args[qpIdx+1])
+	}
+}
+
+// Default rate-control: -qp:0 → -rc_mode VBR -b:v <maxrate>. iHD's CQP
+// mode ignores -maxrate; converting to VBR makes the encoder respect
+// PMS's intended bitrate. -maxrate / -bufsize stay as PMS sent.
+func TestRewriter_RC_VBR_Default(t *testing.T) {
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	// -qp:0 must be stripped.
+	if containsString(out.Args, "-qp:0") {
+		t.Errorf("expected -qp:0 stripped under default VBR mode, got: %v", out.Args)
+	}
+	// -rc_mode VBR must be injected.
+	rcIdx := indexOfArg(out.Args, "-rc_mode", 0)
+	if rcIdx < 0 {
+		t.Fatal("expected -rc_mode injection")
+	}
+	if out.Args[rcIdx+1] != "VBR" {
+		t.Errorf("-rc_mode=%q want VBR", out.Args[rcIdx+1])
+	}
+	// -b:v must equal -maxrate value PMS sent.
+	bvIdx := indexOfArg(out.Args, "-b:v", 0)
+	if bvIdx < 0 {
+		t.Fatal("expected -b:v injection")
+	}
+	maxIdx := indexOfArg(out.Args, "-maxrate:0", 0)
+	if maxIdx < 0 {
+		t.Fatal("-maxrate:0 missing post-rewrite")
+	}
+	if out.Args[bvIdx+1] != out.Args[maxIdx+1] {
+		t.Errorf("-b:v=%q != -maxrate:0=%q (must match)", out.Args[bvIdx+1], out.Args[maxIdx+1])
+	}
+	// Change tag emitted.
+	foundRCTag := false
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "rc:CQP(") && strings.Contains(c, "->VBR") {
+			foundRCTag = true
+			break
+		}
+	}
+	if !foundRCTag {
+		t.Errorf("missing rc:CQP->VBR tag: %v", out.Changes)
+	}
+}
+
+// SCALEPLEX_RC_MODE=CBR overrides default VBR.
+func TestRewriter_RC_CBR_EnvOverride(t *testing.T) {
+	t.Setenv("SCALEPLEX_RC_MODE", "CBR")
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	rcIdx := indexOfArg(out.Args, "-rc_mode", 0)
+	if rcIdx < 0 || out.Args[rcIdx+1] != "CBR" {
+		t.Errorf("expected -rc_mode CBR, got rcIdx=%d args=%v", rcIdx, out.Args)
+	}
+}
+
+// SCALEPLEX_RC_MODE=CQP disables the conversion (legacy passthrough).
+func TestRewriter_RC_CQP_EnvOverride(t *testing.T) {
+	t.Setenv("SCALEPLEX_RC_MODE", "CQP")
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	if !containsString(out.Args, "-qp:0") {
+		t.Errorf("expected -qp:0 to survive under CQP mode, got: %v", out.Args)
+	}
+	if containsString(out.Args, "-rc_mode") {
+		t.Errorf("expected NO -rc_mode injection under CQP mode")
 	}
 }
 
@@ -556,6 +628,89 @@ func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
 	t.Fatal("no -map found after filter")
 }
 
+// PS4 + 4K HDR + SRT-burn case. PMS chose a full SW pipeline because
+// its HW pipeline can't combine HW tonemap + inlineass(SW). The
+// rewriter reshapes to HW hybrid: hwupload + scale_vaapi(p010) +
+// tonemap_vaapi(nv12) + hwdownload + inlineass + hwupload. Reclaims
+// HW for every stage except the libass render step. Live argv
+// captured 2026-05-13 23:19Z on session ee6xs0g12mq5k6bcdom62ju9-
+// ed6ea7eb-03b4-4f81-b640-5aa9580b3978.
+func TestRewriter_SWHDR_InlineAss_Reshape(t *testing.T) {
+	args := []string{
+		"-codec:0", "hevc",
+		"-codec:1", "dca",
+		"-i", "/media/m.mkv",
+		"-i", "/transcode/sess/temp-0.srt",
+		"-start_at_zero", "-copyts", "-fps_mode", "cfr",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex",
+		"[0:0]scale=w=1920:h=1080:force_divisible_by=4[0];" +
+			"[0]format=p010,tonemap=hable[1];" +
+			"[1]format=pix_fmts=yuv420p|nv12[2];" +
+			"[2]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:language=en:overrides=ScaledBorderAndShadow\\\\\\=yes:outline=2.6:shadow=1.7:font_size=54[3]",
+		"-map", "[3]",
+		"-codec:0", "libx264",
+		"-crf:0", "21",
+		"-preset:0", "veryfast",
+		"-segment_format", "mpegts", "-f", "ssegment",
+		"-segment_time", "1",
+		"-segment_start_number", "0",
+		"media-%05d.ts",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, map[string]string{}, &RewriteOpts{
+		ProbeVideoColor: func(string) (string, string, string) {
+			return "smpte2084", "bt2020nc", "bt2020"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "filter:hdr-tonemap-vaapi-passthrough-inlineass") {
+		t.Fatalf("missing hdr-tonemap-vaapi-passthrough-inlineass tag: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "encode:libx264->h264_vaapi") {
+		t.Fatalf("expected libx264->h264_vaapi swap: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "decode:bare-hw-upgrade:hevc") {
+		t.Fatalf("expected bare-hw-upgrade decode injection: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "map-label-update") {
+		t.Fatalf("expected map-label-update to retarget -map [3]->[15]: %v", out.Changes)
+	}
+	// Filter chain must use the HW reshape — scale_vaapi + tonemap_vaapi
+	// + hwdownload/hwupload bracket around inlineass.
+	idx := findFilterComplex(out.Args, "[0:0]")
+	got := out.Args[idx]
+	for _, mustHave := range []string{
+		"[0:0]hwupload[10]",
+		"scale_vaapi=w=1920:h=1080:format=p010",
+		"tonemap_vaapi=transfer=bt709:format=nv12",
+		"hwdownload",
+		"inlineass=",
+		"hwupload[15]",
+	} {
+		if !strings.Contains(got, mustHave) {
+			t.Errorf("filter chain missing %q\n  got: %s", mustHave, got)
+		}
+	}
+	// Plex's 4 unknown AVOption keys must be stripped (language/
+	// overrides/outline/shadow) — fork's vf_inlineass rejects them.
+	for _, mustStrip := range []string{"language=", "overrides=", "outline=", "shadow="} {
+		if strings.Contains(got, mustStrip) {
+			t.Errorf("Plex AVOption %q must be stripped from inlineass=", mustStrip)
+		}
+	}
+	// -map [3] should be rewritten to -map [15].
+	for i := idx + 1; i < len(out.Args)-1; i++ {
+		if out.Args[i] == "-map" && out.Args[i+1] == "[3]" {
+			t.Errorf("found stale -map [3] post-reshape — map-label-update did not retarget")
+		}
+	}
+}
+
 func TestRewriter_Bail_UnknownDecoder(t *testing.T) {
 	args := []string{
 		"-codec:0", "librav1e", "-i", "m.mkv",
@@ -684,6 +839,81 @@ func TestRewriter_OptimizeRemux_hevc_PreservesSidecars(t *testing.T) {
 	}
 }
 
+// Plex Web Chrome DASH playback with text subs: video uses `-codec:0
+// copy` (remux fast-path) PLUS a subtitle side-channel output running
+// `-f segment -segment_format ass` with `-segment_list
+// http://127.0.0.1:32400/...?stream=subtitles` loopback URL. Worker
+// pod has no PMS on loopback → ECONNREFUSED → ffmpeg exits 145 in the
+// remux fast-path. Rewriter must rewrite the side-channel URL to
+// SCALEPLEX_PMS_BASE_URL with X-Plex-Token (same shape as the main
+// rewriter's side-channel handling). Observed 2026-05-14 on FMJ
+// Plex Web Chrome.
+func TestRewriter_OptimizeRemux_PlexWebDASH_SubSideChannel(t *testing.T) {
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://clusterplex-pms.clusterplex.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}
+	args := []string{
+		"-codec:0", "hevc", "-codec:1", "dca",
+		"-noaccurate_seek", "-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/media/Movies/FMJ/FMJ.mkv",
+		"-noaccurate_seek", "-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/transcode/Transcode/Sessions/abc/temp-0.srt",
+		"-start_at_zero", "-copyts", "-fps_mode", "cfr",
+		"-y", "-nostats", "-loglevel", "quiet", "-loglevel_plex", "error",
+		"-progressurl", "http://127.0.0.1:32400/video/:/transcode/session/abc/def/progress",
+		"-map", "0:0", "-codec:0", "copy",
+		"-filter_complex", "[0:1] aresample=async=1:ochl='stereo':osr=48000[0]",
+		"-map", "[0]", "-metadata:s:1", "language=eng",
+		"-codec:1", "aac", "-b:1", "256k",
+		"-f", "dash", "-seg_duration", "5", "-dash_segment_type", "mp4",
+		"-init_seg_name", "init-stream$RepresentationID$.m4s",
+		"-media_seg_name", "chunk-stream$RepresentationID$-$Number%05d$.m4s",
+		"-window_size", "5", "-delete_removed", "false", "-skip_to_segment", "1",
+		"-manifest_name", "http://127.0.0.1:32400/video/:/transcode/session/abc/def/manifest?X-Plex-Http-Pipeline=infinite",
+		"-avoid_negative_ts", "disabled", "-map_metadata", "-1", "-map_chapters", "-1", "dash",
+		"-map", "1:s:0", "-metadata:s:0", "language=eng",
+		"-codec:0", "ass", "-strict_ts:0", "0",
+		"-f", "segment", "-segment_format", "ass", "-segment_time", "1",
+		"-segment_header_filename", "sub-header", "-segment_start_number", "0",
+		"-segment_list", "http://127.0.0.1:32400/video/:/transcode/session/abc/def/manifest?stream=subtitles&X-Plex-Http-Pipeline=infinite",
+		"-segment_list_type", "csv", "-segment_list_size", "5",
+		"-segment_list_separate_stream_times", "1",
+		"-segment_format_options", "ignore_readorder=1",
+		"-segment_list_unfinished", "1", "-fflags", "+flush_packets",
+		"sub-chunk-%05d",
+	}
+	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("remux fast-path should fire: %v", out.Changes)
+	}
+	// Side-channel -segment_list must point at relay, not loopback.
+	idx := indexOfArg(out.Args, "-segment_list", 0)
+	if idx < 0 || idx+1 >= len(out.Args) {
+		t.Fatalf("-segment_list missing: %v", out.Args)
+	}
+	got := out.Args[idx+1]
+	if strings.HasPrefix(got, "http://127.0.0.1:32400") {
+		t.Errorf("-segment_list still loopback: %s", got)
+	}
+	if !strings.Contains(got, "clusterplex-pms.clusterplex.svc:32499") {
+		t.Errorf("-segment_list not rewritten to relay: %s", got)
+	}
+	if !strings.Contains(got, "X-Plex-Token=tok123") {
+		t.Errorf("X-Plex-Token not appended: %s", got)
+	}
+	hasTag := false
+	for _, c := range out.Changes {
+		if c == "subs:side-channel-segment_list:rewrite-to-relay" {
+			hasTag = true
+			break
+		}
+	}
+	if !hasTag {
+		t.Errorf("expected subs:side-channel-segment_list:rewrite-to-relay tag: %v", out.Changes)
+	}
+}
+
 // Detection-shape argv carries `-codec:1 aac` even when the source
 // audio is actually EAC3/AC3/DTS. PMS expects Plex's bundled EAE to
 // bridge any source codec; stock ffmpeg honours the hint literally
@@ -780,6 +1010,71 @@ func TestRewriter_Bail_StripsPlexPrivateFlags(t *testing.T) {
 	}
 	if !hasBail {
 		t.Errorf("expected skip: change still present alongside scrub: %v", out.Changes)
+	}
+}
+
+// PMS side-channel SRT extractor argv: subtitle pipe only, output `-codec:0
+// copy`, no decoder before `-i`. Rewriter must hit no-decoder bail AND strip
+// `-strict_ts:0` (fork rejects → exit 8) AND rewrite `-segment_list` loopback
+// URL to the relay (worker pod has no PMS on 127.0.0.1:32400 → ECONNREFUSED →
+// ffmpeg muxer task-error → exit 145). Observed 2026-05-14 on LG webOS
+// sidecar SRT.
+func TestRewriter_Bail_SubtitleSideChannel_StripsAndRewrites(t *testing.T) {
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://clusterplex-pms.clusterplex.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}
+	args := []string{
+		"-ss", "112", "-analyzeduration", "20000000", "-probesize", "20000000",
+		"-i", "/transcode/Transcode/Sessions/plex-transcode-abc/temp-0.srt",
+		"-start_at_zero", "-copyts", "-y", "-nostats", "-loglevel", "quiet",
+		"-loglevel_plex", "error",
+		"-progressurl", "http://127.0.0.1:32400/video/:/transcode/session/abc/def/progress",
+		"-map", "0:s:0", "-metadata:s:0", "language=eng",
+		"-codec:0", "copy", "-strict_ts:0", "0",
+		"-f", "segment", "-segment_format", "srt", "-segment_time", "1",
+		"-segment_start_number", "0",
+		"-segment_list", "http://127.0.0.1:32400/video/:/transcode/session/abc/def/manifest?X-Plex-Http-Pipeline=infinite",
+		"-segment_list_type", "csv",
+		"-avoid_negative_ts", "disabled",
+		"chunk-%05d",
+	}
+	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("expected Applied=true, got changes=%v", out.Changes)
+	}
+	for i := 0; i < len(out.Args); i++ {
+		if strings.HasPrefix(out.Args[i], "-strict_ts") {
+			t.Errorf("any -strict_ts* still present at %d: %v", i, out.Args)
+		}
+	}
+	idx := indexOfArg(out.Args, "-segment_list", 0)
+	if idx < 0 || idx+1 >= len(out.Args) {
+		t.Fatalf("-segment_list missing: %v", out.Args)
+	}
+	got := out.Args[idx+1]
+	if strings.HasPrefix(got, "http://127.0.0.1:32400") {
+		t.Errorf("-segment_list still loopback: %s", got)
+	}
+	if !strings.Contains(got, "clusterplex-pms.clusterplex.svc:32499") {
+		t.Errorf("-segment_list not rewritten to relay: %s", got)
+	}
+	if !strings.Contains(got, "X-Plex-Token=tok123") {
+		t.Errorf("X-Plex-Token not appended: %s", got)
+	}
+	hasBail, hasDropStrict, hasRewrite := false, false, false
+	for _, c := range out.Changes {
+		switch c {
+		case "skip:no-decoder":
+			hasBail = true
+		case "drop:-strict_ts(bail)":
+			hasDropStrict = true
+		case "bail:segment_list:rewrite-to-relay":
+			hasRewrite = true
+		}
+	}
+	if !hasBail || !hasDropStrict || !hasRewrite {
+		t.Errorf("missing change tags (bail=%v strict=%v rewrite=%v): %v", hasBail, hasDropStrict, hasRewrite, out.Changes)
 	}
 }
 
