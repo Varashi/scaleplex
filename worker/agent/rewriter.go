@@ -211,6 +211,58 @@ var (
 	reFilterHDR = regexp.MustCompile(
 		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[\d+\];` +
 			`.*zscale.*tonemap.*format=pix_fmts=[^\[]*nv12\[(\d+)\]$`)
+	// SW HDR + inlineass burn-in PMS pattern. PMS sends this when
+	// source is HDR (BT.2020 PQ), target is SDR, AND text-sub burn-in
+	// is required. Plex's transcoder collapses the whole pipeline to
+	// SW because its HW pipeline can't combine HW tonemap +
+	// inlineass(SW). scaleplex CAN: we reshape to
+	//   hwupload → scale_vaapi(p010) → tonemap_vaapi(nv12) →
+	//   hwdownload → inlineass → hwupload → hevc_vaapi,
+	// keeping the libass render step on CPU but everything else on
+	// the GPU. Net result: PS4-class clients (HDR source, SDR
+	// transcode, text-sub-burn) get HW transcode that Plex's prod
+	// transcoder can't produce.
+	//
+	// Filter shape captured 2026-05-13 on PS4 + FMJ 4K HDR + SRT burn:
+	//   [0:0]scale=w=W:h=H:force_divisible_by=4[0];
+	//   [0]format=p010,tonemap=hable[1];
+	//   [1]format=pix_fmts=yuv420p|nv12[2];
+	//   [2]inlineass=...[3]
+	reFilterHDRAss = regexp.MustCompile(
+		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
+			`\[0\]format=p010,tonemap=hable\[1\];` +
+			`\[1\]format=pix_fmts=[^\[]*nv12\[2\];` +
+			`\[2\]inlineass=([^\[]*)\[3\]$`)
+	// HW VAAPI decode + OpenCL tonemap + inlineass burn-in. PMS first-
+	// choice when source is HDR AND text-sub burn-in is required AND
+	// PMS `Use hardware-accelerated tone mapping` is ON. Plex's argv
+	// keeps the GPU pipeline via the OpenCL ICD detour for tonemap,
+	// hwdownloads before inlineass, hwuploads after for encode.
+	// Captured 2026-05-13 on PS4 retry (PMS first ran this, ffmpeg
+	// exited 8 because our rewriter bailed, PMS fell back to the SW
+	// shape reFilterHDRAss handles).
+	//
+	// scaleplex-ffmpeg7 has tonemap_vaapi natively — no OpenCL detour
+	// needed. We reshape to the same target shape as reFilterHDRAss:
+	//   hwupload → scale_vaapi(p010) → tonemap_vaapi(nv12) →
+	//   hwdownload → inlineass → hwupload.
+	//
+	// Filter shape:
+	//   [0:0]hwupload[0];
+	//   [0]scale_vaapi=w=W:h=H:format=p010[1];
+	//   [1]hwmap=derive_device=opencl[2];
+	//   [2]tonemap_opencl=tonemap=...:format=nv12:m=...:p=...:r=...[3];
+	//   [3]hwdownload,format=nv12[4];
+	//   [4]inlineass=...[5];
+	//   [5]hwupload[6]
+	reFilterHWOpenCLAss = regexp.MustCompile(
+		`^\[0:0\]hwupload\[0\];` +
+			`\[0\]scale_vaapi=w=(\d+):h=(\d+)(?::format=[A-Za-z0-9]+)?\[1\];` +
+			`\[1\]hwmap=derive_device=opencl\[2\];` +
+			`\[2\]tonemap_opencl=[^\[]+\[3\];` +
+			`\[3\]hwdownload,format=[A-Za-z0-9]+\[4\];` +
+			`\[4\]inlineass=([^\[]+)\[5\];` +
+			`\[5\]hwupload\[6\]$`)
 	// reInitHW accepts both PMS argv shapes for `-init_hw_device`:
 	//   `vaapi=vaapi:`                                — SW-decode, PMS
 	//   doesn't know the device because the worker chooses it.
@@ -605,6 +657,37 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 			OldLabel: "[" + finalIdx + "]",
 			NewLabel: "[2]",
 			Mode:     "hdr-tonemap-vaapi",
+		}
+	}
+
+	if m := reFilterHDRAss.FindStringSubmatch(filterStr); m != nil {
+		// HDR-source + SDR-target + text-sub burn-in. PMS sent a full SW
+		// chain; we force HW reshape with libass on CPU between
+		// hwdownload/hwupload brackets. Mirrors reFilterAss text branch
+		// but with the tonemap step PMS's SW pattern declared inline.
+		w, h, assParams := m[1], m[2], m[3]
+		if subSrc == nil || subSrc.Kind != "text" {
+			// Bitmap subs reach us via reFilterAss (PGS uses
+			// `format=nv12 + inlineass` without the separate tonemap
+			// step); only the text path lands here. Bail loud if we
+			// see anything else.
+			return nil
+		}
+		strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
+		strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+		return &filterRewrite{
+			Filter: fmt.Sprintf(
+				"[0:0]hwupload[10];"+
+					"[10]scale_vaapi=w=%s:h=%s:format=p010,"+
+					"tonemap_vaapi=transfer=bt709:format=nv12[11];"+
+					"[11]hwdownload[12];"+
+					"[12]format=pix_fmts=nv12[13];"+
+					"[13]inlineass=%s[14];"+
+					"[14]hwupload[15]",
+				w, h, strippedAss),
+			OldLabel: "[3]",
+			NewLabel: "[15]",
+			Mode:     "hdr-tonemap-vaapi-passthrough-inlineass",
 		}
 	}
 
@@ -1288,6 +1371,16 @@ func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]
 	out, manifestChanges = rewriteManifestName(out, inputEnv)
 	changes = append(changes, manifestChanges...)
 
+	// Plex Web Chrome DASH sessions have a SECOND output: subtitle
+	// side-channel running `-f segment -segment_format ass` with its
+	// own `-segment_list http://127.0.0.1:32400/...?stream=subtitles`
+	// loopback URL. Worker pod has no PMS on loopback; rewrite to the
+	// relay (variant="side-channel" matches the stream=subtitles
+	// fingerprint). Without this the sub side-channel ECONNREFUSED's
+	// and ffmpeg exits 145 in the remux fast-path. Observed
+	// 2026-05-14 on Plex Web Chrome FMJ DASH playback.
+	rewriteSegmentList(out, inputEnv, "", &changes, "side-channel")
+
 	// 2-6. Audio EAE swap, eae_prefix drop, progressurl capture,
 	// loglevel + nostats fix-ups, env strips. All shared with the
 	// main rewriter — see helpers above for rationale.
@@ -1359,6 +1452,59 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 			args = removeArgs(args, i, 2)
 			bailChanges = append(bailChanges, "drop:-progressurl(bail)")
+		}
+		// `-strict_ts*` (any stream specifier suffix) — Plex movenc/dashenc
+		// extension, no fork equivalent. Side-channel SRT/audio subtitler
+		// argvs carry it after `-codec:0 copy` and hit this bail path; if
+		// not stripped, our fork exits 8 on "Unrecognized option strict_ts".
+		for {
+			i := -1
+			for j := 0; j < len(args); j++ {
+				if strings.HasPrefix(args[j], "-strict_ts") {
+					i = j
+					break
+				}
+			}
+			if i < 0 || i+1 >= len(args) {
+				break
+			}
+			args = removeArgs(args, i, 2)
+			bailChanges = append(bailChanges, "drop:-strict_ts(bail)")
+		}
+		// `-segment_list http://127.0.0.1:32400/...` — PMS loopback URL that
+		// the segment muxer PUTs the CSV manifest to. Worker pod's loopback
+		// has no PMS; ffmpeg gets ECONNREFUSED and exits with the muxer's
+		// task-error status (~145). Rewrite to SCALEPLEX_PMS_BASE_URL +
+		// X-Plex-Token, same shape as the full rewriter's rewriteSegmentList.
+		// Observed 2026-05-14 on LG webOS sidecar SRT side-channel.
+		base := envOr("SCALEPLEX_PMS_BASE_URL", "")
+		if envBase, ok := inputEnv["SCALEPLEX_PMS_BASE_URL"]; ok && envBase != "" {
+			base = envBase
+		}
+		if base != "" {
+			tok := inputEnv["X_PLEX_TOKEN"]
+			from := 0
+			for {
+				i := indexOfArg(args, "-segment_list", from)
+				if i < 0 || i+1 >= len(args) {
+					break
+				}
+				from = i + 2
+				orig := args[i+1]
+				if !strings.HasPrefix(orig, "http://127.0.0.1:32400") {
+					continue
+				}
+				rewritten := strings.Replace(orig, "http://127.0.0.1:32400", base, 1)
+				if tok != "" {
+					if strings.Contains(rewritten, "?") {
+						rewritten += "&X-Plex-Token=" + tok
+					} else {
+						rewritten += "?X-Plex-Token=" + tok
+					}
+				}
+				args[i+1] = rewritten
+				bailChanges = append(bailChanges, "bail:segment_list:rewrite-to-relay")
+			}
 		}
 		return args, bailChanges
 	}
@@ -1793,8 +1939,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					return bail("hw-decode-sub:no-inlineass-filter")
 				}
 				m := reFilterHWAss.FindStringSubmatch(args[vfIdx])
+				openclMode := false
+				assGroup := 5
 				if m == nil {
-					return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
+					// HW VAAPI + OpenCL tonemap variant. PMS emits this
+					// when HW tonemap pref is ON. We can swap the OpenCL
+					// detour for tonemap_vaapi and keep the inlineass
+					// passthrough.
+					m = reFilterHWOpenCLAss.FindStringSubmatch(args[vfIdx])
+					if m == nil {
+						return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
+					}
+					openclMode = true
+					assGroup = 3
 				}
 				w, h := m[1], m[2]
 				// Force nv12 across the libass step (matches the SW
@@ -1817,7 +1974,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// AVOption keys vf_inlineass doesn't parse. Sidecar -i,
 				// -map_inlineass, and null-sub output all stay — the
 				// fork's scaleplex_inlineass binding owns those.
-				assParams := m[5]
+				assParams := m[assGroup]
 				strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
 				strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
 				args[vfIdx] = fmt.Sprintf(
@@ -1828,7 +1985,36 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						"[3]hwupload[4]",
 					scaleStep, strippedAss,
 				)
-				changes = append(changes, "hw-decode:filter:inlineass-passthrough")
+				modeTag := "hw-decode:filter:inlineass-passthrough"
+				oldMapLabel := "[4]"
+				if openclMode {
+					modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-passthrough"
+					// reFilterHWOpenCLAss matches a graph that ends at
+					// label [6] (extra hwmap→opencl + tonemap_opencl +
+					// hwdownload + inlineass + hwupload). Our rewrite
+					// collapses to label [4]; PMS's `-map [6]` must
+					// retarget or ffmpeg bails with "Output with label
+					// '6' does not exist".
+					oldMapLabel = "[6]"
+				}
+				changes = append(changes, modeTag)
+				if oldMapLabel != "[4]" {
+					for i := vfIdx + 1; i < len(args)-1; i++ {
+						if args[i] != "-map" {
+							continue
+						}
+						v := args[i+1]
+						if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
+							if strings.HasPrefix(v, `"`) {
+								args[i+1] = `"[4]"`
+							} else {
+								args[i+1] = "[4]"
+							}
+							changes = append(changes, "hw-decode:map-label-update")
+							break
+						}
+					}
+				}
 				newInputIdx = indexOfArg(args, "-i", 0)
 				encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
 			case "bitmap":
@@ -1885,6 +2071,48 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			changes = append(changes, fmt.Sprintf("crf%d->qp%d(off=%d)", crf, qp, offset))
 		} else {
 			changes = append(changes, "crf->qp")
+		}
+	}
+
+	// 6b. CQP → VBR/CBR rate-control conversion.
+	//
+	// iHD's hevc_vaapi/h264_vaapi in CQP mode (when -qp:0 is set)
+	// IGNORES -maxrate:0 entirely. For 4K HEVC HDR PMS-emitted qp
+	// values (qp=15 for high-quality direct-encode sessions on
+	// HDR-capable clients), the encoder produces ~200 Mbps actual
+	// output regardless of PMS's 20 Mbps -maxrate target. Client
+	// buffers can't keep up over network → intermittent buffering
+	// on the receiving end (LG webOS 4K HEVC HDR 2026-05-14).
+	//
+	// Convert to VBR so iHD honors the rate ceiling. The encoder
+	// picks QP dynamically per-frame to hit the bitrate target.
+	// Quality on complex scenes drops slightly but bitrate stays in
+	// PMS's intended budget.
+	//
+	// Memory `project_scaleplex.md` notes a prior bench (2026-05-06)
+	// where `-rc_mode VBR -b:v 20Mbps -bufsize 40Mb` produced 100
+	// Mbps segments post-seek — early-Arc driver behaviour. iHD
+	// 25.2+ on Arc A310 needs revalidation; flip to CBR via
+	// SCALEPLEX_RC_MODE=CBR if VBR overshoots persist. CQP=legacy
+	// passthrough (pre-2026-05-14 behaviour) for diagnostic A/B.
+	rcMode := envOr("SCALEPLEX_RC_MODE", "VBR")
+	if rcMode != "CQP" {
+		qpIdx := indexOfArg(args, "-qp:0", encCodecIdx+1)
+		maxrateIdx := indexOfArg(args, "-maxrate:0", encCodecIdx+1)
+		if qpIdx >= 0 && qpIdx+1 < len(args) && maxrateIdx >= 0 && maxrateIdx+1 < len(args) {
+			origQP := args[qpIdx+1]
+			maxrate := args[maxrateIdx+1]
+			// Remove -qp:0 <N> entirely.
+			args = removeArgs(args, qpIdx, 2)
+			// Re-locate maxrate (index may have shifted left).
+			maxrateIdx = indexOfArg(args, "-maxrate:0", encCodecIdx+1)
+			if maxrateIdx > 0 {
+				// Inject -rc_mode <mode> -b:v <maxrate> immediately
+				// before -maxrate:0. The encoder picks up rc_mode from
+				// the per-output option block.
+				args = spliceArgs(args, maxrateIdx, "-rc_mode", rcMode, "-b:v", maxrate)
+				changes = append(changes, fmt.Sprintf("rc:CQP(qp=%s)->%s(b:v=%s)", origQP, rcMode, maxrate))
+			}
 		}
 	}
 

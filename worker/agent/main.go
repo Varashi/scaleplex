@@ -625,7 +625,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	recordSpeedFromOutput(stderrTail.String())
 
 	rawTail := stderrTail.String()
-	const maxTail = 1024
+	const maxTail = 8192
 	tail := rawTail
 	if len(tail) > maxTail {
 		tail = "..." + tail[len(tail)-maxTail:]
