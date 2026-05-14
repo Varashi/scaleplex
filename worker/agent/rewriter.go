@@ -2074,48 +2074,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// 6b. CQP → VBR/CBR rate-control conversion.
-	//
-	// iHD's hevc_vaapi/h264_vaapi in CQP mode (when -qp:0 is set)
-	// IGNORES -maxrate:0 entirely. For 4K HEVC HDR PMS-emitted qp
-	// values (qp=15 for high-quality direct-encode sessions on
-	// HDR-capable clients), the encoder produces ~200 Mbps actual
-	// output regardless of PMS's 20 Mbps -maxrate target. Client
-	// buffers can't keep up over network → intermittent buffering
-	// on the receiving end (LG webOS 4K HEVC HDR 2026-05-14).
-	//
-	// Convert to VBR so iHD honors the rate ceiling. The encoder
-	// picks QP dynamically per-frame to hit the bitrate target.
-	// Quality on complex scenes drops slightly but bitrate stays in
-	// PMS's intended budget.
-	//
-	// Memory `project_scaleplex.md` notes a prior bench (2026-05-06)
-	// where `-rc_mode VBR -b:v 20Mbps -bufsize 40Mb` produced 100
-	// Mbps segments post-seek — early-Arc driver behaviour. iHD
-	// 25.2+ on Arc A310 needs revalidation; flip to CBR via
-	// SCALEPLEX_RC_MODE=CBR if VBR overshoots persist. CQP=legacy
-	// passthrough (pre-2026-05-14 behaviour) for diagnostic A/B.
-	rcMode := envOr("SCALEPLEX_RC_MODE", "VBR")
-	if rcMode != "CQP" {
-		qpIdx := indexOfArg(args, "-qp:0", encCodecIdx+1)
-		maxrateIdx := indexOfArg(args, "-maxrate:0", encCodecIdx+1)
-		if qpIdx >= 0 && qpIdx+1 < len(args) && maxrateIdx >= 0 && maxrateIdx+1 < len(args) {
-			origQP := args[qpIdx+1]
-			maxrate := args[maxrateIdx+1]
-			// Remove -qp:0 <N> entirely.
-			args = removeArgs(args, qpIdx, 2)
-			// Re-locate maxrate (index may have shifted left).
-			maxrateIdx = indexOfArg(args, "-maxrate:0", encCodecIdx+1)
-			if maxrateIdx > 0 {
-				// Inject -rc_mode <mode> -b:v <maxrate> immediately
-				// before -maxrate:0. The encoder picks up rc_mode from
-				// the per-output option block.
-				args = spliceArgs(args, maxrateIdx, "-rc_mode", rcMode, "-b:v", maxrate)
-				changes = append(changes, fmt.Sprintf("rc:CQP(qp=%s)->%s(b:v=%s)", origQP, rcMode, maxrate))
-			}
-		}
-	}
-
 	// 7. Translate -preset:0 <x264-name> → -compression_level:v <N>
 	// (Plex emits x264 preset names; iHD VAAPI uses a 1-7 TargetUsage
 	// scale where 7 = fastest, 1 = highest quality.)
