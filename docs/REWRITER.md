@@ -21,9 +21,9 @@ session Balls_Up...c11a7e73: rewriter applied:
   filter:plain, map-label-update, encode:libx264->h264_vaapi,
   crf->qp, preset:veryfast->compression_level:6, drop:-x264opts:0,
   inject:sei+a53_cc, audio:eac3_eae->eac3, drop:-eae_prefix:1,
-  hls:segment_list_size:5->99999, hls:drop:-copyts(seek),
+  hls:drop:-copyts(seek),
   hls:segment_list:rewrite-to-relay, seek-offset:captured=888.000s,
-  force_key_frames:offset-by-seek, progress:append-X-Plex-Token,
+  progress:append-X-Plex-Token,
   progressurl:captured-for-reporter,
   inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle),
   loglevel:->info, drop:-nostats,
@@ -326,10 +326,11 @@ Rewriter changes:
   muxer supports this — verified locally.
 - `-segment_list_separate_stream_times` / `-segment_list_unfinished`
   pass through (patch 0096 no-op stubs).
-- `-segment_list_size 5` → `99999`. Plex's small CSV window drops
-  older rows as ffmpeg outpaces playback; PMS then 200/0-bytes any
-  chunk request that falls outside the window. **Label:**
-  `hls:segment_list_size:5->99999`.
+- `-segment_list_size` passes through. scaleplex-ffmpeg patch 0106
+  detects URL-handler outputs (`seg->list` contains `://`) and force-
+  buffers the full chunk history regardless of `list_size`. Plex's
+  bake-in of `5` becomes inert for URL outputs. Retired rewriter bump
+  2026-05-14.
 - **Strip `-copyts` ONLY on seek sessions** (`-ss <off>` set).
   Stock jellyfin 7.x segment muxer + `-ss` + `-copyts` produces
   zero chunks even though encoder runs (verified BH6 hevc_vaapi
@@ -339,24 +340,14 @@ Rewriter changes:
 - Rewrite `-segment_list <PMS-loopback>` to `<relay>?...&scaleplex_seg_time=<N>`.
   **Label:** `hls:segment_list:rewrite-to-relay`.
 
-## `-force_key_frames` rewrite (seek path)
+## `-force_key_frames` rewrite (seek path) — RETIRED 2026-05-14
 
-Plex always emits `-force_key_frames:0 "expr:gte(t,n_forced*8)"`. With
-`-copyts -ss 1384`, the encoder's `t` starts at 1384, the expression is
-true for every frame whose `n_forced*8 <= t`, and ffmpeg fires ~`off/8`
-forced keyframes back-to-back at the start, then nothing for 8s. The
-HLS segment muxer needs a keyframe to close — first segment swallows
-tens of minutes (observed: 222 MB / 23 min on Balls Up).
-
-When seek is captured (`-ss > 0`), the rewriter rewrites the expression
-to subtract the seek offset:
-
-```
-expr:gte(t,n_forced*8)  →  expr:gte(t-1384.000,n_forced*8)
-```
-
-The keyframe cadence then matches PMS's intent (kf at output 0, 8, 16,
-…) and segments split every 8s. **Label:** `force_key_frames:offset-by-seek`.
+Historical workaround for an IDR-storm on pre-fork ffmpeg 3.4. Tested
+2026-05-13: jellyfin-ffmpeg 7.1's `hevc_vaapi` handles
+`expr:gte(t,n_forced*N)` cleanly even with `-copyts -ss <large>`. The
+rewriter retains `seekOffsetSeconds` capture for the orchestrator
+checkpoint but no longer rewrites the expression. **Label retired:**
+`force_key_frames:offset-by-seek`.
 
 ## Other tweaks
 
