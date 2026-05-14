@@ -273,9 +273,10 @@ For posterity, dead ends explored before each working fix:
 **To verify seek works on a new client class:**
 
 1. Watch worker logs while seeking. The change list should include
-   `seek-offset:captured=<N>s` for HLS and DASH paths, plus
-   `force_key_frames:offset-by-seek` for HLS. Absent → seek wasn't
-   detected and the rewriter's seek codepath isn't running.
+   `seek-offset:captured=<N>s` for HLS and DASH paths. Absent → seek
+   wasn't detected and the rewriter's seek codepath isn't running.
+   (Note: `force_key_frames:offset-by-seek` retired 2026-05-14;
+   jellyfin-ffmpeg 7.1 handles the IDR storm natively.)
 
 2. For HLS specifically, check disk: `ls -la /transcode/Transcode/Sessions/*<job-uuid>*/`
    on a worker. Healthy = `media-NNNNN.ts` files of normal size

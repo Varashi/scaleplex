@@ -132,7 +132,7 @@ done
 | 2 (audio-only) | `audio:<src>_eae-><dst>`, `drop:-eae_prefix:N` |
 | 3 (HDR pass-through) | `decode:hw-passthrough:hevc`, `encode:hw-passthrough:hevc_vaapi`, `video:hdr-source(smpte2084)`, NO `tonemap-injected` |
 | 4 (HDR→SDR tonemap) | `decode:hw-passthrough:hevc`, `encode:hw-passthrough:h264_vaapi`, `video:hdr-source(smpte2084)`, **`filter:hw-passthrough-tonemap-injected`** |
-| 5 (seek) | tags from prior case + `force_key_frames:offset-by-seek=<T>s`, segment renumber tags |
+| 5 (seek) | tags from prior case + `seek-offset:captured=<T>s`, segment renumber tags |
 | 6 (sub-burn) | `subtitle:bitmap:<spec>` OR `subtitle:embedded-extract:<spec>` OR `subtitle:sidecar-staged`; HW path adds `hw-decode:filter:inlineass->subtitles` |
 
 ## Failure capture
