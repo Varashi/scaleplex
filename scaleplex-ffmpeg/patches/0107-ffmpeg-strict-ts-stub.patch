@@ -39,7 +39,7 @@ Last-Update: 2026-05-15
  extern char *plex_loglevel_sink;
 +extern char *plex_strict_ts_sink;
  extern float max_error_rate;
-
+ 
  extern char *filter_nbthreads;
 --- a/fftools/ffmpeg.c
 +++ b/fftools/ffmpeg.c
@@ -49,7 +49,7 @@ Last-Update: 2026-05-15
  char *plex_loglevel_sink = NULL;
 +// scaleplex/PLEX: stub sink for `-strict_ts:N` (Plex CLI compat).
 +char *plex_strict_ts_sink = NULL;
-
+ 
  InputFile   **input_files   = NULL;
  int        nb_input_files   = 0;
 --- a/fftools/ffmpeg_opt.c
@@ -68,3 +68,4 @@ Last-Update: 2026-05-15
      { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
          { .func_arg = opt_progress },
        "write program-readable progress information", "url" },
+ 
