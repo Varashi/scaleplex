@@ -54,7 +54,7 @@ Last-Update: 2026-05-15
  int        nb_input_files   = 0;
 --- a/fftools/ffmpeg_opt.c
 +++ b/fftools/ffmpeg_opt.c
-@@ -1581,6 +1581,12 @@
+@@ -1581,6 +1581,13 @@
      // scaleplex/PLEX: accept Plex's -loglevel_plex <name> as a stub.
      { "loglevel_plex",          OPT_TYPE_STRING, OPT_EXPERT, { &plex_loglevel_sink },
          "Plex-style secondary log level (no-op stub for CLI compat)", "level" },
@@ -68,4 +68,3 @@ Last-Update: 2026-05-15
      { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
          { .func_arg = opt_progress },
        "write program-readable progress information", "url" },
- 
