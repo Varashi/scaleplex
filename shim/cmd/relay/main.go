@@ -95,43 +95,18 @@ func main() {
 		var contentLen int64 = r.ContentLength
 		query := r.URL.Query()
 		segTimeStr := query.Get("scaleplex_seg_time")
-		mkvOffsetMsStr := query.Get("scaleplex_mkv_offset_ms")
-		if segTimeStr != "" || mkvOffsetMsStr != "" {
+		if segTimeStr != "" {
 			query.Del("scaleplex_seg_time")
-			query.Del("scaleplex_mkv_offset_ms")
 			u.RawQuery = query.Encode()
 		} else {
 			u.RawQuery = r.URL.RawQuery
 		}
-		if r.Method == http.MethodPost && manifestPathRE.MatchString(r.URL.Path) {
-			// Read body once; we may both patch chunks AND rewrite rows.
+		if r.Method == http.MethodPost && manifestPathRE.MatchString(r.URL.Path) && segTimeStr != "" {
 			body, err := io.ReadAll(r.Body)
 			if err == nil {
-				// Matroska chunk in-place patching. Shifts every Cluster's
-				// Timecode element by the session's -ss offset so mpv
-				// anchors its timeline to the right absolute position.
-				// Idempotent — segment_list_size=5 sliding-window POSTs
-				// that re-mention older chunks don't stack the offset.
-				if mkvOffsetMsStr != "" {
-					if offsetMs, err := strconv.ParseUint(mkvOffsetMsStr, 10, 64); err == nil && offsetMs > 0 {
-						dir := sessionDirFromManifestURL(r.URL.Path)
-						names := chunkFilenamesFromCSV(body)
-						if dir != "" && len(names) > 0 {
-							n, perr := patchSessionMatroskaChunks(dir, names, offsetMs)
-							if perr != nil {
-								log.Printf("relay mkv-patch %s: %v (patched=%d/%d)", dir, perr, n, len(names))
-							} else if n > 0 {
-								log.Printf("relay mkv-patch %s: %d chunk(s) +%dms", dir, n, offsetMs)
-							}
-						}
-					}
-				}
-				// HLS-mpegts CSV row rewrite (existing behaviour).
-				if segTimeStr != "" {
-					segTime, err := strconv.ParseFloat(segTimeStr, 64)
-					if err == nil && segTime > 0 {
-						body = rewriteSegmentListCSV(body, segTime)
-					}
+				segTime, err := strconv.ParseFloat(segTimeStr, 64)
+				if err == nil && segTime > 0 {
+					body = rewriteSegmentListCSV(body, segTime)
 				}
 				bodyReader = bytes.NewReader(body)
 				contentLen = int64(len(body))

@@ -350,18 +350,6 @@ func stripPlexInlineassFilterArgs(filterStr string) string {
 	return out.String()
 }
 
-// captureSeekSeconds returns the value of the first `-ss N` argv pair as
-// seconds, or 0 if none/invalid. Used by the HLS chunk relay path to
-// know the session's source-time start offset.
-func captureSeekSeconds(args []string) float64 {
-	if i := indexOfArg(args, "-ss", 0); i >= 0 && i+1 < len(args) {
-		if v, err := strconv.ParseFloat(args[i+1], 64); err == nil && v > 0 {
-			return v
-		}
-	}
-	return 0
-}
-
 func indexOfArg(args []string, key string, from int) int {
 	for i := from; i < len(args); i++ {
 		if args[i] == key {
@@ -2164,72 +2152,37 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// Plex Web's Chromium MSE accepts the stream without the
 	// per-segment moov re-init that confused it pre-patch.
 
-	// HLS: Plex's `-f ssegment` is its custom stream-segmenter muxer.
-	// Stock ffmpeg's `-f segment` covers most of what's needed; translate.
-	//
-	// Plex argv pattern (captured from Plex Transcoder recon, 2026-05-06):
-	//   -segment_format matroska     → -segment_format mpegts (matroska
-	//                                    inside .ts is Plex's quirk; stock
-	//                                    `segment` muxer with mpegts is
-	//                                    standards-compliant HLS)
-	//   -f ssegment                  → -f segment
-	//   -individual_header_trailer 0 → DROP (Plex-only)
-	//   -segment_header_filename hdr → DROP (Plex-only; mpegts segments
-	//                                    are self-contained)
-	//   -segment_list_separate_stream_times 1 → DROP (Plex-only)
-	//   -segment_list_unfinished 1   → DROP (Plex-only)
-	//   -segment_format_options ...  → DROP (Plex-only inner-format opts)
-	//   -segment_time, -segment_start_number, -segment_time_delta,
-	//   -segment_list <url>, -segment_list_type csv, -segment_list_size,
-	//   "media-%05d.ts" output       → KEEP (stock supports all)
+	// HLS: Plex's `-f ssegment` (custom stream-segmenter muxer) and
+	// related segment.c options pass through to scaleplex-ffmpeg7
+	// natively:
+	//   -f ssegment                  — patch 0098 adds AVFMT_GLOBALHEADER
+	//                                  to ff_stream_segment_muxer (shared
+	//                                  code with ff_segment_muxer via
+	//                                  `.priv_class = &seg_class`)
+	//   -segment_list_separate_stream_times / -segment_list_unfinished
+	//                                — patch 0096 registers as no-op
+	//                                  AVOptions (stripped globally
+	//                                  above; full per-stream end-time
+	//                                  emit scheduled for Phase 2b)
+	//   -segment_list_size           — left untouched; patch 0106
+	//                                  force-buffers full chunk history
+	//                                  on URL-handler outputs regardless
+	//                                  of list_size, making the value
+	//                                  inert for our PMS-aggregation case
+	//   -copyts                       — kept on matroska + ssegment seek
+	//                                  sessions. Patch 0103 dropped the
+	//                                  jellyfin `reference_stream_first_pts`
+	//                                  end_pts adjustment that broke
+	//                                  split cadence on `-ss + -copyts`,
+	//                                  restoring Plex-fork split semantics.
+	//                                  Cluster.Timecode in each chunk now
+	//                                  reflects absolute source PTS — relay
+	//                                  has nothing to patch.
 	//
 	// Stock segment muxer with -segment_list <http_url> POSTs the listfile
 	// to that URL natively (CSV with -segment_list_type csv). PMS reads
 	// the CSV and synthesises the m3u8 it serves to clients.
 	if isHLS {
-		// `-f ssegment` passthrough: scaleplex-ffmpeg7 patch 0098 adds
-		// AVFMT_GLOBALHEADER to ff_stream_segment_muxer so it accepts
-		// Plex's `-flags +global_header` / `-segment_header_filename`
-		// combination natively. The muxer code is shared with
-		// ff_segment_muxer (`.priv_class = &seg_class`), so behaviour
-		// is identical for Plex's argv shape. Previously rewriter
-		// translated to `-f segment` because the missing flag left
-		// the header file empty + Plex Android 404'd on /base/header.
-
-		// -segment_list_size bump is handled inside rewriteSegmentList
-		// (per-output scope so the DASH+subs side-channel output gets
-		// the same treatment).
-		// (-segment_list_separate_stream_times / -segment_list_unfinished
-		// are stripped globally above for both HLS and the DASH+subs
-		// embedded-subtitle output. Don't duplicate the strip here.)
-
-		// `-copyts` handling — matroska segment (Plex Windows) keeps it.
-		//
-		// Scaleplex-ffmpeg7 patch 0103 (2026-05-13) drops the jellyfin
-		// `reference_stream_first_pts` end_pts adjustment that broke
-		// split cadence on `-ss + -copyts` segmented output, restoring
-		// Plex-fork split semantics: end_pts stays at `seg->time *
-		// (count+1)` and every keyframe past the first packet whose
-		// pts >= end_pts triggers a split. Cluster.Timecode in each
-		// chunk reflects absolute source PTS without relay patching.
-		//
-		// Plex's HLS-Android shape (`-f ssegment -segment_format
-		// matroska`) historically had `-copyts` stripped here because
-		// stock 7.1.3's segment muxer produced one giant chunk on
-		// `-ss + -copyts` (Balls Up media-00173.ts grew to 222 MB).
-		// Patch 0103 fixes that too, since `ssegment` and `segment`
-		// share `seg_write_packet`. Strip kept off below by default;
-		// flip `SCALEPLEX_KEEP_COPYTS_HLS_STRIP=1` to restore the old
-		// behaviour while validating the fork patch on Plex Android.
-		seekOff := captureSeekSeconds(args)
-		stripCopytsLegacy := envOr("SCALEPLEX_KEEP_COPYTS_HLS_STRIP", "") == "1"
-		if seekOff > 0 && stripCopytsLegacy && outputFormat == "ssegment" {
-			if i := indexOfArg(args, "-copyts", 0); i >= 0 {
-				args = removeArgs(args, i, 1)
-				changes = append(changes, "hls:drop:-copyts(seek-legacy)")
-			}
-		}
-
 		// `-segment_format_options live=1` passes through. scaleplex-
 		// ffmpeg7 patch 0094 makes matroskaenc.c always write Duration
 		// regardless of is_live, and jellyfin 7.x's `IS_SEEKABLE = pb
