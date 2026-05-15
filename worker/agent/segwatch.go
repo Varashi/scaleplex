@@ -154,7 +154,7 @@ func watchChunkSequence(ctx context.Context, dir, sessionID string, lastSeq *ato
 //
 // `dir` is created if missing so we don't race ffmpeg's mkdir.
 // `spawnedAt` is used to observe the spawn-to-first-segment latency
-// histogram for status.boeye.net.
+// histogram (Prometheus).
 func watchFirstSegment(ctx context.Context, dir, sessionID string, w *lockedWriter, spawnedAt time.Time) {
 	if dir == "" {
 		return

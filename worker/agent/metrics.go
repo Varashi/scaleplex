@@ -1,6 +1,6 @@
 package main
 
-// Prometheus metrics — exposed at /metrics for status.boeye.net to scrape.
+// Prometheus metrics — exposed at /metrics for any scraper.
 //
 // Buckets are chosen for transcode-shaped workloads:
 //   - session_duration_seconds covers single-clip transcodes (a few s)

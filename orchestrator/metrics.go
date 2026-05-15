@@ -1,6 +1,6 @@
 package main
 
-// Prometheus metrics for status.boeye.net.
+// Prometheus metrics exposed on /metrics for any scraper.
 
 import (
 	"github.com/prometheus/client_golang/prometheus"

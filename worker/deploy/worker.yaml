@@ -57,16 +57,19 @@ spec:
         runAsUser: 1000
         runAsGroup: 100
         supplementalGroups: [44, 568]
+      # Replace the NFS server + paths with your media/transcode store.
+      # /media is mounted read-only; /transcode is the shared scratch PMS
+      # also writes to (must be identical to PMS's transcode dir).
       volumes:
         - name: media
           nfs:
-            server: skw-truenas-nfs.boeye.net
-            path: /mnt/DATA/mediapool/media
+            server: <nfs-host>
+            path: /path/to/media
             readOnly: true
         - name: transcode
           nfs:
-            server: skw-truenas-nfs.boeye.net
-            path: /mnt/SSD/mediapool/clusterplextranscode
+            server: <nfs-host>
+            path: /path/to/transcode
       containers:
         - name: agent
           image: ghcr.io/varashi/scaleplex_worker:latest
