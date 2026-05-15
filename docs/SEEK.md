@@ -1,14 +1,22 @@
 # Seek
 
-Seek is the hardest problem we shipped. Plex's bundled ffmpeg has a
-custom dashenc fork and a custom `ssegment` muxer that handle seek with
-internal state we can't access. Stock ffmpeg has neither, so getting
-seek to behave on both DASH and HLS clients took multiple layered
-fixes.
+> **Partly historical.** This documents how seek was solved during the
+> *stock-ffmpeg era*. Most of the **DASH** machinery below — the
+> `patchSeekChunkTimestamps` tfdt/sidx post-processor, the chunk
+> renumber, the `manifest_publish.go` publisher — was **superseded**
+> and removed once scaleplex-ffmpeg7 absorbed the Plex-fork behaviour:
+> patch 0095 (native `-manifest_name` + `-skip_to_segment`), patch 0103
+> (drops jellyfin's `reference_stream_first_pts` adjust), patch 0104
+> (CMAF-strict movflags). DASH seek now works without worker-side
+> chunk post-processing. The **HLS CSV-rewrite in the relay**
+> (`scaleplex_seg_time`) is still live. The failure-mode diagnostics
+> and the *Operational notes* section remain useful reading.
 
-This doc captures the failure modes, the diagnostics that pinpointed
-each, and the fix. It's worth reading before touching the rewriter,
-segwatch, or relay.
+Seek was the hardest problem in the stock-ffmpeg build-up. Plex's
+bundled ffmpeg has a custom dashenc fork and a custom `ssegment` muxer
+that handle seek with internal state stock ffmpeg doesn't have — so
+getting seek to behave on both DASH and HLS clients took multiple
+layered fixes, captured here.
 
 ## DASH seek
 

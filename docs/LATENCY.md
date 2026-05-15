@@ -1,5 +1,13 @@
 # First-frame latency budget
 
+> **HISTORICAL / design doc.** This was the pre-implementation latency
+> design — targets, levers, and a v1/v2 split. It's kept for the
+> rationale behind the worker pre-warm, adaptive probesize, no-LOCAL_RELAY
+> and pod-startup design. Levers 1-5 + 7 shipped in v1.0; levers 6 + 8
+> (partial-segment HLS, pre-rendered hot content) were deferred and not
+> built. The pod-startup rules below are still current design constraints;
+> the rest is intent, not a description of the shipped system.
+
 **Goal:** play within **2-3 seconds** of click on LAN clients. Stretch
 target: <1.5s for sessions where the worker is warm.
 

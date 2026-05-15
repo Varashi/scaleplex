@@ -80,8 +80,12 @@ Set `serviceAccount.<id>: {}` and the SA gets named after the *release*,
 not the *identifier*. Controllers reference SA by identifier, mismatch
 breaks pod creation. Required `forceRename: <name>` to align.
 
-**scaleplex consequence**: ship our own Helm chart, not bjw-s
-app-template. Explicit SA names everywhere.
+**scaleplex consequence**: scaleplex deploys via bjw-s app-template
+anyway — it's the homelab-standard chart and keeps storage / network /
+scheduling in the operator's hands. The SA-naming gotcha is handled
+explicitly with `serviceAccount.<id>.forceRename: <name>` where a
+controller needs a named SA. (An earlier plan called for a first-party
+chart; that was dropped — see `README.md` Deploy section.)
 
 ## 9. Orchestrator's `ROUND_ROBIN` strategy is broken
 

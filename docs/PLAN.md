@@ -1,9 +1,20 @@
 # scaleplex implementation plan
 
-## Status (2026-05-10)
+> **HISTORICAL.** This is the original pre-implementation plan, kept for
+> context. scaleplex v1.0.0 shipped 2026-05-15. For the current system
+> see [`ARCHITECTURE.md`](ARCHITECTURE.md), [`REWRITER.md`](REWRITER.md),
+> [`SEEK.md`](SEEK.md), [`RESILIENCE.md`](RESILIENCE.md),
+> [`TUNING.md`](TUNING.md) and the top-level `README.md` / `CHANGELOG.md`.
+> Some forecasts here were superseded — e.g. the "ship our own Helm
+> chart" call in Phase 5 was dropped (scaleplex deploys via bjw-s
+> app-template).
 
-Phases 1–7 of the original implementation plan landed during 2026-05-05 / -06.
-Production cutover from clusterplex completed 2026-05-06.
+## Status (historical)
+
+Phases 1–7 of the original implementation plan landed during 2026-05-05 / -06,
+moving the scaleplex stack onto its own test PMS (the `clusterplex`
+namespace). Production family-PMS cutover to scaleplex happened later,
+2026-05-15, alongside the v1.0.0 tag.
 
 A second tranche of resilience work shipped 2026-05-10:
 

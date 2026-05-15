@@ -21,7 +21,6 @@ session Balls_Up...c11a7e73: rewriter applied:
   filter:plain, map-label-update, encode:libx264->h264_vaapi,
   crf->qp, preset:veryfast->compression_level:6, drop:-x264opts:0,
   inject:sei+a53_cc, audio:eac3_eae->eac3, drop:-eae_prefix:1,
-  hls:drop:-copyts(seek),
   hls:segment_list:rewrite-to-relay, seek-offset:captured=888.000s,
   progress:append-X-Plex-Token,
   progressurl:captured-for-reporter,
@@ -32,28 +31,36 @@ session Balls_Up...c11a7e73: rewriter applied:
 
 Each label below maps to one of the transformations documented here.
 
-scaleplex-ffmpeg7 patches 0094–0098 absorb several rewrites that
-earlier versions of the worker did at argv-time. The rewriter no
-longer emits these tags (and ffmpeg accepts the originals natively):
+scaleplex-ffmpeg7 patches `0094`–`0107` absorb the rewrites that
+earlier versions of the worker did at argv-time. As Plex-fork
+behaviour moved into the fork, the matching rewriter "bandaids" were
+retired — by v1.0 the rewriter only strips Plex-private flags the
+fork still can't parse, does intentional integration (relay routing,
+auth tokens), or swaps SW→HW codecs. The rewriter no longer emits
+these tags (ffmpeg accepts the originals natively):
 
 - `drop:-loglevel_plex` — patch 0098 registers the option as an
+  OPT_TYPE_STRING sink.
+- `drop:-strict_ts` — patch 0107 registers `-strict_ts` as an
   OPT_TYPE_STRING sink.
 - `hls:f=ssegment->segment` — patch 0098 adds `AVFMT_GLOBALHEADER`
   to `ff_stream_segment_muxer`; Plex's `-f ssegment` shape works
   without translation.
+- `hls:segment_list_size:5->99999` — patch 0106 force-buffers the
+  full chunk history on URL-handler segment lists; `list_size` is
+  inert there.
 - `hls:drop:-segment_list_unfinished` / `-segment_list_separate_stream_times`
-  — patch 0096 registers both as no-op `AVOptions` (Phase 2a stub;
-  functional CSV-emit logic deferred to Phase 2b).
+  — patch 0096 registers both as `AVOptions` (functional
+  separate-stream-times CSV emit landed in the 0096 v2 rev).
+- the CQP→VBR rate-control rewrite — patch 0105: `vaapi_encode`
+  auto-selects QVBR when `-qp` + `-maxrate` are both set.
+- `force_key_frames:offset-by-seek` — dead-code retired; jellyfin
+  7.1's `hevc_vaapi` handles the IDR expression natively.
 - `inject:-canthrottleurl` is NEW (from patch 0097) — rewriter
   injects a relay-URL for ffmpeg's in-binary canThrottle handler.
 
-What WAS dropped from the audit but still has a rewrite path: the
-`-segment_format_options live=1 → live=0+overrides` rewrite.
-Production PMS argvs (Plex Android) carry `output_ts_offset=10`
-and never `live=1`, so the rewrite is dead code in current
-captures. But the synthetic Plex-Windows fixture exercises it,
-and Plex Windows hardware has not been re-tested since patch 0094
-landed; leaving the rewrite as a safety net.
+`inject:sei+a53_cc` is kept deliberately — not a bandaid; see the
+encoder section below.
 
 ## Codec swaps
 
@@ -93,8 +100,14 @@ Side effects:
   quality difference at QP=22. **Label:** `preset:veryfast->compression_level:6`.
 - `-x264opts:0 <stuff>` is dropped — those options are libx264-specific,
   not portable to VAAPI. **Label:** `drop:-x264opts:0`.
-- `-sei:0 a53_cc` is injected so VAAPI's encoder embeds Closed Caption
-  608 data the same way Plex's libx264 build does. **Label:** `inject:sei+a53_cc`.
+- `-sei:0 -a53_cc` is injected to match Plex prod's convention. PMS
+  emits `-sei:0 -a53_cc` on HEVC/libx265 sessions but omits it on
+  libx264 ones; in `AV_OPT_TYPE_FLAGS` syntax `-a53_cc` *removes* the
+  a53_cc flag, and jellyfin-ffmpeg's `vaapi_encode` defaults it ON.
+  Injecting it on the libx264-originated sessions keeps every
+  HW-encode session consistent with Plex's behaviour (no a53_cc SEI;
+  Plex drives captions through its own pipeline). Kept deliberately —
+  an intentional integration, not a bandaid. **Label:** `inject:sei+a53_cc`.
 
 ### `*_eae` → stock encoder (audio encoder)
 
@@ -257,7 +270,7 @@ relay's URL on the PMS pod:
 | Flag | Plex sets | Rewritten to |
 |---|---|---|
 | `-progressurl` | `http://127.0.0.1:32400/.../progress` | `${SCALEPLEX_PMS_BASE_URL}/.../progress?X-Plex-Token=${X_PLEX_TOKEN}` |
-| `-manifest_name` | `http://127.0.0.1:32400/.../manifest?...` | (DASH only — captured for `manifest_publish.go`, stripped from argv) |
+| `-manifest_name` | `http://127.0.0.1:32400/.../manifest?...` | `${SCALEPLEX_PMS_BASE_URL}/.../manifest?...&X-Plex-Token=...` — rewritten in-place; ffmpeg's dashenc PUTs the `.mpd` body itself (patch 0095 backports Plex's `-manifest_name` extension) |
 | `-segment_list` | `http://127.0.0.1:32400/.../manifest?...` | `${SCALEPLEX_PMS_BASE_URL}/.../manifest?...&X-Plex-Token=...&scaleplex_seg_time=<N>` |
 
 `SCALEPLEX_PMS_BASE_URL` is set in the worker DaemonSet env, e.g.
@@ -265,7 +278,7 @@ relay's URL on the PMS pod:
 listens on 32499 and forwards to 32400.
 
 **Labels:** `progress:append-X-Plex-Token`, `progressurl:captured-for-reporter`,
-`manifest_name:captured-for-publisher`, `hls:segment_list:rewrite-to-relay`.
+`manifest_name:rewrite-to-relay`, `hls:segment_list:rewrite-to-relay`.
 
 ffmpeg's `-progress` doesn't attach Authorization headers, so the token
 goes in the query string — the relay just forwards it through.
@@ -274,26 +287,31 @@ goes in the query string — the relay just forwards it through.
 
 The rewriter detects DASH via `outputFormat == "dash"`.
 
-- `-extra_window_size 999999` injected. Without it, ffmpeg's dashenc
-  cleanup deletes chunks the moment they fall out of the rolling
-  window, but PMS's NFS-readdir-driven serve is asynchronous and
-  occasionally races the cleanup → 404 to client.
-- `-format_options "movflags=+empty_moov+default_base_moof+separate_moof+cmaf"`
-  injected before `-f dash`. Stock dashenc emits self-contained mp4
-  segments by default (`ftyp+moov+styp+sidx+moof+mdat`) which MSE
-  rejects as duplicate-init. The CMAF flags trim each chunk to
-  `styp+sidx+moof+mdat`.
-- `-skip_to_segment N` passes through to ffmpeg untouched. scaleplex-ffmpeg7
-  (patch 0095) starts dashenc's segment_index at N natively so
-  chunk-stream0-NNNNN.m4s aligns with PMS's `.mpd` `startNumber=`. The
-  rewriter only emits a diagnostic change-tag (`skip_to_segment:passthrough=N`).
-- `-ss <off>` captured into `RewriteResult.SeekOffsetSeconds`. The
-  segwatch's `patchSeekChunkTimestamps` uses it to add
-  `seekOffset*timescale` to each chunk's `tfdt.bmdt` and `sidx.ept`
-  after the rename. See [SEEK.md#dash-seek](SEEK.md#dash-seek).
-- `-manifest_name <url>` extracted; `manifest_publish.go` POSTs the
-  `.mpd` body on each rewrite (Plex's ffmpeg fork does this natively;
-  stock dashenc treats `-manifest_name` as a filename).
+Most of the DASH handling moved into scaleplex-ffmpeg7 — the worker
+no longer post-processes chunks or publishes the manifest itself:
+
+- `-delete_removed false` passes through. Patch 0095 backports Plex's
+  dashenc `-delete_removed` extension; chunks survive past the rolling
+  window so PMS's async NFS-readdir serve can't race a cleanup. (This
+  retired the old `-extra_window_size 999999` injection.)
+- CMAF-strict `movflags` are applied by dashenc itself — patch 0104
+  defaults `+empty_moov+default_base_moof+separate_moof+cmaf` on
+  URL-handler output, so each chunk is `styp+sidx+moof+mdat` (MSE
+  rejects the self-contained-mp4 default as duplicate-init). The
+  rewriter no longer injects `-format_options`.
+- `-skip_to_segment N` passes through. Patch 0095 starts dashenc's
+  segment_index at N natively, so `chunk-stream0-NNNNN.m4s` aligns
+  with PMS's `.mpd` `startNumber=`. Diagnostic tag only
+  (`skip_to_segment:passthrough=N`).
+- `-manifest_name <url>` is rewritten in-place to the relay URL;
+  dashenc PUTs the `.mpd` body itself (patch 0095). The old
+  worker-side `manifest_publish.go` and the `patchSeekChunkTimestamps`
+  tfdt/sidx post-processor were removed once the fork handled seek
+  timestamps natively (patch 0103 dropped jellyfin's
+  `reference_stream_first_pts` adjust). See [SEEK.md](SEEK.md) for the
+  history.
+- `-ss <off>` is still captured into `RewriteResult.SeekOffsetSeconds`
+  for the orchestrator checkpoint/recovery path.
 
 PTS handling on DASH **stays as Plex sends it** (`-copyts -start_at_zero
 -avoid_negative_ts disabled`). Removing `-start_at_zero` blanked the AAC
@@ -331,12 +349,14 @@ Rewriter changes:
   buffers the full chunk history regardless of `list_size`. Plex's
   bake-in of `5` becomes inert for URL outputs. Retired rewriter bump
   2026-05-14.
-- **Strip `-copyts` ONLY on seek sessions** (`-ss <off>` set).
-  Stock jellyfin 7.x segment muxer + `-ss` + `-copyts` produces
-  zero chunks even though encoder runs (verified BH6 hevc_vaapi
-  -ss 4801). Strip rebases PTS to 0, splits resume.
-  Initial-play sessions KEEP `-copyts` — stripping there caused PS4
-  chunk-0 PTS-offset loop. **Label:** `hls:drop:-copyts(seek)`.
+- `-copyts` is **kept** (matroska + ssegment, seek and initial-play
+  alike). Stock jellyfin 7.x's segment muxer used to produce zero
+  chunks on `-ss + -copyts` because jellyfin added a
+  `reference_stream_first_pts` adjustment that shifted the split
+  boundary past the live encode window. Patch 0103 drops that adjust,
+  restoring Plex-fork split semantics — so the rewriter no longer
+  strips `-copyts` at all. (The old env-gated legacy strip and the
+  `hls:drop:-copyts(seek)` tag were removed in the v1.0 cleanup.)
 - Rewrite `-segment_list <PMS-loopback>` to `<relay>?...&scaleplex_seg_time=<N>`.
   **Label:** `hls:segment_list:rewrite-to-relay`.
 
@@ -402,7 +422,8 @@ inject, no encoder swap, no filter chain. Just the minimal fix-ups
 that still apply, all sharing helpers with the main rewriter so a fix
 in one path lands in both:
 
-- Drop `-loglevel_plex`, `-delete_removed`, `-strict_ts:N`, `-xioerror`
+- Drop `-delete_removed`, `-xioerror` (`-loglevel_plex` and
+  `-strict_ts:N` now pass through — fork patch 0098/0107 sinks)
 - `swapEAEAudioDecoders` — `*_eae` → stock base codec (`eac3_eae`→`eac3`)
 - `dropEAEPrefixFlags` — orphaned `-eae_prefix:N` pairs
 - `capturePMSProgressURL` — strip `-progressurl`, surface the rewritten
@@ -438,15 +459,18 @@ focused fix applied: anything Plex-Transcoder-specific that stock
 ffmpeg can't parse must come off, or the spawn fails on the first
 unrecognised flag with empty stderr (loglevel quiet hides the error).
 
-`scrubPlexFlagsOnBail` runs unconditionally on every bail. It drops:
+`scrubPlexFlagsOnBail` runs unconditionally on every bail. It:
 
-- `-loglevel_plex <level>` — Plex-private log verbosity
-- `-progressurl <url>` — Plex progress sink
-- `-delete_removed <bool>` — Plex DASH muxer extension
-- `-xioerror` — Plex-private boolean
+- drops `-progressurl <url>` — its loopback URL is unreachable from a
+  worker pod; ffmpeg would try to PUT and fail.
+- rewrites a loopback `-segment_list` URL to the relay (same shape as
+  the full rewriter's `rewriteSegmentList`) — observed on LG webOS
+  sidecar-SRT side-channel argvs that hit the bail path.
 
-Bails with `Applied=true` when the scrub mutated the argv, so the
-worker spawns the cleaned copy.
+`-loglevel_plex` and `-strict_ts:N` are *not* scrubbed — fork patches
+0098/0107 make stock ffmpeg accept them. `-xioerror` has never been
+seen in the corpus. Bails with `Applied=true` when the scrub mutated
+the argv, so the worker spawns the cleaned copy.
 
 `dropInputAudioDecoderHints` runs on `bail("no-decoder")` specifically
 — that bail reason fires when there's no `-codec:0` for video before
@@ -481,7 +505,7 @@ plus `skip:no-decoder` on the changes list.
 documented above and a few "must-NOT-touch" guards:
 
 - Initial play with no `-ss` must not rewrite `force_key_frames`.
-- HLS argv must have `-copyts` stripped; DASH must keep it.
+- `-copyts` is kept on both HLS and DASH (patch 0103 — no strip).
 - VAAPI hwaccel injection must not duplicate when already present.
 - Map-label updates must not corrupt graphs that already use shifted
   labels.
@@ -489,8 +513,8 @@ documented above and a few "must-NOT-touch" guards:
   (rather than producing a broken filter chain).
 - `*_eae` audio swap accepts any `-codec:N` index (`rewriter_eae_test.go::TestRewriter_EAE_MultiStreamIndex`)
   + handles `truehd_eae` fallback to `eac3` (`TestRewriter_EAE_TrueHDFallback`).
-- HLS + seek + sub-burn brackets `subtitles=` with `setpts` so libass
-  reads absolute time while the encoder still emits 0-based PTS.
+- Text sub burn-in keeps Plex's `inlineass=` filter and strips only the
+  Plex-private AVOption keys (`TestRewriter_InlineassPassthrough_*`).
 
 ## Replay regression set
 
