@@ -235,9 +235,7 @@ restarts (s6 longrun), traffic resumes.
 **NFS hiccup.** Both worker (writing segments) and PMS (serving them)
 see EIO. ffmpeg may bail. PMS retries the transcode, see "worker dies"
 above. The workers used to read from `/media` over NFS too; that path
-needs the NFS mount option `hard` to retry rather than fail (see
-[`feedback_nfs_root_squash_silent_failure.md`](../../.claude/projects/-home-frank-boeye-net/memory/feedback_nfs_root_squash_silent_failure.md)
-for an unrelated NFS gotcha).
+needs the NFS mount option `hard` to retry rather than fail.
 
 **iHD VAAPI corruption.** GPU enters a bad state (rare). Worker's
 ffmpeg fails with VA-API errors. Agent reports failure, returns

@@ -1,24 +1,24 @@
 # Client test matrix
 
 Live-test sheet for validating scaleplex worker behavior across Plex
-clients. The clusterplex namespace runs a test PMS with the scaleplex
-DOCKER_MODS bundle active — every transcode session there flows
-through `clusterplex-orchestrator` → `clusterplex-worker-*`.
+clients. Run against a PMS with the scaleplex `DOCKER_MODS` bundle
+active — every transcode session flows through the scaleplex
+orchestrator → worker pods.
 
 ## Pre-flight
 
 ```bash
 # All workers on the same image, ready
-kubectl -n clusterplex get pods -l app.kubernetes.io/controller=worker \
+kubectl -n <namespace> get pods -l app.kubernetes.io/controller=worker \
   -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[0].ready
 
 # No leftover sessions
-kubectl -n clusterplex exec deploy/clusterplex-pms -- \
-  curl -s "http://localhost:32400/status/sessions?X-Plex-Token=REDACTED_PLEX_TOKEN" \
+kubectl -n <namespace> exec deploy/<pms-deployment> -- \
+  curl -s "http://localhost:32400/status/sessions?X-Plex-Token=<token>" \
   | grep -oE 'sessionKey="[^"]*"' | wc -l
 
 # Image SHA written into rewriter logs (correlate with k8s commit log)
-kubectl -n clusterplex logs -l app.kubernetes.io/controller=worker --tail=1 \
+kubectl -n <namespace> logs -l app.kubernetes.io/controller=worker --tail=1 \
   | grep -oE 'scaleplex-agent v[a-f0-9]+' | head -1
 ```
 
@@ -59,7 +59,7 @@ if recoverable.
 
 - **Install:** Microsoft Store or plex.tv/desktop. Sign in with same
   Plex account. Server should appear automatically.
-- **Force test PMS:** `Settings → General → Advanced → Show Advanced` — select the **clusterplex** server (it has identifier `clusterplex.boeye.net`).
+- **Force test PMS:** `Settings → General → Advanced → Show Advanced` — select the scaleplex-backed server.
 - **Protocol:** Plex for Windows uses **DASH** for transcodes (same path as Plex Web Chrome).
 - **Force transcode for case 3/4:** Quality menu → "Convert Automatically" → select 4 Mbps 720p. For HDR→SDR force, use a non-HEVC-capable quality.
 - **Likely transcode trigger:** TrueHD source (case 2 already) or 4K → 1080p quality switch.
@@ -111,12 +111,12 @@ easier to just grep all 3 worker pods:
 ```bash
 # Per-session rewriter tags (replace SESSION_PREFIX with first part of session UUID,
 # or filter on the basename of the source file)
-kubectl -n clusterplex logs -l app.kubernetes.io/controller=worker --since=2m \
+kubectl -n <namespace> logs -l app.kubernetes.io/controller=worker --since=2m \
   | grep -E "rewriter applied:" | tail -5
 
 # Live ffmpeg cmdline (for verifying filter chain / hwaccel)
-for p in $(kubectl -n clusterplex get pod -l app.kubernetes.io/controller=worker -o jsonpath='{.items[*].metadata.name}'); do
-  out=$(kubectl -n clusterplex exec "$p" -- sh -c 'cat /proc/$(pgrep ffmpeg | head -1)/cmdline 2>/dev/null | tr "\0" " "' 2>&1)
+for p in $(kubectl -n <namespace> get pod -l app.kubernetes.io/controller=worker -o jsonpath='{.items[*].metadata.name}'); do
+  out=$(kubectl -n <namespace> exec "$p" -- sh -c 'cat /proc/$(pgrep ffmpeg | head -1)/cmdline 2>/dev/null | tr "\0" " "' 2>&1)
   if [ -n "$out" ] && [ "$out" != " " ]; then
     echo "=== $p ==="
     echo "$out" | tr ' ' '\n' | grep -E "^-(codec|hwaccel|filter|init_hw|f|c)" -A1 | head -40
@@ -141,19 +141,19 @@ If a case fails (buffering, error toast, wrong colors, audio dropout):
 
 ```bash
 # 1. Dump the full ffmpeg cmdline of the broken session
-WORKER=clusterplex-worker-XXXXX
-kubectl -n clusterplex exec $WORKER -- sh -c 'cat /proc/$(pgrep ffmpeg | head -1)/cmdline | tr "\0" "\n"' > /tmp/broken.argv
+WORKER=<worker-pod>
+kubectl -n <namespace> exec $WORKER -- sh -c 'cat /proc/$(pgrep ffmpeg | head -1)/cmdline | tr "\0" "\n"' > /tmp/broken.argv
 
 # 2. Find the rewriter input argv (corpus capture)
-kubectl -n clusterplex exec $WORKER -- sh -c 'ls -lt /scaleplex-corpus/ | head -5'
+kubectl -n <namespace> exec $WORKER -- sh -c 'ls -lt /scaleplex-corpus/ | head -5'
 # Copy the most recent JSON locally for debugging
-kubectl -n clusterplex cp $WORKER:/scaleplex-corpus/<latest>.json /tmp/broken-input.json
+kubectl -n <namespace> cp $WORKER:/scaleplex-corpus/<latest>.json /tmp/broken-input.json
 
 # 3. ffmpeg stderr — last 200 lines
-kubectl -n clusterplex exec $WORKER -- sh -c 'find /transcode -name "*.log" -mmin -2 | head -1 | xargs tail -200' > /tmp/broken.stderr
+kubectl -n <namespace> exec $WORKER -- sh -c 'find /transcode -name "*.log" -mmin -2 | head -1 | xargs tail -200' > /tmp/broken.stderr
 
 # 4. PMS log slice
-kubectl -n clusterplex exec deploy/clusterplex-pms -- \
+kubectl -n <namespace> exec deploy/<pms-deployment> -- \
   tail -200 "/config/Library/Application Support/Plex Media Server/Logs/Plex Media Server.log"
 
 # 5. Browser/client diagnostics
@@ -169,8 +169,8 @@ via `worker/agent/replay_test.go`.
 
 Walk clients in this order — covers maximum risk surface fastest:
 
-1. **Plex for Windows** (you, today) — most-used desktop client, DASH path.
-2. **LG webOS** (wife's likely usage) — biggest UX cost if broken.
+1. **Plex for Windows** — common desktop client, DASH path.
+2. **LG webOS** — living-room TV client, biggest UX cost if broken.
 3. **PS4** — strict mpegts compliance flush.
 4. **Plex Web Firefox** — alternate MSE.
 5. **iOS** — if you have an iPhone/iPad handy.

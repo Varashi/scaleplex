@@ -261,7 +261,7 @@ relay's URL on the PMS pod:
 | `-segment_list` | `http://127.0.0.1:32400/.../manifest?...` | `${SCALEPLEX_PMS_BASE_URL}/.../manifest?...&X-Plex-Token=...&scaleplex_seg_time=<N>` |
 
 `SCALEPLEX_PMS_BASE_URL` is set in the worker DaemonSet env, e.g.
-`http://clusterplex-pms.clusterplex.svc:32499`. The relay sidecar
+`http://<pms-service>.<namespace>.svc:32499`. The relay sidecar
 listens on 32499 and forwards to 32400.
 
 **Labels:** `progress:append-X-Plex-Token`, `progressurl:captured-for-reporter`,
@@ -502,10 +502,11 @@ Username from `X_PLEX_*`) plus ffmpeg's exit status, duration,
 segments-created, and stderr tail. Replay then re-runs every captured
 argv through the current rewriter and compares outcomes — historical
 exit-0 successes that now exit non-zero are flagged as regressions.
-The capture+outcome plumbing is identical on both surfaces:
-clusterplex worker (Go agent — `persistArgvCapture` +
-`persistArgvOutcome`) and production plex (bash tee-wrapper —
-`CLIENT:KEY=VALUE` headers + `OUTCOME:exit_status=N ...` footer).
+Captures come from two surfaces with identical outcome plumbing: the
+scaleplex worker (Go agent — `persistArgvCapture` +
+`persistArgvOutcome`) and, where a native Plex Transcoder is wrapped
+for comparison, a bash tee-wrapper (`CLIENT:KEY=VALUE` headers +
+`OUTCOME:exit_status=N ...` footer).
 
 The bail path is exercised explicitly in tests
 (`TestRewriter_Bail_*`) — a regression that quietly succeeded would be

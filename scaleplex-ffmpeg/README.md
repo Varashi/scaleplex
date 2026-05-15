@@ -136,16 +136,30 @@ can be cached. `lib/split-docker-build.sh` rewrites jellyfin's
    per jellyfin bump.
 3. `./build.sh` to rebuild the deb against the new deps. If patches
    reject, edit hunk offsets (`patch --dry-run` against a fresh
-   checkout shows the new line numbers) and re-test.
+   checkout shows the new line numbers) and re-test. Patches apply in
+   numeric order (`0094` … `0107`), each one against the tree state
+   left by the previous — so an early patch's drift shifts the
+   anchors every later patch sees.
 4. `./build.sh` should run in ~5-10 min once the deps base is cached
    locally / on GHCR.
-5. Commit the new `VERSION` + any patch fixups. Rebuild the worker
+5. **Validate against the argv corpus.** Build the replay test and run
+   it inside a worker pod against the new deb — this is the regression
+   net that catches argv-parse / filter-graph / encoder-open breakage a
+   jellyfin bump can introduce:
+   ```sh
+   go test -tags=replay -c -o /tmp/replay.test ./worker/agent
+   # kubectl cp into a worker pod, then:
+   /tmp/replay.test -test.run TestReplayCorpus -test.timeout 30m
+   ```
+   Locally, `REPLAY_NO_FFMPEG=1 go test -tags=replay -run TestReplayCorpus`
+   validates the rewriter half without ffmpeg.
+6. Commit the new `VERSION` + any patch fixups. Rebuild the worker
    image (`build-worker` GHA picks up the new ffmpeg deb artifact
    via cross-workflow download).
 
-Patches are intentionally small (Phase 1 = 1 LOC, Phase 3 = ~80 LOC,
-Phase 4 = ~50 LOC, etc.) and located in a handful of files only —
-rebasing should remain a 15-minute exercise per jellyfin bump.
+The 14 patches (`0094`–`0107`) are small and touch a handful of files
+only — rebasing should remain a sub-hour exercise per jellyfin bump,
+most of it the one-time deps rebuild.
 
 ## Rebasing on a new Plex Transcoder release
 

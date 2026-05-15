@@ -32,30 +32,36 @@ bookkeeping is unchanged.
 
 ## Status
 
-**Working end-to-end as of 2026-05-06** on the test PMS pod
-(`clusterplex-pms-*` with shim swapped via `DOCKER_MODS`):
+**v1.0 — feature-complete and validated.** Every client/format cell in
+the matrix below has been exercised end-to-end (initial play, seek,
+quality change, subtitle burn-in as applicable) on the scaleplex PMS
+deployment:
 
-| Streaming format | Initial play | Seek | Quality change | Notes |
+| Client / format | Play | Seek | Subs | Notes |
 |---|:-:|:-:|:-:|---|
-| DASH (Plex Web Chrome) | ✓ | ✓ | ✓ | Real-time + Optimize jobs |
-| HLS / mpegts (Plex Android) | ✓ | ✓ | — | |
-| HLS / matroska (Plex Android, 4K HDR + 5.1 EAC3) | ✓ | ✓ | ✓ | mkv-in-.ts triggered when codec/audio combo can't fit mpegts |
-| Plex Optimize (HW-decode shape: `-hwaccel:0 vaapi`) | ✓ | n/a | n/a | hevc_vaapi mp4 + faststart, multi-track audio + sub-sidecar copy |
-| Plex Optimize (remux shape: bare decoder + `-codec:0 copy`) | ✓ | n/a | n/a | covered by `tryOptimizeRemux` fast-path; preserves multi-input sidecar SRTs |
-| PMS Detection / ML pre-pass (intro / credits / voice activity markers) | ✓ | n/a | n/a | bail-path scrub strips Plex-private flags + input audio decoder hints (any stream-spec form) so ffmpeg auto-detects the right decoder |
+| Plex Web — DASH (Chrome / Firefox) | ✓ | ✓ | ✓ | Burn-in + text-sub side-channel (`-segment_format ass`) |
+| Plex Android — HLS mpegts | ✓ | ✓ | ✓ | |
+| Plex Android — HLS matroska (4K HDR + 5.1 EAC3) | ✓ | ✓ | ✓ | mkv-in-`.ts` when codec/audio can't fit mpegts |
+| Plex Windows desktop — segmented matroska | ✓ | ✓ | ✓ | Cosmetic playhead-reset on seek — see [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) |
+| LG webOS — HLS (4K HEVC HDR) | ✓ | ✓ | ✓ | PGS overlay + SRT burn-in |
+| Plex Optimize (HW-decode + remux fast-path) | ✓ | n/a | ✓ | mp4 + faststart, multi-track audio, sidecar SRT copy |
+| PMS Detection / ML pre-pass | ✓ | n/a | n/a | bail-path scrub — ffmpeg runs the original argv cleaned of Plex-private flags |
 
-**Source matrix tested:** AV1 + HEVC + H264 sources; SDR + HDR10; embedded
-+ sidecar SRT / ASS text subs (burn-in via fork-native `inlineass=` filter);
-embedded PGS bitmap subs (overlay_vaapi).
+**Source matrix:** AV1 + HEVC + H264; SDR + HDR10; embedded and sidecar
+SRT / ASS text subs (burn-in via the fork-native `inlineass=` filter);
+embedded PGS bitmap subs (`overlay_vaapi`). HDR→SDR via `tonemap_vaapi`.
 
-**Untested / pending:** LG WebOS, PS4, Apple TV, iOS clients;
-sustained-load and concurrent-session benchmarks; full production cutover
-(currently only the test PMS pod runs the shim, clusterplex on
-production PMS is untouched).
+**Resilience:** PMS `canThrottle` pass-through, multi-engine GPU load
+reporting, transparent mid-stream worker recovery across DaemonSet rolls
+(see [`docs/RESILIENCE.md`](docs/RESILIENCE.md)).
 
-Image tag tracked in `worker/deploy/worker.yaml` and the
-`scaleplex_pms_dockermod` GHCR repo. Builds are sha-pinned (CI publishes
-`sha-<short>` and Renovate/manual bumps update the deploy YAML).
+**Deployment scope.** v1.0 is a code milestone — the software is
+release-ready. Pointing any particular PMS instance at scaleplex is an
+independent operational decision, not gated on this tag.
+
+**Images** are sha-pinned — CI publishes `ghcr.io/varashi/scaleplex_worker`,
+`scaleplex_orchestrator`, and `scaleplex_pms_dockermod` as `sha-<short>`;
+the Helm release pins each tag explicitly.
 
 ## Architecture
 
@@ -130,33 +136,45 @@ loopback-equivalent endpoint to call back on (workers can't reach PMS's
 
 ## Deploy
 
-Today scaleplex deploys via raw YAML manifests next to the existing
-clusterplex namespace. The PMS pod is the existing
-`clusterplex-pms-*` deployment with the `DOCKER_MODS` env var pointed at
-`scaleplex_pms_dockermod`:
+scaleplex is Kubernetes-native. It adds three things to a cluster and
+**does not own the PMS pod** — PMS stays whatever you already run, which
+keeps rollback a one-line revert.
 
-```yaml
-env:
-  - name: DOCKER_MODS
-    value: ghcr.io/varashi/scaleplex_pms_dockermod:sha-<short>
-  - name: LOCAL_RELAY_ENABLED
-    value: "1"
-  - name: LOCAL_RELAY_PORT
-    value: "32499"
-  - name: SCALEPLEX_ORCHESTRATOR_URL
-    value: http://scaleplex-orchestrator.scaleplex.svc.cluster.local:3500
-```
+1. **Worker** — a DaemonSet, one pod per GPU node (Intel iGPU / Arc,
+   `/dev/dri/render*`). Pre-warms VAAPI; `/readyz` gates on warm-up.
+2. **Orchestrator** — a stateless Deployment. DNS-discovers workers via
+   a headless Service and routes each task to the least-loaded one.
+3. **PMS DOCKER_MOD** — on your existing PMS container, point
+   `DOCKER_MODS` at `scaleplex_pms_dockermod`. The mod lays down the
+   shim as `Plex Transcoder` and runs the relay sidecar:
 
-Worker DaemonSet runs in the `scaleplex` namespace, scheduled on
-`gpu-worker` nodes. Orchestrator is a single Deployment.
+   ```yaml
+   env:
+     DOCKER_MODS: ghcr.io/varashi/scaleplex_pms_dockermod:sha-<short>
+     LOCAL_RELAY_ENABLED: "1"
+     LOCAL_RELAY_PORT: "32499"
+     SCALEPLEX_ORCHESTRATOR_URL: http://<orchestrator-service>.<namespace>.svc:3500
+   ```
 
-Rollback is a one-liner: revert `DOCKER_MODS` on the PMS deploy, scale
-clusterplex's orchestrator back up, `flux resume hr clusterplex -n
-clusterplex`. The shim's cont-init script restores `Plex Transcoder.real`
-on next PMS start.
+The worker container needs the i915 PMU capability (`PERFMON` in the
+container bounding set; the agent binary carries `cap_perfmon=ep`) for
+GPU-load reporting, and the worker + PMS pods must share the NFS volumes
+PMS transcodes into (`/transcode`) and reads media from (`/media`).
 
-A proper Helm chart is on the roadmap; the placeholder lives at
-`charts/scaleplex/`.
+**Rollback** — remove the `DOCKER_MODS` env from the PMS container. The
+shim's cont-init script restores `Plex Transcoder.real` on next PMS
+start. The worker DaemonSet and orchestrator can be left running or
+removed independently; they are inert without the shim feeding them.
+
+**Helm.** scaleplex is deployed in the reference setup as a
+[bjw-s `app-template`](https://github.com/bjw-s-labs/helm-charts)
+HelmRelease — homelab-familiar, and it keeps storage / networking /
+scheduling fully in the operator's hands. A reference `values.yaml`
+fragment carrying the scaleplex-structural pieces (worker DaemonSet
+shape, headless discovery Service, PERFMON cap) is the planned
+distribution artifact; a dedicated first-party chart is a possible
+follow-up if the reference proves clumsy. The `charts/scaleplex/`
+directory is a placeholder.
 
 ## Docs
 
@@ -166,6 +184,8 @@ A proper Helm chart is on the roadmap; the placeholder lives at
 - [`docs/SEEK.md`](docs/SEEK.md) — DASH and HLS seek deep-dive (the hardest problems we shipped).
 - [`docs/LATENCY.md`](docs/LATENCY.md) — first-frame latency budget and design levers.
 - [`docs/RESILIENCE.md`](docs/RESILIENCE.md) — PMS canThrottle pass-through, multi-engine GPU load, mid-stream worker recovery.
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — tracked limitations as of v1.0.
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 - [`docs/PLAN.md`](docs/PLAN.md) — original implementation plan (historical; mostly delivered).
 - [`docs/LESSONS-FROM-CLUSTERPLEX.md`](docs/LESSONS-FROM-CLUSTERPLEX.md) — concrete pitfalls scaleplex avoids by design.
 

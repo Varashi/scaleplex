@@ -126,8 +126,7 @@ Highest-risk / highest-value to validate next:
 
 ## Promotion criteria
 
-scaleplex graduates from `clusterplex-pms` (test) to `plex/plex`
-(production) when:
+scaleplex graduates from a test PMS instance to a production one when:
 
 - All `Validated this session` rows above stay green after one
   rebuild + redeploy cycle
