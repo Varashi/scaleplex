@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "jellyfin-ffmpeg base tag pinned in scaleplex-ffmpeg/VERSION",
+      "managerFilePatterns": ["/^scaleplex-ffmpeg/VERSION$/"],
+      "matchStrings": ["(?<currentValue>v[\\d.]+-\\d+)"],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "jellyfin/jellyfin-ffmpeg",
+      "versioningTemplate": "loose"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDepNames": ["jellyfin/jellyfin-ffmpeg"],
+      "automerge": false,
+      "labels": ["ffmpeg-base"],
+      "description": "A jellyfin-ffmpeg bump forces a deps-image rebuild (build-deps.sh, ~30-40 min) and re-validation of the 0094-0107 patch series against the new base. Always human-gated."
+    }
+  ]
+}
