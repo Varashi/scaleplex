@@ -28,6 +28,24 @@ reference cluster (3× Intel Arc A310, iHD driver).
 | `HW_LIBVA_DRIVERS_PATH` | (libva auto-discovers) | Only needed to override the driver search path, e.g. when pointing at a bundled driver cache. |
 | `WORKER_MAX_SESSIONS` | `0` (unlimited) | Soft cap on concurrent sessions per worker. At the cap the worker refuses new dispatch so the orchestrator routes elsewhere. |
 
+## Diagnostics / development
+
+These knobs are **off by default** and exist for developers and for
+troubleshooting a specific session. None of them should be set on a
+normal production deployment — argv capture in particular writes a
+growing corpus of JSON files to shared storage.
+
+| Env var | Where | Default | Effect |
+|---|---|---|---|
+| `WORKER_DUMP_ARGV` | worker DaemonSet | unset (off) | Set to `1` to capture every dispatched PMS argv. Logs the argv to worker stderr and writes a per-session JSON capture (argv in + rewritten argv + outcome) under `$WORKER_ARGV_CORPUS_DIR`. Only the literal value `1` enables it — `0`/`false`/unset all disable. Use when investigating new PMS argv shapes (HW-decode mode, Plex version bumps). |
+| `WORKER_ARGV_CORPUS_DIR` | worker DaemonSet | `/transcode/_argv-corpus` | Target directory for `WORKER_DUMP_ARGV` JSON captures. The default lands on the shared transcode volume so captures survive pod restarts and are reachable from outside the cluster. No effect unless `WORKER_DUMP_ARGV=1`. |
+| `SCALEPLEX_DUMP_ARGV` | PMS shim | unset (off) | Set to `1` (or `true`) to make the PMS-side shim log the original Plex transcoder argv before it is handed to the orchestrator. Pairs with `WORKER_DUMP_ARGV` to capture both ends of a session. |
+| `SCALEPLEX_DEBUG` | PMS shim | unset (off) | Set to `1` (or `true`) for verbose shim decision logging (dispatch target, fallback reasons). |
+
+For verbose **worker-side** ffmpeg / throttle logging use
+`SCALEPLEX_FFMPEG_LOGLEVEL=debug` (see the quality/behaviour table) —
+that is the per-cycle Phase-4 canThrottle diagnostic channel.
+
 ## Notes
 
 - **No HEVC SW-encode path.** Plex's software encode only ever emits

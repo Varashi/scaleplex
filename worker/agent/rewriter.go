@@ -274,8 +274,6 @@ var (
 	reInitHW = regexp.MustCompile(`^vaapi=vaapi:(?:/dev/dri/[A-Za-z0-9_]+(?:,driver=[A-Za-z0-9_]+)?)?$`)
 )
 
-func envBool(k string) bool { return os.Getenv(k) == "true" }
-
 func envOr(k, dflt string) string {
 	if v, ok := os.LookupEnv(k); ok && v != "" {
 		return v

@@ -376,13 +376,15 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	if req.Rewrite {
 		// Env-gated argv capture for debugging new PMS argv shapes
 		// (HW-decode mode, Plex version bumps, etc.). Off by default to
-		// keep logs clean; flip WORKER_DUMP_ARGV=1 on the worker pod or
+		// keep logs clean; set WORKER_DUMP_ARGV=1 on the worker pod or
 		// DaemonSet env when investigating. Logs to stderr AND, when
 		// the dir exists / can be created, writes a JSON capture under
 		// $WORKER_ARGV_CORPUS_DIR (default /transcode/_argv-corpus,
 		// shared NFS so it survives pod restarts and is reachable from
-		// outside the cluster). Idempotent on session_id.
-		if os.Getenv("WORKER_DUMP_ARGV") != "" {
+		// outside the cluster). Idempotent on session_id. Must match
+		// the outcome-stamp gate below — `== "1"`, so WORKER_DUMP_ARGV=0
+		// genuinely disables it.
+		if os.Getenv("WORKER_DUMP_ARGV") == "1" {
 			log.Printf("session %s: argv=%q", req.SessionID, req.Args)
 			persistArgvCapture(req.SessionID, req.Cwd, req.Args, req.Env)
 		}
