@@ -162,6 +162,7 @@ A proper Helm chart is on the roadmap; the placeholder lives at
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, data flow, where state lives.
 - [`docs/REWRITER.md`](docs/REWRITER.md) — every Plex-private argv quirk and its stock-ffmpeg translation.
+- [`docs/TUNING.md`](docs/TUNING.md) — operator env knobs for transcode quality + behaviour.
 - [`docs/SEEK.md`](docs/SEEK.md) — DASH and HLS seek deep-dive (the hardest problems we shipped).
 - [`docs/LATENCY.md`](docs/LATENCY.md) — first-frame latency budget and design levers.
 - [`docs/RESILIENCE.md`](docs/RESILIENCE.md) — PMS canThrottle pass-through, multi-engine GPU load, mid-stream worker recovery.
