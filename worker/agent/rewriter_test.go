@@ -521,9 +521,12 @@ func TestRewriter_PresetMapping_FullArgRewrite(t *testing.T) {
 	}
 }
 
-func TestRewriter_NoPresetEmitted_DefaultsFastest(t *testing.T) {
+func TestRewriter_NoPresetEmitted_NoCompressionLevelInject(t *testing.T) {
 	// libx265 path: PMS emits -x265-params instead of -preset:0. Worker
-	// has nothing to translate, so we inject compression_level=7.
+	// must NOT inject -compression_level:v — let vaapi_encode dispatch
+	// to the iHD driver's intrinsic default (~TU=4 balanced), which
+	// matches Plex Transcoder's prod behaviour. B5 bandaid retired
+	// 2026-05-15.
 	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -535,8 +538,14 @@ func TestRewriter_NoPresetEmitted_DefaultsFastest(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "inject:compression_level=7") {
-		t.Fatalf("missing default-fastest injection: %v", out.Changes)
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "inject:compression_level") ||
+			strings.HasPrefix(c, "preset:") {
+			t.Errorf("no compression_level change expected when PMS omits -preset:0, got %q: %v", c, out.Changes)
+		}
+	}
+	if containsString(out.Args, "-compression_level:v") {
+		t.Errorf("-compression_level:v must not be injected: %v", out.Args)
 	}
 }
 
