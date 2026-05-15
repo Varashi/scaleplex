@@ -2053,6 +2053,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// 7. Translate -preset:0 <x264-name> → -compression_level:v <N>
 	// (Plex emits x264 preset names; iHD VAAPI uses a 1-7 TargetUsage
 	// scale where 7 = fastest, 1 = highest quality.)
+	//
+	// When PMS doesn't emit a preset (e.g. x265 path with
+	// `-x265-params` instead), do nothing — let stock vaapi_encode
+	// leave `compression_level == FF_COMPRESSION_DEFAULT`, which
+	// dispatches to the iHD driver's intrinsic default (~TU=4
+	// balanced). Matches Plex Transcoder's prod behaviour (their
+	// `-quality` AVOption defaults to 0 → driver-vendor-default).
+	// We previously injected `cl=7` (max speed) here, which was
+	// +30-70% throughput vs cl=2 on no-sub workloads but more
+	// aggressive than Plex on the quality axis. Bandaid B5 retired
+	// 2026-05-15.
 	if i := indexOfArg(args, "-preset:0", encCodecIdx+1); i >= 0 && i+1 < len(args) {
 		preset := args[i+1]
 		cl := mapX264PresetToVAAPI(preset)
@@ -2060,11 +2071,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// Inject right after the encoder so the encoder context picks it up.
 		args = spliceArgs(args, encCodecIdx+2, "-compression_level:v", cl)
 		changes = append(changes, "preset:"+preset+"->compression_level:"+cl)
-	} else {
-		// No preset emitted (e.g. an x265 path with -x265-params instead);
-		// default to fastest. Worker GPU wants throughput, not max quality.
-		args = spliceArgs(args, encCodecIdx+2, "-compression_level:v", "7")
-		changes = append(changes, "inject:compression_level=7")
 	}
 
 	// Drop the remaining SW-encoder-specific flags.
