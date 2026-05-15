@@ -65,52 +65,29 @@ the Helm release pins each tag explicitly.
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────┐
-│  PMS pod                                       │
-│  ┌──────────────────────────────────────────┐  │
-│  │ Plex Media Server                        │  │
-│  │ /usr/lib/plexmediaserver/Plex Transcoder │  │
-│  │     ↓ symlinked to                       │  │
-│  │ scaleplex-shim  (~5 MB Go binary)        │  │
-│  │                                          │  │
-│  │ scaleplex-relay (sidecar, 32499→32400)   │  │
-│  │   POST→PUT for /progress                 │  │
-│  │   CSV rewrite for /manifest (HLS seek)   │  │
-│  └────────────────┬─────────────────────────┘  │
-└───────────────────┼────────────────────────────┘
-                    │ HTTP POST {args, env, cwd, session_id}
-                    ▼
-       ┌─────────────────────────────┐
-       │ scaleplex-orchestrator      │
-       │   - DNS-discovers workers   │
-       │   - tracks active sessions  │
-       │   - picks least-loaded      │
-       └──────┬──────────────────────┘
-              │ HTTP forward (verbatim)
-   ┌──────────┼──────────────┐
-   ▼          ▼              ▼
- ┌────────┐ ┌────────┐ ┌────────┐
- │Worker 1│ │Worker 2│ │Worker 3│   DaemonSet on gpu-worker nodes
- │        │ │        │ │        │
- │ scaleplex-agent (Go)         │   - Ubuntu 24.04
- │  - rewrites Plex argv → VAAPI│   - scaleplex-ffmpeg7
- │  - spawns ffmpeg              │   - intel-media-va-driver-non-free
- │  - watches segments, posts    │   - libass, fonts (DejaVu, Noto)
- │    progress + manifest        │   - render group access (568)
- │  - adaptive probesize         │
- └───┬────┘                      │
-     │ writes segments
-     ▼
- ┌──────────────────────────────────┐
- │ /transcode  (NFS, shared w/ PMS) │
- │   plex-transcode-<session>/      │
- │     header                       │
- │     media-NNNNN.ts (HLS)         │
- │     init-stream0.m4s (DASH)      │
- │     chunk-stream0-NNNNN.m4s      │
- │     dash                         │
- └──────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph pmspod["PMS pod"]
+        plex["Plex Media Server"]
+        shim["<b>Plex Transcoder</b> → scaleplex-shim<br/><i>~5 MB static Go binary</i>"]
+        relay["scaleplex-relay <i>(sidecar)</i><br/>:32499 → :32400<br/>POST→PUT progress · HLS CSV rewrite"]
+        plex -- spawns transcode --> shim
+    end
+
+    orch["<b>scaleplex-orchestrator</b><br/>DNS-discovers workers · tracks sessions<br/>routes to least-loaded"]
+
+    subgraph wpool["Worker DaemonSet — gpu-worker nodes (×3)"]
+        agent["<b>scaleplex-agent</b> + scaleplex-ffmpeg7<br/>rewrites Plex argv → VAAPI · adaptive probesize<br/>spawns ffmpeg · watches segments"]
+    end
+
+    nfs[("/transcode — NFS<br/>shared with PMS<br/>header · media-NNNNN.ts · chunk-stream0-*.m4s")]
+
+    shim -- "HTTP POST {args, env, cwd, session_id}" --> orch
+    orch -- "forward verbatim" --> agent
+    agent -- "writes segments" --> nfs
+    nfs -- "PMS serves segments" --> plex
+    agent -- "progress / manifest callbacks" --> relay
+    relay --> plex
 ```
 
 **Boundary:** PMS only needs to see segments on disk and receive HTTP
