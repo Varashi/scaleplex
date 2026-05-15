@@ -85,8 +85,8 @@ emits:
   it already does for ffmpeg output.
 
 Logs flow worker stderr → orchestrator stream → PMS shim → PMS pod
-log. `k logs pms -n clusterplex | grep scaleplex/ct` works as long
-as the session's worker is healthy.
+log. `kubectl logs <pms-pod> -n <namespace> | grep scaleplex/ct` works
+as long as the session's worker is healthy.
 
 ## 2. Multi-engine GPU load
 
@@ -225,8 +225,7 @@ the auto-rebalancer on top.
 ## Operational caveats
 
 - **PSA bump for the worker namespace**: `pod-security.kubernetes.io/enforce`
-  must be `privileged` so PERFMON can be granted. Documented in
-  `cluster-talos/.../clusterplex/app/namespace.yaml`.
+  must be `privileged` so PERFMON can be granted.
 - **`allowPrivilegeEscalation: true`** on the worker container — file
   capabilities don't land if `no_new_privs` is set.
 - **Sysfs reader requires no caps**; the privileged-bump only matters

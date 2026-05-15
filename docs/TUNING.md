@@ -21,7 +21,7 @@ reference cluster (3× Intel Arc A310, iHD driver).
 
 | Env var | Default | Effect |
 |---|---|---|
-| `SCALEPLEX_PMS_BASE_URL` | (required) | Cluster URL of the PMS relay sidecar, e.g. `http://clusterplex-pms.clusterplex.svc:32499`. The rewriter uses it to retarget `-progressurl`, `-segment_list`, `-canthrottleurl`, and `-manifest_name` away from PMS loopback so worker pods can reach them. |
+| `SCALEPLEX_PMS_BASE_URL` | (required) | Cluster URL of the PMS relay sidecar, e.g. `http://<pms-service>.<namespace>.svc:32499`. The rewriter uses it to retarget `-progressurl`, `-segment_list`, `-canthrottleurl`, and `-manifest_name` away from PMS loopback so worker pods can reach them. |
 | `X_PLEX_TOKEN` | (required) | Per-session Plex auth token, appended as a query param to the relay URLs above so the relay can re-issue authenticated PUTs to PMS. Supplied per session by the shim. |
 | `HW_RENDER_DEVICE` | `/dev/dri/renderD128` | VAAPI render node passed to `-init_hw_device`. |
 | `HW_VAAPI_DRIVER` | `iHD` | libva driver name. `iHD` for Intel Gen9+ / Arc. |
