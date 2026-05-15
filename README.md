@@ -156,10 +156,32 @@ keeps rollback a one-line revert.
      SCALEPLEX_ORCHESTRATOR_URL: http://<orchestrator-service>.<namespace>.svc:3500
    ```
 
-The worker container needs the i915 PMU capability (`PERFMON` in the
-container bounding set; the agent binary carries `cap_perfmon=ep`) for
-GPU-load reporting, and the worker + PMS pods must share the NFS volumes
-PMS transcodes into (`/transcode`) and reads media from (`/media`).
+The worker + PMS pods must share the NFS volumes PMS transcodes into
+(`/transcode`) and reads media from (`/media`) — the worker writes
+segments exactly where the PMS serves them.
+
+### Namespace topology — pick one
+
+The worker wants `CAP_PERFMON` to read the i915 hardware PMU for
+GPU-busy load telemetry (needed on GPUs with no sysfs busy file, e.g.
+Intel Arc). `PERFMON` is on Pod Security Admission's `privileged`-only
+allowlist. That forces a choice:
+
+- **A — fold into the PMS namespace.** Run the worker + orchestrator in
+  the same namespace as your PMS. Simplest — the worker reuses the PMS's
+  exact `/transcode` + `/media` volume definitions, so the paths cannot
+  drift. Cost: that namespace must be PSA `privileged`. Fine for a
+  single-operator cluster where you control every manifest.
+- **B — dedicated `scaleplex` namespace.** Keeps your PMS namespace at
+  PSA `baseline`; only the `scaleplex` namespace is `privileged`. You
+  must configure the worker fleet to mount the **same** `/transcode` NFS
+  export the PMS uses.
+
+Either way the worker carries `cap_perfmon=ep` as a file capability so
+only the agent binary gets the bits, not the whole container. If you'd
+rather keep every namespace at `baseline`, drop the `PERFMON` capability
+entirely — the worker falls back cleanly and the orchestrator
+load-balances on session count instead of GPU-busy %.
 
 **Rollback** — remove the `DOCKER_MODS` env from the PMS container. The
 shim's cont-init script restores `Plex Transcoder.real` on next PMS
