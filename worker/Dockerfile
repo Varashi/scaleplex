@@ -66,8 +66,6 @@ RUN groupadd -g 568 render2 || true && \
     useradd -u 1000 -g users -G video,render2 -m -s /bin/bash scaleplex || true
 
 COPY --from=agent-build /out/scaleplex-agent /usr/local/bin/scaleplex-agent
-COPY worker/scaleplex-entrypoint.sh /usr/local/bin/scaleplex-entrypoint
-RUN chmod +x /usr/local/bin/scaleplex-entrypoint
 
 # File-capability so the agent can perf_event_open() the i915 PMU even
 # when running as uid 1000. K8s `capabilities.add` alone only seeds the
@@ -107,8 +105,4 @@ EXPOSE 3501
 # "Connection error" (live repro 2026-05-08: Plex Android, force-burn
 # subs + seek, 2 min wall clock no segments).
 RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v 2>&1 | tail -3
-# Wrapper: prefers /transcode/_dev/scaleplex-agent if present (NFS-shared
-# dev overlay so a `go build && cp && pkill` round-trip swaps the binary
-# in seconds without rebuilding the image). Falls through to the baked
-# binary in production.
-ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/scaleplex-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/scaleplex-agent"]
