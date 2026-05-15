@@ -2081,7 +2081,24 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// 8. -sei:0 -a53_cc before -force_key_frames:0
+	// 8. Match Plex prod's "no a53_cc SEI in HW-encoded output" convention.
+	//
+	// PMS emits `-sei:0 -a53_cc` on every HEVC/libx265 session (201/287
+	// corpus entries) but omits it on libx264 sessions (10 entries).
+	// In stock AV_OPT_TYPE_FLAGS parser semantics `-X` REMOVES flag X,
+	// not adds it. Plex's bundled libavcodec.so.60 has `a53_cc` as a
+	// SEI flag (verified via `strings`), but their published 1.12.3
+	// source omits it — private patch. Net Plex-prod intent: strip
+	// a53_cc SEI on every HW-encode session so their separate CC
+	// pipeline (PGS-style overlay) drives caption rendering, not SEI
+	// passthrough.
+	//
+	// Without our inject, jellyfin-ffmpeg's h264_vaapi default
+	// (`IDENTIFIER|TIMING|RECOVERY_POINT|A53_CC`, a53_cc default-ON
+	// per vaapi_encode_h264.c L1089) would emit a53_cc SEI on the 10
+	// libx264-swapped-to-h264_vaapi sessions — diverging from Plex
+	// prod. Inject keeps libx264 sessions consistent with the libx265
+	// majority. Tag stays for replay-corpus diagnostics.
 	if indexOfArg(args, "-sei:0", 0) < 0 {
 		if fkfIdx := indexOfArg(args, "-force_key_frames:0", encCodecIdx+1); fkfIdx >= 0 {
 			args = spliceArgs(args, fkfIdx, "-sei:0", "-a53_cc")
