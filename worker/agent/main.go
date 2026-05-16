@@ -373,6 +373,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	progressURL := ""
 	seekOffsetSeconds := 0.0
 	isMatroskaSegment := false
+	var subPrerender *SubPrerenderSpec
 	if req.Rewrite {
 		// Env-gated argv capture for debugging new PMS argv shapes
 		// (HW-decode mode, Plex version bumps, etc.). Off by default to
@@ -399,6 +400,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			progressURL = res.ProgressURL
 			seekOffsetSeconds = res.SeekOffsetSeconds
 			isMatroskaSegment = res.IsMatroskaSegment
+			subPrerender = res.SubPrerender
 			metricRewriteApplied.WithLabelValues("applied").Inc()
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 		} else {
@@ -420,6 +422,29 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		if len(psChanges) > 0 {
 			log.Printf("session %s: probesize: %s", req.SessionID, strings.Join(psChanges, ","))
 		}
+	}
+
+	// Subtitle pre-render: when the rewriter chose the GPU-overlay
+	// burn-in path it appended `-i <fifo>` to finalArgs and returned a
+	// SubPrerenderSpec. Spawn the pre-render that feeds that FIFO
+	// before the main transcode — the main `-i <fifo>` blocks until a
+	// writer appears. A pre-render failure fails the session: spawning
+	// the main ffmpeg would otherwise hang forever on the empty FIFO.
+	if subPrerender != nil {
+		pr, err := spawnSubPrerender(ctx, subPrerender)
+		if err != nil {
+			log.Printf("session %s: subtitle pre-render failed: %v", req.SessionID, err)
+			http.Error(w, "sub pre-render: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("session %s: spawned subtitle pre-render pid=%d", req.SessionID, pr.Process.Pid)
+		defer func() {
+			if pr.Process != nil {
+				_ = pr.Process.Kill()
+			}
+			_ = pr.Wait()
+			_ = os.Remove(subPrerender.FIFOPath)
+		}()
 	}
 
 	cmd := exec.CommandContext(ctx, ffmpegBin, finalArgs...)

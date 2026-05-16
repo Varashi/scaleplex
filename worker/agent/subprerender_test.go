@@ -1,0 +1,96 @@
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func argvHasPair(args []string, flag, val string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag && args[i+1] == val {
+			return true
+		}
+	}
+	return false
+}
+
+func argvVal(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func TestBuildSubPrerenderArgs_Basic(t *testing.T) {
+	spec := &SubPrerenderSpec{
+		FIFOPath: "/transcode/s/scaleplex-sub-overlay.fifo",
+		Width:    1920,
+		Height:   1080,
+	}
+	args := buildSubPrerenderArgs(spec, "/transcode/s/temp-0.srt")
+
+	if !strings.Contains(argvVal(args, "-i"), "color=c=black@0.0:s=1920x1080:r=5") {
+		t.Errorf("canvas wrong: %q", argvVal(args, "-i"))
+	}
+	vf := argvVal(args, "-vf")
+	if !strings.Contains(vf, "subtitles=/transcode/s/temp-0.srt") {
+		t.Errorf("subtitles filter missing/wrong: %q", vf)
+	}
+	if !strings.HasSuffix(vf, ",mpdecimate") {
+		t.Errorf("mpdecimate missing: %q", vf)
+	}
+	if strings.Contains(vf, "setpts=") {
+		t.Errorf("no seek → no setpts expected: %q", vf)
+	}
+	if !argvHasPair(args, "-c:v", "ffv1") {
+		t.Error("ffv1 encoder missing")
+	}
+	if !argvHasPair(args, "-fps_mode", "vfr") {
+		t.Error("-fps_mode vfr missing")
+	}
+	if !argvHasPair(args, "-f", "matroska") {
+		t.Error("matroska muxer missing")
+	}
+	if args[len(args)-1] != spec.FIFOPath {
+		t.Errorf("output not the FIFO: %q", args[len(args)-1])
+	}
+}
+
+func TestBuildSubPrerenderArgs_SeekOffset(t *testing.T) {
+	spec := &SubPrerenderSpec{
+		FIFOPath:          "/t/f.fifo",
+		Width:             1280,
+		Height:            720,
+		SeekOffsetSeconds: 83.5,
+	}
+	vf := argvVal(buildSubPrerenderArgs(spec, "/t/s.srt"), "-vf")
+	if !strings.HasPrefix(vf, "setpts=PTS+83.500/TB,subtitles=") {
+		t.Errorf("seek setpts prefix wrong: %q", vf)
+	}
+}
+
+func TestBuildSubPrerenderArgs_EscapesPath(t *testing.T) {
+	spec := &SubPrerenderSpec{FIFOPath: "/t/f.fifo", Width: 1920, Height: 1080}
+	vf := argvVal(buildSubPrerenderArgs(spec, "/media/Movie: The Thing/sub.srt"), "-vf")
+	if !strings.Contains(vf, `Movie\: The Thing`) {
+		t.Errorf("filter-path colon not escaped: %q", vf)
+	}
+}
+
+func TestSubPrerenderEnv_HomeOverride(t *testing.T) {
+	env := subPrerenderEnv()
+	homeCount := 0
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HOME=") {
+			homeCount++
+			if kv != "HOME=/home/ubuntu" {
+				t.Errorf("HOME = %q, want /home/ubuntu", kv)
+			}
+		}
+	}
+	if homeCount != 1 {
+		t.Errorf("expected exactly one HOME entry, got %d", homeCount)
+	}
+}

@@ -75,6 +75,11 @@ type SubPrerenderSpec struct {
 	// agent resolves it to a `subtitles` filter selector. Empty when
 	// SourcePath is a single-stream sidecar file.
 	StreamSpec string
+	// Embedded — true when SourcePath is the source media container
+	// and the subtitle is an embedded stream (the agent extracts it
+	// first); false when SourcePath is a standalone sidecar file the
+	// `subtitles` filter can read directly.
+	Embedded bool
 	// Width, Height — overlay canvas size; matches the transcode's
 	// post-scale target resolution.
 	Width  int
@@ -2127,6 +2132,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						FIFOPath:   fifoPath,
 						SourcePath: srcPath,
 						StreamSpec: subSrc.StreamSpec,
+						Embedded:   subSrc.FilePath == "",
 						Width:      wInt,
 						Height:     hInt,
 					}
