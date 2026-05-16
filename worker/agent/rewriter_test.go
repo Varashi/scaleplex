@@ -551,6 +551,7 @@ func TestRewriter_NoPresetEmitted_NoCompressionLevelInject(t *testing.T) {
 }
 
 func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
 	args := []string{
 		"-codec:0", "libdav1d",
 		"-i", "/media/m.mkv",
@@ -598,6 +599,7 @@ func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
 // captured 2026-05-13 23:19Z on session ee6xs0g12mq5k6bcdom62ju9-
 // ed6ea7eb-03b4-4f81-b640-5aa9580b3978.
 func TestRewriter_SWHDR_InlineAss_Reshape(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
 	args := []string{
 		"-codec:0", "hevc",
 		"-codec:1", "dca",
@@ -1545,6 +1547,7 @@ func TestPlexInlineassToForceStyle_Empty(t *testing.T) {
 // stock ffmpeg we have to inject tonemap_vaapi explicitly or HDR
 // values render with washed colors on every SDR client.
 func TestRewriter_HDRSource_PlainTarget_InjectsTonemap(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
 	probe := func(source string) (transfer, primaries, space string) {
 		return "smpte2084", "bt2020", "bt2020nc"
 	}

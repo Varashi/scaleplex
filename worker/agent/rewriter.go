@@ -678,6 +678,63 @@ type filterRewrite struct {
 // implicitly; we have to spell it out for stock ffmpeg or the encoder
 // receives PQ-quantized values mapped into BT.709 range without
 // tonemapping → washed colors on every HDR-on-SDR-client transcode.
+
+// tonemapUsesOpenCL reports whether the HDR→SDR tone-mapping stage runs
+// on the OpenCL `tonemap_opencl` filter — algorithm-selectable, honors
+// Plex's TranscoderTonemapAlgorithm — rather than iHD's fixed-curve
+// `tonemap_vaapi`. Default OpenCL; SCALEPLEX_TONEMAP=vaapi forces the
+// fixed BT.2390 EETF curve back (instant rollback without a rebuild).
+func tonemapUsesOpenCL() bool {
+	return !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi")
+}
+
+// tonemapAlgo is the OpenCL tone-mapping curve scaleplex uses when it
+// injects a tonemap stage itself (HDR source, SDR target, Plex's argv
+// carried no tonemap filter — HW-decode passthrough / SW shapes).
+// Overridable via SCALEPLEX_TONEMAP_ALGO; the default mirrors the
+// popular community choice for HDR10→SDR. When Plex's argv DOES carry a
+// `tonemap_opencl` filter, its algorithm is honored instead (see
+// substituteOpenCLTonemap).
+func tonemapAlgo() string {
+	switch v := strings.ToLower(os.Getenv("SCALEPLEX_TONEMAP_ALGO")); v {
+	case "hable", "mobius", "reinhard", "bt2390", "linear", "gamma", "clip":
+		return v
+	}
+	return "hable"
+}
+
+// tonemapStage returns the filter fragment that converts an HDR p010
+// VAAPI surface into an SDR (BT.709) nv12 VAAPI surface. It is inserted
+// directly after a `scale_vaapi=...:format=p010` step and its output is
+// a VAAPI surface either way, so it is drop-in wherever `tonemap_vaapi`
+// stood. `algo` is the OpenCL tone-mapping algorithm; empty falls back
+// to tonemapAlgo(); ignored entirely in vaapi mode.
+//
+//	opencl: hwmap→opencl, tonemap_opencl=<algo>, hwmap→vaapi:reverse=1
+//	vaapi:  tonemap_vaapi (iHD fixed BT.2390 EETF)
+//
+// The OpenCL device is self-derived by hwmap from the input frame's
+// VAAPI device — no `-init_hw_device opencl` is needed.
+func tonemapStage(algo string) string {
+	if !tonemapUsesOpenCL() {
+		return "tonemap_vaapi=transfer=bt709:format=nv12"
+	}
+	if algo == "" {
+		algo = tonemapAlgo()
+	}
+	return "hwmap=derive_device=opencl," +
+		"tonemap_opencl=tonemap=" + algo +
+		":transfer=bt709:matrix=bt709:primaries=bt709:format=nv12," +
+		"hwmap=derive_device=vaapi:reverse=1"
+}
+
+// hdrScaleTonemap returns the combined `scale_vaapi(p010) + tonemap`
+// chain that downscales and tone-maps an HDR source to an SDR nv12
+// VAAPI surface. See tonemapStage.
+func hdrScaleTonemap(w, h string) string {
+	return "scale_vaapi=w=" + w + ":h=" + h + ":format=p010," + tonemapStage("")
+}
+
 func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sourceIsHDR bool) *filterRewrite {
 	_ = mediaPath
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
@@ -709,9 +766,7 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 		// filter HDR path (see reFilterPlain branch below).
 		scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
 		if sourceIsHDR {
-			scaleStep = fmt.Sprintf(
-				"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
-				w, h)
+			scaleStep = hdrScaleTonemap(w, h)
 		}
 
 		if subSrc != nil && subSrc.Kind == "bitmap" && subSrc.StreamSpec != "" {
@@ -773,11 +828,8 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 		w, h, finalIdx := m[1], m[2], m[3]
 		return &filterRewrite{
 			Filter: fmt.Sprintf(
-				"[0:0]hwupload[0];"+
-					"[0]scale_vaapi=w=%s:h=%s:format=p010,"+
-					"tonemap_vaapi=transfer=bt709:format=nv12[1];"+
-					"[1]hwupload[2]",
-				w, h),
+				"[0:0]hwupload[0];[0]%s[1];[1]hwupload[2]",
+				hdrScaleTonemap(w, h)),
 			OldLabel: "[" + finalIdx + "]",
 			NewLabel: "[2]",
 			Mode:     "hdr-tonemap-vaapi",
@@ -801,14 +853,12 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 		strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
 		return &filterRewrite{
 			Filter: fmt.Sprintf(
-				"[0:0]hwupload[10];"+
-					"[10]scale_vaapi=w=%s:h=%s:format=p010,"+
-					"tonemap_vaapi=transfer=bt709:format=nv12[11];"+
+				"[0:0]hwupload[10];[10]%s[11];"+
 					"[11]hwdownload[12];"+
 					"[12]format=pix_fmts=nv12[13];"+
 					"[13]inlineass=%s[14];"+
 					"[14]hwupload[15]",
-				w, h, strippedAss),
+				hdrScaleTonemap(w, h), strippedAss),
 			OldLabel: "[3]",
 			NewLabel: "[15]",
 			Mode:     "hdr-tonemap-vaapi-passthrough-inlineass",
@@ -827,11 +877,8 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 			// "plain", no tonemap, colors visibly off).
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
-					"[0:0]hwupload[0];"+
-						"[0]scale_vaapi=w=%s:h=%s:format=p010,"+
-						"tonemap_vaapi=transfer=bt709:format=nv12[1];"+
-						"[1]hwupload[2]",
-					w, h),
+					"[0:0]hwupload[0];[0]%s[1];[1]hwupload[2]",
+					hdrScaleTonemap(w, h)),
 				OldLabel: "[1]",
 				NewLabel: "[2]",
 				Mode:     "hdr-tonemap-vaapi-implicit",
@@ -849,13 +896,12 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 	return nil
 }
 
-// substituteOpenCLTonemap rewrites Plex's OpenCL-based HW tonemap filter
-// chain in -filter_complex to use VAAPI tonemap directly. PMS with the
-// `Use hardware-accelerated tone mapping` pref ON emits a chain that
-// hwmaps VAAPI → OpenCL, runs tonemap_opencl, hwmaps OpenCL → VAAPI,
-// then hwuploads. scaleplex-ffmpeg7 (jellyfin base) has tonemap_vaapi
-// which does the same job without leaving the VAAPI device — fewer
-// memory copies, no OpenCL ICD dependency, no platform-detect race.
+// substituteOpenCLTonemap normalizes Plex's OpenCL HW tonemap filter
+// chain in -filter_complex. PMS with the `Use hardware-accelerated tone
+// mapping` pref ON emits a chain that hwmaps VAAPI → OpenCL, runs
+// tonemap_opencl with the algorithm from the PMS
+// `TranscoderTonemapAlgorithm` pref, hwmaps OpenCL → VAAPI, then
+// hwuploads.
 //
 // Pattern matched (label numbers vary):
 //
@@ -863,27 +909,25 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 //	[A]tonemap_opencl=tonemap=<algo>:format=<pixfmt>:m=<mtx>:p=<prim>:r=<rng>[B];
 //	[B]hwmap=derive_device=vaapi:reverse=1[C]
 //
-// Substituted with:
+// In the default OpenCL tonemap mode the chain is re-emitted in
+// scaleplex's canonical comma form, PRESERVING Plex's chosen algorithm
+// — the whole point of this path is to honor TranscoderTonemapAlgorithm
+// instead of discarding it:
 //
-//	[X]tonemap_vaapi=transfer=bt709:matrix=<mtx>:primaries=<prim>:format=<pixfmt>[C]
+//	[X]hwmap=derive_device=opencl,tonemap_opencl=tonemap=<algo>:transfer=bt709:matrix=<mtx>:primaries=<prim>:format=<pixfmt>,hwmap=derive_device=vaapi:reverse=1[C]
 //
-// The tonemap algorithm Plex sends (hable / mobius / reinhard / etc.,
-// from the PMS `TranscoderTonemapAlgorithm` pref) is DISCARDED — iHD
-// VAAPI's tonemap path uses a fixed BT.2390 EETF curve internally and
-// doesn't expose per-algorithm tuning. Visual result is comparable to
-// hable for HDR10 sources. For finer algorithm control the user would
-// need to fall back to a SW tonemap chain (slow) or wait for iHD to
-// expose tunables.
-//
-// Matrix / primaries / range from Plex's chain ARE preserved when
-// present.
+// With SCALEPLEX_TONEMAP=vaapi it collapses to a single fixed-curve
+// tonemap_vaapi instead — the algorithm is then discarded, since iHD's
+// VAAPI VPP tonemap uses a fixed BT.2390 EETF curve with no per-
+// algorithm tuning. matrix / primaries from Plex's chain are preserved
+// in both modes; range has no tonemap_vaapi equivalent.
 //
 // Returns updated args + true if a substitution was applied.
 var openclTonemapRE = regexp.MustCompile(
 	`\[(\d+)\]hwmap=derive_device=opencl\[\d+\];` +
 		`\[\d+\]tonemap_opencl=(?P<opts>[^[]+)\[\d+\];` +
 		`\[\d+\]hwmap=derive_device=vaapi:reverse=1\[(\d+)\]`)
-var tonemapOptRE = regexp.MustCompile(`(?:^|:)(format|m|p|r)=([a-z0-9-]+)`)
+var tonemapOptRE = regexp.MustCompile(`(?:^|:)(tonemap|format|m|p|r|t)=([a-z0-9-]+)`)
 
 func substituteOpenCLTonemap(args []string) ([]string, bool) {
 	for i := 0; i+1 < len(args); i++ {
@@ -901,10 +945,10 @@ func substituteOpenCLTonemap(args []string) ([]string, bool) {
 		startLabel := orig[m[2]:m[3]]
 		opts := orig[m[4]:m[5]]
 		endLabel := orig[m[6]:m[7]]
-		// Parse k=v pairs from the opencl filter opts. We preserve
-		// format/m/p/r; tonemap (algorithm) is discarded — iHD VAAPI
-		// tonemap_vaapi has a fixed internal curve.
-		var pixFmt, matrix, primaries string
+		// Parse k=v pairs from the opencl filter opts. format / m
+		// (matrix) / p (primaries) are preserved; tonemap (algorithm)
+		// is preserved in OpenCL mode, discarded in vaapi mode.
+		var pixFmt, matrix, primaries, algo string
 		for _, kv := range tonemapOptRE.FindAllStringSubmatch(opts, -1) {
 			switch kv[1] {
 			case "format":
@@ -913,26 +957,49 @@ func substituteOpenCLTonemap(args []string) ([]string, bool) {
 				matrix = kv[2]
 			case "p":
 				primaries = kv[2]
-				// "r" (range) has no tonemap_vaapi equivalent option —
-				// VAAPI sets range based on the surrounding pipeline.
+			case "tonemap":
+				algo = kv[2]
+				// "r" (range) / "t" (transfer) have no tonemap_vaapi
+				// equivalent option — VAAPI derives them from the
+				// surrounding pipeline; we always target SDR bt709.
 			}
 		}
 		if pixFmt == "" {
 			pixFmt = "nv12"
 		}
-		// Build tonemap_vaapi options. transfer=bt709 is the standard
-		// SDR target (we don't expose other transfers — iHD only goes
-		// HDR10 → SDR-bt709 in this filter).
-		vaapiOpts := "transfer=bt709"
-		if matrix != "" {
-			vaapiOpts += ":matrix=" + matrix
+		var replacement string
+		if tonemapUsesOpenCL() {
+			// Re-emit Plex's chain in canonical comma form, keeping its
+			// algorithm. matrix / primaries default to bt709 (the SDR
+			// target) when Plex's chain did not pin them.
+			if algo == "" {
+				algo = tonemapAlgo()
+			}
+			if matrix == "" {
+				matrix = "bt709"
+			}
+			if primaries == "" {
+				primaries = "bt709"
+			}
+			replacement = fmt.Sprintf(
+				"[%s]hwmap=derive_device=opencl,"+
+					"tonemap_opencl=tonemap=%s:transfer=bt709:matrix=%s:primaries=%s:format=%s,"+
+					"hwmap=derive_device=vaapi:reverse=1[%s]",
+				startLabel, algo, matrix, primaries, pixFmt, endLabel)
+		} else {
+			// SCALEPLEX_TONEMAP=vaapi: collapse to the fixed-curve
+			// VAAPI filter. transfer=bt709 is the standard SDR target.
+			vaapiOpts := "transfer=bt709"
+			if matrix != "" {
+				vaapiOpts += ":matrix=" + matrix
+			}
+			if primaries != "" {
+				vaapiOpts += ":primaries=" + primaries
+			}
+			vaapiOpts += ":format=" + pixFmt
+			replacement = fmt.Sprintf("[%s]tonemap_vaapi=%s[%s]",
+				startLabel, vaapiOpts, endLabel)
 		}
-		if primaries != "" {
-			vaapiOpts += ":primaries=" + primaries
-		}
-		vaapiOpts += ":format=" + pixFmt
-		replacement := fmt.Sprintf("[%s]tonemap_vaapi=%s[%s]",
-			startLabel, vaapiOpts, endLabel)
 		args[i+1] = orig[:m[0]] + replacement + orig[m[1]:]
 		return args, true
 	}
@@ -1428,8 +1495,8 @@ func injectHWPassthroughTonemap(filterStr string) (string, bool) {
 		return "", false
 	}
 	out := fmt.Sprintf(
-		"[%s]hwupload[%s];[%s]scale_vaapi=w=%s:h=%s:format=p010[%s];[%s]tonemap_vaapi=transfer=bt709:format=nv12[%s]",
-		in, a1, a1, w, h, b1, b1, final,
+		"[%s]hwupload[%s];[%s]scale_vaapi=w=%s:h=%s:format=p010[%s];[%s]%s[%s]",
+		in, a1, a1, w, h, b1, b1, tonemapStage(""), final,
 	)
 	return out, true
 }
@@ -1645,16 +1712,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	args := cloneArgs(inputArgs)
 	env := cloneEnv(inputEnv)
 
-	// Substitute Plex's OpenCL HW-tonemap filter chain with tonemap_vaapi.
-	// PMS with `Use hardware-accelerated tone mapping` ON emits a
-	// hwmap=opencl → tonemap_opencl → hwmap=vaapi-reverse chain. We
-	// collapse to a single tonemap_vaapi (scaleplex-ffmpeg7/jellyfin has
-	// the VAAPI filter, fewer copies, no OpenCL ICD dependency). Runs
-	// before phase 1 so any later filter-chain inspection sees the
+	// Normalize Plex's OpenCL HW-tonemap filter chain. PMS with `Use
+	// hardware-accelerated tone mapping` ON emits a hwmap=opencl →
+	// tonemap_opencl → hwmap=vaapi-reverse chain. By default we re-emit
+	// it in canonical comma form keeping Plex's chosen algorithm;
+	// SCALEPLEX_TONEMAP=vaapi collapses it to fixed-curve tonemap_vaapi.
+	// Runs before phase 1 so any later filter-chain inspection sees the
 	// already-substituted form.
 	if newArgs, did := substituteOpenCLTonemap(args); did {
 		args = newArgs
-		changes = append(changes, "filter:tonemap_opencl->tonemap_vaapi")
+		if tonemapUsesOpenCL() {
+			changes = append(changes, "filter:tonemap_opencl-normalized")
+		} else {
+			changes = append(changes, "filter:tonemap_opencl->tonemap_vaapi")
+		}
 	}
 
 	// Plex Optimize remux fast-path. PMS emits a bare `-codec:0 h264`
@@ -2056,7 +2127,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				w, h := m[1], m[2]
 				// Force nv12 across the libass step (matches the SW
 				// pass-through path). HDR-source detection runs below so
-				// scaleStep prepends tonemap_vaapi when needed; PQ →
+				// scaleStep prepends the tonemap stage when needed; PQ →
 				// BT.709 nv12 before libass renders SDR glyphs over it.
 				if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 					if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
@@ -2066,9 +2137,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 				scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
 				if sourceIsHDR {
-					scaleStep = fmt.Sprintf(
-						"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
-						w, h)
+					scaleStep = hdrScaleTonemap(w, h)
 				}
 				// Animated ASS (karaoke / transform / move / fade) can't
 				// be pre-rasterized once per cue — keep the per-frame

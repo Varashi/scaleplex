@@ -10,6 +10,7 @@ import (
 // 2026-05-10 PM during a forced videoCodec=h264 streaming session
 // against Big Hero 6 4K HDR.
 func TestInjectHWPassthroughTonemap_RewritesNV12ChainToTonemap(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
 	in := "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=nv12[1];[1]hwupload[2]"
 	out, ok := injectHWPassthroughTonemap(in)
 	if !ok {
@@ -45,6 +46,7 @@ func TestInjectHWPassthroughTonemap_LeavesComplexChainUntouched(t *testing.T) {
 // End-to-end: HW-decode + HDR source + SDR encoder → rewriter splices
 // tonemap into PMS's filter chain.
 func TestRewriter_HWDecode_HDR_SDR_InjectsTonemap(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
 	args := []string{
 		"-codec:0", "hevc",
 		"-hwaccel:0", "vaapi",
@@ -112,5 +114,123 @@ func TestRewriter_HWDecode_SDR_NoTonemapInjected(t *testing.T) {
 	}
 	if containsString(out.Changes, "filter:hw-passthrough-tonemap-injected") {
 		t.Fatalf("SDR source must not trigger tonemap: %v", out.Changes)
+	}
+}
+
+// hwDecodeHDRArgs is the PMS HW-decode HDR→SDR argv shape (naive
+// format=nv12 chain, no tonemap) used by the OpenCL-tonemap tests.
+func hwDecodeHDRArgs() []string {
+	return []string{
+		"-codec:0", "hevc",
+		"-hwaccel:0", "vaapi",
+		"-hwaccel_output_format:0", "vaapi",
+		"-hwaccel_device:0", "vaapi",
+		"-i", "/media/Movies/HDRMovie.mkv",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=nv12[1];[1]hwupload[2]",
+		"-map", "[2]",
+		"-codec:0", "h264_vaapi",
+		"-qp:0", "22",
+	}
+}
+
+func filterComplexOf(args []string) string {
+	for i, a := range args {
+		if a == "-filter_complex" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// Default (no SCALEPLEX_TONEMAP set) → the injected tonemap stage runs
+// on tonemap_opencl with the hable algorithm, self-deriving the OpenCL
+// device from the VAAPI frame context.
+func TestTonemap_OpenCL_DefaultInjectsHableChain(t *testing.T) {
+	out := Rewrite(hwDecodeHDRArgs(), nil, &RewriteOpts{
+		ProbeVideoColor: func(string) (string, string, string) {
+			return "smpte2084", "bt2020", "bt2020nc"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	f := filterComplexOf(out.Args)
+	for _, want := range []string{
+		"scale_vaapi=w=1280:h=720:format=p010",
+		"hwmap=derive_device=opencl",
+		"tonemap_opencl=tonemap=hable",
+		"hwmap=derive_device=vaapi:reverse=1",
+	} {
+		if !strings.Contains(f, want) {
+			t.Errorf("filter missing %q:\n%s", want, f)
+		}
+	}
+	if strings.Contains(f, "tonemap_vaapi") {
+		t.Errorf("default mode must not emit tonemap_vaapi:\n%s", f)
+	}
+}
+
+// SCALEPLEX_TONEMAP_ALGO overrides the injected algorithm.
+func TestTonemap_OpenCL_AlgoEnvOverride(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP_ALGO", "mobius")
+	out := Rewrite(hwDecodeHDRArgs(), nil, &RewriteOpts{
+		ProbeVideoColor: func(string) (string, string, string) {
+			return "smpte2084", "bt2020", "bt2020nc"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if f := filterComplexOf(out.Args); !strings.Contains(f, "tonemap_opencl=tonemap=mobius") {
+		t.Errorf("expected tonemap=mobius:\n%s", f)
+	}
+}
+
+// When PMS itself sends an OpenCL tonemap chain, the algorithm it chose
+// (TranscoderTonemapAlgorithm) is preserved, not discarded.
+func TestSubstituteOpenCLTonemap_PreservesPlexAlgorithm(t *testing.T) {
+	args := []string{
+		"-filter_complex",
+		"[0]hwmap=derive_device=opencl[1];" +
+			"[1]tonemap_opencl=tonemap=reinhard:format=nv12:m=bt709:p=bt709:r=tv[2];" +
+			"[2]hwmap=derive_device=vaapi:reverse=1[3]",
+	}
+	out, did := substituteOpenCLTonemap(args)
+	if !did {
+		t.Fatal("expected substitution")
+	}
+	f := filterComplexOf(out)
+	if !strings.Contains(f, "tonemap_opencl=tonemap=reinhard") {
+		t.Errorf("Plex's algorithm (reinhard) must be preserved:\n%s", f)
+	}
+	if !strings.Contains(f, "hwmap=derive_device=opencl,tonemap_opencl") {
+		t.Errorf("expected canonical comma-form chain:\n%s", f)
+	}
+	if !strings.Contains(f, "hwmap=derive_device=vaapi:reverse=1[3]") {
+		t.Errorf("end label must be preserved:\n%s", f)
+	}
+}
+
+// SCALEPLEX_TONEMAP=vaapi collapses Plex's OpenCL chain to the fixed-
+// curve tonemap_vaapi filter (algorithm discarded).
+func TestSubstituteOpenCLTonemap_VAAPIModeCollapses(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi")
+	args := []string{
+		"-filter_complex",
+		"[0]hwmap=derive_device=opencl[1];" +
+			"[1]tonemap_opencl=tonemap=reinhard:format=nv12:m=bt709:p=bt709:r=tv[2];" +
+			"[2]hwmap=derive_device=vaapi:reverse=1[3]",
+	}
+	out, did := substituteOpenCLTonemap(args)
+	if !did {
+		t.Fatal("expected substitution")
+	}
+	f := filterComplexOf(out)
+	if !strings.Contains(f, "tonemap_vaapi=transfer=bt709:matrix=bt709:primaries=bt709:format=nv12") {
+		t.Errorf("vaapi mode must collapse to tonemap_vaapi:\n%s", f)
+	}
+	if strings.Contains(f, "tonemap_opencl") {
+		t.Errorf("vaapi mode must not keep tonemap_opencl:\n%s", f)
 	}
 }
