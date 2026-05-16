@@ -285,20 +285,45 @@ the filter graph).
 
 ### HDR tonemap (HDR source → SDR output)
 
-`tonemap_vaapi` is **not in Plex's ffmpeg build** (they keep
-`tonemap_cuda` and `tonemap_opencl` only). Workers run scaleplex-ffmpeg7
-(jellyfin-ffmpeg + a small Plex-backport patch layer — see
-[`scaleplex-ffmpeg/`](../scaleplex-ffmpeg/)) which has `tonemap_vaapi`.
-
 When the rewriter sees an HDR source (color_transfer=smpte2084 etc. via
-ffprobe) targeting SDR output, it injects:
+ffprobe) targeting SDR output, it injects a tone-mapping stage after
+`scale_vaapi=...:format=p010`. The stage runs in one of two modes,
+selected by the `SCALEPLEX_TONEMAP` env var:
+
+**OpenCL (default).** `tonemap_opencl` is algorithm-selectable, so it
+honors Plex's `TranscoderTonemapAlgorithm` preset:
+
+```
+scale_vaapi=w=W:h=H:format=p010,
+hwmap=derive_device=opencl,
+tonemap_opencl=tonemap=<algo>:transfer=bt709:matrix=bt709:primaries=bt709:format=nv12,
+hwmap=derive_device=vaapi:reverse=1
+```
+
+`hwmap` self-derives the OpenCL device from the input frame's VAAPI
+device — no `-init_hw_device opencl` is needed. The output is a VAAPI
+nv12 surface, so the stage is drop-in wherever the old `tonemap_vaapi`
+filter stood. `<algo>` comes from Plex's chain when PMS sent one (see
+`substituteOpenCLTonemap`), otherwise from `SCALEPLEX_TONEMAP_ALGO`
+(default `hable`). Costs ~15% throughput vs the fixed-curve filter —
+still ~10× realtime at 4K HDR→1080p on an Arc A310.
+
+**VAAPI fixed-curve** (`SCALEPLEX_TONEMAP=vaapi`). iHD's VAAPI VPP
+tone-map — a fixed BT.2390 EETF curve, no per-algorithm tuning:
 
 ```
 scale_vaapi=w=W:h=H:format=p010,
 tonemap_vaapi=transfer=bt709:format=nv12
 ```
 
-into the VAAPI filter chain.
+`tonemap_vaapi` is **not in Plex's ffmpeg build** (they ship
+`tonemap_cuda` / `tonemap_opencl` only); scaleplex-ffmpeg7
+(jellyfin-ffmpeg) has it.
+
+> The VAAPI↔Vulkan `libplacebo` route (richer tunables) is **not** used:
+> Intel's ANV Vulkan driver reports `sync import caps: 0x0`, so the
+> zero-copy VAAPI→Vulkan interop can't synchronize. `tonemap_opencl`
+> gives the algorithm choice without that dependency.
 
 ### Subtitle bail conditions
 
