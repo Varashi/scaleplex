@@ -39,6 +39,7 @@ RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|'
       libva2 libva-drm2 \
       vainfo \
       fontconfig fonts-dejavu-core \
+      strace \
       tini && \
     rm /tmp/scaleplex-ffmpeg7_*.deb && \
     rm -rf /var/lib/apt/lists/*
