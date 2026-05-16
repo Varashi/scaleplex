@@ -2197,6 +2197,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// here the overlay would rebase to 0 while the main
 					// video stays at the seek offset — overlay_vaapi
 					// framesync never aligns and the transcode stalls.
+					//
+					// `-probesize 32 -analyzeduration 0`: without them
+					// find_stream_info reads up to probesize (5 MB) of the
+					// FIFO before returning, and since the overlay is
+					// sparse that forces the pre-render to grind seconds
+					// of timeline ahead while the main ffmpeg blocks —
+					// ~5 s of startup latency. The Matroska header alone
+					// gives the codec and dimensions, so a minimal probe
+					// returns in ~0.8 s (measured).
 					lastInput := -1
 					for i := 0; i+1 < len(args); i++ {
 						if args[i] == "-i" {
@@ -2204,7 +2213,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					if lastInput >= 0 {
-						args = spliceArgs(args, lastInput+2, "-copyts", "-i", fifoPath)
+						args = spliceArgs(args, lastInput+2,
+							"-copyts", "-probesize", "32", "-analyzeduration", "0",
+							"-i", fifoPath)
 					}
 					// reFilterHWOpenCLAss argv ends at label [6] with
 					// `-map [6]`; our overlay graph outputs [4]. Retarget.
