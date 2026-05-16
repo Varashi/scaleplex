@@ -316,6 +316,12 @@ filter stood. `<algo>` precedence: Plex's chain when PMS sent one (see
 throughput vs the fixed-curve filter — still ~10× realtime at 4K
 HDR→1080p on an Arc A310.
 
+> The worker **must** strip `OCL_ICD_VENDORS` from the spawn env (it
+> does — see `stripEAEEnvVars`). PMS sets `OCL_ICD_VENDORS=0` to disable
+> OpenCL ICD discovery in its own ffmpeg; inherited by a worker ffmpeg
+> it makes the OpenCL loader find zero platforms (`clGetPlatformIDs` →
+> `-1001`) and the whole tonemap_opencl transcode fails.
+
 **VAAPI fixed-curve** (`SCALEPLEX_TONEMAP=vaapi`). iHD's VAAPI VPP
 tone-map — a fixed BT.2390 EETF curve, no per-algorithm tuning:
 
