@@ -20,7 +20,7 @@ COPY worker/agent/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
       -o /out/scaleplex-agent ./...
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
 LABEL org.opencontainers.image.description="scaleplex worker — scaleplex-ffmpeg + Intel iHD VAAPI + Go agent"
 LABEL org.opencontainers.image.licenses=MIT
