@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -1465,6 +1466,46 @@ func TestSubtitleKind(t *testing.T) {
 		if got := subtitleKind(codec); got != want {
 			t.Errorf("subtitleKind(%q) = %q want %q", codec, got, want)
 		}
+	}
+}
+
+// subtitleIsAnimated routes animated ASS to the inlineass path and
+// SRT / static ASS to the pre-render overlay path.
+func TestSubtitleIsAnimated(t *testing.T) {
+	read := func(content string) func(string) ([]byte, error) {
+		return func(string) ([]byte, error) { return []byte(content), nil }
+	}
+	readErr := func(string) ([]byte, error) { return nil, fmt.Errorf("boom") }
+
+	tests := []struct {
+		name  string
+		codec string
+		path  string
+		read  func(string) ([]byte, error)
+		want  bool
+	}{
+		{"srt never animated", "subrip", "/x.srt", nil, false},
+		{"srt alias", "srt", "/x.srt", nil, false},
+		{"static ass dialogue", "ass", "/x.ass",
+			read("Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello world"), false},
+		{"ass karaoke \\k", "ass", "/x.ass",
+			read(`Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\k50}la{\k30}la`), true},
+		{"ass transform \\t", "ass", "/x.ass",
+			read(`Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\t(0,500,\fscx120)}grow`), true},
+		{"ass movement \\move", "ass", "/x.ass",
+			read(`Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\move(0,0,100,100)}slide`), true},
+		{"ass fade \\fad", "ass", "/x.ass",
+			read(`Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\fad(200,200)}fade`), true},
+		{"embedded ass conservative", "ass", "", nil, true},
+		{"ass read error conservative", "ass", "/x.ass", readErr, true},
+		{"mov_text static", "mov_text", "", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subtitleIsAnimated(tt.codec, tt.path, tt.read); got != tt.want {
+				t.Errorf("subtitleIsAnimated(%q, %q) = %v want %v", tt.codec, tt.path, got, tt.want)
+			}
+		})
 	}
 }
 

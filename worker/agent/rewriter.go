@@ -48,6 +48,42 @@ type RewriteResult struct {
 	// The agent uses this to start `watchAndPatchMatroskaChunks`
 	// instead of the DASH-style chunk-renumber watcher.
 	IsMatroskaSegment bool
+	// SubPrerender — non-nil when the rewriter chose the pre-rendered
+	// GPU-overlay path for a text-subtitle burn-in (SRT / static ASS)
+	// instead of the per-frame inlineass filter. The agent uses it to
+	// spawn the subtitle pre-render alongside the main ffmpeg.
+	SubPrerender *SubPrerenderSpec
+}
+
+// SubPrerenderSpec, when set on a RewriteResult, tells the agent to
+// spawn a subtitle pre-render process alongside the main ffmpeg. The
+// pre-render rasterizes the text subtitle into a sparse transparent
+// video written to FIFOPath; the rewritten main filter graph reads
+// that FIFO as a second input and composites it with overlay_vaapi.
+// See project_scaleplex_srt_to_pgs_gpu.
+type SubPrerenderSpec struct {
+	// FIFOPath — the named pipe the agent creates and the pre-render
+	// writes Matroska/ffv1 to. The rewritten main argv already carries
+	// `-i FIFOPath`, so the two must agree.
+	FIFOPath string
+	// SourcePath — the file the pre-render's `subtitles` filter reads:
+	// a sidecar .srt path, or the source media container when the
+	// subtitle is an embedded stream.
+	SourcePath string
+	// StreamIndex — for an embedded subtitle, the stream index the
+	// `subtitles` filter selects. -1 for an external sidecar file.
+	StreamIndex int
+	// Width, Height — overlay canvas size; matches the transcode's
+	// post-scale target resolution.
+	Width  int
+	Height int
+	// SeekOffsetSeconds — the pre-render timeline must start here so it
+	// aligns with a -ss seek session's main video. 0 on initial play.
+	SeekOffsetSeconds float64
+	// ForceStyle — optional `subtitles` filter force_style= string
+	// carrying Plex's burn-in styling. Empty until the style-mapping
+	// phase populates it.
+	ForceStyle string
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -395,6 +431,47 @@ func subtitleKind(codec string) string {
 		return "bitmap"
 	}
 	return "unknown"
+}
+
+// assAnimationTags are the ASS override tags whose visual effect
+// changes within a single cue's on-screen lifetime: karaoke fills
+// (\k family), transforms (\t), movement (\move) and fades (\fad /
+// \fade). A cue carrying any of these cannot be pre-rasterized to one
+// static bitmap — it must keep the per-frame libass `inlineass` path.
+var assAnimationTags = []string{`\k`, `\K`, `\t(`, `\move(`, `\fad`}
+
+// subtitleIsAnimated reports whether a text subtitle needs per-frame
+// rendering (animated ASS) rather than the once-per-cue pre-render
+// overlay path.
+//
+//   - SRT/SubRip carries no override tags — never animated.
+//   - ASS/SSA is scanned for animation override tags. When the file
+//     can't be read (embedded stream, or a read error) the answer is
+//     conservatively true, so the session keeps the safe inlineass
+//     path instead of silently dropping karaoke / motion.
+//   - Other text codecs have no animation model — treated as static.
+func subtitleIsAnimated(codec, filePath string, readFile func(string) ([]byte, error)) bool {
+	switch strings.ToLower(codec) {
+	case "subrip", "srt":
+		return false
+	case "ass", "ssa":
+		if filePath == "" || readFile == nil {
+			return true
+		}
+		data, err := readFile(filePath)
+		if err != nil {
+			return true
+		}
+		body := string(data)
+		for _, tag := range assAnimationTags {
+			if strings.Contains(body, tag) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 // SubtitleSource is the result of analysing -map_inlineass + -i argv.
