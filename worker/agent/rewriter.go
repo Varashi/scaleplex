@@ -2148,13 +2148,24 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					)
 					// Drop `-map_inlineass <spec>` — no inlineass filter
 					// consumes it on this path; the pre-render reads the
-					// subtitle itself. Then append the overlay FIFO as the
-					// final input, just before -filter_complex.
+					// subtitle itself.
 					if mi := indexOfArg(args, "-map_inlineass", 0); mi >= 0 && mi+1 < len(args) {
 						args = removeArgs(args, mi, 2)
 					}
-					if fc := indexOfArg(args, "-filter_complex", 0); fc >= 0 {
-						args = spliceArgs(args, fc, "-i", fifoPath)
+					// Append the overlay FIFO immediately after the last
+					// existing input's path. It must NOT go just before
+					// -filter_complex: Plex puts output-side options
+					// (-start_at_zero, -copyts, -fps_mode) between the last
+					// input and the filtergraph, and a new -i there makes
+					// ffmpeg mis-parse those as input options for the FIFO.
+					lastInput := -1
+					for i := 0; i+1 < len(args); i++ {
+						if args[i] == "-i" {
+							lastInput = i
+						}
+					}
+					if lastInput >= 0 {
+						args = spliceArgs(args, lastInput+2, "-i", fifoPath)
 					}
 					// reFilterHWOpenCLAss argv ends at label [6] with
 					// `-map [6]`; our overlay graph outputs [4]. Retarget.
