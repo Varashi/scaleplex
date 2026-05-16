@@ -38,6 +38,11 @@ func TestBuildSubPrerenderArgs_Basic(t *testing.T) {
 	if !strings.Contains(vf, "subtitles=/transcode/s/temp-0.srt") {
 		t.Errorf("subtitles filter missing/wrong: %q", vf)
 	}
+	// alpha=1 is mandatory — without it the text renders with alpha 0
+	// on the transparent canvas and the overlay is invisible.
+	if !strings.Contains(vf, ":alpha=1") {
+		t.Errorf("subtitles filter missing alpha=1: %q", vf)
+	}
 	if !strings.HasSuffix(vf, ",mpdecimate") {
 		t.Errorf("mpdecimate missing: %q", vf)
 	}

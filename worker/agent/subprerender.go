@@ -46,7 +46,11 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 		vf += "setpts=PTS+" +
 			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB,"
 	}
-	vf += "subtitles=" + escapeFilterPath(subFile)
+	// alpha=1 is required: the subtitles filter leaves the alpha
+	// channel untouched by default, so rendering onto the transparent
+	// canvas yields text with the correct RGB but alpha 0 — an
+	// invisible overlay. alpha=1 makes it composite the alpha too.
+	vf += "subtitles=" + escapeFilterPath(subFile) + ":alpha=1"
 	if spec.ForceStyle != "" {
 		// Single-quote the value: it is a comma-separated list, and an
 		// unquoted comma would be read as a filterchain separator
