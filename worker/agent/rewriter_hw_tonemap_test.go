@@ -12,7 +12,7 @@ import (
 func TestInjectHWPassthroughTonemap_RewritesNV12ChainToTonemap(t *testing.T) {
 	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
 	in := "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=nv12[1];[1]hwupload[2]"
-	out, ok := injectHWPassthroughTonemap(in)
+	out, ok := injectHWPassthroughTonemap(in, resolveTonemapConfig(nil))
 	if !ok {
 		t.Fatalf("expected match, got false")
 	}
@@ -27,7 +27,7 @@ func TestInjectHWPassthroughTonemap_RewritesNV12ChainToTonemap(t *testing.T) {
 // here would double-convert and break HDR pass-through.
 func TestInjectHWPassthroughTonemap_LeavesP010ChainUntouched(t *testing.T) {
 	in := "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=p010[1];[1]hwupload[2]"
-	_, ok := injectHWPassthroughTonemap(in)
+	_, ok := injectHWPassthroughTonemap(in, resolveTonemapConfig(nil))
 	if ok {
 		t.Fatalf("p010 chain must not match SDR pattern")
 	}
@@ -37,7 +37,7 @@ func TestInjectHWPassthroughTonemap_LeavesP010ChainUntouched(t *testing.T) {
 // rewrite paths — the simple pattern shouldn't snag them.
 func TestInjectHWPassthroughTonemap_LeavesComplexChainUntouched(t *testing.T) {
 	in := "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1];[1][2:s:0]overlay_vaapi[3]"
-	_, ok := injectHWPassthroughTonemap(in)
+	_, ok := injectHWPassthroughTonemap(in, resolveTonemapConfig(nil))
 	if ok {
 		t.Fatalf("multi-step chain must not match the simple pattern")
 	}
@@ -196,7 +196,7 @@ func TestSubstituteOpenCLTonemap_PreservesPlexAlgorithm(t *testing.T) {
 			"[1]tonemap_opencl=tonemap=reinhard:format=nv12:m=bt709:p=bt709:r=tv[2];" +
 			"[2]hwmap=derive_device=vaapi:reverse=1[3]",
 	}
-	out, did := substituteOpenCLTonemap(args)
+	out, did := substituteOpenCLTonemap(args, resolveTonemapConfig(nil))
 	if !did {
 		t.Fatal("expected substitution")
 	}
@@ -222,7 +222,7 @@ func TestSubstituteOpenCLTonemap_VAAPIModeCollapses(t *testing.T) {
 			"[1]tonemap_opencl=tonemap=reinhard:format=nv12:m=bt709:p=bt709:r=tv[2];" +
 			"[2]hwmap=derive_device=vaapi:reverse=1[3]",
 	}
-	out, did := substituteOpenCLTonemap(args)
+	out, did := substituteOpenCLTonemap(args, resolveTonemapConfig(nil))
 	if !did {
 		t.Fatal("expected substitution")
 	}
@@ -232,5 +232,64 @@ func TestSubstituteOpenCLTonemap_VAAPIModeCollapses(t *testing.T) {
 	}
 	if strings.Contains(f, "tonemap_opencl") {
 		t.Errorf("vaapi mode must not keep tonemap_opencl:\n%s", f)
+	}
+}
+
+// resolveTonemapConfig: defaults, the Plex on/off pref, and algorithm
+// precedence (Plex pref > operator env > built-in hable).
+func TestResolveTonemapConfig(t *testing.T) {
+	if c := resolveTonemapConfig(nil); !c.enabled || !c.useOpenCL || c.algo != "hable" {
+		t.Errorf("default: want enabled+opencl+hable, got %+v", c)
+	}
+	if c := resolveTonemapConfig(map[string]string{"SCALEPLEX_PLEX_TONEMAP": "0"}); c.enabled {
+		t.Errorf("SCALEPLEX_PLEX_TONEMAP=0 must disable, got %+v", c)
+	}
+	if c := resolveTonemapConfig(map[string]string{"SCALEPLEX_PLEX_TONEMAP_ALGO": "reinhard"}); c.algo != "reinhard" {
+		t.Errorf("algo from Plex pref: want reinhard, got %q", c.algo)
+	}
+	// Plex's pref outranks the operator's SCALEPLEX_TONEMAP_ALGO.
+	t.Setenv("SCALEPLEX_TONEMAP_ALGO", "clip")
+	if c := resolveTonemapConfig(map[string]string{"SCALEPLEX_PLEX_TONEMAP_ALGO": "mobius"}); c.algo != "mobius" {
+		t.Errorf("Plex pref must outrank operator env: want mobius, got %q", c.algo)
+	}
+	// Operator env is the fallback when Plex sent nothing.
+	if c := resolveTonemapConfig(nil); c.algo != "clip" {
+		t.Errorf("operator-env fallback: want clip, got %q", c.algo)
+	}
+}
+
+// Plex's tone-mapping pref off → scaleplex honors it: no tonemap stage
+// injected on an HDR source, even though it would otherwise wash out.
+func TestRewriter_PlexTonemapDisabled_NoImplicitInjection(t *testing.T) {
+	out := Rewrite(hwDecodeHDRArgs(),
+		map[string]string{"SCALEPLEX_PLEX_TONEMAP": "0"},
+		&RewriteOpts{ProbeVideoColor: func(string) (string, string, string) {
+			return "smpte2084", "bt2020", "bt2020nc"
+		}})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	f := filterComplexOf(out.Args)
+	if strings.Contains(f, "tonemap_opencl") || strings.Contains(f, "tonemap_vaapi") {
+		t.Errorf("Plex tonemap pref off — no tonemap stage must be injected:\n%s", f)
+	}
+	if !containsString(out.Changes, "tonemap:skipped(plex-pref-off)") {
+		t.Errorf("expected tonemap:skipped(plex-pref-off) change tag: %v", out.Changes)
+	}
+}
+
+// Plex's tone-mapping pref on (default) → the injected stage uses the
+// algorithm from Plex's TranscoderToneMappingAgorithm pref.
+func TestRewriter_PlexTonemapAlgoFromPref(t *testing.T) {
+	out := Rewrite(hwDecodeHDRArgs(),
+		map[string]string{"SCALEPLEX_PLEX_TONEMAP_ALGO": "reinhard"},
+		&RewriteOpts{ProbeVideoColor: func(string) (string, string, string) {
+			return "smpte2084", "bt2020", "bt2020nc"
+		}})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if f := filterComplexOf(out.Args); !strings.Contains(f, "tonemap_opencl=tonemap=reinhard") {
+		t.Errorf("expected Plex's pref algorithm (reinhard):\n%s", f)
 	}
 }

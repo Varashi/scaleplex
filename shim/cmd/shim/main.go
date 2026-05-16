@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -345,7 +346,52 @@ func collectEnv() map[string]string {
 		}
 		out["SCALEPLEX_PMS_BASE_URL"] = "http://" + host + ":" + port
 	}
+	// Surface Plex's HDR tone-mapping prefs so the worker rewriter can
+	// honor them — the worker pod can't read PMS's config volume. The
+	// rewriter reads SCALEPLEX_PLEX_TONEMAP (0 = disabled) and
+	// SCALEPLEX_PLEX_TONEMAP_ALGO. Absent values fail safe (tonemap on).
+	if tmEnabled, tmAlgo, ok := readPlexTonemapPrefs(); ok {
+		if tmEnabled != "" {
+			out["SCALEPLEX_PLEX_TONEMAP"] = tmEnabled
+		}
+		if tmAlgo != "" {
+			out["SCALEPLEX_PLEX_TONEMAP_ALGO"] = tmAlgo
+		}
+	}
 	return out
+}
+
+// readPlexTonemapPrefs reads the HDR tone-mapping settings from PMS's
+// Preferences.xml. It returns the raw TranscoderToneMapping ("0"/"1")
+// and TranscoderToneMappingAgorithm (note Plex's misspelled key) values
+// and whether the file was found and parsed. Best-effort: a miss means
+// the worker falls back to its own defaults (tonemap on).
+func readPlexTonemapPrefs() (toneMapping, algo string, ok bool) {
+	var candidates []string
+	if p := os.Getenv("SCALEPLEX_PLEX_PREFS"); p != "" {
+		candidates = append(candidates, p)
+	}
+	if d := os.Getenv("PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR"); d != "" {
+		candidates = append(candidates, filepath.Join(d, "Plex Media Server", "Preferences.xml"))
+	}
+	candidates = append(candidates,
+		"/config/Library/Application Support/Plex Media Server/Preferences.xml")
+
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var p struct {
+			ToneMapping string `xml:"TranscoderToneMapping,attr"`
+			ToneMapAlgo string `xml:"TranscoderToneMappingAgorithm,attr"`
+		}
+		if err := xml.Unmarshal(data, &p); err != nil {
+			continue
+		}
+		return p.ToneMapping, p.ToneMapAlgo, true
+	}
+	return "", "", false
 }
 
 func envOr(k, dflt string) string {
