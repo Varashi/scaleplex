@@ -672,26 +672,26 @@ type filterRewrite struct {
 // burn-in source (text path or bitmap stream); the function picks the
 // matching filter shape. See detectSubtitleSource for source resolution.
 //
-// sourceIsHDR triggers an implicit tonemap_vaapi injection when the
-// matched filter is the SDR-target "plain" pattern. Plex's bundled
-// transcoder relied on its own tonemap (opencl/cuda/sw) firing
-// implicitly; we have to spell it out for stock ffmpeg or the encoder
-// receives PQ-quantized values mapped into BT.709 range without
-// tonemapping → washed colors on every HDR-on-SDR-client transcode.
+// scaleplex never injects a tonemap of its own: HDR→SDR tone mapping
+// happens iff Plex's argv carries a tonemap filter (reFilterHDR /
+// reFilterHDRAss / the tonemap_opencl chain). sourceIsHDR only labels
+// the diagnostic Mode string.
 
-// tonemapConfig is the resolved HDR→SDR tone-mapping policy for one
-// rewrite. It folds three inputs:
+// tonemapConfig is the resolved HDR→SDR tone-mapping backend policy.
+// scaleplex does NOT decide whether to tonemap — Plex does: if Plex's
+// argv carries a tonemap filter, scaleplex honors it; if it doesn't
+// (Plex's "Use hardware-accelerated tone mapping" pref is off — Plex
+// then does no tonemapping at all), scaleplex doesn't either. This
+// config only picks the backend for the tonemap Plex DID ask for:
 //   - SCALEPLEX_TONEMAP (worker-pod env): `opencl` (default) vs `vaapi`
-//     fixed-curve — the operator's backend choice.
-//   - Plex's TranscoderToneMapping (per-PMS, surfaced by the shim as
-//     SCALEPLEX_PLEX_TONEMAP in the task env): the user's on/off switch.
-//   - the algorithm: Plex's TranscoderToneMappingAgorithm
-//     (SCALEPLEX_PLEX_TONEMAP_ALGO) → SCALEPLEX_TONEMAP_ALGO operator
-//     override → `hable`.
+//     fixed-curve.
+//   - algo: SCALEPLEX_TONEMAP_ALGO operator override → `hable` — used
+//     only by the SW-chain reshapes (reFilterHDR/HDRAss) where the
+//     algorithm isn't carried through; substituteOpenCLTonemap keeps
+//     the algorithm straight off Plex's own chain.
 type tonemapConfig struct {
 	useOpenCL bool   // false = iHD fixed-curve tonemap_vaapi
-	enabled   bool   // false = Plex's tone-mapping pref is OFF — do not inject
-	algo      string // algorithm for stages scaleplex injects itself
+	algo      string // fallback algorithm for the SW-chain reshapes
 }
 
 func validTonemapAlgo(a string) bool {
@@ -702,27 +702,15 @@ func validTonemapAlgo(a string) bool {
 	return false
 }
 
-// resolveTonemapConfig builds the tone-mapping policy from the worker-
-// pod env and the per-task env (the latter carries the shim-surfaced
-// Plex prefs). `enabled` defaults to true: Plex's own default is ON,
-// and a missing pref (shim couldn't read Preferences.xml) must fail
-// safe — skipping a needed tonemap renders washed/clipped colors.
-func resolveTonemapConfig(inputEnv map[string]string) tonemapConfig {
+// resolveTonemapConfig builds the tone-mapping backend policy from the
+// worker-pod env.
+func resolveTonemapConfig() tonemapConfig {
 	cfg := tonemapConfig{
 		useOpenCL: !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi"),
-		enabled:   true,
 		algo:      "hable",
 	}
-	switch strings.ToLower(inputEnv["SCALEPLEX_PLEX_TONEMAP"]) {
-	case "0", "false":
-		cfg.enabled = false
-	}
-	algo := strings.ToLower(inputEnv["SCALEPLEX_PLEX_TONEMAP_ALGO"])
-	if !validTonemapAlgo(algo) {
-		algo = strings.ToLower(os.Getenv("SCALEPLEX_TONEMAP_ALGO"))
-	}
-	if validTonemapAlgo(algo) {
-		cfg.algo = algo
+	if a := strings.ToLower(os.Getenv("SCALEPLEX_TONEMAP_ALGO")); validTonemapAlgo(a) {
+		cfg.algo = a
 	}
 	return cfg
 }
@@ -754,8 +742,8 @@ func (tm tonemapConfig) stage(algo string) string {
 
 // hdrScale returns the combined `scale_vaapi(p010) + tonemap` chain that
 // downscales and tone-maps an HDR source to an SDR nv12 VAAPI surface.
-// Callers must check tonemapConfig.enabled before using it — when Plex's
-// tone-mapping pref is off this still emits a tonemap.
+// Used by the reFilterHDR/HDRAss reshapes — i.e. only where Plex's argv
+// already declared a tonemap.
 func (tm tonemapConfig) hdrScale(w, h string) string {
 	return "scale_vaapi=w=" + w + ":h=" + h + ":format=p010," + tm.stage("")
 }
@@ -782,17 +770,12 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 		// expects. eof_action=pass keeps the stream open after the
 		// last subtitle event; repeatlast=1 holds the final caption
 		// until video ends (matches Plex's UX).
-		// HDR-aware scale step. When source is HDR but encoder targets
-		// SDR (which sub burn-in always does — both `subtitles=` and
-		// `overlay_vaapi` produce BT.709 output), the scale_vaapi must
-		// run in p010 → tonemap_vaapi → nv12. Without it the PQ values
-		// crash into BT.709 NV12 range with no transfer-function
-		// conversion → washed colors. Same root cause as the plain-
-		// filter HDR path (see reFilterPlain branch below).
+		//
+		// No tonemap is injected here. If Plex wanted HDR→SDR tone
+		// mapping it would carry a tonemap filter in the argv (handled
+		// by reFilterHDRAss / reFilterHWOpenCLAss); a plain reFilterAss
+		// match means Plex emitted none, so scaleplex emits none either.
 		scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
-		if sourceIsHDR && tm.enabled {
-			scaleStep = tm.hdrScale(w, h)
-		}
 
 		if subSrc != nil && subSrc.Kind == "bitmap" && subSrc.StreamSpec != "" {
 			mode := "overlay-vaapi-bitmap"
@@ -892,23 +875,10 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 
 	if m := reFilterPlain.FindStringSubmatch(filterStr); m != nil {
 		w, h := m[1], m[2]
-		if sourceIsHDR && tm.enabled {
-			// Plex's argv targets SDR (`format=pix_fmts=yuv420p|nv12`)
-			// but the source video is HDR — inject tonemap_vaapi so
-			// the encoder gets BT.709-mapped values instead of raw
-			// PQ. Without this the output looks washed and clipped on
-			// every HDR remux played to an SDR client (observed on
-			// Balls Up + LG WebOS 2026-05-06: filter chain matched
-			// "plain", no tonemap, colors visibly off).
-			return &filterRewrite{
-				Filter: fmt.Sprintf(
-					"[0:0]hwupload[0];[0]%s[1];[1]hwupload[2]",
-					tm.hdrScale(w, h)),
-				OldLabel: "[1]",
-				NewLabel: "[2]",
-				Mode:     "hdr-tonemap-vaapi-implicit",
-			}
-		}
+		// No implicit tonemap: a plain SDR-target chain with no tonemap
+		// filter is exactly what Plex emits when HW tone mapping is off
+		// (Plex then does no tonemapping at all). scaleplex matches that
+		// — it does not second-guess Plex with an injected tonemap.
 		return &filterRewrite{
 			Filter: fmt.Sprintf(
 				"[0:0]hwupload[0];[0]scale_vaapi=w=%s:h=%s:format=nv12[1];[1]hwupload[2]",
@@ -1397,6 +1367,7 @@ func dropNostatsFlag(args []string) ([]string, bool) {
 //     clGetPlatformIDs returns -1001, which kills any tonemap_opencl
 //     HDR transcode. Stripping it lets ocl-icd fall back to its
 //     default /etc/OpenCL/vendors, where the Intel ICD lives.
+//
 // X_PLEX_TOKEN is intentionally KEPT for the progress reporter.
 func stripEAEEnvVars(env map[string]string) (map[string]string, []string) {
 	var changes []string
@@ -1481,57 +1452,6 @@ func dropInputAudioDecoderHints(args []string) ([]string, []string) {
 		}
 	}
 	return args, changes
-}
-
-// reHWPassthroughSDRChain matches PMS's HW-decode HDR→SDR filter
-// chain — the case where PMS naively drops 10-bit HDR (p010) to 8-bit
-// SDR (nv12) by setting format=nv12 on scale_vaapi, with no
-// transfer-function conversion. The pattern is the canonical 3-step
-// shape PMS emits when targeting an 8-bit encoder (h264_vaapi, or
-// hevc_vaapi default Main profile):
-//
-//	[0:0]hwupload[A];[A]scale_vaapi=w=W:h=H:format=nv12[B];[B]hwupload[C]
-//
-// Backreferences aren't supported in RE2; we capture all six tokens
-// and validate label-pair equality in injectHWPassthroughTonemap.
-//
-// Captures: source-stream label, A, W, H, A-consumer / B-producer,
-// B-consumer / C-producer, final label C.
-var reHWPassthroughSDRChain = regexp.MustCompile(
-	`^\[([0-9:]+)\]hwupload\[(\w+)\];` +
-		`\[(\w+)\]scale_vaapi=w=(\d+):h=(\d+):format=nv12\[(\w+)\];` +
-		`\[(\w+)\]hwupload\[(\w+)\]$`,
-)
-
-// injectHWPassthroughTonemap rewrites the matched chain to route
-// through tonemap_vaapi for proper PQ→BT.709 transfer-function
-// conversion. The result has the same final output label so PMS's
-// `-map [<final>]` keeps resolving:
-//
-//	[0:0]hwupload[a];[a]scale_vaapi=...:format=p010[b];[b]tonemap_vaapi=transfer=bt709:format=nv12[final]
-//
-// (Drops the redundant trailing hwupload — tonemap_vaapi outputs to
-// a VAAPI surface already.)
-//
-// Returns (newFilter, true) on match, ("", false) otherwise.
-func injectHWPassthroughTonemap(filterStr string, tm tonemapConfig) (string, bool) {
-	m := reHWPassthroughSDRChain.FindStringSubmatch(filterStr)
-	if m == nil {
-		return "", false
-	}
-	in, a1, a2, w, h, b1, b2, final := m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]
-	// Label pairs must connect: a1 (output of first hwupload) ==
-	// a2 (input of scale_vaapi); b1 (output of scale_vaapi) ==
-	// b2 (input of trailing hwupload). Otherwise it's not the chain
-	// we recognise.
-	if a1 != a2 || b1 != b2 {
-		return "", false
-	}
-	out := fmt.Sprintf(
-		"[%s]hwupload[%s];[%s]scale_vaapi=w=%s:h=%s:format=p010[%s];[%s]%s[%s]",
-		in, a1, a1, w, h, b1, b1, tm.stage(""), final,
-	)
-	return out, true
 }
 
 // setWorkerHomeEnv repoints HOME at the worker image's pre-populated
@@ -1652,9 +1572,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	changes := []string{}
 
-	// HDR→SDR tone-mapping policy for this session: operator backend
-	// choice + Plex's on/off pref + algorithm, all folded once here.
-	tm := resolveTonemapConfig(inputEnv)
+	// Tone-mapping backend (opencl vs vaapi) for the tonemap Plex's
+	// argv asked for. scaleplex never decides whether to tonemap.
+	tm := resolveTonemapConfig()
 
 	// On bail we don't run the full rewriter, but `-progressurl` must
 	// still come off — its URL is loopback-only, ffmpeg would try to
@@ -2081,45 +2001,16 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 		changes = append(changes, "encode:hw-passthrough:"+swEncoder)
 
-		// HW-decode HDR→SDR tonemap injection. PMS's HW-passthrough
-		// filter chain for SDR-encode targets (h264_vaapi, or
-		// hevc_vaapi default Main profile) drops 10-bit p010 to 8-bit
-		// nv12 via naive `format=nv12` on scale_vaapi — no transfer-
-		// function curve, PQ values shoved into BT.709 8-bit range
-		// produce washed/clipped colors. Plex's bundled transcoder
-		// papered over this with its own opencl/cuda/sw tonemap; we
-		// have to spell it out for stock ffmpeg.
-		//
-		// Live observation 2026-05-10 PM: streaming Big Hero 6 4K HDR
-		// with videoCodec=h264 → PMS chain
-		//   [0:0]hwupload[0];[0]scale_vaapi=...:format=nv12[1];[1]hwupload[2]
-		// ran clean (no error) but output had crushed highlights.
-		//
-		// Detect via reHWPassthroughSDRChain (matches PMS's exact
-		// 3-step shape). Gate on sourceIsHDR so we don't double-tonemap
-		// SDR sources. Only fires for the SDR-target shape — if PMS
-		// asked for `format=p010` the regex doesn't match and HDR is
-		// preserved as-is. The injection is also gated on tm.enabled —
-		// when Plex's tone-mapping pref is off we honor it and leave the
-		// chain untonemapped (Plex's own behavior with the pref off).
+		// HDR source detection (diagnostic only). scaleplex does NOT
+		// inject a tonemap: when Plex's HW-decode chain is the plain
+		// `scale_vaapi=...:format=nv12` shape with no tonemap filter,
+		// that means Plex's "Use hardware-accelerated tone mapping" is
+		// off and Plex itself does no tonemapping — scaleplex matches
+		// that behavior rather than second-guessing it.
 		if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 			if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
 				sourceIsHDR = true
-				if !tm.enabled {
-					changes = append(changes,
-						"video:hdr-source("+strings.ToLower(transfer)+")",
-						"tonemap:skipped(plex-pref-off)")
-				}
-				for i := 0; tm.enabled && i < len(args); i++ {
-					if args[i] == "-filter_complex" && i+1 < len(args) {
-						if newFilter, ok := injectHWPassthroughTonemap(args[i+1], tm); ok {
-							args[i+1] = newFilter
-							changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
-							changes = append(changes, "filter:hw-passthrough-tonemap-injected")
-							break
-						}
-					}
-				}
+				changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
 			}
 		}
 
@@ -2170,9 +2061,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 				w, h := m[1], m[2]
 				// Force nv12 across the libass step (matches the SW
-				// pass-through path). HDR-source detection runs below so
-				// scaleStep prepends the tonemap stage when needed; PQ →
-				// BT.709 nv12 before libass renders SDR glyphs over it.
+				// pass-through path). HDR-source detection is diagnostic
+				// only — no tonemap is injected here; if Plex wanted one
+				// it would carry a tonemap_opencl chain (reFilterHWOpenCLAss).
 				if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 					if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
 						sourceIsHDR = true
@@ -2180,9 +2071,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					}
 				}
 				scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
-				if sourceIsHDR && tm.enabled {
-					scaleStep = tm.hdrScale(w, h)
-				}
 				// Animated ASS (karaoke / transform / move / fade) can't
 				// be pre-rasterized once per cue — keep the per-frame
 				// inlineass path. SRT and static ASS route to the GPU

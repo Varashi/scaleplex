@@ -1,40 +1,9 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func TestReadPlexTonemapPrefs(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "Preferences.xml")
-	xmlBody := `<?xml version="1.0" encoding="utf-8"?>` + "\n" +
-		`<Preferences MachineIdentifier="x" TranscoderToneMapping="0" ` +
-		`TranscoderToneMappingAgorithm="mobius" FriendlyName="y"/>`
-	if err := os.WriteFile(path, []byte(xmlBody), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SCALEPLEX_PLEX_PREFS", path)
-	tm, algo, ok := readPlexTonemapPrefs()
-	if !ok {
-		t.Fatal("expected ok")
-	}
-	if tm != "0" {
-		t.Errorf("TranscoderToneMapping: want 0, got %q", tm)
-	}
-	if algo != "mobius" {
-		t.Errorf("algorithm: want mobius, got %q", algo)
-	}
-}
-
-func TestReadPlexTonemapPrefs_MissingFile(t *testing.T) {
-	t.Setenv("SCALEPLEX_PLEX_PREFS", filepath.Join(t.TempDir(), "absent.xml"))
-	t.Setenv("PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR", filepath.Join(t.TempDir(), "absent"))
-	if _, _, ok := readPlexTonemapPrefs(); ok {
-		t.Error("expected ok=false when Preferences.xml is absent")
-	}
-}
 
 func TestDeriveSessionID_FromInputPath(t *testing.T) {
 	args := []string{"-codec:0", "libdav1d", "-i", "/media/Movies/Inception.mkv", "-c:v", "libx264"}

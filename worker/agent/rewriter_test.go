@@ -1542,12 +1542,13 @@ func TestPlexInlineassToForceStyle_Empty(t *testing.T) {
 	}
 }
 
-// HDR source + SDR-target argv (the "plain" filter pattern, which
-// Plex used to autoinject tonemap on its bundled musl ffmpeg). With
-// stock ffmpeg we have to inject tonemap_vaapi explicitly or HDR
-// values render with washed colors on every SDR client.
-func TestRewriter_HDRSource_PlainTarget_InjectsTonemap(t *testing.T) {
-	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
+// HDR source + a plain SDR-target argv: scaleplex does NOT inject a
+// tonemap. A plain chain with no tonemap filter is exactly what Plex
+// emits when HW tone mapping is off — Plex then does no tonemapping
+// itself — so scaleplex matches that rather than second-guessing it.
+// HDR is still detected (diagnostic change tag) but the graph stays
+// plain.
+func TestRewriter_HDRSource_PlainTarget_NoImplicitTonemap(t *testing.T) {
 	probe := func(source string) (transfer, primaries, space string) {
 		return "smpte2084", "bt2020", "bt2020nc"
 	}
@@ -1558,27 +1559,10 @@ func TestRewriter_HDRSource_PlainTarget_InjectsTonemap(t *testing.T) {
 	if !containsString(out.Changes, "video:hdr-source(smpte2084)") {
 		t.Fatalf("expected hdr-source label: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:hdr-tonemap-vaapi-implicit") {
-		t.Fatalf("expected hdr-tonemap-vaapi-implicit mode: %v", out.Changes)
-	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
-	if !strings.Contains(f, "tonemap_vaapi=transfer=bt709:format=nv12") {
-		t.Errorf("filter must include tonemap_vaapi:\n%s", f)
-	}
-	if !strings.Contains(f, "scale_vaapi=w=2276:h=1280:format=p010") {
-		t.Errorf("scale_vaapi must use p010 input format for tonemap:\n%s", f)
-	}
-}
-
-// HLG (ARIB STD-B67) is the other HDR transfer; same path.
-func TestRewriter_HDRSource_HLG(t *testing.T) {
-	probe := func(string) (string, string, string) {
-		return "arib-std-b67", "bt2020", "bt2020nc"
-	}
-	out := Rewrite(swArgsAV1H264, nil, &RewriteOpts{ProbeVideoColor: probe})
-	if !containsString(out.Changes, "filter:hdr-tonemap-vaapi-implicit") {
-		t.Fatalf("HLG should trigger implicit tonemap: %v", out.Changes)
+	if strings.Contains(f, "tonemap_vaapi") || strings.Contains(f, "tonemap_opencl") {
+		t.Errorf("no tonemap must be injected on a plain HDR→SDR chain:\n%s", f)
 	}
 }
 
