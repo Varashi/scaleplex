@@ -2084,8 +2084,11 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 	}
 }
 
-func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
-	// pass-through is hardcoded since B6 (PR #4); no env knob
+// HW-decode + SRT sidecar burn-in routes to the GPU-overlay
+// pre-render path: the inlineass bracket is replaced by an
+// overlay_vaapi graph, an overlay FIFO is appended as a third input,
+// -map_inlineass is dropped, and SubPrerender is populated.
+func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 	args := []string{
 		"-loglevel", "quiet",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -2103,34 +2106,25 @@ func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
 		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
 	}
 	out := Rewrite(args, nil, &RewriteOpts{
-		FSExists: func(string) bool { return true },
-		ProbeSubtitleCodec: func(string, string) string {
-			return "subrip"
-		},
+		FSExists:           func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
 	})
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
 	}
-	vfIdx := -1
-	for i, a := range out.Args {
-		if a == "-filter_complex" {
-			vfIdx = i + 1
-			break
-		}
-	}
+	vfIdx := findFilterComplex(out.Args, "[0:0]")
 	if vfIdx < 0 {
 		t.Fatal("missing -filter_complex")
 	}
-	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
-		t.Errorf("inlineass dropped: %s", out.Args[vfIdx])
+	graph := out.Args[vfIdx]
+	if strings.Contains(graph, "inlineass=") {
+		t.Errorf("inlineass should be gone on the pre-render path: %s", graph)
 	}
-	for _, k := range []string{":language=", ":overrides=", ":outline=", ":shadow="} {
-		if strings.Contains(out.Args[vfIdx], k) {
-			t.Errorf("Plex key %q not stripped: %s", k, out.Args[vfIdx])
-		}
+	if !strings.Contains(graph, "overlay_vaapi=") {
+		t.Errorf("overlay_vaapi missing: %s", graph)
 	}
-	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
-		t.Errorf("-map_inlineass dropped (should pass through)")
+	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
+		t.Errorf("-map_inlineass should be dropped on the pre-render path")
 	}
 	iCount := 0
 	for _, a := range out.Args {
@@ -2138,17 +2132,84 @@ func TestRewriter_InlineassPassthrough_HW_KeepsSidecarAndStrip(t *testing.T) {
 			iCount++
 		}
 	}
-	if iCount != 2 {
-		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
+	if iCount != 3 {
+		t.Errorf("expected 3 -i (source + sidecar + overlay FIFO), got %d", iCount)
+	}
+	if out.SubPrerender == nil {
+		t.Fatal("SubPrerender not populated")
+	}
+	sp := out.SubPrerender
+	if sp.SourcePath != "/transcode/Sub/temp-0.srt" {
+		t.Errorf("SourcePath = %q", sp.SourcePath)
+	}
+	if sp.StreamSpec != "1:s:0" {
+		t.Errorf("StreamSpec = %q", sp.StreamSpec)
+	}
+	if sp.Width != 1280 || sp.Height != 720 {
+		t.Errorf("WxH = %dx%d want 1280x720", sp.Width, sp.Height)
+	}
+	if sp.FIFOPath == "" {
+		t.Error("FIFOPath empty")
+	}
+	if !strings.Contains(graph, "format=bgra") {
+		t.Errorf("overlay branch should consume the FIFO input: %s", graph)
+	}
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Error("null-sub output dropped (should pass through)")
+	}
+	gotTag := false
+	for _, c := range out.Changes {
+		if c == "hw-decode:filter:sub-prerender-overlay" {
+			gotTag = true
+		}
+	}
+	if !gotTag {
+		t.Errorf("missing sub-prerender-overlay tag: %v", out.Changes)
+	}
+}
+
+// Embedded ASS can't be scanned for animation tags (no sidecar file
+// on disk), so it conservatively keeps the per-frame inlineass path
+// and does not populate SubPrerender.
+func TestRewriter_InlineassPassthrough_HW_EmbeddedASS(t *testing.T) {
+	args := []string{
+		"-loglevel", "quiet",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi",
+		"-codec:0", "hevc",
+		"-i", "/media/x.mkv",
+		"-map_inlineass", "0:3",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=nv12[1];[1]hwdownload,format=nv12[2];[2]inlineass=font_scale=1.0:font_path=/x:language=en:overrides=foo:outline=2:shadow=1:font_size=54[3];[3]hwupload[4]",
+		"-map", "[4]",
+		"-codec:0", "hevc_vaapi",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "0:3", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists:           func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string { return "ass" },
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	vfIdx := findFilterComplex(out.Args, "[0:0]")
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex")
+	}
+	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
+		t.Errorf("inlineass should be kept for embedded ASS: %s", out.Args[vfIdx])
+	}
+	if out.SubPrerender != nil {
+		t.Errorf("SubPrerender should be nil on the inlineass path")
 	}
 	gotTag := false
 	for _, c := range out.Changes {
 		if c == "hw-decode:filter:inlineass-passthrough" {
 			gotTag = true
-			break
 		}
 	}
 	if !gotTag {
-		t.Errorf("missing hw-decode:filter:inlineass-passthrough tag: %v", out.Changes)
+		t.Errorf("missing inlineass-passthrough tag: %v", out.Changes)
 	}
 }

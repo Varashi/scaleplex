@@ -70,9 +70,11 @@ type SubPrerenderSpec struct {
 	// a sidecar .srt path, or the source media container when the
 	// subtitle is an embedded stream.
 	SourcePath string
-	// StreamIndex — for an embedded subtitle, the stream index the
-	// `subtitles` filter selects. -1 for an external sidecar file.
-	StreamIndex int
+	// StreamSpec — the raw `-map_inlineass` stream specifier (e.g.
+	// "0:3" for an embedded subtitle, "1:s:0" for a sidecar). The
+	// agent resolves it to a `subtitles` filter selector. Empty when
+	// SourcePath is a single-stream sidecar file.
+	StreamSpec string
 	// Width, Height — overlay canvas size; matches the transcode's
 	// post-scale target resolution.
 	Width  int
@@ -1786,6 +1788,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// supported (PMS likely doesn't request it when HW probe matches).
 	var rewritten *filterRewrite
 	var subSrc *subtitleSource
+	var subPrerender *SubPrerenderSpec
 	sourceIsHDR := false
 
 	if !isHWDecode {
@@ -2009,50 +2012,125 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						"scale_vaapi=w=%s:h=%s:format=p010,tonemap_vaapi=transfer=bt709:format=nv12",
 						w, h)
 				}
-				// Keep Plex's inlineass= filter; strip the 4 Plex-only
-				// AVOption keys vf_inlineass doesn't parse. Sidecar -i,
-				// -map_inlineass, and null-sub output all stay — the
-				// fork's scaleplex_inlineass binding owns those.
-				assParams := m[assGroup]
-				strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
-				strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
-				args[vfIdx] = fmt.Sprintf(
-					"[0:0]hwupload[0];"+
-						"[0]%s[1];"+
-						"[1]hwdownload,format=nv12[2];"+
-						"[2]inlineass=%s[3];"+
-						"[3]hwupload[4]",
-					scaleStep, strippedAss,
-				)
-				modeTag := "hw-decode:filter:inlineass-passthrough"
-				oldMapLabel := "[4]"
-				if openclMode {
-					modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-passthrough"
-					// reFilterHWOpenCLAss matches a graph that ends at
-					// label [6] (extra hwmap→opencl + tonemap_opencl +
-					// hwdownload + inlineass + hwupload). Our rewrite
-					// collapses to label [4]; PMS's `-map [6]` must
-					// retarget or ffmpeg bails with "Output with label
-					// '6' does not exist".
-					oldMapLabel = "[6]"
-				}
-				changes = append(changes, modeTag)
-				if oldMapLabel != "[4]" {
-					for i := vfIdx + 1; i < len(args)-1; i++ {
-						if args[i] != "-map" {
-							continue
-						}
-						v := args[i+1]
-						if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
-							if strings.HasPrefix(v, `"`) {
-								args[i+1] = `"[4]"`
-							} else {
-								args[i+1] = "[4]"
+				// Animated ASS (karaoke / transform / move / fade) can't
+				// be pre-rasterized once per cue — keep the per-frame
+				// inlineass path. SRT and static ASS route to the GPU
+				// overlay pre-render path in the else branch.
+				if subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile) {
+					// Keep Plex's inlineass= filter; strip the 4 Plex-only
+					// AVOption keys vf_inlineass doesn't parse. Sidecar -i,
+					// -map_inlineass, and null-sub output all stay — the
+					// fork's scaleplex_inlineass binding owns those.
+					assParams := m[assGroup]
+					strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
+					strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+					args[vfIdx] = fmt.Sprintf(
+						"[0:0]hwupload[0];"+
+							"[0]%s[1];"+
+							"[1]hwdownload,format=nv12[2];"+
+							"[2]inlineass=%s[3];"+
+							"[3]hwupload[4]",
+						scaleStep, strippedAss,
+					)
+					modeTag := "hw-decode:filter:inlineass-passthrough"
+					oldMapLabel := "[4]"
+					if openclMode {
+						modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-passthrough"
+						// reFilterHWOpenCLAss matches a graph that ends at
+						// label [6] (extra hwmap→opencl + tonemap_opencl +
+						// hwdownload + inlineass + hwupload). Our rewrite
+						// collapses to label [4]; PMS's `-map [6]` must
+						// retarget or ffmpeg bails with "Output with label
+						// '6' does not exist".
+						oldMapLabel = "[6]"
+					}
+					changes = append(changes, modeTag)
+					if oldMapLabel != "[4]" {
+						for i := vfIdx + 1; i < len(args)-1; i++ {
+							if args[i] != "-map" {
+								continue
 							}
-							changes = append(changes, "hw-decode:map-label-update")
-							break
+							v := args[i+1]
+							if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
+								if strings.HasPrefix(v, `"`) {
+									args[i+1] = `"[4]"`
+								} else {
+									args[i+1] = "[4]"
+								}
+								changes = append(changes, "hw-decode:map-label-update")
+								break
+							}
 						}
 					}
+				} else {
+					// SRT / static ASS → pre-render the subtitle once per
+					// cue into a sparse transparent video and composite it
+					// on the GPU with overlay_vaapi, replacing the per-frame
+					// CPU inlineass bracket. The agent spawns the pre-render
+					// (writing to FIFOPath) from SubPrerenderSpec; the graph
+					// reads that FIFO as a second video input.
+					// See project_scaleplex_srt_to_pgs_gpu.
+					fifoDir := sessionDir
+					if fifoDir == "" {
+						fifoDir = "/tmp/scaleplex"
+					}
+					fifoPath := fifoDir + "/scaleplex-sub-overlay.fifo"
+					fifoInput := 0
+					for _, a := range args {
+						if a == "-i" {
+							fifoInput++
+						}
+					}
+					args[vfIdx] = fmt.Sprintf(
+						"[0:0]hwupload[10];"+
+							"[10]%s[11];"+
+							"[%d:v]format=bgra,hwupload[12];"+
+							"[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[4]",
+						scaleStep, fifoInput,
+					)
+					// Drop `-map_inlineass <spec>` — no inlineass filter
+					// consumes it on this path; the pre-render reads the
+					// subtitle itself. Then append the overlay FIFO as the
+					// final input, just before -filter_complex.
+					if mi := indexOfArg(args, "-map_inlineass", 0); mi >= 0 && mi+1 < len(args) {
+						args = removeArgs(args, mi, 2)
+					}
+					if fc := indexOfArg(args, "-filter_complex", 0); fc >= 0 {
+						args = spliceArgs(args, fc, "-i", fifoPath)
+					}
+					// reFilterHWOpenCLAss argv ends at label [6] with
+					// `-map [6]`; our overlay graph outputs [4]. Retarget.
+					if openclMode {
+						for i := 0; i+1 < len(args); i++ {
+							if args[i] != "-map" {
+								continue
+							}
+							if args[i+1] == "[6]" {
+								args[i+1] = "[4]"
+								break
+							}
+							if args[i+1] == `"[6]"` {
+								args[i+1] = `"[4]"`
+								break
+							}
+						}
+					}
+					srcPath := subSrc.FilePath
+					if srcPath == "" {
+						if ii := indexOfArg(args, "-i", 0); ii >= 0 && ii+1 < len(args) {
+							srcPath = args[ii+1]
+						}
+					}
+					wInt, _ := strconv.Atoi(w)
+					hInt, _ := strconv.Atoi(h)
+					subPrerender = &SubPrerenderSpec{
+						FIFOPath:   fifoPath,
+						SourcePath: srcPath,
+						StreamSpec: subSrc.StreamSpec,
+						Width:      wInt,
+						Height:     hInt,
+					}
+					changes = append(changes, "hw-decode:filter:sub-prerender-overlay")
 				}
 				newInputIdx = indexOfArg(args, "-i", 0)
 				encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
@@ -2357,6 +2435,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			changes = append(changes, fmt.Sprintf("seek-offset:captured=%.3fs", v))
 		}
 	}
+	// The subtitle pre-render timeline must start at the same offset as
+	// a seek session's main video, or overlay_vaapi framesync places
+	// the burned text at the wrong time.
+	if subPrerender != nil {
+		subPrerender.SeekOffsetSeconds = seekOffsetSeconds
+	}
 
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest
 	// body to this URL whenever the .mpd is regenerated; PMS gates
@@ -2441,6 +2525,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		ProgressURL:       progressURL,
 		SeekOffsetSeconds: seekOffsetSeconds,
 		IsMatroskaSegment: isMatroskaSegment,
+		SubPrerender:      subPrerender,
 	}
 }
 
