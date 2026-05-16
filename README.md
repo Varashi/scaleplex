@@ -19,9 +19,10 @@ keeps the distributed-transcode shape but swaps workers to **stock ffmpeg**
 Concretely this unlocks:
 
 - HW HDR→SDR tonemap (`tonemap_vaapi`)
-- HW subtitle burn-in: bitmap subs via `overlay_vaapi`, text subs via a
-  fork-native port of Plex's `inlineass` filter (scaleplex-ffmpeg7 patches
-  0099-0101)
+- HW subtitle burn-in: SRT / static ASS pre-rendered and composited via
+  `overlay_vaapi` (no fork patch — ~4.7× realtime at 4K HDR vs ~2.2× on
+  the per-frame CPU path), animated ASS via a fork-native port of Plex's
+  `inlineass` filter, bitmap subs via `overlay_vaapi`
 - HDR Main10 passthrough where the client supports it
 - Direct NFS segment writes — no `LOCAL_RELAY` HTTP hop
 - First-frame latency as a first-class design goal (see [docs/LATENCY.md](docs/LATENCY.md))
@@ -32,10 +33,11 @@ bookkeeping is unchanged.
 
 ## Status
 
-**v1.0 — feature-complete and validated.** Every client/format cell in
+**v1.1 — feature-complete and validated.** Every client/format cell in
 the matrix below has been exercised end-to-end (initial play, seek,
 quality change, subtitle burn-in as applicable) on the scaleplex PMS
-deployment:
+deployment. v1.1 adds the GPU-overlay text-sub burn-in path (SRT /
+static ASS), validated on the `plex-test` bench:
 
 | Client / format | Play | Seek | Subs | Notes |
 |---|:-:|:-:|:-:|---|
@@ -48,14 +50,15 @@ deployment:
 | PMS Detection / ML pre-pass | ✓ | n/a | n/a | bail-path scrub — ffmpeg runs the original argv cleaned of Plex-private flags |
 
 **Source matrix:** AV1 + HEVC + H264; SDR + HDR10; embedded and sidecar
-SRT / ASS text subs (burn-in via the fork-native `inlineass=` filter);
+SRT / ASS text subs (SRT / static ASS burn-in via the `overlay_vaapi`
+pre-render path, animated ASS via the fork-native `inlineass=` filter);
 embedded PGS bitmap subs (`overlay_vaapi`). HDR→SDR via `tonemap_vaapi`.
 
 **Resilience:** PMS `canThrottle` pass-through, multi-engine GPU load
 reporting, transparent mid-stream worker recovery across DaemonSet rolls
 (see [`docs/RESILIENCE.md`](docs/RESILIENCE.md)).
 
-**Deployment scope.** v1.0 is a code milestone — the software is
+**Deployment scope.** v1.1 is a code milestone — the software is
 release-ready. Pointing any particular PMS instance at scaleplex is an
 independent operational decision, not gated on this tag.
 
@@ -183,7 +186,7 @@ directory is a placeholder.
 - [`docs/SEEK.md`](docs/SEEK.md) — DASH and HLS seek deep-dive (the hardest problems we shipped).
 - [`docs/LATENCY.md`](docs/LATENCY.md) — first-frame latency budget and design levers.
 - [`docs/RESILIENCE.md`](docs/RESILIENCE.md) — PMS canThrottle pass-through, multi-engine GPU load, mid-stream worker recovery.
-- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — tracked limitations as of v1.0.
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — tracked limitations as of v1.1.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 - [`docs/PLAN.md`](docs/PLAN.md) — original implementation plan (historical; mostly delivered).
 - [`docs/LESSONS-FROM-CLUSTERPLEX.md`](docs/LESSONS-FROM-CLUSTERPLEX.md) — concrete pitfalls scaleplex avoids by design.

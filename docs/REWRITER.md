@@ -162,7 +162,66 @@ The map-label update is needed because we add `hwupload` inside the
 existing chain, which can shift `[N]` labels — the rewriter walks the
 graph, increments labels mentioned later in the argv (`-map "[1]"` etc.).
 
-### Text sub burn-in (Plex inlineass pass-through)
+### Text sub burn-in
+
+A text-sub burn-in session takes one of two routes, picked per session
+by `subtitleIsAnimated()`:
+
+- **SRT / static ASS → GPU overlay pre-render** — the default for
+  effectively all text subs (new in v1.1).
+- **Animated ASS → `inlineass` pass-through** — ASS carrying karaoke /
+  `\t` / `\move` / `\fad` tags needs per-frame rendering and can't be
+  pre-rendered, so it keeps the per-frame `inlineass` filter.
+
+`subtitleIsAnimated()`: SRT carries no override tags so it is never
+animated; ASS is scanned for animation tags, and an unreadable file is
+treated as animated (conservative — falls back to the safe `inlineass`
+path).
+
+#### GPU overlay pre-render (SRT / static ASS)
+
+The rewriter replaces Plex's per-frame CPU `inlineass` bracket
+(`hwdownload` → libass → `hwupload`) with a GPU `overlay_vaapi`
+composite. The agent spawns a second ffmpeg — the *pre-render* — from
+the `SubPrerenderSpec` the rewriter returns: it rasterises the subtitle
+to a sparse transparent video (`subtitles` → `mpdecimate` → `ffv1` /
+Matroska) and streams it through a FIFO. The main transcode reads that
+FIFO as a second video input and composites it on the GPU. All filters
+are stock scaleplex-ffmpeg7 — **no fork patch involved**.
+
+Graph (initial play):
+
+```
+[0:0]hwupload[10];
+[10]scale_vaapi=...[11];               # +tonemap_vaapi for HDR
+[N:v]format=bgra,hwupload[12];         # N = the FIFO input index
+[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[4]
+```
+
+The rewriter also:
+
+- **Drops `-map_inlineass <spec>`** — no `inlineass` filter consumes it
+  on this path; the pre-render reads the subtitle itself.
+- **Appends the FIFO `-i`** immediately after the last real input's
+  path (never just before `-filter_complex` — Plex parks output-side
+  options like `-start_at_zero` / `-copyts` / `-fps_mode` there, and a
+  new `-i` would mis-parse them as input options). FIFO input flags:
+  `-copyts -probesize 32 -analyzeduration 0` — `-copyts` keeps the
+  overlay timestamps; the minimal probe stops `find_stream_info` from
+  reading megabytes of the sparse FIFO at startup (~5 s grind → ~0.8 s).
+
+**Seek:** the main video reaches the filtergraph at the seek offset
+(PTS N) but the overlay starts at ~0, so `overlay_vaapi` framesync would
+drain the overlay 0→N hunting for a pair. The rewriter rebases both
+branches to zero with `setpts=PTS-STARTPTS` around `overlay_vaapi`, then
+rebases the composite back with `setpts=PTS+offset` so dashenc and the
+seek-chunk/tfdt machinery see the unchanged source timeline (client
+playhead unaffected). Initial play (offset 0) keeps the plain graph.
+
+**Label:** `hw-decode:filter:sub-prerender-overlay`. See
+[`SEEK.md`](SEEK.md) and `project_scaleplex_srt_to_pgs_gpu`.
+
+#### inlineass pass-through (animated ASS)
 
 Plex's `-map_inlineass 0:N` + `inlineass=...` filter is **Plex-private**
 in stock ffmpeg, but scaleplex-ffmpeg7 ports it directly
@@ -204,11 +263,6 @@ The rewriter keeps Plex's argv shape intact and only:
 `filter:passthrough-inlineass-hdr` (HDR) /
 `hw-decode:filter:inlineass-passthrough` (HW-decode path),
 `map-label-update`.
-
-This replaced the original "hybrid inline-ASS" path (subtitles= filter
-on a staged sidecar file, with a setpts PTS-shift bracket for HLS+seek)
-in 2026-05-12 once the fork's vf_inlineass landed and was live-validated
-on Plex Android (HLS+seek + cold start) and Plex Windows direct-play.
 
 ### Bitmap sub burn-in (overlay_vaapi)
 
@@ -253,8 +307,8 @@ when:
 
 - Filter graph contains a `subtitles=...` already (Plex's own SW path)
 - Decoder is unrecognised
-- Filter shape doesn't match any known mode (plain / passthrough-inlineass /
-  overlay-vaapi-bitmap / hdr-tonemap-vaapi)
+- Filter shape doesn't match any known mode (plain / sub-prerender-overlay /
+  passthrough-inlineass / overlay-vaapi-bitmap / hdr-tonemap-vaapi)
 
 These are diagnostic dead-ends rather than failures: stock ffmpeg with
 the original Plex argv will fail, but the failure surface is ffmpeg's
