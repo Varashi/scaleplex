@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.1.1 — 2026-05-16
+
+Documentation-only patch release. The v1.1.0 tag landed before the prose
+docs were refreshed for the new feature; v1.1.1 carries the matching
+docs.
+
+- `README.md` — version references bumped to v1.1; subtitle burn-in
+  description now covers both text-sub routes (SRT / static ASS via the
+  `overlay_vaapi` pre-render, animated ASS via `inlineass`).
+- `docs/REWRITER.md` — "Text sub burn-in" section rewritten for the
+  GPU-overlay pre-render path: the `subtitleIsAnimated()` routing, the
+  overlay graph, seek rebasing, FIFO input flags, and the
+  `hw-decode:filter:sub-prerender-overlay` change tag.
+
 ## v1.1.0 — 2026-05-16
 
 ### GPU-overlay subtitle burn-in
