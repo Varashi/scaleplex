@@ -71,14 +71,15 @@ func TestBuildSubPrerenderArgs_SeekOffset(t *testing.T) {
 		SeekOffsetSeconds: 83.5,
 	}
 	vf := argvVal(buildSubPrerenderArgs(spec, "/t/s.srt"), "-vf")
-	// Up-shift before subtitles so it renders the cue at the seek
-	// point; down-shift after so the overlay output stays 0-based and
-	// aligns with the seeked main video (-copyts -start_at_zero).
+	// A single up-shift to the seek offset: the subtitles filter picks
+	// the cue at that point and the overlay output PTS matches the
+	// seeked main video (which keeps real timestamps via -copyts). No
+	// down-shift — the overlay must stay at the seek offset.
 	if !strings.HasPrefix(vf, "setpts=PTS+83.500/TB,subtitles=") {
 		t.Errorf("missing up-shift before subtitles: %q", vf)
 	}
-	if !strings.Contains(vf, ":alpha=1,setpts=PTS-83.500/TB,mpdecimate") {
-		t.Errorf("missing down-shift after subtitles: %q", vf)
+	if strings.Contains(vf, "setpts=PTS-") {
+		t.Errorf("overlay must stay at the seek offset, no down-shift: %q", vf)
 	}
 }
 

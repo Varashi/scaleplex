@@ -38,29 +38,25 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=rgba",
 		spec.Width, spec.Height, subPrerenderFPS)
 
-	off := strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64)
-
 	vf := ""
 	if spec.SeekOffsetSeconds > 0 {
-		// Shift the synthetic timeline UP to the seek offset so the
-		// subtitles filter (which picks cues by frame PTS) renders the
-		// cues active at the seek point.
-		vf += "setpts=PTS+" + off + "/TB,"
+		// Shift the synthetic timeline up to the seek offset. This does
+		// double duty: the subtitles filter picks cues by frame PTS so
+		// it renders the cues active at the seek point, AND the overlay
+		// output PTS then matches the seeked main video, which keeps
+		// its real (non-zero) timestamps via `-ss N ... -copyts`. The
+		// agent also passes `-copyts` on the overlay `-i` so ffmpeg
+		// does not rebase the overlay input back to zero — without both
+		// halves overlay_vaapi framesync never aligns and the transcode
+		// grinds frame-by-frame from 0 up to the seek point.
+		vf += "setpts=PTS+" +
+			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB,"
 	}
 	// alpha=1 is required: the subtitles filter leaves the alpha
 	// channel untouched by default, so rendering onto the transparent
 	// canvas yields text with the correct RGB but alpha 0 — an
 	// invisible overlay. alpha=1 makes it composite the alpha too.
 	vf += "subtitles=" + escapeFilterPath(subFile) + ":alpha=1"
-	if spec.SeekOffsetSeconds > 0 {
-		// Shift the timeline back DOWN so the overlay output is
-		// 0-based. A seek session's main video is rebased to ~0 by
-		// `-copyts -start_at_zero` (the reason dashenc writes tfdt=0).
-		// If the overlay stayed at the seek offset, overlay_vaapi
-		// framesync would never align main (~0) with overlay (offset)
-		// and the whole transcode stalls.
-		vf += ",setpts=PTS-" + off + "/TB"
-	}
 	// force_style (spec.ForceStyle) is deliberately NOT applied. Plex's
 	// font_size / outline / shadow are sized for a PlayRes matching the
 	// render height, but the stock subtitles filter renders a raw SRT

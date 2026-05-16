@@ -2158,6 +2158,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// (-start_at_zero, -copyts, -fps_mode) between the last
 					// input and the filtergraph, and a new -i there makes
 					// ffmpeg mis-parse those as input options for the FIFO.
+					//
+					// `-copyts` on the FIFO input is required: ffmpeg
+					// rebases a plain input's timestamps to start at zero,
+					// but on a seek session the main video keeps its real
+					// (non-zero) PTS via its own -copyts. Without -copyts
+					// here the overlay would rebase to 0 while the main
+					// video stays at the seek offset — overlay_vaapi
+					// framesync never aligns and the transcode stalls.
 					lastInput := -1
 					for i := 0; i+1 < len(args); i++ {
 						if args[i] == "-i" {
@@ -2165,7 +2173,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					if lastInput >= 0 {
-						args = spliceArgs(args, lastInput+2, "-i", fifoPath)
+						args = spliceArgs(args, lastInput+2, "-copyts", "-i", fifoPath)
 					}
 					// reFilterHWOpenCLAss argv ends at label [6] with
 					// `-map [6]`; our overlay graph outputs [4]. Retarget.

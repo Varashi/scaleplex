@@ -2183,16 +2183,18 @@ func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 	if sp.FIFOPath == "" {
 		t.Error("FIFOPath empty")
 	}
-	// The overlay FIFO -i must sit immediately after the last real
+	// The overlay FIFO input must sit immediately after the last real
 	// input, ahead of Plex's output-side options (-start_at_zero,
 	// -copyts, -fps_mode) — otherwise ffmpeg mis-parses those as input
-	// options for the FIFO and the session fails at arg parsing.
+	// options for the FIFO. It is inserted as `-copyts -i <fifo>` so
+	// ffmpeg keeps the overlay's (non-zero, on seek) timestamps.
 	srtIdx := indexOfArg(out.Args, "/transcode/Sub/temp-0.srt", 0)
-	if srtIdx < 0 || srtIdx+2 >= len(out.Args) ||
-		out.Args[srtIdx+1] != "-i" || out.Args[srtIdx+2] != sp.FIFOPath {
-		t.Errorf("overlay FIFO -i not inserted right after the sidecar input: %v", out.Args)
+	if srtIdx < 0 || srtIdx+3 >= len(out.Args) ||
+		out.Args[srtIdx+1] != "-copyts" || out.Args[srtIdx+2] != "-i" ||
+		out.Args[srtIdx+3] != sp.FIFOPath {
+		t.Errorf("overlay FIFO not inserted as `-copyts -i <fifo>` after the sidecar input: %v", out.Args)
 	}
-	if fps := indexOfArg(out.Args, "-fps_mode", 0); fps >= 0 && fps < srtIdx+2 {
+	if fps := indexOfArg(out.Args, "-fps_mode", 0); fps >= 0 && fps < srtIdx+1 {
 		t.Errorf("-fps_mode precedes the overlay FIFO input — will be mis-parsed")
 	}
 	if !strings.Contains(graph, "format=bgra") {
