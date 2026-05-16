@@ -48,7 +48,10 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	}
 	vf += "subtitles=" + escapeFilterPath(subFile)
 	if spec.ForceStyle != "" {
-		vf += ":force_style=" + spec.ForceStyle
+		// Single-quote the value: it is a comma-separated list, and an
+		// unquoted comma would be read as a filterchain separator
+		// (splitting off `,mpdecimate`).
+		vf += ":force_style='" + spec.ForceStyle + "'"
 	}
 	vf += ",mpdecimate"
 

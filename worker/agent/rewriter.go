@@ -391,6 +391,59 @@ func stripPlexInlineassFilterArgs(filterStr string) string {
 	return out.String()
 }
 
+// assStyleKeys is the subset of ASS [V4+ Styles] field names accepted
+// in a `subtitles` filter force_style= value. Plex's inlineass
+// `overrides=` list mixes these with script-info keys (e.g.
+// ScaledBorderAndShadow) that force_style ignores — keep only the
+// real style fields.
+var assStyleKeys = map[string]bool{
+	"FontName": true, "FontSize": true, "Bold": true, "Italic": true,
+	"Underline": true, "StrikeOut": true, "PrimaryColour": true,
+	"SecondaryColour": true, "OutlineColour": true, "BackColour": true,
+	"BorderStyle": true, "Outline": true, "Shadow": true,
+	"Alignment": true, "MarginL": true, "MarginR": true, "MarginV": true,
+	"ScaleX": true, "ScaleY": true, "Spacing": true, "Angle": true,
+}
+
+// plexInlineassToForceStyle translates the parameters of Plex's
+// `inlineass=` filter into a `subtitles` filter force_style= value so
+// the pre-rendered overlay reproduces Plex's burn-in styling. Plex's
+// top-level keys font_size / outline / shadow map onto the ASS style
+// fields FontSize / Outline / Shadow; the `overrides=` sub-list
+// already carries ASS style fields and is passed through (style
+// fields only). font_scale / font_path / fontconfig_file / language
+// have no force_style equivalent and are dropped.
+//
+// `params` is everything after `inlineass=` — top-level pairs are
+// `:`-separated and no value contains a top-level `:` (verified across
+// the argv corpus; same assumption as stripPlexInlineassFilterArgs).
+// Returns "" when nothing usable was found.
+func plexInlineassToForceStyle(params string) string {
+	var pairs []string
+	for _, p := range strings.Split(params, ":") {
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch kv[0] {
+		case "font_size":
+			pairs = append(pairs, "FontSize="+kv[1])
+		case "outline":
+			pairs = append(pairs, "Outline="+kv[1])
+		case "shadow":
+			pairs = append(pairs, "Shadow="+kv[1])
+		case "overrides":
+			for _, ov := range strings.Split(kv[1], ",") {
+				okv := strings.SplitN(ov, "=", 2)
+				if len(okv) == 2 && assStyleKeys[okv[0]] {
+					pairs = append(pairs, okv[0]+"="+okv[1])
+				}
+			}
+		}
+	}
+	return strings.Join(pairs, ",")
+}
+
 func indexOfArg(args []string, key string, from int) int {
 	for i := from; i < len(args); i++ {
 		if args[i] == key {
@@ -2135,6 +2188,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						Embedded:   subSrc.FilePath == "",
 						Width:      wInt,
 						Height:     hInt,
+						ForceStyle: plexInlineassToForceStyle(m[assGroup]),
 					}
 					changes = append(changes, "hw-decode:filter:sub-prerender-overlay")
 				}

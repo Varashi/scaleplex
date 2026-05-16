@@ -1509,6 +1509,37 @@ func TestSubtitleIsAnimated(t *testing.T) {
 	}
 }
 
+// plexInlineassToForceStyle maps Plex's inlineass params onto a
+// subtitles-filter force_style= value.
+func TestPlexInlineassToForceStyle(t *testing.T) {
+	params := "font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Noto Sans Medium,Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000:outline=2.6:shadow=1.7:font_size=54"
+	got := plexInlineassToForceStyle(params)
+	for _, want := range []string{
+		"FontName=Noto Sans Medium", "Bold=500",
+		"PrimaryColour=&H00FFFFFF", "OutlineColour=&H00020713",
+		"BackColour=&HCC000000", "Outline=2.6", "Shadow=1.7", "FontSize=54",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("force_style missing %q: %s", want, got)
+		}
+	}
+	// Non-style keys and script-info fields must not leak through.
+	for _, bad := range []string{
+		"ScaledBorderAndShadow", "font_path", "fontconfig_file",
+		"language", "font_scale", "NotoSans-Medium",
+	} {
+		if strings.Contains(got, bad) {
+			t.Errorf("force_style should not contain %q: %s", bad, got)
+		}
+	}
+}
+
+func TestPlexInlineassToForceStyle_Empty(t *testing.T) {
+	if got := plexInlineassToForceStyle("font_scale=1.0:language=en"); got != "" {
+		t.Errorf("expected empty force_style, got %q", got)
+	}
+}
+
 // HDR source + SDR-target argv (the "plain" filter pattern, which
 // Plex used to autoinject tonemap on its bundled musl ffmpeg). With
 // stock ffmpeg we have to inject tonemap_vaapi explicitly or HDR

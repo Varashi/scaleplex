@@ -79,6 +79,24 @@ func TestBuildSubPrerenderArgs_EscapesPath(t *testing.T) {
 	}
 }
 
+func TestBuildSubPrerenderArgs_ForceStyleQuoted(t *testing.T) {
+	spec := &SubPrerenderSpec{
+		FIFOPath:   "/t/f.fifo",
+		Width:      1920,
+		Height:     1080,
+		ForceStyle: "FontSize=54,Outline=2.6",
+	}
+	vf := argvVal(buildSubPrerenderArgs(spec, "/t/s.srt"), "-vf")
+	if !strings.Contains(vf, ":force_style='FontSize=54,Outline=2.6'") {
+		t.Errorf("force_style not single-quoted: %q", vf)
+	}
+	// mpdecimate must sit outside the quoted value or it gets parsed
+	// as a force_style entry instead of the next filter.
+	if !strings.HasSuffix(vf, "',mpdecimate") {
+		t.Errorf("mpdecimate must follow the quoted force_style: %q", vf)
+	}
+}
+
 func TestSubPrerenderEnv_HomeOverride(t *testing.T) {
 	env := subPrerenderEnv()
 	homeCount := 0
