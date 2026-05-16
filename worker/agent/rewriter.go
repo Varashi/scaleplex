@@ -1387,12 +1387,20 @@ func dropNostatsFlag(args []string) ([]string, bool) {
 	return args, false
 }
 
-// stripEAEEnvVars removes EAE_ROOT and FFMPEG_EXTERNAL_LIBS — both
-// point at Plex Transcoder paths that don't exist on the worker pod.
+// stripEAEEnvVars removes Plex-Transcoder-private env vars that break
+// stock ffmpeg on the worker:
+//   - EAE_ROOT / FFMPEG_EXTERNAL_LIBS point at Plex Transcoder paths
+//     that don't exist on the worker pod.
+//   - OCL_ICD_VENDORS is set to "0" by PMS to disable OpenCL ICD
+//     discovery in its bundled ffmpeg. Inherited by a worker ffmpeg it
+//     makes the OpenCL loader scan a bogus path → zero platforms →
+//     clGetPlatformIDs returns -1001, which kills any tonemap_opencl
+//     HDR transcode. Stripping it lets ocl-icd fall back to its
+//     default /etc/OpenCL/vendors, where the Intel ICD lives.
 // X_PLEX_TOKEN is intentionally KEPT for the progress reporter.
 func stripEAEEnvVars(env map[string]string) (map[string]string, []string) {
 	var changes []string
-	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
+	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "OCL_ICD_VENDORS"} {
 		if _, ok := env[k]; ok {
 			delete(env, k)
 			changes = append(changes, "env:strip:"+k)

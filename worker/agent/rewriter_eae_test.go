@@ -215,6 +215,7 @@ func TestRewriter_StripsPlexEnv(t *testing.T) {
 	in := map[string]string{
 		"EAE_ROOT":             "/run/plex-temp/.../EasyAudioEncoder",
 		"FFMPEG_EXTERNAL_LIBS": "/config/.../Codecs/abc/",
+		"OCL_ICD_VENDORS":      "0",
 		"X_PLEX_TOKEN":         "secret",
 		"TZ":                   "Europe/Brussels",
 	}
@@ -222,7 +223,7 @@ func TestRewriter_StripsPlexEnv(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS"} {
+	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "OCL_ICD_VENDORS"} {
 		if _, ok := out.Env[k]; ok {
 			t.Errorf("%s should be stripped from env (still present: %q)", k, out.Env[k])
 		}
