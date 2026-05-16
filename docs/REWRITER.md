@@ -193,7 +193,7 @@ Graph (initial play):
 
 ```
 [0:0]hwupload[10];
-[10]scale_vaapi=...[11];               # +tonemap_vaapi for HDR
+[10]scale_vaapi=...[11];
 [N:v]format=bgra,hwupload[12];         # N = the FIFO input index
 [11][12]overlay_vaapi=eof_action=pass:repeatlast=1[4]
 ```
@@ -271,7 +271,7 @@ them. The rewriter routes them through `overlay_vaapi` instead:
 
 ```
 [0:0]hwupload[10];
-[10]scale_vaapi=w=W:h=H:format=nv12[11];      # or +tonemap_vaapi for HDR
+[10]scale_vaapi=w=W:h=H:format=nv12[11];
 [streamSpec]format=bgra[12];
 [12]hwupload[13];
 [11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]
@@ -285,36 +285,29 @@ the filter graph).
 
 ### HDR tonemap (HDR source → SDR output)
 
-When the rewriter sees an HDR source (color_transfer=smpte2084 etc. via
-ffprobe) targeting SDR output, it injects a tone-mapping stage after
-`scale_vaapi=...:format=p010` — **unless Plex's tone-mapping pref is
-off**. The shim reads `TranscoderToneMapping` from PMS's
-`Preferences.xml` and surfaces it as `SCALEPLEX_PLEX_TONEMAP` in the
-task env; when it is `0` the rewriter skips the implicit injection
-(change tag `tonemap:skipped(plex-pref-off)`) so scaleplex honors the
-user's choice rather than overriding it. A missing pref fails safe —
-tone mapping on. The stage runs in one of two modes, selected by the
-`SCALEPLEX_TONEMAP` env var:
+**scaleplex never decides whether to tone-map — Plex does.** Plex
+tone-maps HDR→SDR only in hardware: with "Use hardware-accelerated tone
+mapping" on, its argv carries a `tonemap_opencl` chain; with it off,
+Plex emits a plain SDR-target chain and does no tone-mapping at all
+(washed/dim output — Plex's own behavior). There is no software
+tone-map path. So the argv is authoritative: scaleplex honors a tonemap
+filter when Plex sent one, and injects nothing when Plex didn't.
 
-**OpenCL (default).** `tonemap_opencl` is algorithm-selectable, so it
-honors Plex's `TranscoderTonemapAlgorithm` preset:
+When Plex's argv carries the OpenCL chain, `substituteOpenCLTonemap`
+re-emits it in canonical comma form, keeping Plex's chosen algorithm:
 
 ```
-scale_vaapi=w=W:h=H:format=p010,
-hwmap=derive_device=opencl,
-tonemap_opencl=tonemap=<algo>:transfer=bt709:matrix=bt709:primaries=bt709:format=nv12,
-hwmap=derive_device=vaapi:reverse=1
+[X]hwmap=derive_device=opencl,
+   tonemap_opencl=tonemap=<algo>:transfer=bt709:matrix=bt709:primaries=bt709:format=nv12,
+   hwmap=derive_device=vaapi:reverse=1[C]
 ```
 
-`hwmap` self-derives the OpenCL device from the input frame's VAAPI
-device — no `-init_hw_device opencl` is needed. The output is a VAAPI
-nv12 surface, so the stage is drop-in wherever the old `tonemap_vaapi`
-filter stood. `<algo>` precedence: Plex's chain when PMS sent one (see
-`substituteOpenCLTonemap`) → Plex's `TranscoderToneMappingAgorithm` pref
-(shim-surfaced as `SCALEPLEX_PLEX_TONEMAP_ALGO`) → the
-`SCALEPLEX_TONEMAP_ALGO` operator override → `hable`. Costs ~15%
-throughput vs the fixed-curve filter — still ~10× realtime at 4K
-HDR→1080p on an Arc A310.
+`hwmap` self-derives the OpenCL device from the VAAPI frame context —
+no `-init_hw_device opencl` needed. `SCALEPLEX_TONEMAP=vaapi` instead
+collapses the chain to iHD's fixed-curve `tonemap_vaapi` (BT.2390 EETF,
+no per-algorithm tuning) — an OpenCL-trouble fallback. `reFilterHDR` /
+`reFilterHDRAss` similarly reshape Plex's explicit SW-shaped tonemap
+chains to the HW pipeline.
 
 > The worker **must** strip `OCL_ICD_VENDORS` from the spawn env (it
 > does — see `stripEAEEnvVars`). PMS sets `OCL_ICD_VENDORS=0` to disable
@@ -322,22 +315,9 @@ HDR→1080p on an Arc A310.
 > it makes the OpenCL loader find zero platforms (`clGetPlatformIDs` →
 > `-1001`) and the whole tonemap_opencl transcode fails.
 
-**VAAPI fixed-curve** (`SCALEPLEX_TONEMAP=vaapi`). iHD's VAAPI VPP
-tone-map — a fixed BT.2390 EETF curve, no per-algorithm tuning:
-
-```
-scale_vaapi=w=W:h=H:format=p010,
-tonemap_vaapi=transfer=bt709:format=nv12
-```
-
-`tonemap_vaapi` is **not in Plex's ffmpeg build** (they ship
-`tonemap_cuda` / `tonemap_opencl` only); scaleplex-ffmpeg7
-(jellyfin-ffmpeg) has it.
-
 > The VAAPI↔Vulkan `libplacebo` route (richer tunables) is **not** used:
 > Intel's ANV Vulkan driver reports `sync import caps: 0x0`, so the
-> zero-copy VAAPI→Vulkan interop can't synchronize. `tonemap_opencl`
-> gives the algorithm choice without that dependency.
+> zero-copy VAAPI→Vulkan interop can't synchronize.
 
 ### Subtitle bail conditions
 
