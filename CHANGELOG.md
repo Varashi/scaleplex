@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.1.0 — 2026-05-16
+
+### GPU-overlay subtitle burn-in
+
+New burn-in path for SRT and static ASS subtitles. The worker rewriter
+replaces Plex's per-frame CPU `inlineass` filter (a `hwdownload` /
+libass / `hwupload` bracket) with a GPU `overlay_vaapi` composite. A
+second ffmpeg — the *pre-render* — rasterises the subtitle to a sparse
+transparent video (`subtitles` → `mpdecimate` → `ffv1`/Matroska) and
+streams it through a FIFO; the main transcode reads that FIFO as a
+second input and composites on the GPU. All stock `scaleplex-ffmpeg7`
+filters — **no new fork patch**.
+
+- Animated ASS (karaoke, `\t`, `\move`, `\fad`) stays on `inlineass`;
+  per-frame motion can't be pre-rendered.
+- Sidecar subtitles are read directly; embedded subtitles are extracted
+  to a temp file first (video/audio streams skipped for a fast extract).
+- Seek rebases the overlay graph to zero around `overlay_vaapi` and back,
+  so framesync aligns without grinding from 0 to the seek point; the
+  main-video timeline is untouched (client playhead unaffected).
+- Measured 4K HDR + SRT burn at ~4.7× realtime, vs ~2.2× on `inlineass`
+  (~1.3× under contention). Validated on the `plex-test` bench: cold
+  start, seek, sidecar and embedded SRT, 4K→4K and 4K→1080p.
+
+### Tooling
+
+- GPLv3 `LICENSE`.
+- Renovate config (`renovate.json`) — tracks dependency and base-image
+  updates, including the jellyfin-ffmpeg base.
+
 ## v1.0.0 — 2026-05-15
 
 First tagged release. scaleplex replaces the `Plex Transcoder` binary on
