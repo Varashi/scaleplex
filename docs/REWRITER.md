@@ -287,8 +287,14 @@ the filter graph).
 
 When the rewriter sees an HDR source (color_transfer=smpte2084 etc. via
 ffprobe) targeting SDR output, it injects a tone-mapping stage after
-`scale_vaapi=...:format=p010`. The stage runs in one of two modes,
-selected by the `SCALEPLEX_TONEMAP` env var:
+`scale_vaapi=...:format=p010` — **unless Plex's tone-mapping pref is
+off**. The shim reads `TranscoderToneMapping` from PMS's
+`Preferences.xml` and surfaces it as `SCALEPLEX_PLEX_TONEMAP` in the
+task env; when it is `0` the rewriter skips the implicit injection
+(change tag `tonemap:skipped(plex-pref-off)`) so scaleplex honors the
+user's choice rather than overriding it. A missing pref fails safe —
+tone mapping on. The stage runs in one of two modes, selected by the
+`SCALEPLEX_TONEMAP` env var:
 
 **OpenCL (default).** `tonemap_opencl` is algorithm-selectable, so it
 honors Plex's `TranscoderTonemapAlgorithm` preset:
@@ -303,10 +309,12 @@ hwmap=derive_device=vaapi:reverse=1
 `hwmap` self-derives the OpenCL device from the input frame's VAAPI
 device — no `-init_hw_device opencl` is needed. The output is a VAAPI
 nv12 surface, so the stage is drop-in wherever the old `tonemap_vaapi`
-filter stood. `<algo>` comes from Plex's chain when PMS sent one (see
-`substituteOpenCLTonemap`), otherwise from `SCALEPLEX_TONEMAP_ALGO`
-(default `hable`). Costs ~15% throughput vs the fixed-curve filter —
-still ~10× realtime at 4K HDR→1080p on an Arc A310.
+filter stood. `<algo>` precedence: Plex's chain when PMS sent one (see
+`substituteOpenCLTonemap`) → Plex's `TranscoderToneMappingAgorithm` pref
+(shim-surfaced as `SCALEPLEX_PLEX_TONEMAP_ALGO`) → the
+`SCALEPLEX_TONEMAP_ALGO` operator override → `hable`. Costs ~15%
+throughput vs the fixed-curve filter — still ~10× realtime at 4K
+HDR→1080p on an Arc A310.
 
 **VAAPI fixed-curve** (`SCALEPLEX_TONEMAP=vaapi`). iHD's VAAPI VPP
 tone-map — a fixed BT.2390 EETF curve, no per-algorithm tuning:
