@@ -71,8 +71,14 @@ func TestBuildSubPrerenderArgs_SeekOffset(t *testing.T) {
 		SeekOffsetSeconds: 83.5,
 	}
 	vf := argvVal(buildSubPrerenderArgs(spec, "/t/s.srt"), "-vf")
+	// Up-shift before subtitles so it renders the cue at the seek
+	// point; down-shift after so the overlay output stays 0-based and
+	// aligns with the seeked main video (-copyts -start_at_zero).
 	if !strings.HasPrefix(vf, "setpts=PTS+83.500/TB,subtitles=") {
-		t.Errorf("seek setpts prefix wrong: %q", vf)
+		t.Errorf("missing up-shift before subtitles: %q", vf)
+	}
+	if !strings.Contains(vf, ":alpha=1,setpts=PTS-83.500/TB,mpdecimate") {
+		t.Errorf("missing down-shift after subtitles: %q", vf)
 	}
 }
 
@@ -84,7 +90,11 @@ func TestBuildSubPrerenderArgs_EscapesPath(t *testing.T) {
 	}
 }
 
-func TestBuildSubPrerenderArgs_ForceStyleQuoted(t *testing.T) {
+func TestBuildSubPrerenderArgs_NoForceStyle(t *testing.T) {
+	// force_style must NOT be applied: Plex's font sizes assume a
+	// render-height PlayRes, but the stock subtitles filter renders a
+	// raw SRT at libass's 384x288 default, so applying them oversizes
+	// the text ~3-4x. libass's default SRT style is correctly sized.
 	spec := &SubPrerenderSpec{
 		FIFOPath:   "/t/f.fifo",
 		Width:      1920,
@@ -92,13 +102,8 @@ func TestBuildSubPrerenderArgs_ForceStyleQuoted(t *testing.T) {
 		ForceStyle: "FontSize=54,Outline=2.6",
 	}
 	vf := argvVal(buildSubPrerenderArgs(spec, "/t/s.srt"), "-vf")
-	if !strings.Contains(vf, ":force_style='FontSize=54,Outline=2.6'") {
-		t.Errorf("force_style not single-quoted: %q", vf)
-	}
-	// mpdecimate must sit outside the quoted value or it gets parsed
-	// as a force_style entry instead of the next filter.
-	if !strings.HasSuffix(vf, "',mpdecimate") {
-		t.Errorf("mpdecimate must follow the quoted force_style: %q", vf)
+	if strings.Contains(vf, "force_style") {
+		t.Errorf("force_style must not be applied (oversizes text): %q", vf)
 	}
 }
 
