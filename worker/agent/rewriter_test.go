@@ -2217,6 +2217,55 @@ func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 // Embedded ASS can't be scanned for animation tags (no sidecar file
 // on disk), so it conservatively keeps the per-frame inlineass path
 // and does not populate SubPrerender.
+// On a seek session the overlay graph rebases both branches to 0
+// before overlay_vaapi and rebases the composite back to the seek
+// offset, so framesync gets a 0-based pair and the main-video
+// timeline reaching dashenc is unchanged.
+func TestRewriter_SubPrerender_HW_Seek(t *testing.T) {
+	args := []string{
+		"-loglevel", "quiet",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi",
+		"-codec:0", "hevc",
+		"-ss", "1800",
+		"-i", "/media/x.mkv",
+		"-codec:1", "subrip",
+		"-ss", "1800",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-start_at_zero", "-copyts",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=p010[1];[1]hwdownload,format=p010[2];[2]inlineass=font_scale=1.0:font_path=/x:outline=2:shadow=1:font_size=54[3];[3]hwupload[4]",
+		"-map", "[4]",
+		"-codec:0", "hevc_vaapi",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists:           func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	vfIdx := findFilterComplex(out.Args, "[0:0]")
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex")
+	}
+	graph := out.Args[vfIdx]
+	// Both branches rebased to 0 ahead of overlay_vaapi.
+	if strings.Count(graph, "setpts=PTS-STARTPTS") != 2 {
+		t.Errorf("expected both branches rebased with setpts=PTS-STARTPTS: %s", graph)
+	}
+	// Composite rebased back to the seek offset.
+	if !strings.Contains(graph, "setpts=PTS+1800.000/TB[4]") {
+		t.Errorf("composite not rebased back to the seek offset: %s", graph)
+	}
+	if !strings.Contains(graph, "overlay_vaapi=") {
+		t.Errorf("overlay_vaapi missing: %s", graph)
+	}
+}
+
 func TestRewriter_InlineassPassthrough_HW_EmbeddedASS(t *testing.T) {
 	args := []string{
 		"-loglevel", "quiet",

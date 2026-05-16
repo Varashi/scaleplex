@@ -2139,13 +2139,44 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							fifoInput++
 						}
 					}
-					args[vfIdx] = fmt.Sprintf(
-						"[0:0]hwupload[10];"+
-							"[10]%s[11];"+
-							"[%d:v]format=bgra,hwupload[12];"+
-							"[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[4]",
-						scaleStep, fifoInput,
-					)
+					// On a seek session the main video reaches the
+					// filtergraph at the seek offset (PTS N), but the
+					// overlay reaches overlay_vaapi's framesync at ~0 —
+					// framesync then drains the overlay 0→N hunting for a
+					// frame to pair, and the pre-render grinds out N
+					// seconds of overlay (startup latency scales with
+					// seek distance). Fix: rebase BOTH branches to 0 with
+					// setpts=PTS-STARTPTS so framesync sees a 0-based
+					// pair (identical to initial-play, which works), then
+					// rebase the composite back to +offset so dashenc and
+					// the seek-chunk/tfdt machinery see the unchanged
+					// source timeline. Initial play (offset 0) keeps the
+					// plain graph untouched.
+					seekOff := 0.0
+					if si := indexOfArg(args, "-ss", 0); si >= 0 && si+1 < len(args) {
+						if v, err := strconv.ParseFloat(args[si+1], 64); err == nil && v > 0 {
+							seekOff = v
+						}
+					}
+					if seekOff > 0 {
+						args[vfIdx] = fmt.Sprintf(
+							"[0:0]hwupload[10];"+
+								"[10]%s,setpts=PTS-STARTPTS[11];"+
+								"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload[12];"+
+								"[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[13];"+
+								"[13]setpts=PTS+%s/TB[4]",
+							scaleStep, fifoInput,
+							strconv.FormatFloat(seekOff, 'f', 3, 64),
+						)
+					} else {
+						args[vfIdx] = fmt.Sprintf(
+							"[0:0]hwupload[10];"+
+								"[10]%s[11];"+
+								"[%d:v]format=bgra,hwupload[12];"+
+								"[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[4]",
+							scaleStep, fifoInput,
+						)
+					}
 					// Drop `-map_inlineass <spec>` — no inlineass filter
 					// consumes it on this path; the pre-render reads the
 					// subtitle itself.
