@@ -168,7 +168,13 @@ func newPMUReader() (*pmuReader, error) {
 			}
 			// pid=-1 + cpu=0: system-wide PMU read on the boot CPU.
 			// i915 PMU is per-device, not per-CPU, so any CPU works.
-			fd, err := unix.PerfEventOpen(attr, -1, 0, -1, 0)
+			//
+			// PERF_FLAG_FD_CLOEXEC is mandatory: without it these i915
+			// PMU fds are inherited by every ffmpeg the agent spawns,
+			// and an inherited i915 perf fd makes the Intel OpenCL
+			// runtime (NEO) enumerate zero platforms — `clGetPlatformIDs`
+			// returns -1001 — which kills any tonemap_opencl transcode.
+			fd, err := unix.PerfEventOpen(attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
 			if err != nil {
 				log.Printf("gpu PMU: perf_event_open %s/%s: %v", filepath.Base(dev), n, err)
 				continue
