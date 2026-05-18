@@ -84,6 +84,17 @@ type SubPrerenderSpec struct {
 	// post-scale target resolution.
 	Width  int
 	Height int
+	// BandHeight — the height of the bottom band the pre-render
+	// actually emits. SRT is always bottom-positioned, so only the
+	// bottom slice of the frame can carry text; emitting just that band
+	// (instead of the full Height) cuts the canvas-size-proportional
+	// CPU (qtrle encode, format converts, the main transcode's overlay
+	// hwupload). The pre-render renders the full frame so libass keeps
+	// correct positioning, then crops to this band. Equal to Height
+	// when the full frame must be emitted (ASS subtitles, which can be
+	// positioned anywhere). The main graph composites the band at
+	// y = Height - BandHeight.
+	BandHeight int
 	// SeekOffsetSeconds — the pre-render timeline must start here so it
 	// aligns with a -ss seek session's main video. 0 on initial play.
 	SeekOffsetSeconds float64
@@ -2155,6 +2166,22 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							fifoInput++
 						}
 					}
+					// Band optimisation. SRT is always bottom-positioned, so
+					// the pre-render only needs to emit the bottom slice of
+					// the frame — the agent renders the full frame (libass
+					// keeps correct positioning) then crops to BandHeight,
+					// and overlay_vaapi composites that band at y=bandY.
+					// Cuts the canvas-size-proportional CPU ~2.5x. ASS can
+					// be positioned anywhere → full frame. Embedded subs are
+					// extracted to SRT by the agent (always bottom) →
+					// band-safe; only a sidecar ASS/SSA stays full-frame.
+					wInt, _ := strconv.Atoi(w)
+					hInt, _ := strconv.Atoi(h)
+					bandH := hInt
+					if hInt > 0 && (subSrc.FilePath == "" || subSrc.Codec == "subrip") {
+						bandH = subPrerenderBandHeight(hInt)
+					}
+					bandY := hInt - bandH
 					// On a seek session the main video reaches the
 					// filtergraph at the seek offset (PTS N), but the
 					// overlay reaches overlay_vaapi's framesync at ~0 —
@@ -2179,9 +2206,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							"[0:0]hwupload[10];"+
 								"[10]%s,setpts=PTS-STARTPTS[11];"+
 								"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload[12];"+
-								"[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[13];"+
+								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[13];"+
 								"[13]setpts=PTS+%s/TB[4]",
-							scaleStep, fifoInput,
+							scaleStep, fifoInput, bandY,
 							strconv.FormatFloat(seekOff, 'f', 3, 64),
 						)
 					} else {
@@ -2189,8 +2216,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							"[0:0]hwupload[10];"+
 								"[10]%s[11];"+
 								"[%d:v]format=bgra,hwupload[12];"+
-								"[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[4]",
-							scaleStep, fifoInput,
+								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[4]",
+							scaleStep, fifoInput, bandY,
 						)
 					}
 					// Drop `-map_inlineass <spec>` — no inlineass filter
@@ -2256,8 +2283,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							srcPath = args[ii+1]
 						}
 					}
-					wInt, _ := strconv.Atoi(w)
-					hInt, _ := strconv.Atoi(h)
 					subPrerender = &SubPrerenderSpec{
 						FIFOPath:   fifoPath,
 						SourcePath: srcPath,
@@ -2265,9 +2290,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						Embedded:   subSrc.FilePath == "",
 						Width:      wInt,
 						Height:     hInt,
+						BandHeight: bandH,
 						ForceStyle: plexInlineassToForceStyle(m[assGroup]),
 					}
 					changes = append(changes, "hw-decode:filter:sub-prerender-overlay")
+					if bandH < hInt {
+						changes = append(changes,
+							fmt.Sprintf("sub-prerender:band=%dx%d@y%d", wInt, bandH, bandY))
+					}
 				}
 				newInputIdx = indexOfArg(args, "-i", 0)
 				encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)

@@ -72,6 +72,63 @@ func TestBuildSubPrerenderArgs_Basic(t *testing.T) {
 	if args[len(args)-1] != spec.FIFOPath {
 		t.Errorf("output not the FIFO: %q", args[len(args)-1])
 	}
+	// BandHeight unset (0) → no crop (full frame).
+	if strings.Contains(vf, "crop=") {
+		t.Errorf("no crop expected when BandHeight unset: %q", vf)
+	}
+}
+
+func TestSubPrerenderBandHeight(t *testing.T) {
+	// bottom 2/5, rounded even.
+	cases := []struct{ h, want int }{
+		{1600, 640}, {1080, 432}, {536, 214}, {720, 288}, {2160, 864},
+	}
+	for _, c := range cases {
+		if got := subPrerenderBandHeight(c.h); got != c.want {
+			t.Errorf("subPrerenderBandHeight(%d) = %d, want %d", c.h, got, c.want)
+		}
+		if subPrerenderBandHeight(c.h)%2 != 0 {
+			t.Errorf("band height for %d is odd", c.h)
+		}
+	}
+}
+
+func TestBuildSubPrerenderArgs_Band(t *testing.T) {
+	// SRT → BandHeight < Height → render full frame, crop the bottom band.
+	spec := &SubPrerenderSpec{
+		FIFOPath:   "/t/f.fifo",
+		Width:      3840,
+		Height:     1600,
+		BandHeight: 640,
+	}
+	vf := argvVal(buildSubPrerenderArgs(spec, "/t/s.srt"), "-vf")
+	// Canvas is still the FULL frame — libass needs it for positioning.
+	if !strings.Contains(argvVal(buildSubPrerenderArgs(spec, "/t/s.srt"), "-i"), "s=3840x1600") {
+		t.Error("canvas must stay full-frame for correct libass positioning")
+	}
+	// Crop the bottom 640 band (y = 1600-640).
+	if !strings.Contains(vf, "crop=3840:640:0:960") {
+		t.Errorf("expected bottom-band crop: %q", vf)
+	}
+	// crop sits after subtitles, before format=argb.
+	if strings.Index(vf, "subtitles=") > strings.Index(vf, "crop=") ||
+		strings.Index(vf, "crop=") > strings.Index(vf, "format=argb") {
+		t.Errorf("filter order wrong (want subtitles,crop,format=argb): %q", vf)
+	}
+}
+
+func TestBuildSubPrerenderArgs_FullFrameWhenBandEqualsHeight(t *testing.T) {
+	// ASS → BandHeight == Height → no crop, full frame emitted.
+	spec := &SubPrerenderSpec{
+		FIFOPath:   "/t/f.fifo",
+		Width:      1920,
+		Height:     1080,
+		BandHeight: 1080,
+	}
+	vf := argvVal(buildSubPrerenderArgs(spec, "/t/s.ass"), "-vf")
+	if strings.Contains(vf, "crop=") {
+		t.Errorf("BandHeight==Height must not crop: %q", vf)
+	}
 }
 
 func TestBuildSubPrerenderArgs_SeekOffset(t *testing.T) {

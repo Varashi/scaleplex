@@ -39,6 +39,33 @@ const subPrerenderFPS = 5
 // subExtractTimeout bounds the embedded-subtitle extraction pre-step.
 const subExtractTimeout = 60 * time.Second
 
+// subPrerenderBandFracNum / subPrerenderBandFracDen — the band the
+// pre-render emits is this fraction of the frame height (bottom 2/5).
+// SRT subtitles sit in the bottom ~25%; 40% leaves comfortable headroom
+// for tall multi-line cues while still cutting the canvas-proportional
+// pre-render + overlay-upload CPU ~2.5x.
+const (
+	subPrerenderBandFracNum = 2
+	subPrerenderBandFracDen = 5
+)
+
+// subPrerenderBandHeight returns the bottom-band height (even, encoders
+// require even dimensions) for an output frame of height h. The rewriter
+// uses it for SRT sources; ASS keeps the full frame.
+func subPrerenderBandHeight(h int) int {
+	if h < 10 {
+		return h
+	}
+	b := h * subPrerenderBandFracNum / subPrerenderBandFracDen
+	if b%2 == 1 {
+		b++
+	}
+	if b >= h {
+		return h
+	}
+	return b
+}
+
 // buildSubPrerenderArgs builds the ffmpeg argv for the subtitle
 // pre-render: a steady-fps transparent canvas with the subtitle burned
 // in by libass, encoded lossless into a streaming container on the FIFO
@@ -89,6 +116,16 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	// style renders correctly sized for the canvas; honoring Plex's
 	// exact sizes needs the SRT converted to ASS with PlayRes = canvas
 	// first — deferred.
+	// Crop to the bottom band: libass rendered against the full frame
+	// (so positioning is correct), but only the bottom band carries SRT
+	// text — emitting just that band shrinks the qtrle encode, the
+	// format convert, and the main transcode's overlay hwupload. The
+	// rewriter places the band at y=Height-BandHeight via overlay_vaapi.
+	// BandHeight == Height (ASS, can be positioned anywhere) → no crop.
+	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
+		vf += fmt.Sprintf(",crop=%d:%d:0:%d",
+			spec.Width, spec.BandHeight, spec.Height-spec.BandHeight)
+	}
 	// qtrle encodes argb; the subtitles filter leaves the canvas rgba.
 	vf += ",format=argb"
 
