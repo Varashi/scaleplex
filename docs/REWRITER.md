@@ -184,19 +184,43 @@ The rewriter replaces Plex's per-frame CPU `inlineass` bracket
 (`hwdownload` → libass → `hwupload`) with a GPU `overlay_vaapi`
 composite. The agent spawns a second ffmpeg — the *pre-render* — from
 the `SubPrerenderSpec` the rewriter returns: it rasterises the subtitle
-to a sparse transparent video (`subtitles` → `mpdecimate` → `ffv1` /
-Matroska) and streams it through a FIFO. The main transcode reads that
-FIFO as a second video input and composites it on the GPU. All filters
-are stock scaleplex-ffmpeg7 — **no fork patch involved**.
+onto a transparent canvas (`subtitles` → `qtrle` / fragmented MOV) and
+streams it through a FIFO. The main transcode reads that FIFO as a
+second video input and composites it on the GPU. All filters are stock
+scaleplex-ffmpeg7 — **no fork patch involved**.
 
 Graph (initial play):
 
 ```
 [0:0]hwupload[10];
 [10]scale_vaapi=...[11];
-[N:v]format=bgra,hwupload[12];         # N = the FIFO input index
-[11][12]overlay_vaapi=eof_action=pass:repeatlast=1[4]
+[N:v]format=bgra,hwupload[12];          # N = the FIFO input index
+[11][12]overlay_vaapi=x=0:y=Y:eof_action=pass:repeatlast=1[4]
 ```
+
+Key constraints on the pre-render (hard-won — see
+`project_scaleplex_av1_decode_corruption`):
+
+- **The overlay stream must be steady, never decimated.** `overlay_vaapi`
+  framesync holds each decoded main-video frame until it has an overlay
+  frame past that PTS; a gap pins the main AV1 decoder's VAAPI surfaces
+  and overruns the pool (`Failed to upload decode parameters: 18`). The
+  pre-render emits a steady 5 fps — `mpdecimate` (even bounded) is
+  forbidden.
+- **Codec is `qtrle` (QuickTime Animation) in fragmented MOV.** qtrle is
+  lossless, carries alpha, and is inter-frame, so the long runs of
+  identical transparent frames encode as near-empty deltas (~9× cheaper
+  than the intra-only ffv1 it replaced). qtrle in Matroska/NUT/AVI
+  mis-decodes — fragmented MOV (`empty_moov`) is the working container.
+- **Band optimisation (SRT only).** SRT is always bottom-positioned, so
+  the pre-render renders the full frame (libass needs it for correct
+  positioning) then crops to the bottom 40% band; `overlay_vaapi` places
+  it at `y = Height - BandHeight`. Cuts the canvas-size-proportional CPU
+  ~2.5×. Sidecar ASS can be positioned anywhere → keeps the full frame
+  (`BandHeight == Height`, `y = 0`).
+- **HDR tonemap is preserved.** When Plex's argv carries an OpenCL
+  tonemap, the rewrite keeps it (scale step → `scale_vaapi(p010)` + the
+  resolved tonemap stage) — dropping it rendered HDR washed/dim.
 
 The rewriter also:
 
@@ -208,7 +232,7 @@ The rewriter also:
   new `-i` would mis-parse them as input options). FIFO input flags:
   `-copyts -probesize 32 -analyzeduration 0` — `-copyts` keeps the
   overlay timestamps; the minimal probe stops `find_stream_info` from
-  reading megabytes of the sparse FIFO at startup (~5 s grind → ~0.8 s).
+  reading the FIFO at startup (~5 s grind → ~0.8 s).
 
 **Seek:** the main video reaches the filtergraph at the seek offset
 (PTS N) but the overlay starts at ~0, so `overlay_vaapi` framesync would

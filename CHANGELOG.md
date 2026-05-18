@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Subtitle burn-in (GPU-overlay pre-render) — correctness + performance
+
+Post-v1.1.1 work on the SRT / static-ASS `overlay_vaapi` pre-render
+path. Validated on the `plex-test` bench.
+
+- **Fixed AV1 HW-decode corruption on subtitle-burn sessions.** The
+  pre-render's `mpdecimate` left multi-second gaps in the overlay
+  stream; `overlay_vaapi` framesync then held the main video's decoded
+  frames waiting for an overlay frame, overran the AV1 decoder's VAAPI
+  surface pool, and the decoder failed mid-stream (`Failed to upload
+  decode parameters: 18` → motion corruption). The overlay is now a
+  steady, undecimated 5 fps stream — `mpdecimate` removed, do not
+  re-add it (even bounded `max=N` reintroduces the gap).
+- **Preserved Plex's HDR tonemap on the sub-burn path.** The HW-decode
+  sub rewrite hardcoded the scale step to `scale_vaapi(nv12)`, dropping
+  the `tonemap_opencl` chain Plex's argv carried — HDR rendered
+  washed/dim. The rewrite now keeps the tonemap (`scale_vaapi(p010)` +
+  the resolved tonemap stage).
+- **Pre-render codec `ffv1` → `qtrle`** (fragmented MOV). qtrle is
+  lossless, carries alpha, and is inter-frame, so the long runs of
+  identical transparent frames between cues encode as near-empty
+  deltas — ~9× less encode CPU than the intra-only ffv1. (ffv1 stays
+  intra; qtrle in Matroska/NUT/AVI mis-decodes — fragmented MOV with
+  `empty_moov` is the working streaming container.)
+- **Bottom-band pre-render (SRT).** SRT is always bottom-positioned, so
+  the pre-render renders the full frame (libass needs it for correct
+  positioning) then crops to the bottom 40% band before the encode;
+  the main graph composites it with `overlay_vaapi=y=Height-BandHeight`.
+  ~2.5× less canvas-size-proportional CPU. Sidecar ASS can be
+  positioned anywhere, so it keeps the full frame.
+
+Net effect: a 4K HDR + SRT-burn worker sustains roughly **8 concurrent
+realtime streams**, up from ~4–5; single-stream transcode CPU roughly
+halved.
+
 ## v1.1.1 — 2026-05-16
 
 Documentation-only patch release. The v1.1.0 tag landed before the prose

@@ -18,7 +18,8 @@ keeps the distributed-transcode shape but swaps workers to **stock ffmpeg**
 
 Concretely this unlocks:
 
-- HW HDR→SDR tonemap (`tonemap_vaapi`)
+- HW HDR→SDR tone-mapping — honored from Plex's argv (OpenCL,
+  algorithm-selectable; `tonemap_vaapi` via the `SCALEPLEX_TONEMAP` knob)
 - HW subtitle burn-in: SRT / static ASS pre-rendered and composited via
   `overlay_vaapi` (no fork patch — ~4.7× realtime at 4K HDR vs ~2.2× on
   the per-frame CPU path), animated ASS via a fork-native port of Plex's
@@ -52,7 +53,8 @@ static ASS), validated on the `plex-test` bench:
 **Source matrix:** AV1 + HEVC + H264; SDR + HDR10; embedded and sidecar
 SRT / ASS text subs (SRT / static ASS burn-in via the `overlay_vaapi`
 pre-render path, animated ASS via the fork-native `inlineass=` filter);
-embedded PGS bitmap subs (`overlay_vaapi`). HDR→SDR via `tonemap_vaapi`.
+embedded PGS bitmap subs (`overlay_vaapi`). HDR→SDR tone-mapping
+honored from Plex's argv.
 
 **Resilience:** PMS `canThrottle` pass-through, multi-engine GPU load
 reporting, transparent mid-stream worker recovery across DaemonSet rolls
