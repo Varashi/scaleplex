@@ -20,25 +20,21 @@ import (
 )
 
 // subPrerenderFPS — the transparent subtitle canvas is rendered at this
-// frame rate. 5 fps gives ±200ms cue timing.
+// steady frame rate. 5 fps gives ±200ms cue timing.
+//
+// The overlay stream must NOT be decimated — not even bounded. To emit
+// a main-video frame at PTS T, overlay_vaapi framesync needs an overlay
+// frame past T; until it has one it holds the decoded main frames, each
+// pinning a VAAPI surface from the main AV1 decoder's small fixed pool.
+// An overlay gap of G seconds makes framesync hold ~G*24 surfaces — and
+// the pool overruns well before 1s. Plain `mpdecimate` (unbounded gap)
+// killed playback ~4min in; `mpdecimate=max=10` (2s gap) killed it
+// ~12s in — both surfaced as the AV1 HW decoder failing with "Failed
+// to upload decode parameters: 18". A steady 5fps holds the gap at
+// 0.2s (~5 surfaces) — safe. ffv1 still encodes every frame, but the
+// identical transparent frames compress tiny; the encode CPU is the
+// price of a framesync-safe overlay. Do not re-add mpdecimate.
 const subPrerenderFPS = 5
-
-// subPrerenderDecimateMax bounds mpdecimate's consecutive-drop run. The
-// overlay must NOT be fully decimated: overlay_vaapi framesync pairs
-// every main-video frame with an overlay frame, and to emit a main
-// frame at PTS T it must have already seen an overlay frame past T.
-// Plain mpdecimate emits one frame per cue transition and the `color`
-// canvas never EOFs, so a quiet stretch (minutes between cues) leaves
-// the FIFO empty — framesync blocks, the main decoder keeps filling its
-// VAAPI surface pool with un-paired frames, and the AV1 HW decoder
-// fails mid-stream with "Failed to upload decode parameters: 18".
-// `mpdecimate=max=N` forces a keepalive frame after N consecutive
-// drops, bounding the gap to N/subPrerenderFPS seconds so framesync
-// always has a fresh frame, while still collapsing the identical
-// transparent frames in quiet runs — a fully steady stream made the
-// pre-render ffv1-encode every frame and cost more CPU than the
-// transcode itself.
-const subPrerenderDecimateMax = 10
 
 // subExtractTimeout bounds the embedded-subtitle extraction pre-step.
 const subExtractTimeout = 60 * time.Second
@@ -79,7 +75,6 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	// style renders correctly sized for the canvas; honoring Plex's
 	// exact sizes needs the SRT converted to ASS with PlayRes = canvas
 	// first — deferred.
-	vf += ",mpdecimate=max=" + strconv.Itoa(subPrerenderDecimateMax)
 
 	return []string{
 		"-hide_banner", "-loglevel", "error", "-y",

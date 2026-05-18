@@ -43,12 +43,11 @@ func TestBuildSubPrerenderArgs_Basic(t *testing.T) {
 	if !strings.Contains(vf, ":alpha=1") {
 		t.Errorf("subtitles filter missing alpha=1: %q", vf)
 	}
-	// mpdecimate must be bounded (max=N), not plain: plain mpdecimate
-	// emits a sparse stream that stalls overlay_vaapi framesync, but a
-	// fully un-decimated stream costs more CPU than the transcode. See
-	// the subPrerenderDecimateMax comment.
-	if !strings.HasSuffix(vf, ",mpdecimate=max=10") {
-		t.Errorf("expected bounded mpdecimate=max=10 suffix: %q", vf)
+	// mpdecimate must NOT be present in any form — even bounded
+	// (max=N) it leaves overlay gaps that overrun the main decoder's
+	// VAAPI surface pool. See the subPrerenderFPS comment.
+	if strings.Contains(vf, "mpdecimate") {
+		t.Errorf("mpdecimate must not be applied (overruns surface pool): %q", vf)
 	}
 	if strings.Contains(vf, "setpts=") {
 		t.Errorf("no seek → no setpts expected: %q", vf)
