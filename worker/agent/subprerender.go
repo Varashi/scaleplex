@@ -20,10 +20,18 @@ import (
 )
 
 // subPrerenderFPS — the transparent subtitle canvas is rendered at this
-// frame rate, then mpdecimate collapses runs of identical frames to one
-// per cue transition. 5 fps gives ±200ms cue timing and keeps the
-// pre-render comfortably ahead of the encoder; mpdecimate makes the
-// emitted frame count independent of this value.
+// steady frame rate. 5 fps gives ±200ms cue timing. The stream must NOT
+// be decimated: overlay_vaapi framesync pairs every main-video frame
+// with an overlay frame, and to emit a main frame at PTS T it must have
+// already seen an overlay frame past T. A decimated overlay emits one
+// frame per cue transition and the `color` canvas never EOFs, so during
+// a quiet stretch (minutes between cues) framesync blocks waiting for an
+// overlay frame that never arrives — the main decoder keeps filling its
+// VAAPI surface pool with un-paired frames until it exhausts and the AV1
+// HW decoder fails mid-stream with "Failed to upload decode parameters:
+// 18". A steady low fps keeps a fresh overlay frame always one step
+// ahead; ffv1 collapses the identical transparent frames to near-zero
+// bytes, so the steady stream costs almost nothing on the wire.
 const subPrerenderFPS = 5
 
 // subExtractTimeout bounds the embedded-subtitle extraction pre-step.
@@ -65,7 +73,6 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	// style renders correctly sized for the canvas; honoring Plex's
 	// exact sizes needs the SRT converted to ASS with PlayRes = canvas
 	// first — deferred.
-	vf += ",mpdecimate"
 
 	return []string{
 		"-hide_banner", "-loglevel", "error", "-y",

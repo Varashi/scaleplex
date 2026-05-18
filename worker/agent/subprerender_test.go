@@ -43,8 +43,11 @@ func TestBuildSubPrerenderArgs_Basic(t *testing.T) {
 	if !strings.Contains(vf, ":alpha=1") {
 		t.Errorf("subtitles filter missing alpha=1: %q", vf)
 	}
-	if !strings.HasSuffix(vf, ",mpdecimate") {
-		t.Errorf("mpdecimate missing: %q", vf)
+	// mpdecimate must NOT be present: a decimated (sparse) overlay
+	// stream stalls overlay_vaapi framesync mid-stream — see the
+	// subPrerenderFPS comment.
+	if strings.Contains(vf, "mpdecimate") {
+		t.Errorf("mpdecimate must not be applied (stalls framesync): %q", vf)
 	}
 	if strings.Contains(vf, "setpts=") {
 		t.Errorf("no seek → no setpts expected: %q", vf)
