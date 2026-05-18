@@ -320,6 +320,30 @@ var (
 			`\[3\]hwdownload,format=[A-Za-z0-9]+\[4\];` +
 			`\[4\]inlineass=([^\[]+)\[5\];` +
 			`\[5\]hwupload\[6\]$`)
+	// HW-decode PGS/bitmap burn-in PMS pattern. When the decode probe
+	// matches, PMS emits its own overlay_vaapi graph for a bitmap
+	// subtitle — but software-scales the subtitle bitmap canvas to the
+	// full output resolution before the GPU overlay. That per-frame SW
+	// `scale` of a multi-megapixel canvas is the one non-HW step in an
+	// otherwise all-VAAPI graph; it pegs the CPU and starves the
+	// transcode below realtime (live repro 2026-05-18: Avatar 4K HDR +
+	// PGS on LG webOS collapsed to ~0.25x realtime).
+	//
+	// Filter shape (captured 2026-05-18, sub stream index varies):
+	//   [0:5]scale=W:H,hwupload[0];
+	//   [0:0]hwupload[1];
+	//   [1]scale_vaapi=w=W:h=H:format=p010[2];
+	//   [2][0]overlay_vaapi,scale_vaapi=format=p010[3];
+	//   [3]hwupload[4]
+	// Group 1 captures the bitmap stream spec, groups 2/3 its SW-scale
+	// target W/H. The rewrite swaps only that leading branch for a GPU
+	// `format=bgra,hwupload,scale_vaapi=w=W:h=H`.
+	reFilterHWBitmapOverlay = regexp.MustCompile(
+		`^\[(0:[0-9]+)\]scale=([0-9]+):([0-9]+),hwupload\[0\];` +
+			`\[0:0\]hwupload\[1\];` +
+			`\[1\]scale_vaapi=w=[0-9]+:h=[0-9]+(?::format=[A-Za-z0-9]+)?\[2\];` +
+			`\[2\]\[0\]overlay_vaapi[^\[]*\[3\];` +
+			`\[3\]hwupload\[4\]$`)
 	// reInitHW accepts both PMS argv shapes for `-init_hw_device`:
 	//   `vaapi=vaapi:`                                — SW-decode, PMS
 	//   doesn't know the device because the worker chooses it.
@@ -1882,9 +1906,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	// SW-decode-only artefacts. In HW-decode mode PMS already shaped
-	// the filter chain, encoder, and map labels for VAAPI; we leave
-	// them untouched. Subtitle burn-in for HW-decode mode is not yet
-	// supported (PMS likely doesn't request it when HW probe matches).
+	// the filter chain, encoder, and map labels for VAAPI, so the
+	// rewriter trusts that graph instead of re-deriving it. The catch:
+	// PMS still slips non-HW steps into its "HW" graph for subtitle
+	// burn-in — a CPU libass bracket for text subs, a SW `scale` of
+	// the bitmap canvas for PGS — so the HW-decode branch below carries
+	// targeted fixups for those cases rather than blanket trust.
 	var rewritten *filterRewrite
 	var subSrc *subtitleSource
 	var subPrerender *SubPrerenderSpec
@@ -2304,6 +2331,32 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			case "bitmap":
 				return bail("hw-decode-sub:bitmap-unsupported")
 			}
+		}
+
+		// PGS / bitmap burn-in in HW-decode mode. PMS emits its own
+		// overlay_vaapi graph here (no `-map_inlineass`, so
+		// detectSubtitleSource finds nothing and subSrc is nil above)
+		// but software-scales the subtitle bitmap canvas to the full
+		// output resolution before the GPU overlay. That per-frame SW
+		// scale of a multi-megapixel canvas pegs the CPU and starves
+		// the transcode below realtime. The rest of Plex's graph is
+		// already all-HW; rewrite just the bitmap branch's
+		// `scale=W:H,hwupload` to a GPU
+		// `format=bgra,hwupload,scale_vaapi=w=W:h=H`.
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] != "-filter_complex" {
+				continue
+			}
+			if m := reFilterHWBitmapOverlay.FindStringSubmatch(args[i+1]); m != nil {
+				old := fmt.Sprintf("[%s]scale=%s:%s,hwupload[0]", m[1], m[2], m[3])
+				neu := fmt.Sprintf(
+					"[%s]format=bgra,hwupload,scale_vaapi=w=%s:h=%s[0]",
+					m[1], m[2], m[3])
+				args[i+1] = strings.Replace(args[i+1], old, neu, 1)
+				changes = append(changes,
+					"hw-decode:filter:bitmap-overlay-scale-vaapi")
+			}
+			break
 		}
 	}
 

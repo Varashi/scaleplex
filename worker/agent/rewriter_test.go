@@ -1746,6 +1746,55 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 	}
 }
 
+// PMS HW-decode + embedded PGS bitmap subtitle burn-in. When the
+// decode probe matches, PMS emits its own overlay_vaapi graph for the
+// bitmap sub but software-scales the subtitle canvas to the full
+// output resolution (`[0:5]scale=W:H,hwupload`) before the GPU
+// overlay. That per-frame SW scale of a multi-megapixel canvas pegs
+// the CPU and starves the transcode below realtime. The rewriter must
+// move it onto the GPU as `format=bgra,hwupload,scale_vaapi`.
+// Captured live 2026-05-18: Avatar 4K HDR + PGS on LG webOS.
+func TestRewriter_HWDecode_PGSOverlay_BitmapScaleToVAAPI(t *testing.T) {
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}
+	args := append([]string(nil), hwDecodeArgsAV1HEVC...)
+	vfIdx := indexOfArg(args, "-filter_complex", 0)
+	args[vfIdx+1] = "[0:5]scale=3840:2160,hwupload[0];" +
+		"[0:0]hwupload[1];" +
+		"[1]scale_vaapi=w=3840:h=2160:format=p010[2];" +
+		"[2][0]overlay_vaapi,scale_vaapi=format=p010[3];" +
+		"[3]hwupload[4]"
+	// PMS's `-map` for this graph points at the final label [4].
+	for i := vfIdx + 1; i+1 < len(args); i++ {
+		if args[i] == "-map" && args[i+1] == "[2]" {
+			args[i+1] = "[4]"
+			break
+		}
+	}
+
+	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
+	}
+	if !containsString(out.Changes, "hw-decode:filter:bitmap-overlay-scale-vaapi") {
+		t.Fatalf("missing bitmap-overlay-scale-vaapi change; got %v", out.Changes)
+	}
+	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
+	if strings.Contains(gotVF, "scale=3840:2160,hwupload[0]") {
+		t.Errorf("SW bitmap scale survived: %q", gotVF)
+	}
+	if !strings.Contains(gotVF, "[0:5]format=bgra,hwupload,scale_vaapi=w=3840:h=2160[0]") {
+		t.Errorf("bitmap branch not rewritten to GPU scale: %q", gotVF)
+	}
+	// Downstream graph (video branch, overlay, trailing) left verbatim.
+	if !strings.Contains(gotVF,
+		"[2][0]overlay_vaapi,scale_vaapi=format=p010[3];[3]hwupload[4]") {
+		t.Errorf("downstream graph altered: %q", gotVF)
+	}
+}
+
 // PMS HW-decode + force-burn subtitle. Captured live from
 // clusterplex-worker-5v2zj 2026-05-08 18:10Z, Plex Android playing
 // The Accountant with a forced English SDH track and the Plex pref
