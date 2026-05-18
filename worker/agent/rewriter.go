@@ -1335,9 +1335,19 @@ func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string,
 	// Splice at index 0 so it lands in global-scope (before -i),
 	// matching ffmpeg's option-context rules. Skip if the option is
 	// somehow already present (shouldn't happen, but be defensive).
+	//
+	// SCALEPLEX_DISABLE_CANTHROTTLE (worker-pod env) suppresses the
+	// injection entirely — a diagnostic escape hatch to A/B whether
+	// canThrottle is responsible for live-session throughput collapse
+	// on heavy (sub-burn) transcodes. With it set, ffmpeg runs
+	// unthrottled; progress is still read via `-progress pipe:N`.
 	if indexOfArg(args, "-canthrottleurl", 0) < 0 {
-		args = spliceArgs(args, 0, "-canthrottleurl", rewritten)
-		changes = append(changes, "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)")
+		if os.Getenv("SCALEPLEX_DISABLE_CANTHROTTLE") != "" {
+			changes = append(changes, "canthrottle:disabled-by-env")
+		} else {
+			args = spliceArgs(args, 0, "-canthrottleurl", rewritten)
+			changes = append(changes, "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)")
+		}
 	}
 	return args, rewritten, changes
 }
