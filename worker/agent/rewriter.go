@@ -80,6 +80,13 @@ type SubPrerenderSpec struct {
 	// first); false when SourcePath is a standalone sidecar file the
 	// `subtitles` filter can read directly.
 	Embedded bool
+	// Bitmap — true when the subtitle is a bitmap format (PGS / VobSub
+	// / DVDSub). The pre-render then scales the sub2video stream
+	// directly (libavcodec rasterizes the bitmap; `scale` upscales it
+	// to the canvas) instead of rendering text via libass `subtitles=`.
+	// No extraction step: the pre-render reads the stream straight from
+	// SourcePath via StreamSpec. See buildSubPrerenderArgs.
+	Bitmap bool
 	// Width, Height — overlay canvas size; matches the transcode's
 	// post-scale target resolution.
 	Width  int
@@ -320,6 +327,27 @@ var (
 			`\[3\]hwdownload,format=[A-Za-z0-9]+\[4\];` +
 			`\[4\]inlineass=([^\[]+)\[5\];` +
 			`\[5\]hwupload\[6\]$`)
+	// HW-decode bitmap-subtitle (PGS/VobSub/DVDSub) burn-in PMS pattern.
+	// When the decode probe matches and a bitmap sub must be burned, PMS
+	// emits its own overlay_vaapi graph that sub2video-bridges the
+	// subtitle stream and SW-upscales it inline. Feeding that sparse
+	// stream to overlay_vaapi lets framesync drain it at frame rate, so
+	// the 4K upscale runs flat-out (~2 cores, transcode collapses). The
+	// rewriter reroutes the bitmap through the sub pre-render instead.
+	//
+	// Filter shape (captured 2026-05-18; sub stream index varies):
+	//   [0:5]scale=W:H,hwupload[0];
+	//   [0:0]hwupload[1];
+	//   [1]scale_vaapi=w=W:h=H:format=p010[2];
+	//   [2][0]overlay_vaapi,scale_vaapi=format=p010[3];
+	//   [3]hwupload[4]
+	// Group 1 = the bitmap stream spec, groups 2/3 = the W/H.
+	reFilterHWBitmapOverlay = regexp.MustCompile(
+		`^\[(0:[0-9]+)\]scale=([0-9]+):([0-9]+),hwupload\[0\];` +
+			`\[0:0\]hwupload\[1\];` +
+			`\[1\]scale_vaapi=w=[0-9]+:h=[0-9]+(?::format=[A-Za-z0-9]+)?\[2\];` +
+			`\[2\]\[0\]overlay_vaapi[^\[]*\[3\];` +
+			`\[3\]hwupload\[4\]$`)
 	// reInitHW accepts both PMS argv shapes for `-init_hw_device`:
 	//   `vaapi=vaapi:`                                — SW-decode, PMS
 	//   doesn't know the device because the worker chooses it.
@@ -2314,6 +2342,83 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			case "bitmap":
 				return bail("hw-decode-sub:bitmap-unsupported")
 			}
+		}
+
+		// PGS / bitmap burn-in in HW-decode mode. PMS emits its own
+		// overlay_vaapi graph that sub2video-bridges the bitmap subtitle
+		// and SW-upscales it inline — no `-map_inlineass`, so the
+		// detectSubtitleSource switch above never sees it. Feeding that
+		// sparse stream to overlay_vaapi lets framesync drain it at
+		// frame rate, running the 4K upscale flat-out (~2 cores, the
+		// transcode collapses). Reroute the bitmap through the sub
+		// pre-render: a separate ffmpeg upscales it rate-bounded and
+		// streams a clean CFR qtrle FIFO; the main graph just reads
+		// that FIFO and overlay_vaapi-composites it.
+		// See project_scaleplex_pgs_prerender.
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] != "-filter_complex" {
+				continue
+			}
+			m := reFilterHWBitmapOverlay.FindStringSubmatch(args[i+1])
+			if m == nil {
+				break
+			}
+			streamSpec, w, h := m[1], m[2], m[3]
+			fifoDir := sessionDir
+			if fifoDir == "" {
+				fifoDir = "/tmp/scaleplex"
+			}
+			fifoPath := fifoDir + "/scaleplex-sub-overlay.fifo"
+			fifoInput := 0
+			for _, a := range args {
+				if a == "-i" {
+					fifoInput++
+				}
+			}
+			seekOff := 0.0
+			if si := indexOfArg(args, "-ss", 0); si >= 0 && si+1 < len(args) {
+				if v, err := strconv.ParseFloat(args[si+1], 64); err == nil && v > 0 {
+					seekOff = v
+				}
+			}
+			// Swap the SW-upscale bitmap branch for a read of the
+			// pre-render's CFR qtrle FIFO; the rest of PMS's graph
+			// (main scale_vaapi + overlay_vaapi) stays verbatim.
+			old := fmt.Sprintf("[%s]scale=%s:%s,hwupload[0]", streamSpec, w, h)
+			neu := fmt.Sprintf("[%d:v]format=bgra,hwupload[0]", fifoInput)
+			args[i+1] = strings.Replace(args[i+1], old, neu, 1)
+			// Append the FIFO input after the last existing -i. -copyts
+			// keeps its PTS; -probesize 32/-analyzeduration 0 stops
+			// find_stream_info grinding the sparse stream at startup.
+			lastInput := -1
+			for j := 0; j+1 < len(args); j++ {
+				if args[j] == "-i" {
+					lastInput = j
+				}
+			}
+			if lastInput >= 0 {
+				args = spliceArgs(args, lastInput+2,
+					"-copyts", "-probesize", "32", "-analyzeduration", "0",
+					"-i", fifoPath)
+			}
+			wInt, _ := strconv.Atoi(w)
+			hInt, _ := strconv.Atoi(h)
+			subPrerender = &SubPrerenderSpec{
+				FIFOPath:          fifoPath,
+				SourcePath:        mediaPath,
+				StreamSpec:        streamSpec,
+				Embedded:          true,
+				Bitmap:            true,
+				Width:             wInt,
+				Height:            hInt,
+				BandHeight:        hInt,
+				SeekOffsetSeconds: seekOff,
+			}
+			changes = append(changes, "hw-decode:filter:bitmap-sub-prerender")
+			// The splice shifted indices; relocate the encoder.
+			newInputIdx = indexOfArg(args, "-i", 0)
+			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+			break
 		}
 	}
 

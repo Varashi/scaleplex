@@ -1746,6 +1746,80 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 	}
 }
 
+// PMS HW-decode + embedded PGS bitmap burn-in. PMS emits its own
+// overlay_vaapi graph that sub2video-bridges the PGS stream and
+// SW-upscales it inline (no -map_inlineass). Fed straight to
+// overlay_vaapi, framesync drains the sparse stream at frame rate and
+// the 4K upscale runs flat-out → ~2 cores, transcode collapses. The
+// rewriter must reroute the bitmap through the sub pre-render: swap
+// the SW-upscale branch for a read of the pre-render's CFR qtrle
+// FIFO, splice the FIFO -i, and return a bitmap SubPrerenderSpec.
+func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}
+	args := append([]string(nil), hwDecodeArgsAV1HEVC...)
+	vfIdx := indexOfArg(args, "-filter_complex", 0)
+	args[vfIdx+1] = "[0:5]scale=3840:2160,hwupload[0];" +
+		"[0:0]hwupload[1];" +
+		"[1]scale_vaapi=w=3840:h=2160:format=p010[2];" +
+		"[2][0]overlay_vaapi,scale_vaapi=format=p010[3];" +
+		"[3]hwupload[4]"
+	for i := vfIdx + 1; i+1 < len(args); i++ {
+		if args[i] == "-map" && args[i+1] == "[2]" {
+			args[i+1] = "[4]"
+			break
+		}
+	}
+
+	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
+	}
+	if !containsString(out.Changes, "hw-decode:filter:bitmap-sub-prerender") {
+		t.Fatalf("missing bitmap-sub-prerender change; got %v", out.Changes)
+	}
+	sp := out.SubPrerender
+	if sp == nil {
+		t.Fatalf("no SubPrerenderSpec returned")
+	}
+	if !sp.Bitmap {
+		t.Errorf("SubPrerenderSpec.Bitmap = false, want true")
+	}
+	if sp.StreamSpec != "0:5" {
+		t.Errorf("StreamSpec = %q, want 0:5", sp.StreamSpec)
+	}
+	if sp.Width != 3840 || sp.Height != 2160 {
+		t.Errorf("W/H = %dx%d, want 3840x2160", sp.Width, sp.Height)
+	}
+	if !sp.Embedded {
+		t.Errorf("Embedded = false, want true")
+	}
+
+	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
+	if strings.Contains(gotVF, "scale=3840:2160,hwupload[0]") {
+		t.Errorf("SW bitmap upscale survived: %q", gotVF)
+	}
+	if !strings.Contains(gotVF, "format=bgra,hwupload[0]") {
+		t.Errorf("FIFO bitmap branch not wired: %q", gotVF)
+	}
+	if !strings.Contains(gotVF,
+		"[2][0]overlay_vaapi,scale_vaapi=format=p010[3];[3]hwupload[4]") {
+		t.Errorf("downstream graph altered: %q", gotVF)
+	}
+	// FIFO input spliced as a real -i
+	found := false
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-i" && out.Args[i+1] == sp.FIFOPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("FIFO -i %q not spliced into argv", sp.FIFOPath)
+	}
+}
+
 // PMS HW-decode + force-burn subtitle. Captured live from
 // clusterplex-worker-5v2zj 2026-05-08 18:10Z, Plex Android playing
 // The Accountant with a forced English SDH track and the Plex pref

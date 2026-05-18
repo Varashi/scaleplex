@@ -86,6 +86,9 @@ func subPrerenderBandHeight(h int) int {
 // moov header up front so the main transcode's tiny `-probesize 32`
 // probe still resolves the codec.
 func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
+	if spec.Bitmap {
+		return buildBitmapPrerenderArgs(spec)
+	}
 	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=rgba",
 		spec.Width, spec.Height, subPrerenderFPS)
 
@@ -140,6 +143,54 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	}
 }
 
+// buildBitmapPrerenderArgs builds the pre-render argv for a bitmap
+// subtitle (PGS / VobSub / DVDSub). Unlike the text path there is no
+// libass `subtitles=` filter and no `color` canvas: the bitmap
+// subtitle stream is sub2video-bridged straight from the source,
+// `scale` upscales that frame to the canvas size, and `fps` makes it
+// the steady CFR stream overlay_vaapi's framesync needs.
+//
+// Why a separate process: feeding the sparse sub2video stream straight
+// into the main transcode's overlay_vaapi lets framesync drain it at
+// frame rate, re-running the (expensive) 4K upscale per pulled frame —
+// CPU climbs to ~2 cores and the transcode collapses. Doing the
+// upscale here, rate-bounded by `fps` at subPrerenderFPS in an
+// isolated process, and handing the main transcode a clean CFR qtrle
+// stream, removes the upscale from the framesync hot path.
+// See project_scaleplex_pgs_prerender.
+func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
+	sel := spec.StreamSpec
+	if sel == "" {
+		sel = "0:s:0"
+	}
+	vf := fmt.Sprintf("[%s]scale=%d:%d,fps=%d",
+		sel, spec.Width, spec.Height, subPrerenderFPS)
+	if spec.SeekOffsetSeconds > 0 {
+		// -ss seeks the source 0-based; shift the output PTS back up to
+		// the seek offset so it aligns with the main video's -copyts
+		// stream (same role as the text path's setpts shift).
+		vf += ",setpts=PTS+" +
+			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB"
+	}
+	// qtrle carries alpha as argb; the sub2video frame is rgba.
+	vf += ",format=argb[o]"
+
+	args := []string{"-hide_banner", "-loglevel", "error", "-y", "-vn", "-an"}
+	if spec.SeekOffsetSeconds > 0 {
+		args = append(args, "-ss",
+			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64))
+	}
+	return append(args,
+		"-i", spec.SourcePath,
+		"-filter_complex", vf,
+		"-map", "[o]",
+		"-fps_mode", "vfr",
+		"-c:v", "qtrle",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mov", spec.FIFOPath,
+	)
+}
+
 // subPrerenderEnv returns the environment for the pre-render ffmpeg:
 // the agent's own env with HOME forced to /home/ubuntu so libass finds
 // the per-user fontconfig cache (matching the main transcode env).
@@ -159,6 +210,11 @@ func subPrerenderEnv() []string {
 // temp .srt next to the FIFO so the filter has a deterministic
 // single-stream input.
 func resolveSubFile(ctx context.Context, spec *SubPrerenderSpec) (string, error) {
+	// Bitmap subs are read straight from the source by buildBitmapPrerenderArgs
+	// (sub2video bridge) — no .srt extraction step.
+	if spec.Bitmap {
+		return spec.SourcePath, nil
+	}
 	if !spec.Embedded {
 		return spec.SourcePath, nil
 	}

@@ -191,3 +191,80 @@ func TestSubPrerenderEnv_HomeOverride(t *testing.T) {
 		t.Errorf("expected exactly one HOME entry, got %d", homeCount)
 	}
 }
+
+func argvHasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildBitmapPrerenderArgs(t *testing.T) {
+	spec := &SubPrerenderSpec{
+		FIFOPath:   "/transcode/s/scaleplex-sub-overlay.fifo",
+		SourcePath: "/media/Movies/Avatar.mkv",
+		StreamSpec: "0:5",
+		Embedded:   true,
+		Bitmap:     true,
+		Width:      3840,
+		Height:     2160,
+	}
+	args := buildSubPrerenderArgs(spec, spec.SourcePath)
+
+	// reads the source media directly; video + audio streams skipped
+	if !argvHasPair(args, "-i", "/media/Movies/Avatar.mkv") {
+		t.Errorf("source -i missing: %v", args)
+	}
+	if !argvHasFlag(args, "-vn") || !argvHasFlag(args, "-an") {
+		t.Errorf("-vn/-an (skip video+audio decode) missing: %v", args)
+	}
+	fc := argvVal(args, "-filter_complex")
+	// bitmap path: no libass subtitles=, no color canvas
+	if strings.Contains(fc, "subtitles=") {
+		t.Errorf("bitmap path must not use libass subtitles=: %q", fc)
+	}
+	if strings.Contains(strings.Join(args, " "), "color=c=black") {
+		t.Errorf("bitmap path must not use a color canvas: %v", args)
+	}
+	// sub2video stream scaled to canvas, made CFR via fps
+	if !strings.Contains(fc, "[0:5]scale=3840:2160,fps=5") {
+		t.Errorf("bitmap scale+fps wrong: %q", fc)
+	}
+	if !strings.HasSuffix(fc, ",format=argb[o]") {
+		t.Errorf("vf must end format=argb[o] for qtrle: %q", fc)
+	}
+	if !argvHasPair(args, "-c:v", "qtrle") {
+		t.Error("qtrle encoder missing")
+	}
+	if !argvHasPair(args, "-f", "mov") {
+		t.Error("mov muxer missing")
+	}
+	if args[len(args)-1] != spec.FIFOPath {
+		t.Errorf("output not the FIFO: %q", args[len(args)-1])
+	}
+	if strings.Contains(fc, "setpts=") {
+		t.Errorf("no seek → no setpts expected: %q", fc)
+	}
+}
+
+func TestBuildBitmapPrerenderArgs_Seek(t *testing.T) {
+	spec := &SubPrerenderSpec{
+		FIFOPath:          "/transcode/s/scaleplex-sub-overlay.fifo",
+		SourcePath:        "/media/x.mkv",
+		StreamSpec:        "0:5",
+		Bitmap:            true,
+		Width:             3840,
+		Height:            2160,
+		SeekOffsetSeconds: 601.5,
+	}
+	args := buildSubPrerenderArgs(spec, spec.SourcePath)
+	if !argvHasPair(args, "-ss", "601.500") {
+		t.Errorf("-ss seek missing: %v", args)
+	}
+	fc := argvVal(args, "-filter_complex")
+	if !strings.Contains(fc, "setpts=PTS+601.500/TB") {
+		t.Errorf("seek setpts shift missing: %q", fc)
+	}
+}
