@@ -31,19 +31,33 @@ import (
 // killed playback ~4min in; `mpdecimate=max=10` (2s gap) killed it
 // ~12s in — both surfaced as the AV1 HW decoder failing with "Failed
 // to upload decode parameters: 18". A steady 5fps holds the gap at
-// 0.2s (~5 surfaces) — safe. ffv1 still encodes every frame, but the
-// identical transparent frames compress tiny; the encode CPU is the
-// price of a framesync-safe overlay. Do not re-add mpdecimate.
+// 0.2s (~5 surfaces) — safe. Do not re-add mpdecimate; keep the stream
+// dense. The encode codec (qtrle, inter-frame) is what keeps a dense
+// stream cheap — see buildSubPrerenderArgs.
 const subPrerenderFPS = 5
 
 // subExtractTimeout bounds the embedded-subtitle extraction pre-step.
 const subExtractTimeout = 60 * time.Second
 
 // buildSubPrerenderArgs builds the ffmpeg argv for the subtitle
-// pre-render: a transparent canvas at the target resolution with the
-// subtitle burned in by libass, decimated to cue-transition frames,
-// encoded lossless (ffv1) into a streaming Matroska written to the
-// FIFO the main transcode consumes.
+// pre-render: a steady-fps transparent canvas with the subtitle burned
+// in by libass, encoded lossless into a streaming container on the FIFO
+// the main transcode consumes.
+//
+// Codec is qtrle (QuickTime Animation): lossless, carries an alpha
+// channel (argb), and inter-frame — an unchanged frame encodes as a
+// near-empty delta. The stream stays dense at subPrerenderFPS (framesync
+// needs that — see the subPrerenderFPS comment), but the long runs of
+// identical transparent frames between subtitle cues cost almost
+// nothing to encode. Measured: ~9x less encode CPU than the intra-only
+// ffv1 it replaced (which re-encoded every identical 4K frame in full).
+//
+// Container is fragmented MOV. qtrle in Matroska loses its pixel-format
+// metadata (decoder then fails "Unsupported colorspace: 0 bits/sample");
+// NUT and AVI also mis-handle it. `frag_keyframe+empty_moov+
+// default_base_moof` makes MOV streamable through the FIFO with the
+// moov header up front so the main transcode's tiny `-probesize 32`
+// probe still resolves the codec.
 func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=rgba",
 		spec.Width, spec.Height, subPrerenderFPS)
@@ -75,14 +89,17 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	// style renders correctly sized for the canvas; honoring Plex's
 	// exact sizes needs the SRT converted to ASS with PlayRes = canvas
 	// first — deferred.
+	// qtrle encodes argb; the subtitles filter leaves the canvas rgba.
+	vf += ",format=argb"
 
 	return []string{
 		"-hide_banner", "-loglevel", "error", "-y",
 		"-f", "lavfi", "-i", canvas,
 		"-vf", vf,
 		"-fps_mode", "vfr",
-		"-c:v", "ffv1",
-		"-f", "matroska", spec.FIFOPath,
+		"-c:v", "qtrle",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mov", spec.FIFOPath,
 	}
 }
 

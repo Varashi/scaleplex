@@ -52,14 +52,22 @@ func TestBuildSubPrerenderArgs_Basic(t *testing.T) {
 	if strings.Contains(vf, "setpts=") {
 		t.Errorf("no seek → no setpts expected: %q", vf)
 	}
-	if !argvHasPair(args, "-c:v", "ffv1") {
-		t.Error("ffv1 encoder missing")
+	// qtrle (inter-frame, lossless, alpha) into fragmented MOV — see
+	// buildSubPrerenderArgs. argb is qtrle's pixel format.
+	if !argvHasPair(args, "-c:v", "qtrle") {
+		t.Error("qtrle encoder missing")
+	}
+	if !strings.HasSuffix(vf, ",format=argb") {
+		t.Errorf("vf must end with format=argb for qtrle: %q", vf)
 	}
 	if !argvHasPair(args, "-fps_mode", "vfr") {
 		t.Error("-fps_mode vfr missing")
 	}
-	if !argvHasPair(args, "-f", "matroska") {
-		t.Error("matroska muxer missing")
+	if !argvHasPair(args, "-f", "mov") {
+		t.Error("mov muxer missing")
+	}
+	if !argvHasPair(args, "-movflags", "frag_keyframe+empty_moov+default_base_moof") {
+		t.Error("streamable MOV -movflags missing")
 	}
 	if args[len(args)-1] != spec.FIFOPath {
 		t.Errorf("output not the FIFO: %q", args[len(args)-1])
