@@ -299,11 +299,13 @@ var (
 	//   [3]hwdownload,format=nv12[4];
 	//   [4]inlineass=...[5];
 	//   [5]hwupload[6]
+	// Group 3 captures Plex's tonemap algorithm — the rewrite must
+	// preserve the tone map, not drop it (HDR would render washed).
 	reFilterHWOpenCLAss = regexp.MustCompile(
 		`^\[0:0\]hwupload\[0\];` +
 			`\[0\]scale_vaapi=w=(\d+):h=(\d+)(?::format=[A-Za-z0-9]+)?\[1\];` +
 			`\[1\]hwmap=derive_device=opencl\[2\];` +
-			`\[2\]tonemap_opencl=[^\[]+\[3\];` +
+			`\[2\]tonemap_opencl=tonemap=([A-Za-z0-9]+)[^\[]*\[3\];` +
 			`\[3\]hwdownload,format=[A-Za-z0-9]+\[4\];` +
 			`\[4\]inlineass=([^\[]+)\[5\];` +
 			`\[5\]hwupload\[6\]$`)
@@ -2057,7 +2059,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
 					}
 					openclMode = true
-					assGroup = 3
+					assGroup = 4
 				}
 				w, h := m[1], m[2]
 				// Force nv12 across the libass step (matches the SW
@@ -2071,6 +2073,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					}
 				}
 				scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
+				if openclMode {
+					// Plex's argv carried scale_vaapi(p010) → hwmap(opencl)
+					// → tonemap_opencl(<algo>) → hwdownload. Preserve the
+					// tone map: scale to p010 then run the resolved tonemap
+					// stage (OpenCL passthrough honoring Plex's algorithm,
+					// or tonemap_vaapi under SCALEPLEX_TONEMAP=vaapi).
+					// Without this the HDR source is squashed straight to
+					// nv12 and renders washed.
+					scaleStep = "scale_vaapi=w=" + w + ":h=" + h +
+						":format=p010," + tm.stage(m[3])
+					changes = append(changes,
+						"hw-decode-sub:tonemap-preserved("+m[3]+")")
+				}
 				// Animated ASS (karaoke / transform / move / fade) can't
 				// be pre-rasterized once per cue — keep the per-frame
 				// inlineass path. SRT and static ASS route to the GPU

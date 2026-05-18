@@ -2260,6 +2260,69 @@ func TestRewriter_SubPrerender_HW_Seek(t *testing.T) {
 	}
 }
 
+func TestRewriter_SubPrerender_HW_OpenCLTonemap(t *testing.T) {
+	// PMS emits this when HW tone mapping is ON: the video branch
+	// scale_vaapi(p010) → hwmap(opencl) → tonemap_opencl(<algo>) →
+	// hwdownload before inlineass. The sub pre-render rewrite must keep
+	// the tone map — dropping it renders HDR washed.
+	args := []string{
+		"-loglevel", "quiet",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi",
+		"-codec:0", "hevc",
+		"-i", "/media/x.mkv",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-start_at_zero", "-copyts",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=p010[1];" +
+			"[1]hwmap=derive_device=opencl[2];" +
+			"[2]tonemap_opencl=tonemap=mobius:format=nv12:m=bt709:p=bt709:r=tv[3];" +
+			"[3]hwdownload,format=nv12[4];" +
+			"[4]inlineass=font_scale=1.0:font_path=/x:language=en:overrides=foo:outline=2:shadow=1:font_size=54[5];" +
+			"[5]hwupload[6]",
+		"-map", "[6]",
+		"-codec:0", "hevc_vaapi",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists:           func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
+	})
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
+	}
+	vfIdx := findFilterComplex(out.Args, "[0:0]")
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex")
+	}
+	graph := out.Args[vfIdx]
+	if strings.Contains(graph, "inlineass=") {
+		t.Errorf("inlineass should be gone on the pre-render path: %s", graph)
+	}
+	if !strings.Contains(graph, "overlay_vaapi=") {
+		t.Errorf("overlay_vaapi missing: %s", graph)
+	}
+	// The tone map must survive — default mode preserves Plex's algo.
+	if !strings.Contains(graph, "tonemap_opencl=tonemap=mobius") {
+		t.Errorf("tonemap dropped — HDR would render washed: %s", graph)
+	}
+	if !strings.Contains(graph, "scale_vaapi=w=1280:h=720:format=p010") {
+		t.Errorf("scale must target p010 ahead of the tonemap: %s", graph)
+	}
+	gotTag := false
+	for _, c := range out.Changes {
+		if c == "hw-decode-sub:tonemap-preserved(mobius)" {
+			gotTag = true
+		}
+	}
+	if !gotTag {
+		t.Errorf("missing tonemap-preserved tag: %v", out.Changes)
+	}
+}
+
 func TestRewriter_InlineassPassthrough_HW_EmbeddedASS(t *testing.T) {
 	args := []string{
 		"-loglevel", "quiet",
