@@ -299,9 +299,10 @@ func TestBuildBitmapPrerenderArgs_Seek(t *testing.T) {
 	if !argvHasFlag(args, "-copyts") {
 		t.Errorf("-copyts missing on seek session: %v", args)
 	}
-	// On seek the canvas itself carries the setpts shift so the CFR
-	// timeline starts at the seek offset (matching the main video's
-	// -copyts stream). The filter chain stays setpts-free.
+	// Canvas is 0-based (no setpts) — the mov muxer rebases output PTS
+	// to 0 anyway. Seek alignment is via setpts=PTS-STARTPTS on the
+	// sub branch, rebasing it to 0-based-from-seek-content to match
+	// the main's -ss N -copyts -start_at_zero behavior.
 	canvasArg := ""
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == "-i" && strings.Contains(args[i+1], "color=c=black") {
@@ -309,12 +310,12 @@ func TestBuildBitmapPrerenderArgs_Seek(t *testing.T) {
 			break
 		}
 	}
-	if !strings.Contains(canvasArg, "setpts=PTS+601.500/TB") {
-		t.Errorf("seek canvas setpts shift missing: %q", canvasArg)
+	if strings.Contains(canvasArg, "setpts=") {
+		t.Errorf("canvas must NOT have setpts (mov rebase flattens it): %q", canvasArg)
 	}
 	fc := argvVal(args, "-filter_complex")
-	if strings.Contains(fc, "setpts=") {
-		t.Errorf("filter chain must NOT have setpts (canvas carries it): %q", fc)
+	if !strings.Contains(fc, "setpts=PTS-STARTPTS") {
+		t.Errorf("sub branch missing setpts=PTS-STARTPTS for seek: %q", fc)
 	}
 }
 

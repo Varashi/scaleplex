@@ -171,12 +171,12 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
 		canvasH = spec.BandHeight
 	}
+	// Canvas stays 0-based (no setpts). The mov muxer rebases all
+	// output timestamps to 0 anyway — any canvas setpts shift would be
+	// silently flattened. Seek alignment is done by rebasing the SUB
+	// branch to 0-based-from-seek (see below).
 	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=rgba",
 		spec.Width, canvasH, subPrerenderFPS)
-	if spec.SeekOffsetSeconds > 0 {
-		canvas += ",setpts=PTS+" +
-			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB"
-	}
 
 	// StreamSpec from the rewriter is in main-argv terms ("0:5" — input
 	// 0 stream 5). In the pre-render the canvas (lavfi) is input 0 and
@@ -188,16 +188,27 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 		sel = "1:" + sel[2:]
 	}
 
-	// Sub branch: scale to FULL frame (positioning is encoded by the
-	// PGS as offsets in its full canvas, so the upscale must use full
+	// Sub branch: scale to FULL frame (PGS positioning is encoded as
+	// pixel offsets in its full canvas, so the upscale must use full
 	// dimensions to land at the right pixel coordinates), then optionally
-	// crop the bottom band. Overlay the band-sized sub onto the
-	// band-sized canvas. The earlier lean form ([0:N]scale,fps=5,format
-	// =argb) was simpler but `fps` rebased the output timeline to PTS 0
-	// regardless of -copyts; driving the timeline from a `color` canvas
-	// keeps cue PTS aligned (a cue at 38.956s lands at output PTS 38.956,
-	// which is what the main's overlay_vaapi framesync needs).
-	subBranch := fmt.Sprintf("[%s]scale=%d:%d", sel, spec.Width, spec.Height)
+	// crop the bottom band. The earlier lean form ([0:N]scale,fps=5,
+	// format=argb) was simpler but `fps` rebased the output timeline to
+	// PTS 0 regardless of -copyts; driving the timeline from a `color`
+	// canvas keeps cue PTS aligned for initial play.
+	//
+	// On a seek session, rebase the sub timeline to 0 (`setpts=PTS-
+	// STARTPTS`). With -copyts, -ss N leaves the sub frames at N+
+	// (absolute); the canvas is 0-based; framesync would mismatch and
+	// drain the sub branch. Rebasing the sub to 0-from-seek-content
+	// puts both inputs on the same 0-based timeline, matching the
+	// main's `-ss N -copyts -start_at_zero` behavior. Initial play
+	// (SeekOffsetSeconds=0) must NOT rebase — the first cue's real
+	// absolute PTS (e.g. 38.956s) drives cue placement.
+	subBranch := fmt.Sprintf("[%s]", sel)
+	if spec.SeekOffsetSeconds > 0 {
+		subBranch += "setpts=PTS-STARTPTS,"
+	}
+	subBranch += fmt.Sprintf("scale=%d:%d", spec.Width, spec.Height)
 	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
 		subBranch += fmt.Sprintf(",crop=%d:%d:0:%d",
 			spec.Width, spec.BandHeight, spec.Height-spec.BandHeight)
