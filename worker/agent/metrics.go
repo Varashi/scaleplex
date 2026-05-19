@@ -71,6 +71,18 @@ var (
 		Help:    "Final ffmpeg speed= ratio (×realtime) per session.",
 		Buckets: []float64{0.25, 0.5, 0.75, 0.9, 1.0, 1.2, 1.5, 2, 3, 5, 8, 12},
 	})
+
+	// metricCurrentSpeed exposes the live ffmpeg `speed=` ratio from the
+	// most recent progress block — across active sessions on this worker.
+	// Updated on every block (~500ms cadence) including during canThrottle
+	// (`usleep(100ms)` slows encoding but still emits progress), unlike
+	// the speed value forwarded to PMS which is suppressed under throttle
+	// to mirror Plex Transcoder. Reset to 0 by main.go when activeCount
+	// hits 0 so stale dashboards don't read a long-dead session.
+	metricCurrentSpeed = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "scaleplex_worker_current_speed_ratio",
+		Help: "Most recent ffmpeg speed= ratio (×realtime) observed on this worker. Includes throttled encoding.",
+	})
 )
 
 // recordSpeedFromOutput parses the last `speed= Xx` from a captured

@@ -515,7 +515,11 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	metricActiveSessions.Set(float64(registry.activeCount()))
 	defer func() {
 		registry.unregister(req.SessionID)
-		metricActiveSessions.Set(float64(registry.activeCount()))
+		n := registry.activeCount()
+		metricActiveSessions.Set(float64(n))
+		if n == 0 {
+			metricCurrentSpeed.Set(0)
+		}
 		metricSessionDurationSeconds.Observe(time.Since(spawnedAt).Seconds())
 	}()
 

@@ -130,6 +130,15 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 				log.Printf("session %s: first progress block out_time_us=%s total_size=%s speed=%s base_url=%s", rc.SessionID, block["out_time_us"], block["total_size"], block["speed"], rc.URL)
 			}
 			putProgressTick(ctx, httpClient, rc, block)
+			// Surface live encode speed for monitoring. Updates even
+			// while canThrottle is asserted (the throttle slows ffmpeg
+			// via usleep but the -progress stream keeps flowing), so
+			// observers can see the actual encode rate that PMS hides.
+			if sv := block["speed"]; sv != "" && sv != "N/A" {
+				if f, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(sv), "x"), 64); err == nil && !math.IsNaN(f) && f > 0 {
+					metricCurrentSpeed.Set(f)
+				}
+			}
 			block = map[string]string{}
 		}
 	}
