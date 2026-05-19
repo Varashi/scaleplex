@@ -226,19 +226,42 @@ func TestBuildBitmapPrerenderArgs(t *testing.T) {
 		t.Errorf("-copyts missing — overlay timeline would rebase: %v", args)
 	}
 	fc := argvVal(args, "-filter_complex")
-	// bitmap path: no libass subtitles=, no color canvas
+	// bitmap path: no libass subtitles=
 	if strings.Contains(fc, "subtitles=") {
 		t.Errorf("bitmap path must not use libass subtitles=: %q", fc)
 	}
-	if strings.Contains(strings.Join(args, " "), "color=c=black") {
-		t.Errorf("bitmap path must not use a color canvas: %v", args)
+	// CFR `color` canvas drives the output timeline (input 0); `fps`
+	// after the scale would rebase the sub2video to PTS 0 regardless of
+	// -copyts (bug repro 2026-05-19), so the canvas+overlay form is the
+	// correct shape.
+	if !argvHasPair(args, "-f", "lavfi") {
+		t.Error("lavfi canvas input missing")
 	}
-	// sub2video stream scaled to canvas, made CFR via fps
-	if !strings.Contains(fc, "[0:5]scale=3840:2160,fps=5") {
-		t.Errorf("bitmap scale+fps wrong: %q", fc)
+	canvasIn := false
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-i" && strings.Contains(args[i+1], "color=c=black@0.0:s=3840x2160:r=5") {
+			canvasIn = true
+			break
+		}
+	}
+	if !canvasIn {
+		t.Errorf("canvas -i (color@0.0:s=3840x2160:r=5) missing: %v", args)
+	}
+	// Source becomes input 1 in the pre-render, so the StreamSpec
+	// remaps "0:5" → "[1:5]" in the filter.
+	if !strings.Contains(fc, "[1:5]scale=3840:2160[sub]") {
+		t.Errorf("source-input streamspec not remapped to [1:5]: %q", fc)
+	}
+	// Overlay onto the canvas with repeatlast/eof_action=pass.
+	if !strings.Contains(fc, "[0:v][sub]overlay=eof_action=pass:repeatlast=1") {
+		t.Errorf("overlay onto canvas missing: %q", fc)
 	}
 	if !strings.HasSuffix(fc, ",format=argb[o]") {
-		t.Errorf("vf must end format=argb[o] for qtrle: %q", fc)
+		t.Errorf("filter must end format=argb[o] for qtrle: %q", fc)
+	}
+	// fps= must NOT appear — the canvas is the rate driver.
+	if strings.Contains(fc, "fps=") {
+		t.Errorf("fps filter must not appear (canvas drives the rate): %q", fc)
 	}
 	if !argvHasPair(args, "-c:v", "qtrle") {
 		t.Error("qtrle encoder missing")
@@ -268,13 +291,24 @@ func TestBuildBitmapPrerenderArgs_Seek(t *testing.T) {
 	if !argvHasPair(args, "-ss", "601.500") {
 		t.Errorf("-ss seek missing: %v", args)
 	}
-	// With -copyts, `-ss N` already yields offset-based PTS — no setpts
-	// shift (that's a text-path artifact of its 0-based color canvas).
 	if !argvHasFlag(args, "-copyts") {
 		t.Errorf("-copyts missing on seek session: %v", args)
 	}
+	// On seek the canvas itself carries the setpts shift so the CFR
+	// timeline starts at the seek offset (matching the main video's
+	// -copyts stream). The filter chain stays setpts-free.
+	canvasArg := ""
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-i" && strings.Contains(args[i+1], "color=c=black") {
+			canvasArg = args[i+1]
+			break
+		}
+	}
+	if !strings.Contains(canvasArg, "setpts=PTS+601.500/TB") {
+		t.Errorf("seek canvas setpts shift missing: %q", canvasArg)
+	}
 	fc := argvVal(args, "-filter_complex")
 	if strings.Contains(fc, "setpts=") {
-		t.Errorf("seek must NOT add setpts (copyts keeps offset PTS): %q", fc)
+		t.Errorf("filter chain must NOT have setpts (canvas carries it): %q", fc)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -159,25 +160,48 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 // stream, removes the upscale from the framesync hot path.
 // See project_scaleplex_pgs_prerender.
 func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
+	// CFR canvas (input 0) drives the output timeline at subPrerenderFPS.
+	// On a seek session a setpts shifts the canvas up to the seek offset
+	// so the overlay composites cues against an offset-based timeline
+	// matching the main video's -copyts stream.
+	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=rgba",
+		spec.Width, spec.Height, subPrerenderFPS)
+	if spec.SeekOffsetSeconds > 0 {
+		canvas += ",setpts=PTS+" +
+			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB"
+	}
+
+	// StreamSpec from the rewriter is in main-argv terms ("0:5" — input
+	// 0 stream 5). In the pre-render the canvas (lavfi) is input 0 and
+	// the source moves to input 1, so remap the leading "0:" → "1:".
 	sel := spec.StreamSpec
 	if sel == "" {
-		sel = "0:s:0"
+		sel = "1:s:0"
+	} else if strings.HasPrefix(sel, "0:") {
+		sel = "1:" + sel[2:]
 	}
-	// qtrle carries alpha as argb; the sub2video frame is rgba.
-	vf := fmt.Sprintf("[%s]scale=%d:%d,fps=%d,format=argb[o]",
-		sel, spec.Width, spec.Height, subPrerenderFPS)
 
-	// -copyts is mandatory. The pre-render reads ONLY the subtitle
-	// stream (-vn -an); without -copyts ffmpeg rebases the first packet
-	// it sees to PTS 0 — and the first subtitle cue is almost never at
-	// 0 — which shifts the whole overlay timeline earlier (cues appear
-	// too soon). With -copyts the sub2video frames keep their absolute
-	// PTS, matching the main video's own -copyts stream. On a seek
-	// session `-ss N` + -copyts already yields offset-based PTS, so no
-	// setpts shift is needed (the text path needs one only because its
-	// `color` canvas is a synthetic 0-based source).
+	// Overlay the sub2video (scaled to canvas size) onto the CFR canvas
+	// at its absolute PTS. The earlier lean form (no canvas, `fps=5`
+	// after the scale) was simpler but `fps` rebases its output timeline
+	// to 0 regardless of -copyts — the first cue landed at output PTS 0
+	// instead of its real time. Driving the timeline from the canvas
+	// keeps cue PTS aligned: a cue at 38.956s lands at output PTS 38.956,
+	// which is what the main transcode's overlay_vaapi needs.
+	fc := fmt.Sprintf(
+		"[%s]scale=%d:%d[sub];[0:v][sub]overlay=eof_action=pass:repeatlast=1,format=argb[o]",
+		sel, spec.Width, spec.Height)
+
+	// -copyts is mandatory. The pre-render reads the source's subtitle
+	// stream with `-vn -an`; without -copyts ffmpeg rebases the first
+	// PGS packet (rarely at 0) to PTS 0, and overlay then composites the
+	// first cue against canvas-PTS 0 — same bug as before. With -copyts
+	// the sub2video frames keep absolute PTS; overlay pairs each with
+	// the canvas frame at the matching PTS.
 	args := []string{
-		"-hide_banner", "-loglevel", "error", "-y", "-copyts", "-vn", "-an",
+		"-hide_banner", "-loglevel", "error", "-y", "-copyts",
+		"-f", "lavfi", "-i", canvas,
+		"-vn", "-an",
 	}
 	if spec.SeekOffsetSeconds > 0 {
 		args = append(args, "-ss",
@@ -185,7 +209,7 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 	}
 	return append(args,
 		"-i", spec.SourcePath,
-		"-filter_complex", vf,
+		"-filter_complex", fc,
 		"-map", "[o]",
 		"-fps_mode", "vfr",
 		"-c:v", "qtrle",
