@@ -220,6 +220,11 @@ func TestBuildBitmapPrerenderArgs(t *testing.T) {
 	if !argvHasFlag(args, "-vn") || !argvHasFlag(args, "-an") {
 		t.Errorf("-vn/-an (skip video+audio decode) missing: %v", args)
 	}
+	// -copyts is mandatory: without it ffmpeg rebases the first PGS cue
+	// (rarely at 0) to PTS 0, shifting the whole overlay timeline early.
+	if !argvHasFlag(args, "-copyts") {
+		t.Errorf("-copyts missing — overlay timeline would rebase: %v", args)
+	}
 	fc := argvVal(args, "-filter_complex")
 	// bitmap path: no libass subtitles=, no color canvas
 	if strings.Contains(fc, "subtitles=") {
@@ -263,8 +268,13 @@ func TestBuildBitmapPrerenderArgs_Seek(t *testing.T) {
 	if !argvHasPair(args, "-ss", "601.500") {
 		t.Errorf("-ss seek missing: %v", args)
 	}
+	// With -copyts, `-ss N` already yields offset-based PTS — no setpts
+	// shift (that's a text-path artifact of its 0-based color canvas).
+	if !argvHasFlag(args, "-copyts") {
+		t.Errorf("-copyts missing on seek session: %v", args)
+	}
 	fc := argvVal(args, "-filter_complex")
-	if !strings.Contains(fc, "setpts=PTS+601.500/TB") {
-		t.Errorf("seek setpts shift missing: %q", fc)
+	if strings.Contains(fc, "setpts=") {
+		t.Errorf("seek must NOT add setpts (copyts keeps offset PTS): %q", fc)
 	}
 }

@@ -163,19 +163,22 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 	if sel == "" {
 		sel = "0:s:0"
 	}
-	vf := fmt.Sprintf("[%s]scale=%d:%d,fps=%d",
-		sel, spec.Width, spec.Height, subPrerenderFPS)
-	if spec.SeekOffsetSeconds > 0 {
-		// -ss seeks the source 0-based; shift the output PTS back up to
-		// the seek offset so it aligns with the main video's -copyts
-		// stream (same role as the text path's setpts shift).
-		vf += ",setpts=PTS+" +
-			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB"
-	}
 	// qtrle carries alpha as argb; the sub2video frame is rgba.
-	vf += ",format=argb[o]"
+	vf := fmt.Sprintf("[%s]scale=%d:%d,fps=%d,format=argb[o]",
+		sel, spec.Width, spec.Height, subPrerenderFPS)
 
-	args := []string{"-hide_banner", "-loglevel", "error", "-y", "-vn", "-an"}
+	// -copyts is mandatory. The pre-render reads ONLY the subtitle
+	// stream (-vn -an); without -copyts ffmpeg rebases the first packet
+	// it sees to PTS 0 — and the first subtitle cue is almost never at
+	// 0 — which shifts the whole overlay timeline earlier (cues appear
+	// too soon). With -copyts the sub2video frames keep their absolute
+	// PTS, matching the main video's own -copyts stream. On a seek
+	// session `-ss N` + -copyts already yields offset-based PTS, so no
+	// setpts shift is needed (the text path needs one only because its
+	// `color` canvas is a synthetic 0-based source).
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-y", "-copyts", "-vn", "-an",
+	}
 	if spec.SeekOffsetSeconds > 0 {
 		args = append(args, "-ss",
 			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64))
