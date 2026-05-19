@@ -196,17 +196,21 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 	// PTS 0 regardless of -copyts; driving the timeline from a `color`
 	// canvas keeps cue PTS aligned for initial play.
 	//
-	// On a seek session, rebase the sub timeline to 0 (`setpts=PTS-
-	// STARTPTS`). With -copyts, -ss N leaves the sub frames at N+
-	// (absolute); the canvas is 0-based; framesync would mismatch and
-	// drain the sub branch. Rebasing the sub to 0-from-seek-content
-	// puts both inputs on the same 0-based timeline, matching the
-	// main's `-ss N -copyts -start_at_zero` behavior. Initial play
-	// (SeekOffsetSeconds=0) must NOT rebase — the first cue's real
-	// absolute PTS (e.g. 38.956s) drives cue placement.
+	// On a seek session, rebase the sub timeline by the SEEK OFFSET
+	// (`setpts=PTS-N/TB`), not by STARTPTS. With -copyts + -ss N the
+	// sub frames are at absolute PTS; subtracting N puts them on the
+	// 0-based-from-seek timeline matching the main video's
+	// `-ss N -copyts -start_at_zero`. Using PTS-STARTPTS instead would
+	// rebase from the FIRST SUB FRAME — which is the next cue AFTER
+	// the seek (e.g. cue at 300.133 with seek 298) — landing that cue
+	// at output PTS 0 instead of its correct PTS 2.133.
+	//
+	// Initial play (SeekOffsetSeconds=0) must NOT rebase — the first
+	// cue's real absolute PTS (e.g. 38.956s) drives cue placement.
 	subBranch := fmt.Sprintf("[%s]", sel)
 	if spec.SeekOffsetSeconds > 0 {
-		subBranch += "setpts=PTS-STARTPTS,"
+		subBranch += "setpts=PTS-" +
+			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB,"
 	}
 	subBranch += fmt.Sprintf("scale=%d:%d", spec.Width, spec.Height)
 	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
@@ -229,7 +233,15 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 		// parallel before merging at overlay.
 		"-filter_complex_threads", "4",
 		"-f", "lavfi", "-i", canvas,
+		// -vn/-an are OUTPUT flags — the demuxer still reads video/audio
+		// packets. For a 4K AV1 + audio MKV that demux alone is
+		// expensive, and on a deep seek (Plex resume) it adds tens of
+		// seconds to startup latency before the first subtitle packet
+		// is reached. -discard:v/-discard:a drop those packets at the
+		// demuxer boundary so only the subtitle stream is actually
+		// parsed.
 		"-vn", "-an",
+		"-discard:v", "all", "-discard:a", "all",
 	}
 	if spec.SeekOffsetSeconds > 0 {
 		args = append(args, "-ss",

@@ -314,8 +314,14 @@ func TestBuildBitmapPrerenderArgs_Seek(t *testing.T) {
 		t.Errorf("canvas must NOT have setpts (mov rebase flattens it): %q", canvasArg)
 	}
 	fc := argvVal(args, "-filter_complex")
-	if !strings.Contains(fc, "setpts=PTS-STARTPTS") {
-		t.Errorf("sub branch missing setpts=PTS-STARTPTS for seek: %q", fc)
+	// Rebase from the SEEK OFFSET, not STARTPTS — STARTPTS would shift
+	// the FIRST sub frame (next cue after seek, e.g. cue at 300.133
+	// with seek 298) to PTS 0, ~2.13s early.
+	if !strings.Contains(fc, "setpts=PTS-601.500/TB") {
+		t.Errorf("sub branch must rebase by seek offset (setpts=PTS-601.500/TB), got: %q", fc)
+	}
+	if strings.Contains(fc, "setpts=PTS-STARTPTS") {
+		t.Errorf("setpts=PTS-STARTPTS is wrong (off by next-cue-vs-seek): %q", fc)
 	}
 }
 
