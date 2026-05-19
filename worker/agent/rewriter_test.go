@@ -1804,9 +1804,15 @@ func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
 	if !strings.Contains(gotVF, "format=bgra,hwupload[0]") {
 		t.Errorf("FIFO bitmap branch not wired: %q", gotVF)
 	}
+	// Overlay rewritten to position the band at y=H-BandH with
+	// eof_action=pass:repeatlast=1 for the band-sized FIFO stream.
+	// 2160 -> band 864 -> y=1296.
 	if !strings.Contains(gotVF,
-		"[2][0]overlay_vaapi,scale_vaapi=format=p010[3];[3]hwupload[4]") {
-		t.Errorf("downstream graph altered: %q", gotVF)
+		"[2][0]overlay_vaapi=x=0:y=1296:eof_action=pass:repeatlast=1,scale_vaapi=format=p010[3];[3]hwupload[4]") {
+		t.Errorf("overlay_vaapi band positioning not applied: %q", gotVF)
+	}
+	if sp.BandHeight != 864 {
+		t.Errorf("BandHeight = %d, want 864 (2/5 of 2160)", sp.BandHeight)
 	}
 	// FIFO input spliced as a real -i
 	found := false

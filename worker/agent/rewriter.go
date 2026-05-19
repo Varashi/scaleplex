@@ -2382,11 +2382,21 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 			}
 			// Swap the SW-upscale bitmap branch for a read of the
-			// pre-render's CFR qtrle FIFO; the rest of PMS's graph
-			// (main scale_vaapi + overlay_vaapi) stays verbatim.
+			// pre-render's CFR qtrle FIFO; rewrite the overlay_vaapi
+			// to position the band at the bottom and add eof_action+
+			// repeatlast for the band-sized FIFO stream.
+			wInt0, _ := strconv.Atoi(w)
+			hInt0, _ := strconv.Atoi(h)
+			bandH0 := subPrerenderBandHeight(hInt0)
+			bandY0 := hInt0 - bandH0
 			old := fmt.Sprintf("[%s]scale=%s:%s,hwupload[0]", streamSpec, w, h)
 			neu := fmt.Sprintf("[%d:v]format=bgra,hwupload[0]", fifoInput)
 			args[i+1] = strings.Replace(args[i+1], old, neu, 1)
+			oldOv := "[2][0]overlay_vaapi,"
+			newOv := fmt.Sprintf(
+				"[2][0]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1,", bandY0)
+			args[i+1] = strings.Replace(args[i+1], oldOv, newOv, 1)
+			_ = wInt0 // (kept for symmetry; used below)
 			// Append the FIFO input after the last existing -i. -copyts
 			// keeps its PTS; -probesize 32/-analyzeduration 0 stops
 			// find_stream_info grinding the sparse stream at startup.
@@ -2401,20 +2411,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					"-copyts", "-probesize", "32", "-analyzeduration", "0",
 					"-i", fifoPath)
 			}
-			wInt, _ := strconv.Atoi(w)
-			hInt, _ := strconv.Atoi(h)
 			subPrerender = &SubPrerenderSpec{
 				FIFOPath:          fifoPath,
 				SourcePath:        mediaPath,
 				StreamSpec:        streamSpec,
 				Embedded:          true,
 				Bitmap:            true,
-				Width:             wInt,
-				Height:            hInt,
-				BandHeight:        hInt,
+				Width:             wInt0,
+				Height:            hInt0,
+				BandHeight:        bandH0,
 				SeekOffsetSeconds: seekOff,
 			}
 			changes = append(changes, "hw-decode:filter:bitmap-sub-prerender")
+			changes = append(changes,
+				fmt.Sprintf("bitmap-prerender:band=%dx%d@y%d", wInt0, bandH0, bandY0))
 			// The splice shifted indices; relocate the encoder.
 			newInputIdx = indexOfArg(args, "-i", 0)
 			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)

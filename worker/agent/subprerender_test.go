@@ -263,6 +263,11 @@ func TestBuildBitmapPrerenderArgs(t *testing.T) {
 	if strings.Contains(fc, "fps=") {
 		t.Errorf("fps filter must not appear (canvas drives the rate): %q", fc)
 	}
+	// Multi-thread the filter graph: scale + canvas branches can run
+	// in parallel before merging at overlay.
+	if !argvHasPair(args, "-filter_complex_threads", "4") {
+		t.Error("-filter_complex_threads 4 missing")
+	}
 	if !argvHasPair(args, "-c:v", "qtrle") {
 		t.Error("qtrle encoder missing")
 	}
@@ -310,5 +315,38 @@ func TestBuildBitmapPrerenderArgs_Seek(t *testing.T) {
 	fc := argvVal(args, "-filter_complex")
 	if strings.Contains(fc, "setpts=") {
 		t.Errorf("filter chain must NOT have setpts (canvas carries it): %q", fc)
+	}
+}
+
+// Band-crop reduces the qtrle/format/main-overlay work to the bottom
+// slice of the frame. Sub is scaled full (positioning) then cropped.
+func TestBuildBitmapPrerenderArgs_BandCrop(t *testing.T) {
+	spec := &SubPrerenderSpec{
+		FIFOPath:   "/transcode/s/scaleplex-sub-overlay.fifo",
+		SourcePath: "/media/Movies/Avatar.mkv",
+		StreamSpec: "0:5",
+		Embedded:   true,
+		Bitmap:     true,
+		Width:      3840,
+		Height:     2160,
+		BandHeight: 864,
+	}
+	args := buildSubPrerenderArgs(spec, spec.SourcePath)
+
+	// canvas is BAND-sized (band height, not full)
+	canvasIn := ""
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-i" && strings.Contains(args[i+1], "color=c=black") {
+			canvasIn = args[i+1]
+			break
+		}
+	}
+	if !strings.Contains(canvasIn, "s=3840x864") {
+		t.Errorf("canvas not band-sized: %q", canvasIn)
+	}
+	fc := argvVal(args, "-filter_complex")
+	// sub scaled to FULL frame, then cropped to bottom band
+	if !strings.Contains(fc, "[1:5]scale=3840:2160,crop=3840:864:0:1296[sub]") {
+		t.Errorf("sub branch scale+crop wrong: %q", fc)
 	}
 }

@@ -161,11 +161,18 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 // See project_scaleplex_pgs_prerender.
 func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 	// CFR canvas (input 0) drives the output timeline at subPrerenderFPS.
-	// On a seek session a setpts shifts the canvas up to the seek offset
-	// so the overlay composites cues against an offset-based timeline
-	// matching the main video's -copyts stream.
+	// When BandHeight < Height the canvas is band-sized — the sub is
+	// scaled to full frame (so positioning is preserved), then cropped
+	// to the bottom band, then composited onto this band canvas. Output
+	// is band-sized → less qtrle encode, less main-side hwupload + less
+	// overlay_vaapi blend area. The main graph places the band at
+	// y = Height - BandHeight.
+	canvasH := spec.Height
+	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
+		canvasH = spec.BandHeight
+	}
 	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=rgba",
-		spec.Width, spec.Height, subPrerenderFPS)
+		spec.Width, canvasH, subPrerenderFPS)
 	if spec.SeekOffsetSeconds > 0 {
 		canvas += ",setpts=PTS+" +
 			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB"
@@ -181,16 +188,22 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 		sel = "1:" + sel[2:]
 	}
 
-	// Overlay the sub2video (scaled to canvas size) onto the CFR canvas
-	// at its absolute PTS. The earlier lean form (no canvas, `fps=5`
-	// after the scale) was simpler but `fps` rebases its output timeline
-	// to 0 regardless of -copyts — the first cue landed at output PTS 0
-	// instead of its real time. Driving the timeline from the canvas
-	// keeps cue PTS aligned: a cue at 38.956s lands at output PTS 38.956,
-	// which is what the main transcode's overlay_vaapi needs.
-	fc := fmt.Sprintf(
-		"[%s]scale=%d:%d[sub];[0:v][sub]overlay=eof_action=pass:repeatlast=1,format=argb[o]",
-		sel, spec.Width, spec.Height)
+	// Sub branch: scale to FULL frame (positioning is encoded by the
+	// PGS as offsets in its full canvas, so the upscale must use full
+	// dimensions to land at the right pixel coordinates), then optionally
+	// crop the bottom band. Overlay the band-sized sub onto the
+	// band-sized canvas. The earlier lean form ([0:N]scale,fps=5,format
+	// =argb) was simpler but `fps` rebased the output timeline to PTS 0
+	// regardless of -copyts; driving the timeline from a `color` canvas
+	// keeps cue PTS aligned (a cue at 38.956s lands at output PTS 38.956,
+	// which is what the main's overlay_vaapi framesync needs).
+	subBranch := fmt.Sprintf("[%s]scale=%d:%d", sel, spec.Width, spec.Height)
+	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
+		subBranch += fmt.Sprintf(",crop=%d:%d:0:%d",
+			spec.Width, spec.BandHeight, spec.Height-spec.BandHeight)
+	}
+	fc := subBranch +
+		"[sub];[0:v][sub]overlay=eof_action=pass:repeatlast=1,format=argb[o]"
 
 	// -copyts is mandatory. The pre-render reads the source's subtitle
 	// stream with `-vn -an`; without -copyts ffmpeg rebases the first
@@ -200,6 +213,10 @@ func buildBitmapPrerenderArgs(spec *SubPrerenderSpec) []string {
 	// the canvas frame at the matching PTS.
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-y", "-copyts",
+		// Let the filter graph use multiple threads — the sub branch
+		// (scale + optional crop) and the canvas branch can run in
+		// parallel before merging at overlay.
+		"-filter_complex_threads", "4",
 		"-f", "lavfi", "-i", canvas,
 		"-vn", "-an",
 	}
