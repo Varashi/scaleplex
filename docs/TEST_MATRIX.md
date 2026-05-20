@@ -59,18 +59,19 @@ either rewriter bails (`applied=false`) or stock tonemap chain runs.
 | Sub-burn · SRT sidecar text · Plex Android HLS+seek (Accountant) | ✓ 2026-05-12 |
 | Sub-burn · SRT sidecar text · Plex Android cold-start (FMJ) | ✓ 2026-05-12 |
 | Sub-burn · SRT sidecar text · Plex Windows direct-play (FMJ) | ✓ 2026-05-12 |
-| **LG webOS · HLS-mpegts · Avatar 4K HEVC HDR + PGS burn (bitmap pre-render) · initial play** | ✓ 2026-05-20 |
-| **Plex Android · HLS · Avatar 4K HDR + PGS burn · seek/resume** | ✓ 2026-05-20 (sha-b364cb3 with FIFO PTS shift) |
+| **LG webOS · HLS-mpegts · Avatar Fire and Ash 4K HDR AV1 + PGS burn (bitmap pre-render) · initial play** | ✓ 2026-05-20 |
+| **Plex Android · HLS · Avatar Fire and Ash 4K HDR AV1 + PGS burn · seek/resume** | ✓ 2026-05-20 (sha-b364cb3 with FIFO PTS shift) |
 | **Plex Android · HLS · Sing 2 4K HDR AV1 + EAC3 (no subs) · initial + seek + audio track switch** | ✓ 2026-05-20 |
-| **Plex Android · HLS · Dusk Till Dawn HEVC 4K HDR + external SRT burn · initial + seek + audio swap** | ✓ 2026-05-20 |
-| **Plex Android · HLS · Dusk Till Dawn HEVC 4K HDR + external SRT direct (no burn)** | ✓ 2026-05-20 |
+| **Plex Android · HLS · From Dusk Till Dawn HEVC 4K HDR + external SRT burn · initial + seek + audio swap** | ✓ 2026-05-20 |
+| **Plex Android · HLS · From Dusk Till Dawn HEVC 4K HDR + external SRT direct (no burn)** | ✓ 2026-05-20 |
 
 > **v1.1 cell completion note (2026-05-20).** A subtle seek-alignment bug
 > on the PGS bitmap pre-render path was fixed in `sha-b364cb3`. Plex's
 > HW-decode bitmap argv carries `-start_at_zero -copyts`; that flag
 > rebases only the muxer-side output PTS to zero, **not** the filter
-> input (verified offline against Avatar with `-ss 540`: the main video
-> shows up in `-filter_complex` at `pts_time:540.003`). The pre-render
+> input (verified offline against Avatar Fire and Ash with `-ss 540`:
+> the source's first frame shows up in `-filter_complex` at
+> `pts_time:540.003`). The pre-render
 > emits a 0-based FIFO (canvas-driven, sub branch rebased by
 > `setpts=PTS-N/TB`), so `overlay_vaapi` was pairing FIFO PTS T with
 > main PTS T → cues drifted forward by exactly `seekOff` seconds. Fix:

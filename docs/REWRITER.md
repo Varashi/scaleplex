@@ -353,8 +353,9 @@ does not grind on the sparse stream at startup.
 
 **Seek alignment.** Plex's HW-decode bitmap argv carries
 `-start_at_zero -copyts`. `-start_at_zero` only zeroes the muxer-side
-output PTS — it does **not** shift the filter input (verified offline:
-at `-ss 540` the main video's `scale_vaapi` outputs `pts_time:540.003`).
+output PTS — it does **not** shift the filter input (verified offline
+against Avatar Fire and Ash AV1 with `-ss 540`: the source's first
+frame arrives in `-filter_complex` at `pts_time:540.003`).
 The pre-render's FIFO arrives in the filter at PTS 0+ (its overlay
 canvas is necessarily 0-based, and the sub branch is rebased by
 `setpts=PTS-N/TB` so the canvas can drive output through dialogue
@@ -364,11 +365,14 @@ rewriter splices `setpts=PTS+<seekOff>/TB` onto the FIFO branch ahead
 of `format=bgra,hwupload[0]` so both meet on the absolute-PTS timeline
 the filter already uses for the main video.
 
-> An earlier attempt (`sha-a451466`) put `setpts=PTS-STARTPTS` on the
-> `[0:0]hwupload[1]` main branch instead. This broke playback with
-> constant forward-skipping; reverted in `sha-3d3efb5`. The right place
-> for the shift is the FIFO branch — the pre-render must keep emitting
-> a 0-based FIFO as its canonical timeline, regardless of seek.
+> An earlier attempt (`sha-a451466`) put `setpts=PTS-STARTPTS` on BOTH
+> the `[0:0]hwupload[1]` main branch AND the FIFO branch — mirroring
+> the SRT pre-render's seek handling. The FIFO half was a no-op (the
+> FIFO is already 0+), the main-branch setpts caused constant
+> forward-skipping in real playback; reverted in `sha-3d3efb5`. The
+> right place is a `setpts=PTS+seekOff/TB` on the FIFO branch alone —
+> shift the FIFO up onto main's already-540+ filter timeline rather
+> than try to rebase main downwards.
 
 **Bottom-band optimisation.** The sub is composited onto a band
 the height of `subPrerenderBandHeight(H)` (2/5 of the frame),
@@ -423,8 +427,16 @@ when:
 
 - Filter graph contains a `subtitles=...` already (Plex's own SW path)
 - Decoder is unrecognised
-- Filter shape doesn't match any known mode (plain / sub-prerender-overlay /
-  passthrough-inlineass / overlay-vaapi-bitmap / hdr-tonemap-vaapi)
+- Filter shape doesn't match any known mode. The shapes the rewriter
+  understands are (filter-rewrite return modes plus the side-channel
+  HW-decode + bitmap-overlay regex path):
+  - `plain` — straight transcode, no subs, no tonemap
+  - `overlay-vaapi-bitmap` / `overlay-vaapi-bitmap-hdr` (SW-decode + bitmap sub)
+  - `passthrough-inlineass` / `passthrough-inlineass-hdr` (text sub via fork's `inlineass`)
+  - `hdr-tonemap-vaapi` / `hdr-tonemap-vaapi-passthrough-inlineass`
+  - `hw-decode:filter:sub-prerender-overlay` (SRT / static-ASS via GPU pre-render)
+  - `hw-decode:filter:bitmap-sub-prerender` (PGS via the canvas+overlay pre-render — see above)
+  - `hw-decode:filter:inlineass-passthrough` (animated ASS on HW-decode path)
 
 These are diagnostic dead-ends rather than failures: stock ffmpeg with
 the original Plex argv will fail, but the failure surface is ffmpeg's

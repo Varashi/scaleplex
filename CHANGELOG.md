@@ -26,8 +26,9 @@ future override.
 
 - **Seek-alignment fix.** Plex's HW-decode bitmap argv carries
   `-start_at_zero -copyts`; that flag zeroes only the muxer-side output
-  PTS, **not** the filter input (verified offline against Avatar with
-  `-ss 540`: the main video's `scale_vaapi` outputs `pts_time:540.003`).
+  PTS, **not** the filter input (verified offline against Avatar Fire
+  and Ash AV1 with `-ss 540`: the source's first frame arrives in
+  `-filter_complex` at `pts_time:540.003`).
   The pre-render emits a 0-based FIFO (canvas-driven, sub branch
   rebased by `setpts=PTS-N/TB`), so `overlay_vaapi` paired FIFO PTS T
   with main PTS T — cues drifted forward by exactly `seekOff` seconds
@@ -35,17 +36,19 @@ future override.
   The rewriter now splices `setpts=PTS+<seekOff>/TB` onto the FIFO
   branch ahead of `format=bgra,hwupload[0]`, putting both branches on
   the absolute-PTS timeline the filter already uses for the main video.
-  An earlier attempt put `setpts=PTS-STARTPTS` on the `[0:0]` main
-  branch (`sha-a451466`); that broke playback with constant
-  forward-skipping and was reverted in `sha-3d3efb5`. The right place
-  for the shift is the FIFO branch — the pre-render must keep emitting
-  a 0-based FIFO regardless of seek.
+  An earlier attempt (`sha-a451466`) mirrored the SRT pre-render's
+  seek handling by adding `setpts=PTS-STARTPTS` on both the main video
+  branch AND the FIFO branch. The FIFO half was a no-op; the
+  main-branch setpts caused constant forward-skipping in real playback.
+  Reverted in `sha-3d3efb5`. The right place is `setpts=PTS+seekOff/TB`
+  on the FIFO branch alone.
 
-- **Validation.** Avatar 4K HDR + PGS on LG webOS (initial play),
-  Avatar PGS on Plex Android (initial + seek/resume), Sing 2 4K HDR
-  AV1 + EAC3 on Plex Android (initial + seek + audio swap), and From
-  Dusk Till Dawn HEVC 4K HDR + external SRT-burn on Plex Android
-  (initial + seek + audio swap). All on the `plex-test` bench.
+- **Validation.** Avatar Fire and Ash 4K HDR AV1 + PGS on LG webOS
+  (initial play), Avatar PGS on Plex Android (initial + seek/resume),
+  Sing 2 4K HDR AV1 + EAC3 on Plex Android (initial + seek + audio
+  swap), and From Dusk Till Dawn HEVC 4K HDR + external SRT-burn on
+  Plex Android (initial + seek + audio swap; SRT direct without burn
+  also validated). All on the `plex-test` bench.
 
 ### Subtitle burn-in (GPU-overlay pre-render) — correctness + performance
 

@@ -310,8 +310,9 @@ with the DASH/HLS machinery above:
 
 - Plex's bitmap HW-decode argv carries `-start_at_zero -copyts`.
   `-start_at_zero` zeroes the **muxer-side** PTS only — it does NOT
-  shift the filter input. Verified offline: at `-ss 540` the main
-  video's `scale_vaapi` outputs `pts_time:540.003`. The FIFO,
+  shift the filter input. Verified offline against Avatar Fire and
+  Ash AV1: at `-ss 540` the source's first frame arrives in
+  `-filter_complex` at `pts_time:540.003`. The FIFO,
   meanwhile, arrives at `pts_time:0+` (its overlay canvas is
   necessarily 0-based and the sub branch is rebased by
   `setpts=PTS-N/TB`). Without compensation `overlay_vaapi` framesync
@@ -321,8 +322,9 @@ with the DASH/HLS machinery above:
 - The rewriter splices `setpts=PTS+<seekOff>/TB` onto the FIFO branch
   ahead of `format=bgra,hwupload[0]` so both meet on the absolute-PTS
   timeline. **The shift belongs on the FIFO branch, not the main**;
-  putting it on `[0:0]` instead (the `sha-a451466` attempt) caused
-  constant forward-skipping in real playback.
+  the `sha-a451466` attempt added `setpts=PTS-STARTPTS` on both the
+  `[0:0]hwupload[1]` main branch and the FIFO branch and caused
+  constant forward-skipping. Reverted in `sha-3d3efb5`.
 
 **Symptom of the bug, if it ever regresses:** seek into a PGS title,
 the displayed cue is a future cue — the offset from dialogue equals
