@@ -31,7 +31,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
       -o /out/scaleplex-relay ./cmd/relay
 
-FROM alpine:3.20 AS layout
+FROM alpine:3.23 AS layout
 RUN mkdir -p /mod/usr/lib/plexmediaserver \
              /mod/usr/local/bin \
              /mod/custom-cont-init.d \
