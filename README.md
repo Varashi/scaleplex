@@ -34,11 +34,17 @@ bookkeeping is unchanged.
 
 ## Status
 
-**v1.1 — feature-complete and validated.** Every client/format cell in
-the matrix below has been exercised end-to-end (initial play, seek,
-quality change, subtitle burn-in as applicable) on the scaleplex PMS
-deployment. v1.1 adds the GPU-overlay text-sub burn-in path (SRT /
-static ASS), validated on the `plex-test` bench:
+**v1.2 — PGS HW-decode pre-render + HDR tonemap pass-through + ffmpeg
+base v7.1.3-6.** Every client/format cell in the matrix below has been
+exercised end-to-end (initial play, seek, quality change, subtitle
+burn-in as applicable) on the scaleplex PMS deployment. v1.2 adds the
+HW-decode bitmap (PGS / VobSub / DVDSub) pre-render path with seek-
+offset FIFO alignment, AV1 HW-decode hardening (steady overlay stream,
+no surface-pool overruns), HDR PQ source passthrough across all
+sub-burn graphs, sub pre-render codec ffv1 → qtrle (~9× less encode
+CPU on the pre-render), SRT bottom-band crop (~2.5× less canvas-cost
+on the burn), and rebases the `scaleplex-ffmpeg` fork onto
+jellyfin-ffmpeg v7.1.3-6:
 
 | Client / format | Play | Seek | Subs | Notes |
 |---|:-:|:-:|:-:|---|
@@ -60,7 +66,7 @@ honored from Plex's argv.
 reporting, transparent mid-stream worker recovery across DaemonSet rolls
 (see [`docs/RESILIENCE.md`](docs/RESILIENCE.md)).
 
-**Deployment scope.** v1.1 is a code milestone — the software is
+**Deployment scope.** v1.2 is a code milestone — the software is
 release-ready. Pointing any particular PMS instance at scaleplex is an
 independent operational decision, not gated on this tag.
 
@@ -188,7 +194,7 @@ directory is a placeholder.
 - [`docs/SEEK.md`](docs/SEEK.md) — DASH and HLS seek deep-dive (the hardest problems we shipped).
 - [`docs/LATENCY.md`](docs/LATENCY.md) — first-frame latency budget and design levers.
 - [`docs/RESILIENCE.md`](docs/RESILIENCE.md) — PMS canThrottle pass-through, multi-engine GPU load, mid-stream worker recovery.
-- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — tracked limitations as of v1.1.
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — tracked limitations as of v1.2.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 - [`docs/PLAN.md`](docs/PLAN.md) — original implementation plan (historical; mostly delivered).
 - [`docs/LESSONS-FROM-CLUSTERPLEX.md`](docs/LESSONS-FROM-CLUSTERPLEX.md) — concrete pitfalls scaleplex avoids by design.

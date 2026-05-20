@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 — 2026-05-20
+
+### Build base — jellyfin-ffmpeg v7.1.3-1 → v7.1.3-6
+
+The `scaleplex-ffmpeg` fork rebased onto jellyfin-ffmpeg v7.1.3-6. All
+14 fork patches (0094-0107) apply cleanly against the new base. No
+file overlap with jellyfin's debian patch series; no fork-patch
+rebasing required.
+
+Upstream changes that land on scaleplex's hot paths:
+
+- **vaapi backports from upstream** (jellyfin patch 0017, new). Touches
+  scaleplex's overlay_vaapi (sub burn), scale_vaapi (HDR tonemap),
+  hevc_vaapi / h264_vaapi encode.
+- **qsv backports from upstream** (jellyfin patch 0018, new). For
+  the h264_qsv branches Plex's argv occasionally takes.
+- **svt-av1 v4 unbreak** (jellyfin patch 0094, new). For Plex AV1
+  output via libsvtav1.
+- **scale_opencl SAR fix** (jellyfin patch 0005). Aspect-ratio data
+  flow on the OpenCL scaler — relevant for the OpenCL tonemap path.
+- **opencl tonemap EETF refactor** (jellyfin patch 0006). Same path.
+- **ffprobe first-vframe runaway / safe bail** (jellyfin patch 0079).
+  Marginal for scaleplex (worker doesn't ffprobe; orchestrator/PMS
+  does).
+
+Validated on `plex-test` worker `sha-187cda0` against the full v1.2
+feature set (PGS HW-decode pre-render + seek, SRT GPU-overlay burn,
+HDR PQ source passthrough, AV1 → HEVC + sub burn, 4K → 4K, 4K → 1024).
+Single-stream throughput burst realtime × 9.5–14, throttled steady
+realtime × 2; no VAAPI surface-pool errors; no rewriter regressions.
 
 ### PGS / bitmap sub burn-in — HW-decode pre-render path + seek alignment
 

@@ -1,7 +1,33 @@
 # Known issues
 
-Tracked limitations as of v1.0. None block playback; each has a
+Tracked limitations as of v1.2. None block playback; each has a
 documented cause and, where relevant, a path to a fix.
+
+## SRT sub-burn pre-render renders full canvas (planned v1.2.1)
+
+**Severity:** perf — not correctness. SRT burn-in works; it just costs
+more CPU than PGS at the same source resolution.
+
+**Symptom.** 4K + SRT burn-in pre-render runs at ~1.5 cores total
+(pre-render ~50% + main ~100%) on plex-test, vs ~0.6 cores total for
+PGS at the same resolution. Per-worker concurrency cap for 4K SRT-burn
+sits around 2 streams.
+
+**Cause.** SRT cues can be positioned anywhere on screen (top, mid,
+sign translations), so the libass-driven pre-render rasterises the
+full 4K canvas (`s=3840x2160`) before crop. PGS pre-render bitmaps are
+already a band; the rewriter crops to `3840x864` at `y=1296` and
+overlays the band — much smaller rasterise + composite surface.
+
+**Path to a fix.** Two angles:
+- Parse the .srt ahead of pre-render. If all cues lack explicit
+  position tags AND fit a bottom-band threshold, render at band-size
+  and overlay at `y=H-BandH`. Fall back to full canvas otherwise.
+- Or post-rasterise per-cue bbox tracking — render full canvas to a
+  tiny in-memory ring, detect cue bbox, crop before encode. Heavier
+  to wire but covers positioned cues correctly.
+
+Tracked for v1.2.1.
 
 ## Plex Windows desktop — playhead resets to 0 on seek
 
