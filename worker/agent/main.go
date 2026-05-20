@@ -431,31 +431,39 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	// writer appears. A pre-render failure fails the session: spawning
 	// the main ffmpeg would otherwise hang forever on the empty FIFO.
 	if subPrerender != nil {
-		pr, err := spawnSubPrerender(ctx, subPrerender)
+		prRes, newArgs, err := spawnSubPrerender(ctx, subPrerender, finalArgs)
 		if err != nil {
 			log.Printf("session %s: subtitle pre-render failed: %v", req.SessionID, err)
 			http.Error(w, "sub pre-render: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// spawnSubPrerender may have updated spec.BandHeight via the
-		// agent-side band resolver — patch the sentinel y= the rewriter
-		// left in the main argv's overlay_vaapi clause to the final
-		// y-offset before the main ffmpeg starts. No-op when the
-		// rewriter didn't emit a sentinel (ASS / bitmap path).
-		if subPrerender.ResolveBandPostExtract {
+		finalArgs = newArgs
+		// Patch BandY sentinel(s). Multi-region writes per-region
+		// sentinels (BandYSentinel for region 0, anchor-suffixed for
+		// the rest); the multi patcher handles both shapes. Single-
+		// region patches the legacy BandYSentinel only.
+		if len(subPrerender.MultiRegion) > 0 {
+			n := PatchMainArgsBandYMulti(finalArgs, subPrerender.MultiRegion)
+			log.Printf("session %s: multi-region pre-render: regions=%d patched=%d",
+				req.SessionID, len(subPrerender.MultiRegion), n)
+		} else if subPrerender.ResolveBandPostExtract {
 			bandY := subPrerender.Height - subPrerender.BandHeight
 			if n := PatchMainArgsBandY(finalArgs, bandY); n > 0 {
 				log.Printf("session %s: agent band resolve: bandH=%d bandY=%d patched=%d",
 					req.SessionID, subPrerender.BandHeight, bandY, n)
 			}
 		}
-		log.Printf("session %s: spawned subtitle pre-render pid=%d", req.SessionID, pr.Process.Pid)
+		for _, pr := range prRes.Cmds {
+			log.Printf("session %s: spawned subtitle pre-render pid=%d", req.SessionID, pr.Process.Pid)
+		}
 		defer func() {
-			if pr.Process != nil {
-				_ = pr.Process.Kill()
+			for _, pr := range prRes.Cmds {
+				if pr.Process != nil {
+					_ = pr.Process.Kill()
+				}
+				_ = pr.Wait()
 			}
-			_ = pr.Wait()
-			_ = os.Remove(subPrerender.FIFOPath)
+			prRes.cleanup()
 		}()
 	}
 

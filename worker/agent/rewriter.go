@@ -119,9 +119,37 @@ type SubPrerenderSpec struct {
 	// this; ASS / static-canvas fallback keeps a fixed band at rewrite
 	// time. See worker/agent/band.go for the patching helpers.
 	ResolveBandPostExtract bool
-	// Sidecar SRTs are read at rewrite time too — same flag — to keep
-	// the resolve site single-source-of-truth, but the agent's call
-	// is the only one that mutates BandHeight on the live spec.
+	// MultiRegion — populated by the agent when planRegions finds more
+	// than one anchor group (e.g. .en.hi SRTs that mix default-bottom
+	// dialogue with a `\an8` sign translation). Each entry carries its
+	// own FIFO, band height, band-y, filtered subtitle file, and the
+	// label of the FIFO -i input in the main argv. When empty the
+	// single-region path runs (BandYSentinel + ResolveAgentBand).
+	// See worker/agent/region.go for plan + filter helpers.
+	MultiRegion []RegionPrerenderSpec
+}
+
+// RegionPrerenderSpec describes one anchor-region pre-render in a
+// multi-region session (Phase 3 of v1.2.2). A single SubPrerenderSpec
+// owns N of these when planRegions decides the source SRT has cues in
+// more than one anchor row.
+type RegionPrerenderSpec struct {
+	// Anchor is the libass anchor group: 1=bottom, 2=top. (Middle
+	// row not implemented in v1.2.2; bails to single-region.)
+	Anchor int
+	// FIFOPath — this region's overlay FIFO (sibling of the main one).
+	FIFOPath string
+	// FilteredFile — a per-region subset of the source SRT containing
+	// only the cues for this anchor. Written by the agent under the
+	// session dir.
+	FilteredFile string
+	// BandHeight / BandY — pixel band the pre-render emits and where
+	// overlay_vaapi composites it.
+	BandHeight int
+	BandY      int
+	// MaxLines — the largest cue line count in this region; informs
+	// BandHeight.
+	MaxLines int
 }
 
 // RewriteOpts is for testability; production callers pass nil.

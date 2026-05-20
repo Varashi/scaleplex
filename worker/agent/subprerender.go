@@ -308,26 +308,59 @@ func resolveSubFile(ctx context.Context, spec *SubPrerenderSpec) (string, error)
 	return extracted, nil
 }
 
-// spawnSubPrerender creates the overlay FIFO and starts the subtitle
-// pre-render ffmpeg writing to it. The returned *exec.Cmd is tracked
-// by the caller for teardown; ctx cancellation also kills it. On any
-// failure the FIFO is removed and an error returned — the caller must
-// then NOT spawn the main transcode, whose `-i <fifo>` would otherwise
-// block forever waiting for a writer.
-func spawnSubPrerender(ctx context.Context, spec *SubPrerenderSpec) (*exec.Cmd, error) {
+// PrerenderResult bundles the per-region pre-render processes + FIFOs
+// that the caller is responsible for tearing down. In the single-region
+// (Phase 1+2) path Cmds and FIFOs each hold one entry; in the multi-
+// region (Phase 3) path they hold one entry per anchor region.
+type PrerenderResult struct {
+	Cmds  []*exec.Cmd
+	FIFOs []string
+}
+
+// spawnSubPrerender resolves the subtitle file, decides between single-
+// region and multi-region pre-render, mutates mainArgs as needed (filter
+// graph + extra -i inputs), and starts the pre-render process(es). The
+// returned mainArgs may be a longer slice than the input when the
+// multi-region path appended extra FIFO inputs.
+//
+// Failure at any step removes any FIFOs already created and returns an
+// error; the caller must then NOT spawn the main ffmpeg (its `-i fifo`
+// would block forever on an empty FIFO).
+func spawnSubPrerender(ctx context.Context, spec *SubPrerenderSpec, mainArgs []string) (*PrerenderResult, []string, error) {
+	// Original single-region FIFO — always created. Phase 3 multi-region
+	// reuses it as the first (bottom) region's FIFO, so the rewriter's
+	// existing `-i <FIFOPath>` and `[N:v]` references stay valid.
 	_ = os.Remove(spec.FIFOPath)
 	if err := syscall.Mkfifo(spec.FIFOPath, 0o600); err != nil {
-		return nil, fmt.Errorf("mkfifo %s: %w", spec.FIFOPath, err)
+		return nil, mainArgs, fmt.Errorf("mkfifo %s: %w", spec.FIFOPath, err)
 	}
+	res := &PrerenderResult{FIFOs: []string{spec.FIFOPath}}
 	subFile, err := resolveSubFile(ctx, spec)
 	if err != nil {
-		os.Remove(spec.FIFOPath)
-		return nil, err
+		res.cleanup()
+		return nil, mainArgs, err
 	}
-	// Data-driven band: with the SRT now on disk (extracted or sidecar),
-	// pick the tight band if the parser approves and overwrite the
-	// rewriter's static-fallback BandHeight in place. Caller patches the
-	// main argv's overlay_vaapi y= afterwards via PatchMainArgsBandY.
+
+	// Try the multi-region plan first — only fires for SRT text specs
+	// with cues in more than one anchor row (Phase 3). Falls through
+	// to the single-region path otherwise. Bitmap path stays out (its
+	// own pre-render shape lives in buildBitmapPrerenderArgs).
+	if spec.ResolveBandPostExtract && !spec.Bitmap {
+		fallback := subPrerenderBandHeight(spec.Height)
+		regions := planMultiRegion(subFile, spec.Height, fallback)
+		if len(regions) >= 2 {
+			out, newArgs, err := spawnMultiRegion(ctx, spec, mainArgs, regions, res)
+			if err != nil {
+				res.cleanup()
+				return nil, mainArgs, err
+			}
+			return out, newArgs, nil
+		}
+	}
+
+	// Single-region path (Phase 1+2). Data-driven band: with the SRT
+	// now on disk, pick the tight band and overwrite BandHeight in
+	// place. Caller patches the main argv's BandYSentinel afterwards.
 	ResolveAgentBand(spec, subFile)
 	cmd := exec.CommandContext(ctx, ffmpegBin, buildSubPrerenderArgs(spec, subFile)...)
 	cmd.Env = subPrerenderEnv()
@@ -336,8 +369,104 @@ func spawnSubPrerender(ctx context.Context, spec *SubPrerenderSpec) (*exec.Cmd, 
 	// opening the FIFO for write until the main transcode opens the
 	// read end. No deadlock — the caller spawns the main ffmpeg next.
 	if err := cmd.Start(); err != nil {
-		os.Remove(spec.FIFOPath)
-		return nil, fmt.Errorf("spawn subtitle pre-render: %w", err)
+		res.cleanup()
+		return nil, mainArgs, fmt.Errorf("spawn subtitle pre-render: %w", err)
 	}
-	return cmd, nil
+	res.Cmds = append(res.Cmds, cmd)
+	return res, mainArgs, nil
+}
+
+// cleanup removes any FIFOs the result tracks. Safe to call multiple
+// times; missing files are ignored.
+func (r *PrerenderResult) cleanup() {
+	for _, f := range r.FIFOs {
+		_ = os.Remove(f)
+	}
+}
+
+// spawnMultiRegion sets up the per-region FIFOs, mutates mainArgs's
+// filter graph to chain overlay_vaapi instances + appends extra `-i`
+// inputs, then spawns one pre-render per region (each reading its
+// region-filtered subtitle file). On success spec.MultiRegion is
+// populated for later patching by PatchMainArgsBandYMulti.
+func spawnMultiRegion(ctx context.Context, spec *SubPrerenderSpec, mainArgs []string, regions []RegionPrerenderSpec, res *PrerenderResult) (*PrerenderResult, []string, error) {
+	// Region 0 reuses spec.FIFOPath (already mkfifo'd) as the bottom
+	// region's FIFO — keeps the rewriter's `-i <FIFOPath>` valid + the
+	// `[N:v]` reference at firstFIFOInput unchanged. Sub file for
+	// region 0 is the agent-filtered bottom subset.
+	regions[0].FIFOPath = spec.FIFOPath
+
+	// Locate the rewriter's `-i <spec.FIFOPath>` so we know:
+	//  - firstFIFOInput  = its position in input-count terms
+	//  - the splice index where additional -i entries land (right after it)
+	firstFIFOInput := -1
+	inputCount := 0
+	fifoArgIdx := -1
+	for i, a := range mainArgs {
+		if a == "-i" && i+1 < len(mainArgs) {
+			if mainArgs[i+1] == spec.FIFOPath {
+				firstFIFOInput = inputCount
+				fifoArgIdx = i
+			}
+			inputCount++
+		}
+	}
+	if firstFIFOInput < 0 || fifoArgIdx < 0 {
+		return nil, mainArgs, fmt.Errorf("multi-region: original FIFO -i not found in args")
+	}
+
+	// Detect seek mode by inspecting the filter graph for the
+	// `setpts=PTS-STARTPTS` prefix the rewriter inserts on -ss > 0.
+	vfIdx := indexOfArg(mainArgs, "-filter_complex", 0)
+	if vfIdx < 0 {
+		return nil, mainArgs, fmt.Errorf("multi-region: -filter_complex missing")
+	}
+	seek := strings.Contains(mainArgs[vfIdx+1], "setpts=PTS-STARTPTS,format=bgra")
+
+	// Mutate the filter_complex string in place.
+	newGraph, err := MutateGraphForMultiRegion(mainArgs[vfIdx+1], regions, firstFIFOInput, seek)
+	if err != nil {
+		return nil, mainArgs, err
+	}
+	mainArgs[vfIdx+1] = newGraph
+
+	// Splice extra `-i <fifo>` entries immediately after the original
+	// FIFO -i. -copyts + minimal probe match the original entry's flags.
+	insertAt := fifoArgIdx + 2 // past `-i <path>`
+	for i := 1; i < len(regions); i++ {
+		entry := []string{
+			"-copyts", "-probesize", "32", "-analyzeduration", "0",
+			"-i", regions[i].FIFOPath,
+		}
+		mainArgs = append(mainArgs[:insertAt],
+			append(append([]string(nil), entry...), mainArgs[insertAt:]...)...)
+		insertAt += len(entry)
+	}
+
+	// mkfifo + spawn for each additional region (region 0 already has
+	// its FIFO; spawn its pre-render below). On any failure unwind.
+	for i := 1; i < len(regions); i++ {
+		_ = os.Remove(regions[i].FIFOPath)
+		if err := syscall.Mkfifo(regions[i].FIFOPath, 0o600); err != nil {
+			return nil, mainArgs, fmt.Errorf("mkfifo %s: %w", regions[i].FIFOPath, err)
+		}
+		res.FIFOs = append(res.FIFOs, regions[i].FIFOPath)
+	}
+
+	for i, r := range regions {
+		subSpec := *spec // shallow copy
+		subSpec.FIFOPath = r.FIFOPath
+		subSpec.BandHeight = r.BandHeight
+		regionSubFile := r.FilteredFile
+		cmd := exec.CommandContext(ctx, ffmpegBin, buildSubPrerenderArgs(&subSpec, regionSubFile)...)
+		cmd.Env = subPrerenderEnv()
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM, Setpgid: true}
+		if err := cmd.Start(); err != nil {
+			return nil, mainArgs, fmt.Errorf("spawn region %d pre-render: %w", i, err)
+		}
+		res.Cmds = append(res.Cmds, cmd)
+	}
+
+	spec.MultiRegion = regions
+	return res, mainArgs, nil
 }
