@@ -16,7 +16,6 @@ package main
 
 import (
 	"bufio"
-	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -158,32 +157,20 @@ func srtTightBandHeight(frameH, lines int) int {
 //     the fallback — not worth diverging from the well-trodden path
 func resolveSRTBand(srtPath string, frameH, fallbackBandH int) (int, bool) {
 	if srtPath == "" || frameH <= 0 {
-		log.Printf("resolveSRTBand: bail empty inputs path=%q frameH=%d", srtPath, frameH)
 		return fallbackBandH, false
 	}
 	res, err := parseSRT(srtPath)
-	if err != nil {
-		log.Printf("resolveSRTBand: parseSRT err path=%q err=%v", srtPath, err)
-		return fallbackBandH, false
-	}
-	if res.Cues == 0 || res.PositionedCue || res.MaxLines == 0 {
-		log.Printf("resolveSRTBand: bail parse-result path=%q cues=%d maxLines=%d positioned=%v",
-			srtPath, res.Cues, res.MaxLines, res.PositionedCue)
+	if err != nil || res.Cues == 0 || res.PositionedCue || res.MaxLines == 0 {
 		return fallbackBandH, false
 	}
 	tight := srtTightBandHeight(frameH, res.MaxLines)
 	if tight <= 0 || tight >= fallbackBandH {
-		log.Printf("resolveSRTBand: bail tight>=fallback path=%q tight=%d fallback=%d maxLines=%d",
-			srtPath, tight, fallbackBandH, res.MaxLines)
 		return fallbackBandH, false
 	}
+	// Require minimum savings to avoid edge-case churn for marginal wins.
 	saved := (fallbackBandH - tight) * 100 / fallbackBandH
 	if saved < srtMinBandSavingsPct {
-		log.Printf("resolveSRTBand: bail marginal path=%q tight=%d fallback=%d saved=%d%%",
-			srtPath, tight, fallbackBandH, saved)
 		return fallbackBandH, false
 	}
-	log.Printf("resolveSRTBand: tight ok path=%q tight=%d fallback=%d maxLines=%d cues=%d saved=%d%%",
-		srtPath, tight, fallbackBandH, res.MaxLines, res.Cues, saved)
 	return tight, true
 }
