@@ -1,6 +1,6 @@
 # Known issues
 
-Tracked limitations as of v1.2. None block playback; each has a
+Tracked limitations as of v1.2.1. None block playback; each has a
 documented cause and, where relevant, a path to a fix.
 
 ## SRT sub-burn pre-render bails to wide band on positional cues (planned v1.2.2)

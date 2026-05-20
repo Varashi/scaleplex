@@ -214,10 +214,22 @@ Key constraints on the pre-render (hard-won — see
   mis-decodes — fragmented MOV (`empty_moov`) is the working container.
 - **Band optimisation (SRT only).** SRT is always bottom-positioned, so
   the pre-render renders the full frame (libass needs it for correct
-  positioning) then crops to the bottom 40% band; `overlay_vaapi` places
-  it at `y = Height - BandHeight`. Cuts the canvas-size-proportional CPU
-  ~2.5×. Sidecar ASS can be positioned anywhere → keeps the full frame
-  (`BandHeight == Height`, `y = 0`).
+  positioning) then crops to a bottom band; `overlay_vaapi` places it
+  at `y = Height - BandHeight`. Cuts the canvas-size-proportional CPU
+  by ~2.5× over the fallback static 40% band, ~4× when the tight band
+  fires (v1.2.1). Sidecar ASS can be positioned anywhere → keeps the
+  full frame (`BandHeight == Height`, `y = 0`).
+- **Tight band for sidecar SRT (v1.2.1+).** When the rewriter sees a
+  sidecar SRT (`-i <path>.srt`), it parses the cues at rewrite time
+  (`worker/agent/subparse.go`). If every cue is plain bottom-aligned
+  the band shrinks to fit the actual max-lines-per-cue plus safety
+  (`5% + lines*6% + 8%` of frame height, even-rounded); rewriter tag
+  `sub-prerender:band:tight` is emitted. Bails to the static 40%
+  fallback band when the parser finds positional cues (`\anN` with
+  N>3, `\pos(...)`, `\move(...)`, `\org(...)`), the savings would be
+  under 10% of the fallback band, or the file is unreadable.
+  Embedded SRT keeps the static fallback band (extraction happens
+  post-rewrite; embedded-side tight band is tracked for v1.2.2).
 - **HDR tonemap is preserved.** When Plex's argv carries an OpenCL
   tonemap, the rewrite keeps it (scale step → `scale_vaapi(p010)` + the
   resolved tonemap stage) — dropping it rendered HDR washed/dim.

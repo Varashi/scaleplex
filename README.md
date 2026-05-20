@@ -34,6 +34,17 @@ bookkeeping is unchanged.
 
 ## Status
 
+**v1.2.1 — tight pre-render band for sidecar SRT.** On top of v1.2's
+PGS HW-decode pre-render + HDR pass-through + ffmpeg base v7.1.3-6,
+v1.2.1 parses sidecar SRT cues at rewrite time and sizes the
+pre-render bottom band to the actual max-lines-per-cue + safety
+margin instead of the static 40% fallback. Live readings on 4K HEVC
+HDR + sidecar SRT: pre-render CPU 47 % → 28 %, total session
+1.69 → 1.31 cores (~22 % saved per session). Bails to the static band
+on positional cues (`\anN`>3, `\pos(...)`, `\move(...)`); embedded
+SRT keeps the static band (extraction happens post-rewrite — tracked
+for v1.2.2 multi-region pre-render).
+
 **v1.2 — PGS HW-decode pre-render + HDR tonemap pass-through + ffmpeg
 base v7.1.3-6.** Every client/format cell in the matrix below has been
 exercised end-to-end (initial play, seek, quality change, subtitle
@@ -194,7 +205,7 @@ directory is a placeholder.
 - [`docs/SEEK.md`](docs/SEEK.md) — DASH and HLS seek deep-dive (the hardest problems we shipped).
 - [`docs/LATENCY.md`](docs/LATENCY.md) — first-frame latency budget and design levers.
 - [`docs/RESILIENCE.md`](docs/RESILIENCE.md) — PMS canThrottle pass-through, multi-engine GPU load, mid-stream worker recovery.
-- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — tracked limitations as of v1.2.
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — tracked limitations as of v1.2.1.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 - [`docs/PLAN.md`](docs/PLAN.md) — original implementation plan (historical; mostly delivered).
 - [`docs/LESSONS-FROM-CLUSTERPLEX.md`](docs/LESSONS-FROM-CLUSTERPLEX.md) — concrete pitfalls scaleplex avoids by design.
