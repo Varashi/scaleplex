@@ -2391,6 +2391,23 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			bandY0 := hInt0 - bandH0
 			old := fmt.Sprintf("[%s]scale=%s:%s,hwupload[0]", streamSpec, w, h)
 			neu := fmt.Sprintf("[%d:v]format=bgra,hwupload[0]", fifoInput)
+			// On a seek session the pre-render's FIFO arrives in the
+			// filter at PTS 0+ (canvas-driven, sub branch rebased by
+			// -seekOff), while Plex's main video reaches the filter at
+			// PTS seekOff+ — `-start_at_zero` only zeroes the muxer-
+			// side timestamps, not the filter input (verified offline:
+			// at -ss 540 the main video shows up in -filter_complex at
+			// pts_time:540.003). Without compensation overlay_vaapi
+			// pairs FIFO PTS T with main PTS T, putting the cue from
+			// movie (seekOff + T) over the frame at movie seekOff —
+			// i.e. subs run seekOff seconds ahead of dialogue. Shift
+			// the FIFO branch up by seekOff so both meet on the
+			// absolute-PTS timeline.
+			if seekOff > 0 {
+				neu = fmt.Sprintf(
+					"[%d:v]setpts=PTS+%.3f/TB,format=bgra,hwupload[0]",
+					fifoInput, seekOff)
+			}
 			args[i+1] = strings.Replace(args[i+1], old, neu, 1)
 			oldOv := "[2][0]overlay_vaapi,"
 			newOv := fmt.Sprintf(

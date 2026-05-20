@@ -1826,6 +1826,46 @@ func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
 	}
 }
 
+// On a seek session the rewriter must shift the FIFO branch up by the
+// seek offset before overlay_vaapi: `-start_at_zero` only zeroes the
+// muxer output, the filter still sees the main video at PTS seekOff+,
+// so a 0-based FIFO would drift cues forward by exactly seekOff.
+func TestRewriter_HWDecode_PGSOverlay_SeekShiftsFIFOUp(t *testing.T) {
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}
+	args := append([]string(nil), hwDecodeArgsAV1HEVC...)
+	// Inject -ss before -i so the rewriter captures a seek offset.
+	inputIdx := indexOfArg(args, "-i", 0)
+	args = append(args[:inputIdx], append([]string{"-ss", "540"}, args[inputIdx:]...)...)
+	vfIdx := indexOfArg(args, "-filter_complex", 0)
+	args[vfIdx+1] = "[0:5]scale=3840:2160,hwupload[0];" +
+		"[0:0]hwupload[1];" +
+		"[1]scale_vaapi=w=3840:h=2160:format=p010[2];" +
+		"[2][0]overlay_vaapi,scale_vaapi=format=p010[3];" +
+		"[3]hwupload[4]"
+	for i := vfIdx + 1; i+1 < len(args); i++ {
+		if args[i] == "-map" && args[i+1] == "[2]" {
+			args[i+1] = "[4]"
+			break
+		}
+	}
+
+	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
+	}
+	if out.SubPrerender == nil || out.SubPrerender.SeekOffsetSeconds != 540 {
+		t.Fatalf("seek offset not propagated to SubPrerenderSpec; got %+v", out.SubPrerender)
+	}
+	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
+	want := "setpts=PTS+540.000/TB,format=bgra,hwupload[0]"
+	if !strings.Contains(gotVF, want) {
+		t.Errorf("FIFO branch missing seek shift %q: %q", want, gotVF)
+	}
+}
+
 // PMS HW-decode + force-burn subtitle. Captured live from
 // clusterplex-worker-5v2zj 2026-05-08 18:10Z, Plex Android playing
 // The Accountant with a forced English SDH track and the Plex pref
