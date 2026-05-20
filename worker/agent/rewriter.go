@@ -656,9 +656,19 @@ func detectSubtitleSource(args []string, sessionDir string, probe func(source, s
 	}
 
 	srcForProbe := args[inputArgIdxs[inputNum]+1]
+	// streamSpec is in PMS-argv terms (e.g. "1:s:0" — second input file,
+	// sub stream 0). For sidecar inputs the probed file is the sidecar
+	// itself, which ffprobe sees as input 0 — re-anchor the leading "N:"
+	// to "0:" or the probe selects a non-existent input and returns "".
+	probeSpec := streamSpec
+	if inputNum > 0 {
+		if colon := strings.Index(probeSpec, ":"); colon > 0 {
+			probeSpec = "0:" + probeSpec[colon+1:]
+		}
+	}
 	codec := ""
 	if probe != nil {
-		codec = strings.ToLower(probe(srcForProbe, streamSpec))
+		codec = strings.ToLower(probe(srcForProbe, probeSpec))
 	}
 	kind := subtitleKind(codec)
 	if kind == "unknown" {
