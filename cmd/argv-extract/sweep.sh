@@ -2,14 +2,15 @@
 # Sweep all argv-corpus sources into ~/scaleplex-corpus/.
 #
 # Pulls:
-#   1. Worker NFS captures from clusterplex-worker pods
-#      (/transcode/_argv-corpus/<sid>.json — written by
-#      persistArgvCapture).
-#   2. Plex production wrapper captures from the plex pod
-#      (/transcode/_argv-corpus/<session>-<job>.argv — written by the
-#      bash tee-wrapper installed via custom-cont-init.d).
+#   1. Worker NFS captures from the prod `plex` PMS pod
+#      (/transcode/_argv-corpus/<sid>.json — written by the worker's
+#      persistArgvCapture when WORKER_DUMP_ARGV=1 is set on the DS).
+#      The PMS pod and worker DS share the /transcode PVC, so reading
+#      via the PMS pod sees worker-written files.
+#   2. Worker NFS captures from the `plex-test` PMS pod (same model).
 #   3. Worker stderr lines from kubectl logs (Go %q-printed argv
-#      slices + rewriter changes + outcome).
+#      slices + rewriter changes + outcome). Captures both `plex` and
+#      `plex-test` worker DSes.
 #
 # Auto-detects each file's format (JSON vs NUL-args). Idempotent —
 # only adds new captures to the corpus.
@@ -37,40 +38,45 @@ if [ ! -x "$EXTRACT_BIN" ]; then
   go build -o "$EXTRACT_BIN" "$(dirname "$(readlink -f "$0")")"
 fi
 
-# 1. clusterplex worker NFS — written by persistArgvCapture.
-CP_POD="$(kubectl -n clusterplex get pod -l app.kubernetes.io/controller=worker \
-  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-if [ -n "$CP_POD" ]; then
-  echo "→ sweeping clusterplex worker NFS via $CP_POD"
-  mkdir -p "$TMP/clusterplex"
-  # kubectl cp is finicky with - and / in paths; use exec+tar instead.
-  kubectl -n clusterplex exec "$CP_POD" -- \
-    bash -c 'cd /transcode && tar cf - _argv-corpus 2>/dev/null' \
-    | tar xf - -C "$TMP/clusterplex" 2>/dev/null || true
-fi
+SWEEP_ARGS=()
 
-# 2. Production plex NFS — written by bash wrapper. Files owned by
-# uid 1000 (abc) inside the pod; root-in-pod can't read them due to
-# NFS root_squash. Stream as abc via runuser.
-PLEX_POD="$(kubectl -n plex get pod -l app.kubernetes.io/name=plex \
-  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-if [ -n "$PLEX_POD" ]; then
-  echo "→ sweeping plex prod NFS via $PLEX_POD"
-  mkdir -p "$TMP/plex"
-  kubectl -n plex exec "$PLEX_POD" -c app -- \
+# Sweep a /transcode/_argv-corpus dir via a PMS pod in $ns.
+# Files are owned by uid 1000 (abc) inside the LSIO PMS container;
+# root-in-pod can't read them under NFS root_squash, so stream as
+# abc via runuser.
+sweep_ns() {
+  local ns="$1"
+  local pms_label="$2"
+  local pod
+  pod="$(kubectl -n "$ns" get pod -l "$pms_label" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -z "$pod" ] && { echo "→ $ns: no PMS pod, skipping"; return; }
+  echo "→ sweeping $ns NFS via $pod"
+  mkdir -p "$TMP/$ns"
+  kubectl -n "$ns" exec "$pod" -c app -- \
     runuser -u abc -- bash -c 'cd /transcode && tar cf - _argv-corpus 2>/dev/null' \
-    | tar xf - -C "$TMP/plex" 2>/dev/null || true
-fi
+    | tar xf - -C "$TMP/$ns" 2>/dev/null || true
+  [ -d "$TMP/$ns/_argv-corpus" ] && SWEEP_ARGS+=(-sweep "$TMP/$ns/_argv-corpus")
+}
 
-# 3. Worker logs — kubectl tail on stdin to extractor. Always include;
-# argv lines are valuable when WORKER_DUMP_ARGV=1 is set on the DS.
+# PMS label keys differ per ns (controller=plex on prod, controller=pms
+# on plex-test); using app.kubernetes.io/name= would also match the
+# orchestrator pod.
+
+# 1. Prod plex NFS.
+sweep_ns plex      app.kubernetes.io/controller=plex
+
+# 2. Plex-test NFS.
+sweep_ns plex-test app.kubernetes.io/controller=pms
+
+# 3. Worker logs — argv lines + outcome metadata (rewriter changes,
+# segments_created, exit_reason, encode_speed). Tail both ns worker DSes.
 echo "→ extracting from worker logs + sweep dirs"
 {
-  kubectl -n clusterplex logs -l app.kubernetes.io/controller=worker \
-    --tail=99999 --since="${SINCE:-24h}" --prefix=true 2>/dev/null || true
-} | "$EXTRACT_BIN" \
-  -corpus "$CORPUS_DIR" \
-  ${CP_POD:+-sweep "$TMP/clusterplex/_argv-corpus"} \
-  ${PLEX_POD:+-sweep "$TMP/plex/_argv-corpus"}
+  for ns in plex plex-test; do
+    kubectl -n "$ns" logs -l app.kubernetes.io/controller=worker \
+      --tail=99999 --since="${SINCE:-24h}" --prefix=true 2>/dev/null || true
+  done
+} | "$EXTRACT_BIN" -corpus "$CORPUS_DIR" "${SWEEP_ARGS[@]}"
 
 echo "→ corpus at $CORPUS_DIR ($(ls "$CORPUS_DIR" | wc -l) entries)"
