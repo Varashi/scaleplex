@@ -288,10 +288,11 @@ The rewriter keeps Plex's argv shape intact and only:
 `hw-decode:filter:inlineass-passthrough` (HW-decode path),
 `map-label-update`.
 
-### Bitmap sub burn-in (overlay_vaapi)
+### Bitmap sub burn-in (overlay_vaapi) — SW-decode path
 
 PGS / VobSub / DVDSub streams are bitmap images; libass can't render
-them. The rewriter routes them through `overlay_vaapi` instead:
+them. On SW-decode sessions the rewriter routes them through
+`overlay_vaapi` directly:
 
 ```
 [0:0]hwupload[10];
@@ -306,6 +307,78 @@ here; the bitmap stream is referenced directly via its stream spec in
 the filter graph).
 
 **Labels:** `filter:overlay-vaapi-bitmap`, `subtitle:bitmap:<spec>(<codec>)`.
+
+### Bitmap sub burn-in (HW-decode pre-render path)
+
+When the session is HW-decode AND PMS emits its own
+`overlay_vaapi` graph for a bitmap sub (regex
+`reFilterHWBitmapOverlay`), the raw graph is:
+
+```
+[0:5]scale=W:H,hwupload[0];           # SW-upscale of the sub2video bridge
+[0:0]hwupload[1];
+[1]scale_vaapi=w=W:h=H:format=p010[2];
+[2][0]overlay_vaapi,scale_vaapi=format=p010[3];
+[3]hwupload[4]
+```
+
+The sparse `sub2video` bridge fed straight into `overlay_vaapi` lets
+framesync drain it at the main-frame rate, re-running the 4K SW
+upscale per pulled frame (~2 cores). The transcode collapses to
+~0.25× realtime mid-stream. Symptom: smooth for 30–60 s, then a hard
+hitch into buffering. Reproduces on Avatar 4K HDR + PGS.
+
+**Fix.** Route the bitmap stream through a separate `buildBitmapPrerenderArgs`
+process (canvas + sub2video composited with SW `overlay`, encoded as
+qtrle into a fragmented MOV streamed via FIFO). The main graph reads
+the FIFO and composes via `overlay_vaapi` — no SW upscale on the
+framesync hot path. The pre-render runs `~0.3-0.5 core total` flat.
+See `project_scaleplex_pgs_prerender` (auto-memory) for the iteration
+history.
+
+The rewritten main graph:
+
+```
+[fifoInput:v](setpts=PTS+SEEK_OFF/TB,)format=bgra,hwupload[0];
+[0:0]hwupload[1];
+[1]scale_vaapi=w=W:h=H:format=p010[2];
+[2][0]overlay_vaapi=x=0:y=H-BandH:eof_action=pass:repeatlast=1,
+   scale_vaapi=format=p010[3];
+[3]hwupload[4]
+```
+
+The pre-render's FIFO is spliced as a second `-i` after the source
+with `-copyts -probesize 32 -analyzeduration 0` so `find_stream_info`
+does not grind on the sparse stream at startup.
+
+**Seek alignment.** Plex's HW-decode bitmap argv carries
+`-start_at_zero -copyts`. `-start_at_zero` only zeroes the muxer-side
+output PTS — it does **not** shift the filter input (verified offline:
+at `-ss 540` the main video's `scale_vaapi` outputs `pts_time:540.003`).
+The pre-render's FIFO arrives in the filter at PTS 0+ (its overlay
+canvas is necessarily 0-based, and the sub branch is rebased by
+`setpts=PTS-N/TB` so the canvas can drive output through dialogue
+gaps). Without compensation `overlay_vaapi` pairs FIFO PTS T with
+main PTS T → cues drift forward by exactly `seekOff` seconds. The
+rewriter splices `setpts=PTS+<seekOff>/TB` onto the FIFO branch ahead
+of `format=bgra,hwupload[0]` so both meet on the absolute-PTS timeline
+the filter already uses for the main video.
+
+> An earlier attempt (`sha-a451466`) put `setpts=PTS-STARTPTS` on the
+> `[0:0]hwupload[1]` main branch instead. This broke playback with
+> constant forward-skipping; reverted in `sha-3d3efb5`. The right place
+> for the shift is the FIFO branch — the pre-render must keep emitting
+> a 0-based FIFO as its canonical timeline, regardless of seek.
+
+**Bottom-band optimisation.** The sub is composited onto a band
+the height of `subPrerenderBandHeight(H)` (2/5 of the frame),
+positioned at `y=H-BandHeight` by the overlay rewrite. Halves the
+qtrle encode + main-side hwupload + overlay blend area. Trade-off:
+clips top-positioned bitmap signs / forced narrative. PGS is
+overwhelmingly bottom SDH/dialogue; accepted.
+
+**Labels:** `hw-decode:filter:bitmap-sub-prerender`,
+`bitmap-prerender:band=WxH@yY`, `seek-offset:captured=<T>s`.
 
 ### HDR tonemap (HDR source → SDR output)
 

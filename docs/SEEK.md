@@ -299,3 +299,35 @@ For posterity, dead ends explored before each working fix:
    for `Completed: 200 GET /base/00NNN.ts ... <bytes> bytes`. **`0 bytes`
    on seek chunks** → CSV rewrite not happening (relay
    misconfig or `scaleplex_seg_time=` not appended).
+
+## Seek on HW-decode PGS sessions (FIFO PTS shift)
+
+For HW-decode bitmap sub burn-in the rewriter routes the PGS through a
+separate sub pre-render and feeds the main `overlay_vaapi` from a FIFO
+(see `REWRITER.md` "Bitmap sub burn-in (HW-decode pre-render path)").
+On a seek session there is one extra correction that has nothing to do
+with the DASH/HLS machinery above:
+
+- Plex's bitmap HW-decode argv carries `-start_at_zero -copyts`.
+  `-start_at_zero` zeroes the **muxer-side** PTS only — it does NOT
+  shift the filter input. Verified offline: at `-ss 540` the main
+  video's `scale_vaapi` outputs `pts_time:540.003`. The FIFO,
+  meanwhile, arrives at `pts_time:0+` (its overlay canvas is
+  necessarily 0-based and the sub branch is rebased by
+  `setpts=PTS-N/TB`). Without compensation `overlay_vaapi` framesync
+  pairs FIFO PTS T with main PTS T — cues drift forward by exactly
+  `seekOff` seconds.
+
+- The rewriter splices `setpts=PTS+<seekOff>/TB` onto the FIFO branch
+  ahead of `format=bgra,hwupload[0]` so both meet on the absolute-PTS
+  timeline. **The shift belongs on the FIFO branch, not the main**;
+  putting it on `[0:0]` instead (the `sha-a451466` attempt) caused
+  constant forward-skipping in real playback.
+
+**Symptom of the bug, if it ever regresses:** seek into a PGS title,
+the displayed cue is a future cue — the offset from dialogue equals
+the seek offset.
+
+**Verification:** the rewriter log line for the session must include
+`seek-offset:captured=<T>s` AND the live `-filter_complex` must show
+`setpts=PTS+<T>.000/TB,format=bgra,hwupload[0]` on the FIFO branch.

@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### PGS / bitmap sub burn-in — HW-decode pre-render path + seek alignment
+
+Bitmap (PGS / VobSub / DVDSub) burn-in on HW-decode sessions used to
+drive `overlay_vaapi`'s framesync to drain the sparse `sub2video`
+stream and re-run the SW upscale flat-out, collapsing the transcode
+to ~0.25× realtime within 30–60 s. The fix routes the bitmap through
+a separate sub pre-render (canvas + sub2video composited with SW
+`overlay`, encoded as qtrle into a fragmented MOV streamed via FIFO),
+so the main graph gets a clean CFR FIFO at `subPrerenderFPS` instead
+of a sparse stream. The rewriter detects PMS's HW-decode bitmap-overlay
+graph (regex `reFilterHWBitmapOverlay`), splices the FIFO `-i`, and
+rewrites `overlay_vaapi` to position the band at `y=H-BandH` with
+`eof_action=pass:repeatlast=1`. Live readings: **~0.3–0.5 core total**,
+steady, no climb. (See `docs/REWRITER.md` "Bitmap sub burn-in
+(HW-decode pre-render path)".)
+
+Bottom-band crop (2/5 of frame height) added to halve canvas-size-
+proportional CPU, matching the SRT path. Trade-off: clips top-positioned
+signs / forced narrative. PGS is overwhelmingly bottom SDH/dialogue;
+accepted as default. A `subPrerenderBandHeight(H)` knob exists for
+future override.
+
+- **Seek-alignment fix.** Plex's HW-decode bitmap argv carries
+  `-start_at_zero -copyts`; that flag zeroes only the muxer-side output
+  PTS, **not** the filter input (verified offline against Avatar with
+  `-ss 540`: the main video's `scale_vaapi` outputs `pts_time:540.003`).
+  The pre-render emits a 0-based FIFO (canvas-driven, sub branch
+  rebased by `setpts=PTS-N/TB`), so `overlay_vaapi` paired FIFO PTS T
+  with main PTS T — cues drifted forward by exactly `seekOff` seconds
+  ("[Kiri sobs]" at seekbar 9:00 was the PGS cue from movie 18:00).
+  The rewriter now splices `setpts=PTS+<seekOff>/TB` onto the FIFO
+  branch ahead of `format=bgra,hwupload[0]`, putting both branches on
+  the absolute-PTS timeline the filter already uses for the main video.
+  An earlier attempt put `setpts=PTS-STARTPTS` on the `[0:0]` main
+  branch (`sha-a451466`); that broke playback with constant
+  forward-skipping and was reverted in `sha-3d3efb5`. The right place
+  for the shift is the FIFO branch — the pre-render must keep emitting
+  a 0-based FIFO regardless of seek.
+
+- **Validation.** Avatar 4K HDR + PGS on LG webOS (initial play),
+  Avatar PGS on Plex Android (initial + seek/resume), Sing 2 4K HDR
+  AV1 + EAC3 on Plex Android (initial + seek + audio swap), and From
+  Dusk Till Dawn HEVC 4K HDR + external SRT-burn on Plex Android
+  (initial + seek + audio swap). All on the `plex-test` bench.
+
 ### Subtitle burn-in (GPU-overlay pre-render) — correctness + performance
 
 Post-v1.1.1 work on the SRT / static-ASS `overlay_vaapi` pre-render

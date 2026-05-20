@@ -29,6 +29,30 @@ purely cosmetic gain.
 **Workaround for users.** None needed — re-clicking the scrubber or
 waiting one position-report cycle corrects the display.
 
+## Plex Windows desktop — external sidecar SRT swap is a no-op
+
+**Severity:** cosmetic / client-side, NOT scaleplex.
+
+**Symptom.** On Plex for Windows direct-play / direct-stream, embedded
+SRT and embedded PGS render fine. Switching the subtitle dropdown from
+an embedded track to an **external sidecar** (`.nl.srt`) is a no-op —
+the previously-rendered track keeps showing. The web "Burn Subtitles:
+Always" preference doesn't affect this client either; that pref is
+Plex-Web-only.
+
+**Cause.** Sub track switching is decided 100% on the client for
+direct play. PMS metadata correctly marks the external sub as
+`selected="1"` and the sidecar file is genuinely Dutch — the Windows
+client just doesn't load it on a hot swap.
+
+**Workaround for users.** Stop playback fully + restart it; the
+external sub then loads correctly.
+
+**Verification:** the PMS log carries no subtitle-decision lines for
+direct play. The actual selection lives in
+`%LOCALAPPDATA%\Plex\Logs\Plex.log` on the desktop. Grep for the
+sidecar's PMS stream id to confirm what the client loaded.
+
 ## SRT sidecar on 4K HEVC HDR — PMS downscales video to SD
 
 **Severity:** expected PMS behaviour, not a scaleplex defect.
