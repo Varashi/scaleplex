@@ -109,6 +109,19 @@ type SubPrerenderSpec struct {
 	// carrying Plex's burn-in styling. Empty until the style-mapping
 	// phase populates it.
 	ForceStyle string
+	// ResolveBandPostExtract — when true, BandHeight is a placeholder
+	// (the static fallback band) and the actual band is computed by
+	// the agent after the sidecar/extracted SRT file is on disk. The
+	// agent calls resolveSRTBand(subFile, ...) before spawning the
+	// pre-render, may overwrite BandHeight with a tighter value, and
+	// then patches the main argv's overlay_vaapi y-offset via the
+	// BandYSentinel placeholder. SRT path (sidecar + embedded) emits
+	// this; ASS / static-canvas fallback keeps a fixed band at rewrite
+	// time. See worker/agent/band.go for the patching helpers.
+	ResolveBandPostExtract bool
+	// Sidecar SRTs are read at rewrite time too — same flag — to keep
+	// the resolve site single-source-of-truth, but the agent's call
+	// is the only one that mutates BandHeight on the live spec.
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -2222,32 +2235,31 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// keeps correct positioning) then crops to BandHeight,
 					// and overlay_vaapi composites that band at y=bandY.
 					// Cuts the canvas-size-proportional CPU ~2.5x. ASS can
-					// be positioned anywhere → full frame. Embedded subs are
-					// extracted to SRT by the agent (always bottom) →
-					// band-safe; only a sidecar ASS/SSA stays full-frame.
+					// be positioned anywhere → full frame.
 					//
-					// v1.2.1 bbox-crop: for SIDECAR SRT the path is known
-					// now, so we parse the cues and derive a tighter band
-					// than the static 40%. Positional cues (\an4-9, \pos,
-					// \move) or marginal savings (<10%) fall back to the
-					// static band. Embedded SRT extraction happens later in
-					// the agent — we keep the static band there.
-					// See worker/agent/subparse.go.
+					// v1.2.2 — band resolution deferred to the agent. The
+					// rewriter sets BandHeight to the static-fallback band
+					// + emits `y=__SP_BANDY__` (BandYSentinel) in the main
+					// argv. After the agent extracts (embedded) or opens
+					// (sidecar) the SRT file, it calls ResolveAgentBand to
+					// pick the actual band height + then PatchMainArgsBandY
+					// to substitute the y value. See worker/agent/band.go.
+					// This unifies the sidecar and embedded SRT paths and
+					// gets embedded SRT into the tight-band path too.
 					wInt, _ := strconv.Atoi(w)
 					hInt, _ := strconv.Atoi(h)
 					bandH := hInt
-					tightBand := false
+					resolveAgent := false
 					isSRT := hInt > 0 && (subSrc.FilePath == "" || subSrc.Codec == "subrip")
 					if isSRT {
 						bandH = subPrerenderBandHeight(hInt)
-						if subSrc.FilePath != "" && subSrc.Codec == "subrip" {
-							if tight, ok := resolveSRTBand(subSrc.FilePath, hInt, bandH); ok {
-								bandH = tight
-								tightBand = true
-							}
-						}
+						resolveAgent = true
 					}
 					bandY := hInt - bandH
+					bandYStr := strconv.Itoa(bandY)
+					if resolveAgent {
+						bandYStr = BandYSentinel
+					}
 					// On a seek session the main video reaches the
 					// filtergraph at the seek offset (PTS N), but the
 					// overlay reaches overlay_vaapi's framesync at ~0 —
@@ -2272,9 +2284,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							"[0:0]hwupload[10];"+
 								"[10]%s,setpts=PTS-STARTPTS[11];"+
 								"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload[12];"+
-								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[13];"+
+								"[11][12]overlay_vaapi=x=0:y=%s:eof_action=pass:repeatlast=1[13];"+
 								"[13]setpts=PTS+%s/TB[4]",
-							scaleStep, fifoInput, bandY,
+							scaleStep, fifoInput, bandYStr,
 							strconv.FormatFloat(seekOff, 'f', 3, 64),
 						)
 					} else {
@@ -2282,8 +2294,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							"[0:0]hwupload[10];"+
 								"[10]%s[11];"+
 								"[%d:v]format=bgra,hwupload[12];"+
-								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[4]",
-							scaleStep, fifoInput, bandY,
+								"[11][12]overlay_vaapi=x=0:y=%s:eof_action=pass:repeatlast=1[4]",
+							scaleStep, fifoInput, bandYStr,
 						)
 					}
 					// Drop `-map_inlineass <spec>` — no inlineass filter
@@ -2350,22 +2362,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					subPrerender = &SubPrerenderSpec{
-						FIFOPath:   fifoPath,
-						SourcePath: srcPath,
-						StreamSpec: subSrc.StreamSpec,
-						Embedded:   subSrc.FilePath == "",
-						Width:      wInt,
-						Height:     hInt,
-						BandHeight: bandH,
-						ForceStyle: plexInlineassToForceStyle(m[assGroup]),
+						FIFOPath:               fifoPath,
+						SourcePath:             srcPath,
+						StreamSpec:             subSrc.StreamSpec,
+						Embedded:               subSrc.FilePath == "",
+						Width:                  wInt,
+						Height:                 hInt,
+						BandHeight:             bandH,
+						ForceStyle:             plexInlineassToForceStyle(m[assGroup]),
+						ResolveBandPostExtract: resolveAgent,
 					}
 					changes = append(changes, "hw-decode:filter:sub-prerender-overlay")
 					if bandH < hInt {
+						// Tag still reflects the rewrite-time (static-fallback)
+						// band. When the agent resolves a tighter band the
+						// pre-render argv shows the final crop= and the main
+						// argv shows the final y= via the BandYSentinel patch;
+						// the static-band tag remains for argv-corpus replay
+						// consistency.
 						changes = append(changes,
 							fmt.Sprintf("sub-prerender:band=%dx%d@y%d", wInt, bandH, bandY))
 					}
-					if tightBand {
-						changes = append(changes, "sub-prerender:band:tight")
+					if resolveAgent {
+						changes = append(changes, "sub-prerender:band:agent-resolve")
 					}
 				}
 				newInputIdx = indexOfArg(args, "-i", 0)

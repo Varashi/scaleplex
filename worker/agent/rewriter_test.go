@@ -2290,14 +2290,18 @@ func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 	if sp.FIFOPath == "" {
 		t.Error("FIFOPath empty")
 	}
-	// SRT → band optimisation: BandHeight is the bottom band (< Height),
-	// and overlay_vaapi composites it at y = Height - BandHeight.
+	// SRT → band optimisation: rewriter sets BandHeight to the static-
+	// fallback band as a placeholder and emits the sentinel y= in the
+	// filter graph for the agent to patch after extraction/parse.
 	if sp.BandHeight != subPrerenderBandHeight(720) {
-		t.Errorf("BandHeight = %d, want %d (band)", sp.BandHeight, subPrerenderBandHeight(720))
+		t.Errorf("BandHeight = %d, want %d (static fallback at rewrite time)",
+			sp.BandHeight, subPrerenderBandHeight(720))
 	}
-	wantY := 720 - subPrerenderBandHeight(720)
-	if !strings.Contains(graph, fmt.Sprintf("overlay_vaapi=x=0:y=%d:", wantY)) {
-		t.Errorf("overlay_vaapi missing band y-offset y=%d: %s", wantY, graph)
+	if !sp.ResolveBandPostExtract {
+		t.Error("ResolveBandPostExtract = false, want true for SRT path")
+	}
+	if !strings.Contains(graph, "overlay_vaapi=x=0:y="+BandYSentinel+":") {
+		t.Errorf("overlay_vaapi missing sentinel y= placeholder: %s", graph)
 	}
 	// The overlay FIFO input must sit immediately after the last real
 	// input, ahead of Plex's output-side options (-start_at_zero,

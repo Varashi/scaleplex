@@ -437,6 +437,18 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "sub pre-render: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// spawnSubPrerender may have updated spec.BandHeight via the
+		// agent-side band resolver — patch the sentinel y= the rewriter
+		// left in the main argv's overlay_vaapi clause to the final
+		// y-offset before the main ffmpeg starts. No-op when the
+		// rewriter didn't emit a sentinel (ASS / bitmap path).
+		if subPrerender.ResolveBandPostExtract {
+			bandY := subPrerender.Height - subPrerender.BandHeight
+			if n := PatchMainArgsBandY(finalArgs, bandY); n > 0 {
+				log.Printf("session %s: agent band resolve: bandH=%d bandY=%d patched=%d",
+					req.SessionID, subPrerender.BandHeight, bandY, n)
+			}
+		}
 		log.Printf("session %s: spawned subtitle pre-render pid=%d", req.SessionID, pr.Process.Pid)
 		defer func() {
 			if pr.Process != nil {
