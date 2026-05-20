@@ -656,9 +656,21 @@ func detectSubtitleSource(args []string, sessionDir string, probe func(source, s
 	}
 
 	srcForProbe := args[inputArgIdxs[inputNum]+1]
+	// streamSpec is in PMS-argv terms (e.g. "1:s:0" — second input file,
+	// sub stream 0). For sidecar inputs the probed file is the sidecar
+	// itself, which ffprobe sees as the only input. ffprobe REJECTS a
+	// file-index prefix in -select_streams when only one input is given
+	// ("Invalid stream specifier: 0:s:0") — drop the leading "N:" entirely
+	// and pass just the type+index portion (e.g. "s:0").
+	probeSpec := streamSpec
+	if inputNum > 0 {
+		if colon := strings.Index(probeSpec, ":"); colon > 0 {
+			probeSpec = probeSpec[colon+1:]
+		}
+	}
 	codec := ""
 	if probe != nil {
-		codec = strings.ToLower(probe(srcForProbe, streamSpec))
+		codec = strings.ToLower(probe(srcForProbe, probeSpec))
 	}
 	kind := subtitleKind(codec)
 	if kind == "unknown" {
@@ -2213,11 +2225,27 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// be positioned anywhere → full frame. Embedded subs are
 					// extracted to SRT by the agent (always bottom) →
 					// band-safe; only a sidecar ASS/SSA stays full-frame.
+					//
+					// v1.2.1 bbox-crop: for SIDECAR SRT the path is known
+					// now, so we parse the cues and derive a tighter band
+					// than the static 40%. Positional cues (\an4-9, \pos,
+					// \move) or marginal savings (<10%) fall back to the
+					// static band. Embedded SRT extraction happens later in
+					// the agent — we keep the static band there.
+					// See worker/agent/subparse.go.
 					wInt, _ := strconv.Atoi(w)
 					hInt, _ := strconv.Atoi(h)
 					bandH := hInt
-					if hInt > 0 && (subSrc.FilePath == "" || subSrc.Codec == "subrip") {
+					tightBand := false
+					isSRT := hInt > 0 && (subSrc.FilePath == "" || subSrc.Codec == "subrip")
+					if isSRT {
 						bandH = subPrerenderBandHeight(hInt)
+						if subSrc.FilePath != "" && subSrc.Codec == "subrip" {
+							if tight, ok := resolveSRTBand(subSrc.FilePath, hInt, bandH); ok {
+								bandH = tight
+								tightBand = true
+							}
+						}
 					}
 					bandY := hInt - bandH
 					// On a seek session the main video reaches the
@@ -2335,6 +2363,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if bandH < hInt {
 						changes = append(changes,
 							fmt.Sprintf("sub-prerender:band=%dx%d@y%d", wInt, bandH, bandY))
+					}
+					if tightBand {
+						changes = append(changes, "sub-prerender:band:tight")
 					}
 				}
 				newInputIdx = indexOfArg(args, "-i", 0)
