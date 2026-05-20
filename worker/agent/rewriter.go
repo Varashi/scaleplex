@@ -2391,24 +2391,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			bandY0 := hInt0 - bandH0
 			old := fmt.Sprintf("[%s]scale=%s:%s,hwupload[0]", streamSpec, w, h)
 			neu := fmt.Sprintf("[%d:v]format=bgra,hwupload[0]", fifoInput)
-			// On a seek session the main video reaches the filtergraph
-			// at PTS N (with -ss N -copyts), while the FIFO is mov-
-			// rebased to 0+. overlay_vaapi's framesync then pairs main
-			// at N+ with FIFO at 0+, drifting cues by N seconds. The
-			// SRT-burn path solves this by adding setpts=PTS-STARTPTS
-			// on both branches before they meet at overlay — both
-			// rebase to 0 from their own first frame, putting them on
-			// the same 0-based-from-seek timeline. Mirror that here.
-			if seekOff > 0 {
-				neu = fmt.Sprintf(
-					"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload[0]", fifoInput)
-			}
 			args[i+1] = strings.Replace(args[i+1], old, neu, 1)
-			if seekOff > 0 {
-				args[i+1] = strings.Replace(args[i+1],
-					"[0:0]hwupload[1]",
-					"[0:0]setpts=PTS-STARTPTS,hwupload[1]", 1)
-			}
 			oldOv := "[2][0]overlay_vaapi,"
 			newOv := fmt.Sprintf(
 				"[2][0]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1,", bandY0)

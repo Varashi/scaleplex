@@ -1826,58 +1826,6 @@ func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
 	}
 }
 
-// PGS overlay rerouted through pre-render + seek session. On a resume
-// (-ss N) the main video reaches the filtergraph at PTS N+ (with
-// -copyts), but the FIFO is mov-rebased to 0+ — overlay_vaapi's
-// framesync would then pair main at N+ with FIFO at 0+, drifting cues
-// by N seconds. The rewriter must add setpts=PTS-STARTPTS to BOTH
-// branches before the overlay (mirrors the SRT-burn seek path) so
-// they meet on a shared 0-based-from-seek timeline.
-func TestRewriter_HWDecode_PGSOverlay_SeekRebasesMainBranches(t *testing.T) {
-	env := map[string]string{
-		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
-		"X_PLEX_TOKEN":           "tok123",
-	}
-	args := append([]string(nil), hwDecodeArgsAV1HEVC...)
-	// Splice -ss 491 BEFORE the source -i (per Plex's resume shape).
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "-i" && strings.Contains(args[i+1], ".mkv") {
-			args = append(args[:i], append([]string{"-ss", "491"}, args[i:]...)...)
-			break
-		}
-	}
-	vfIdx := indexOfArg(args, "-filter_complex", 0)
-	args[vfIdx+1] = "[0:5]scale=3840:2160,hwupload[0];" +
-		"[0:0]hwupload[1];" +
-		"[1]scale_vaapi=w=3840:h=2160:format=p010[2];" +
-		"[2][0]overlay_vaapi,scale_vaapi=format=p010[3];" +
-		"[3]hwupload[4]"
-	for i := vfIdx + 1; i+1 < len(args); i++ {
-		if args[i] == "-map" && args[i+1] == "[2]" {
-			args[i+1] = "[4]"
-			break
-		}
-	}
-
-	out := Rewrite(args, env, nil)
-	if !out.Applied {
-		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
-	}
-	sp := out.SubPrerender
-	if sp == nil || sp.SeekOffsetSeconds != 491 {
-		t.Fatalf("SubPrerender SeekOffsetSeconds = %v, want 491", sp)
-	}
-	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
-	// FIFO branch rebased
-	if !strings.Contains(gotVF, "setpts=PTS-STARTPTS,format=bgra,hwupload[0]") {
-		t.Errorf("FIFO branch missing setpts=PTS-STARTPTS: %q", gotVF)
-	}
-	// Main video branch rebased
-	if !strings.Contains(gotVF, "[0:0]setpts=PTS-STARTPTS,hwupload[1]") {
-		t.Errorf("main-video branch missing setpts=PTS-STARTPTS: %q", gotVF)
-	}
-}
-
 // PMS HW-decode + force-burn subtitle. Captured live from
 // clusterplex-worker-5v2zj 2026-05-08 18:10Z, Plex Android playing
 // The Accountant with a forced English SDH track and the Plex pref
