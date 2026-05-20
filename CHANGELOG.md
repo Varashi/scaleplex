@@ -1,5 +1,47 @@
 # Changelog
 
+## v1.2.1 — 2026-05-20
+
+### SRT sub-burn pre-render — tight bottom band for plain sidecar SRT
+
+For sidecar SRT inputs the rewriter now parses the cues at rewrite time and
+sizes the pre-render's bottom band to the actual maximum-lines-per-cue plus
+a safety margin, instead of the static 40% fallback shipped in v1.2.0.
+
+Constants calibrated against the worker image with default `subtitles=`
+filter + DejaVu Sans + libass default style (measured 2026-05-20 via
+`cropdetect` on 1/2/4-line cues at 1080p + 4K):
+`bandH = 5% + lines * 6% + 8% safety` of frame height, even-rounded.
+
+Live readings on plex-test 4K HEVC HDR + sidecar Dutch SRT (707 cues, max
+2 lines): pre-render `crop=3840:540:0:1620` (vs prior 864 px band, ~37 %
+smaller). Pre-render CPU 47 % → 28 %, total session 1.69 → 1.31 cores
+(~22 % saved). Emits a new rewriter change tag `sub-prerender:band:tight`.
+
+Bails to the static fallback band when:
+- the parser can't reach the file (embedded SRT extraction happens
+  post-rewrite; embedded path stays on the static band for now);
+- any cue carries a positional override (`\anN` with N>3, `\pos(...)`,
+  `\move(...)`, `\org(...)`) that moves it off the default bottom row;
+- the computed savings would be < 10 % of the fallback band (avoids
+  churn for marginal wins).
+
+The next-tier optimisation — multi-region pre-render so positional cues
+in otherwise-bottom-aligned SRTs also benefit — is tracked for v1.2.2.
+
+### Sidecar codec-probe stream-spec fix
+
+Pre-existing bug surfaced during the tight-band rollout. The codec probe
+for a sidecar subtitle input passed PMS-argv stream-spec `1:s:0`
+verbatim to ffprobe against a single-stream sidecar file. ffprobe
+rejects a file-index prefix when only one input is given ("Invalid
+stream specifier"), the codec lookup returned empty, and any rewriter
+code path that gated on `subSrc.Codec == "subrip"` silently degraded.
+
+Worker now drops the leading `N:` when probing a sidecar input
+(`1:s:0` → `s:0`). Embedded paths (input 0) keep their PMS-argv form
+against the source file (e.g. `0:3`).
+
 ## v1.2.0 — 2026-05-20
 
 ### Build base — jellyfin-ffmpeg v7.1.3-1 → v7.1.3-6
