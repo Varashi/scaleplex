@@ -112,7 +112,7 @@ type SubPrerenderSpec struct {
 	// ResolveBandPostExtract — when true, BandHeight is a placeholder
 	// (the static fallback band) and the actual band is computed by
 	// the agent after the sidecar/extracted SRT file is on disk. The
-	// agent calls resolveSRTBand(subFile, ...) before spawning the
+	// agent calls resolveSubBand(subFile, ...) before spawning the
 	// pre-render, may overwrite BandHeight with a tighter value, and
 	// then patches the main argv's overlay_vaapi y-offset via the
 	// BandYSentinel placeholder. SRT path (sidecar + embedded) emits
@@ -2250,8 +2250,22 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					hInt, _ := strconv.Atoi(h)
 					bandH := hInt
 					resolveAgent := false
-					isSRT := hInt > 0 && (subSrc.FilePath == "" || subSrc.Codec == "subrip")
-					if isSRT {
+					// Defer band decision to the agent for any text format
+					// the parser-dispatch can handle:
+					//  - embedded subs (FilePath empty) — the agent extracts
+					//    to .srt before pre-render, so parseSRT will see it
+					//  - sidecar SRT (Codec=="subrip") — parseSRT on the
+					//    sidecar file
+					//  - sidecar static ASS/SSA (Codec=="ass"|"ssa") —
+					//    parseASS on the sidecar file. Animated ASS never
+					//    reaches this code path (subtitleIsAnimated routes
+					//    it to the inlineass passthrough branch).
+					isTextSub := hInt > 0 &&
+						(subSrc.FilePath == "" ||
+							subSrc.Codec == "subrip" ||
+							subSrc.Codec == "ass" ||
+							subSrc.Codec == "ssa")
+					if isTextSub {
 						bandH = subPrerenderBandHeight(hInt)
 						resolveAgent = true
 					}

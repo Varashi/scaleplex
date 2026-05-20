@@ -254,15 +254,15 @@ func TestResolveSRTBand_TightWin(t *testing.T) {
 Hello world
 `
 	p := writeSRT(t, "tight.srt", body)
-	got, ok := resolveSRTBand(p, 2160, 864)
+	got, ok := resolveSubBand(p, 2160, 864)
 	if !ok {
-		t.Fatalf("resolveSRTBand: ok=false, want true for plain 1-line SRT")
+		t.Fatalf("resolveSubBand: ok=false, want true for plain 1-line SRT")
 	}
 	if got >= 864 {
-		t.Errorf("resolveSRTBand: got %d, want < 864 fallback", got)
+		t.Errorf("resolveSubBand: got %d, want < 864 fallback", got)
 	}
 	if got%2 != 0 {
-		t.Errorf("resolveSRTBand: got %d, want even", got)
+		t.Errorf("resolveSubBand: got %d, want even", got)
 	}
 }
 
@@ -272,12 +272,12 @@ func TestResolveSRTBand_PositionedFallback(t *testing.T) {
 {\an8}Top sign translation
 `
 	p := writeSRT(t, "anpos.srt", body)
-	got, ok := resolveSRTBand(p, 2160, 864)
+	got, ok := resolveSubBand(p, 2160, 864)
 	if ok {
-		t.Errorf("resolveSRTBand: ok=true, want false (positioned cue)")
+		t.Errorf("resolveSubBand: ok=true, want false (positioned cue)")
 	}
 	if got != 864 {
-		t.Errorf("resolveSRTBand: got %d, want 864 fallback", got)
+		t.Errorf("resolveSubBand: got %d, want 864 fallback", got)
 	}
 }
 
@@ -295,26 +295,26 @@ Line four
 `
 	p := writeSRT(t, "ml.srt", body)
 	// Tight = ~746, fallback 800 → saving ~6%, rejected.
-	got, ok := resolveSRTBand(p, 2160, 800)
+	got, ok := resolveSubBand(p, 2160, 800)
 	if ok {
-		t.Errorf("resolveSRTBand: ok=true, want false (marginal savings)")
+		t.Errorf("resolveSubBand: ok=true, want false (marginal savings)")
 	}
 	if got != 800 {
-		t.Errorf("resolveSRTBand: got %d, want 800 fallback", got)
+		t.Errorf("resolveSubBand: got %d, want 800 fallback", got)
 	}
 }
 
 func TestResolveSRTBand_NoFile(t *testing.T) {
-	got, ok := resolveSRTBand("", 2160, 864)
+	got, ok := resolveSubBand("", 2160, 864)
 	if ok || got != 864 {
-		t.Errorf("resolveSRTBand(empty path): got=%d ok=%v, want 864/false", got, ok)
+		t.Errorf("resolveSubBand(empty path): got=%d ok=%v, want 864/false", got, ok)
 	}
 }
 
 func TestResolveSRTBand_EmptyFile(t *testing.T) {
 	p := writeSRT(t, "empty.srt", "")
-	got, ok := resolveSRTBand(p, 2160, 864)
+	got, ok := resolveSubBand(p, 2160, 864)
 	if ok || got != 864 {
-		t.Errorf("resolveSRTBand(empty file): got=%d ok=%v, want 864/false", got, ok)
+		t.Errorf("resolveSubBand(empty file): got=%d ok=%v, want 864/false", got, ok)
 	}
 }

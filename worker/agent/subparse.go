@@ -147,7 +147,8 @@ func srtTightBandHeight(frameH, lines int) int {
 	return h
 }
 
-// resolveSRTBand picks the bottom-band height for a given SRT pre-render.
+// resolveSubBand picks the bottom-band height for a given subtitle file
+// (SRT, ASS, or SSA — dispatched by extension via parseSubBand).
 // Returns the (possibly tighter) band height and whether it differs from
 // the static fallback. The static fallback is used when:
 //   - the file can't be read (returns fallback band, ok=false)
@@ -155,11 +156,11 @@ func srtTightBandHeight(frameH, lines int) int {
 //   - any cue carries a positional override tag
 //   - the computed tight band saves less than srtMinBandSavingsPct of
 //     the fallback — not worth diverging from the well-trodden path
-func resolveSRTBand(srtPath string, frameH, fallbackBandH int) (int, bool) {
-	if srtPath == "" || frameH <= 0 {
+func resolveSubBand(subPath string, frameH, fallbackBandH int) (int, bool) {
+	if subPath == "" || frameH <= 0 {
 		return fallbackBandH, false
 	}
-	res, err := parseSRT(srtPath)
+	res, err := parseSubBand(subPath)
 	if err != nil || res.Cues == 0 || res.PositionedCue || res.MaxLines == 0 {
 		return fallbackBandH, false
 	}

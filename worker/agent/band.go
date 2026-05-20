@@ -3,13 +3,13 @@ package main
 // Agent-side band resolution + main-argv patching.
 //
 // The pre-render's bottom-band height is data-driven (parsed from the
-// SRT). For SIDECAR SRT the file is on disk at rewrite time, but for
-// EMBEDDED SRT the agent's own extraction step writes the file later.
-// To unify both, the rewriter emits a sentinel y-offset in the main
-// argv's overlay_vaapi clause and sets SubPrerenderSpec.ResolveBandPostExtract.
-// The agent then:
+// sidecar/extracted subtitle file). For SIDECAR SRT the file is on disk
+// at rewrite time, but for EMBEDDED SRT the agent's own extraction
+// step writes the file later. To unify both, the rewriter emits a
+// sentinel y-offset in the main argv's overlay_vaapi clause and sets
+// SubPrerenderSpec.ResolveBandPostExtract. The agent then:
 //  1. resolves the subtitle file (sidecar path or extracted .srt),
-//  2. calls resolveSRTBand to pick band height + y-offset,
+//  2. calls parseSubBand (dispatching by extension) to pick band height,
 //  3. writes the chosen y back into the main argv via PatchMainArgsBandY.
 // Pre-render argv is built post-resolve from the now-final spec.BandHeight,
 // so no in-place patch is needed on that side.
@@ -18,6 +18,31 @@ import (
 	"strconv"
 	"strings"
 )
+
+// parseSubBand dispatches to the right cue parser by file extension.
+// Both SRT and ASS parsers return the same SRTBandResult shape (max-
+// line count + cue total + positional bail flag), so downstream tightness
+// math is uniform across formats. Unknown extensions return an empty
+// result (no cues) so the caller falls back to the static band.
+func parseSubBand(subFile string) (SRTBandResult, error) {
+	switch lowerExt(subFile) {
+	case ".srt":
+		return parseSRT(subFile)
+	case ".ass", ".ssa":
+		return parseASS(subFile)
+	}
+	return SRTBandResult{}, nil
+}
+
+// lowerExt returns the lowercase file extension including the dot, or
+// "" when none.
+func lowerExt(p string) string {
+	i := strings.LastIndex(p, ".")
+	if i < 0 || i == len(p)-1 {
+		return ""
+	}
+	return strings.ToLower(p[i:])
+}
 
 // BandYSentinel is the literal token the rewriter writes into the main
 // argv where overlay_vaapi's y= value belongs when band resolution is
@@ -46,7 +71,7 @@ func ResolveAgentBand(spec *SubPrerenderSpec, subFile string) int {
 	if spec.Height <= 0 || subFile == "" {
 		return spec.Height - spec.BandHeight
 	}
-	if tight, ok := resolveSRTBand(subFile, spec.Height, spec.BandHeight); ok {
+	if tight, ok := resolveSubBand(subFile, spec.Height, spec.BandHeight); ok {
 		spec.BandHeight = tight
 	}
 	return spec.Height - spec.BandHeight
