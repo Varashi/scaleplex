@@ -658,12 +658,14 @@ func detectSubtitleSource(args []string, sessionDir string, probe func(source, s
 	srcForProbe := args[inputArgIdxs[inputNum]+1]
 	// streamSpec is in PMS-argv terms (e.g. "1:s:0" — second input file,
 	// sub stream 0). For sidecar inputs the probed file is the sidecar
-	// itself, which ffprobe sees as input 0 — re-anchor the leading "N:"
-	// to "0:" or the probe selects a non-existent input and returns "".
+	// itself, which ffprobe sees as the only input. ffprobe REJECTS a
+	// file-index prefix in -select_streams when only one input is given
+	// ("Invalid stream specifier: 0:s:0") — drop the leading "N:" entirely
+	// and pass just the type+index portion (e.g. "s:0").
 	probeSpec := streamSpec
 	if inputNum > 0 {
 		if colon := strings.Index(probeSpec, ":"); colon > 0 {
-			probeSpec = "0:" + probeSpec[colon+1:]
+			probeSpec = probeSpec[colon+1:]
 		}
 	}
 	codec := ""

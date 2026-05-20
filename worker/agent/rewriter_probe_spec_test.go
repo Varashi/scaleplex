@@ -37,8 +37,10 @@ func TestRewriter_ProbeSpec_Sidecar_ReanchoredToInput0(t *testing.T) {
 	if gotSrc != "/transcode/Sub/temp-0.srt" {
 		t.Errorf("probe source = %q, want sidecar path", gotSrc)
 	}
-	if gotSpec != "0:s:0" {
-		t.Errorf("probe spec = %q, want 0:s:0 (re-anchored to ffprobe input 0)", gotSpec)
+	// ffprobe rejects a file-index prefix when only one input is given;
+	// the spec must be the bare stream selector (type+index).
+	if gotSpec != "s:0" {
+		t.Errorf("probe spec = %q, want s:0 (bare stream selector for sidecar)", gotSpec)
 	}
 }
 
