@@ -12,7 +12,7 @@
 # before docker build. Build context root must be the scaleplex repo
 # root (matches existing `worker/...` paths).
 
-FROM golang:1.23-bookworm AS agent-build
+FROM golang:1.26-bookworm AS agent-build
 WORKDIR /src
 COPY worker/agent/go.mod worker/agent/go.sum ./
 RUN go mod download
