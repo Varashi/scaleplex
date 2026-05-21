@@ -37,6 +37,8 @@ import (
 const (
 	// regionBottom — default + `\an1`/`\an2`/`\an3`.
 	regionBottom = 2
+	// regionMiddle — `\an4`/`\an5`/`\an6` (mid-row, rare).
+	regionMiddle = 5
 	// regionTop — `\an7`/`\an8`/`\an9`.
 	regionTop = 8
 )
@@ -54,12 +56,12 @@ var srtAbsoluteOverridePattern = regexp.MustCompile(`\\(?:pos\s*\(|move\s*\(|org
 // decide between single-region and multi-region pre-render.
 type SRTRegionCounts struct {
 	Bottom     int
-	Top        int
 	Middle     int
+	Top        int
 	Positional int
-	// MaxLinesBottom / MaxLinesTop — largest line count per region,
-	// used to size each region's band.
+	// Per-region largest line count, used to size each region's band.
 	MaxLinesBottom int
+	MaxLinesMiddle int
 	MaxLinesTop    int
 }
 
@@ -92,13 +94,16 @@ func countSRTRegions(srtPath string) (SRTRegionCounts, error) {
 			if cueLines > rc.MaxLinesBottom {
 				rc.MaxLinesBottom = cueLines
 			}
+		case regionMiddle:
+			rc.Middle++
+			if cueLines > rc.MaxLinesMiddle {
+				rc.MaxLinesMiddle = cueLines
+			}
 		case regionTop:
 			rc.Top++
 			if cueLines > rc.MaxLinesTop {
 				rc.MaxLinesTop = cueLines
 			}
-		default:
-			rc.Middle++
 		}
 	}
 
@@ -119,14 +124,7 @@ func countSRTRegions(srtPath string) (SRTRegionCounts, error) {
 				continue
 			}
 			if m := srtAnchorAnPattern.FindStringSubmatch(line); m != nil {
-				switch m[1] {
-				case "1", "2", "3":
-					cueAnchor = regionBottom
-				case "7", "8", "9":
-					cueAnchor = regionTop
-				default:
-					cueAnchor = 5 // middle marker — not in v1.2.2 plan
-				}
+				cueAnchor = anchorFromTag(m[1])
 			}
 			cueLines++
 			continue
@@ -144,67 +142,128 @@ func countSRTRegions(srtPath string) (SRTRegionCounts, error) {
 	return rc, sc.Err()
 }
 
+// anchorFromTag maps an `\anN` value to the region marker.
+func anchorFromTag(n string) int {
+	switch n {
+	case "1", "2", "3":
+		return regionBottom
+	case "4", "5", "6":
+		return regionMiddle
+	case "7", "8", "9":
+		return regionTop
+	}
+	return regionBottom
+}
+
 // planMultiRegion decides whether a multi-region plan is worth running
-// for the given SRT + canvas height. Returns the regions to render or
-// an empty slice when the single-region path should be used (which the
-// caller then handles via ResolveAgentBand as in Phase 1+2).
+// for the given subtitle file + canvas height. Returns the regions to
+// render or an empty slice when the single-region path should be used
+// (caller falls through to ResolveAgentBand as in Phase 1+2).
 //
-// Multi-region triggers only when:
-//   - bottom + top rows both have cues
-//   - no positional / middle cues (those bail to single-region fallback)
-//   - both regions' tight bands beat the static fallback meaningfully
-func planMultiRegion(srtPath string, frameH, fallbackBandH int) []RegionPrerenderSpec {
-	if srtPath == "" || frameH <= 0 || fallbackBandH <= 0 {
+// Multi-region triggers when at least two of {bottom, middle, top} have
+// cues, no `\pos` / `\move` overrides force a bail, and each populated
+// region's tight band beats the static fallback. Dispatches by file
+// extension so the same shape covers SRT and ASS sidecars.
+func planMultiRegion(subPath string, frameH, fallbackBandH int) []RegionPrerenderSpec {
+	if subPath == "" || frameH <= 0 || fallbackBandH <= 0 {
 		return nil
 	}
-	rc, err := countSRTRegions(srtPath)
-	if err != nil {
+	rc, err := countSubRegions(subPath)
+	if err != nil || rc.Positional > 0 {
 		return nil
 	}
-	if rc.Bottom == 0 || rc.Top == 0 {
+	// Region order matters for filter-graph chaining (bottom first to
+	// match the rewriter's existing FIFO slot at [12], then middle,
+	// then top). Order also drives the per-region sentinel naming —
+	// see regionSentinel.
+	type cand struct {
+		anchor   int
+		count    int
+		maxLines int
+		bandY    func(frameH, bandH int) int
+		fileTag  string // "bottom"/"middle"/"top"
+		fifoTag  string
+	}
+	cands := []cand{
+		{
+			anchor: regionBottom, count: rc.Bottom, maxLines: rc.MaxLinesBottom,
+			bandY:   func(h, b int) int { return h - b },
+			fileTag: "bottom", fifoTag: "bottom",
+		},
+		{
+			anchor: regionMiddle, count: rc.Middle, maxLines: rc.MaxLinesMiddle,
+			bandY: func(h, b int) int {
+				y := (h - b) / 2
+				if y%2 == 1 {
+					y--
+				}
+				return y
+			},
+			fileTag: "middle", fifoTag: "middle",
+		},
+		{
+			anchor: regionTop, count: rc.Top, maxLines: rc.MaxLinesTop,
+			bandY:   func(h, b int) int { return 0 },
+			fileTag: "top", fifoTag: "top",
+		},
+	}
+
+	var regions []RegionPrerenderSpec
+	sessionDir := filepath.Dir(subPath)
+	ext := lowerExt(subPath)
+	for _, c := range cands {
+		if c.count == 0 {
+			continue
+		}
+		band := srtTightBandHeight(frameH, c.maxLines)
+		if band <= 0 || band >= fallbackBandH {
+			return nil // any region not tighter than fallback → bail
+		}
+		filtered := filepath.Join(sessionDir,
+			fmt.Sprintf("scaleplex-sub-region-%s%s", c.fileTag, ext))
+		if err := filterSubByAnchor(subPath, filtered, c.anchor); err != nil {
+			return nil
+		}
+		regions = append(regions, RegionPrerenderSpec{
+			Anchor:       c.anchor,
+			FIFOPath:     filepath.Join(sessionDir, "scaleplex-sub-overlay-"+c.fifoTag+".fifo"),
+			FilteredFile: filtered,
+			BandHeight:   band,
+			BandY:        c.bandY(frameH, band),
+			MaxLines:     c.maxLines,
+		})
+	}
+	if len(regions) < 2 {
 		return nil // single-region; let Phase 1+2 handle it
 	}
-	if rc.Middle > 0 || rc.Positional > 0 {
-		return nil // bail to single-region fallback (handled upstream)
-	}
+	return regions
+}
 
-	bottomBand := srtTightBandHeight(frameH, rc.MaxLinesBottom)
-	topBand := srtTightBandHeight(frameH, rc.MaxLinesTop)
-	if bottomBand <= 0 || topBand <= 0 {
-		return nil
+// countSubRegions dispatches to the right region counter by extension
+// (.srt → SRT cue walker, .ass / .ssa → ASS event walker). Unknown
+// extensions return an empty result so the caller falls back to single-
+// region.
+func countSubRegions(subPath string) (SRTRegionCounts, error) {
+	switch lowerExt(subPath) {
+	case ".srt":
+		return countSRTRegions(subPath)
+	case ".ass", ".ssa":
+		return countASSRegions(subPath)
 	}
-	if bottomBand >= fallbackBandH || topBand >= fallbackBandH {
-		return nil // no win
-	}
+	return SRTRegionCounts{}, nil
+}
 
-	sessionDir := filepath.Dir(srtPath)
-	bottomFile := filepath.Join(sessionDir, "scaleplex-sub-region-bottom.srt")
-	topFile := filepath.Join(sessionDir, "scaleplex-sub-region-top.srt")
-	if err := filterSRTByAnchor(srtPath, bottomFile, regionBottom); err != nil {
-		return nil
+// filterSubByAnchor dispatches to the right per-anchor filter by
+// extension. Caller is responsible for writing the filtered file into
+// a location the pre-render's `subtitles=` filter can read.
+func filterSubByAnchor(srcPath, dstPath string, anchor int) error {
+	switch lowerExt(srcPath) {
+	case ".srt":
+		return filterSRTByAnchor(srcPath, dstPath, anchor)
+	case ".ass", ".ssa":
+		return filterASSByAnchor(srcPath, dstPath, anchor)
 	}
-	if err := filterSRTByAnchor(srtPath, topFile, regionTop); err != nil {
-		return nil
-	}
-
-	return []RegionPrerenderSpec{
-		{
-			Anchor:       regionBottom,
-			FIFOPath:     filepath.Join(sessionDir, "scaleplex-sub-overlay-bottom.fifo"),
-			FilteredFile: bottomFile,
-			BandHeight:   bottomBand,
-			BandY:        frameH - bottomBand,
-			MaxLines:     rc.MaxLinesBottom,
-		},
-		{
-			Anchor:       regionTop,
-			FIFOPath:     filepath.Join(sessionDir, "scaleplex-sub-overlay-top.fifo"),
-			FilteredFile: topFile,
-			BandHeight:   topBand,
-			BandY:        0,
-			MaxLines:     rc.MaxLinesTop,
-		},
-	}
+	return fmt.Errorf("filterSubByAnchor: unsupported extension %q", lowerExt(srcPath))
 }
 
 // filterSRTByAnchor copies cues belonging to the requested anchor row
@@ -295,16 +354,11 @@ func filterSRTByAnchor(srcPath, dstPath string, anchor int) error {
 }
 
 // classifyCueAnchor inspects a cue's text lines and returns the anchor
-// row marker (regionBottom or regionTop). Default = regionBottom.
+// row marker. Default = regionBottom (no override).
 func classifyCueAnchor(body []string) int {
 	for _, ln := range body {
 		if m := srtAnchorAnPattern.FindStringSubmatch(ln); m != nil {
-			switch m[1] {
-			case "7", "8", "9":
-				return regionTop
-			case "1", "2", "3":
-				return regionBottom
-			}
+			return anchorFromTag(m[1])
 		}
 	}
 	return regionBottom
