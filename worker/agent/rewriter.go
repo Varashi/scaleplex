@@ -117,6 +117,15 @@ type SubPrerenderSpec struct {
 	// carrying Plex's burn-in styling. Empty until the style-mapping
 	// phase populates it.
 	ForceStyle string
+	// ResolveBandPostExtract — when true (SRT, sidecar + embedded), the
+	// rewriter seeded BandHeight with the static-fallback band and left
+	// `__SP_BANDY__`/`__SP_BANDH__` sentinels in the main argv. The agent
+	// calls ResolveAgentBand once the SRT file is on disk (sidecar path or
+	// post-extraction) to pick the real band, overwrites BandHeight in
+	// place, builds the pre-render from the final spec, then patches the
+	// sentinels via PatchMainArgsBand. False for ASS (fixed full-frame
+	// band at rewrite time) and the bitmap path. See worker/agent/band.go.
+	ResolveBandPostExtract bool
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -2286,32 +2295,40 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// keeps correct positioning) then crops to BandHeight,
 					// and overlay_vaapi composites that band at y=bandY.
 					// Cuts the canvas-size-proportional CPU ~2.5x. ASS can
-					// be positioned anywhere → full frame. Embedded subs are
-					// extracted to SRT by the agent (always bottom) →
-					// band-safe; only a sidecar ASS/SSA stays full-frame.
+					// be positioned anywhere → full frame.
 					//
-					// v1.2.1 bbox-crop: for SIDECAR SRT the path is known
-					// now, so we parse the cues and derive a tighter band
-					// than the static 40%. Positional cues (\an4-9, \pos,
-					// \move) or marginal savings (<10%) fall back to the
-					// static band. Embedded SRT extraction happens later in
-					// the agent — we keep the static band there.
-					// See worker/agent/subparse.go.
+					// Band resolution is DEFERRED to the agent for both
+					// sidecar AND embedded SRT: the cue parse needs the file
+					// on disk, but embedded SRT is only extracted by the
+					// agent after rewrite. The rewriter seeds the static
+					// fallback band + emits `y=__SP_BANDY__` (and, under a
+					// render-res cap, `h=__SP_BANDH__`) sentinels; the agent
+					// runs resolveSRTBand post-extraction, overwrites the
+					// band, and patches the sentinels. This unifies the two
+					// paths and gets embedded SRT into the tight band too.
+					// See worker/agent/band.go + subparse.go.
 					wInt, _ := strconv.Atoi(w)
 					hInt, _ := strconv.Atoi(h)
 					bandH := hInt
-					tightBand := false
+					resolveAgent := false
 					isSRT := hInt > 0 && (subSrc.FilePath == "" || subSrc.Codec == "subrip")
 					if isSRT {
+						// Band height is data-driven from the SRT cues, but
+						// embedded SRT isn't on disk until the agent extracts
+						// it. Defer the resolve to the agent (post-extraction)
+						// for BOTH sidecar and embedded so the two paths are
+						// identical and embedded gets the tight band too. Seed
+						// the static-fallback band and emit sentinels the agent
+						// patches once it knows the real band.
+						// See worker/agent/band.go.
 						bandH = subPrerenderBandHeight(hInt)
-						if subSrc.FilePath != "" && subSrc.Codec == "subrip" {
-							if tight, ok := resolveSRTBand(subSrc.FilePath, hInt, bandH); ok {
-								bandH = tight
-								tightBand = true
-							}
-						}
+						resolveAgent = true
 					}
 					bandY := hInt - bandH
+					bandYStr := strconv.Itoa(bandY)
+					if resolveAgent {
+						bandYStr = BandYSentinel
+					}
 					// Optional lower-resolution sub render
 					// (SCALEPLEX_SUB_RENDER_HEIGHT): the pre-render
 					// rasterises the band at renderW×renderH (cheaper libass
@@ -2323,7 +2340,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					renderW, renderH, subDown := subRenderDims(wInt, hInt)
 					subUpscale := ""
 					if subDown {
-						subUpscale = fmt.Sprintf(",scale_vaapi=w=%d:h=%d", wInt, bandH)
+						bandHStr := strconv.Itoa(bandH)
+						if resolveAgent {
+							// bandH is decided by the agent post-extraction;
+							// the scale_vaapi upscale target height is patched
+							// alongside the overlay y-offset.
+							bandHStr = BandHSentinel
+						}
+						subUpscale = fmt.Sprintf(",scale_vaapi=w=%d:h=%s", wInt, bandHStr)
 					}
 					// On a seek session the main video reaches the
 					// filtergraph at the seek offset (PTS N), but the
@@ -2349,9 +2373,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							"[0:0]hwupload[10];"+
 								"[10]%s,setpts=PTS-STARTPTS[11];"+
 								"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload%s[12];"+
-								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[13];"+
+								"[11][12]overlay_vaapi=x=0:y=%s:eof_action=pass:repeatlast=1[13];"+
 								"[13]setpts=PTS+%s/TB[4]",
-							scaleStep, fifoInput, subUpscale, bandY,
+							scaleStep, fifoInput, subUpscale, bandYStr,
 							strconv.FormatFloat(seekOff, 'f', 3, 64),
 						)
 					} else {
@@ -2359,8 +2383,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 							"[0:0]hwupload[10];"+
 								"[10]%s[11];"+
 								"[%d:v]format=bgra,hwupload%s[12];"+
-								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[4]",
-							scaleStep, fifoInput, subUpscale, bandY,
+								"[11][12]overlay_vaapi=x=0:y=%s:eof_action=pass:repeatlast=1[4]",
+							scaleStep, fifoInput, subUpscale, bandYStr,
 						)
 					}
 					// Drop `-map_inlineass <spec>` — no inlineass filter
@@ -2427,14 +2451,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					subPrerender = &SubPrerenderSpec{
-						FIFOPath:   fifoPath,
-						SourcePath: srcPath,
-						StreamSpec: subSrc.StreamSpec,
-						Embedded:   subSrc.FilePath == "",
-						Width:      wInt,
-						Height:     hInt,
-						BandHeight: bandH,
-						ForceStyle: plexInlineassToForceStyle(m[assGroup]),
+						FIFOPath:               fifoPath,
+						SourcePath:             srcPath,
+						StreamSpec:             subSrc.StreamSpec,
+						Embedded:               subSrc.FilePath == "",
+						Width:                  wInt,
+						Height:                 hInt,
+						BandHeight:             bandH,
+						ForceStyle:             plexInlineassToForceStyle(m[assGroup]),
+						ResolveBandPostExtract: resolveAgent,
 					}
 					if subDown {
 						subPrerender.RenderWidth = renderW
@@ -2445,12 +2470,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						changes = append(changes,
 							fmt.Sprintf("sub-prerender:render=%dx%d", renderW, renderH))
 					}
-					if bandH < hInt {
+					// Band is resolved by the agent post-extraction (SRT) or
+					// fixed at rewrite time (ASS full frame). The actual band
+					// height is logged by the agent at resolve time.
+					if resolveAgent {
+						changes = append(changes, "sub-prerender:band:agent-resolve")
+					} else if bandH < hInt {
 						changes = append(changes,
 							fmt.Sprintf("sub-prerender:band=%dx%d@y%d", wInt, bandH, bandY))
-					}
-					if tightBand {
-						changes = append(changes, "sub-prerender:band:tight")
 					}
 				}
 				newInputIdx = indexOfArg(args, "-i", 0)

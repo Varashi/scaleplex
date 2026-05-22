@@ -349,6 +349,13 @@ func spawnSubPrerender(ctx context.Context, spec *SubPrerenderSpec) (*exec.Cmd, 
 		os.Remove(spec.FIFOPath)
 		return nil, err
 	}
+	// Data-driven band: with the SRT now on disk (extracted or sidecar),
+	// pick the tight band if the parser approves and overwrite the
+	// rewriter's static-fallback BandHeight in place, BEFORE building the
+	// pre-render argv (so the canvas crop / render-res band match). The
+	// caller patches the main argv's overlay y= + scale_vaapi h= via
+	// PatchMainArgsBand afterwards. No-op for ASS / bitmap / unflagged.
+	ResolveAgentBand(spec, subFile)
 	cmd := exec.CommandContext(ctx, ffmpegBin, buildSubPrerenderArgs(spec, subFile)...)
 	cmd.Env = subPrerenderEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM, Setpgid: true}
