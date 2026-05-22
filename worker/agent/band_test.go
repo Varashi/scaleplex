@@ -117,7 +117,12 @@ func TestRewriter_AgentResolve_EndToEnd(t *testing.T) {
 	}
 	// Agent steps (mirror main.go): resolve the band, then patch the argv.
 	bandY := ResolveAgentBand(out.SubPrerender, srt)
-	PatchMainArgsBand(out.Args, bandY, out.SubPrerender.BandHeight)
+	// Both sentinels (overlay y + scale_vaapi h) must be present and patched
+	// under the 1080 render cap — a regression that drops either would patch
+	// fewer than 2 and is caught here, ahead of the no-leak check below.
+	if patched := PatchMainArgsBand(out.Args, bandY, out.SubPrerender.BandHeight); patched != 2 {
+		t.Fatalf("PatchMainArgsBand patched %d sentinels, want 2 (y + h)", patched)
+	}
 
 	tight := srtTightBandHeight(2160, 1)
 	if out.SubPrerender.BandHeight != tight {
