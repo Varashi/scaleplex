@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Sub pre-render render-resolution knob (`SCALEPLEX_SUB_RENDER_HEIGHT`)
+
+The text sub-burn pre-render previously rasterised libass at the full output
+resolution (the band crop only shrank the downstream qtrle encode + main
+hwupload, not libass itself). A controlled breakdown (media-toolkit, libass
+0.17.3, 707-cue Dutch SRT) showed libass ≈ 52 % and format+qtrle ≈ 48 % of
+the pre-render, **both scaling ~linearly with rendered pixel area** — the 4K
+full-frame libass render is the dominant remaining sub-burn cost.
+
+New worker env knob `SCALEPLEX_SUB_RENDER_HEIGHT` caps the libass render
+height. The pre-render rasterises the band at `renderW × renderH` and the
+main graph HW-upscales it (`scale_vaapi`) back to the output band before
+`overlay_vaapi`. Default `1080`: at 4K it renders 1920×1080 and upscales 2×,
+cutting pre-render CPU ~4.25× (measured 4K vs 1080 canvas A/B) plus a smaller
+FIFO frame ⇒ less main-side hwupload. Outputs ≤ the cap are untouched.
+
+- Tiers `720`/`1080`/`1440`; `0` opts out to a native full-res render.
+- Validated live on plex-test (From Dusk Till Dawn, 4K HEVC HDR + Dutch SRT):
+  pre-render renders 1920×1080, main graph `scale_vaapi=w=3840:h=540`, no
+  stall; A/B vs native render shows only marginal glyph softening at 1080.
+- `scale_vaapi` on a BGRA overlay surface verified on Arc/iHD (the earlier
+  PGS no-op was specific to sub2video bitmap surfaces).
+- Emits a `sub-prerender:render=WxH` rewriter change tag when active.
+
 ## v1.2.1 — 2026-05-20
 
 ### SRT sub-burn pre-render — tight bottom band for plain sidecar SRT

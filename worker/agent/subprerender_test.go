@@ -117,6 +117,43 @@ func TestBuildSubPrerenderArgs_Band(t *testing.T) {
 	}
 }
 
+func TestBuildSubPrerenderArgs_LowRes(t *testing.T) {
+	// SCALEPLEX_SUB_RENDER_HEIGHT cap → rewriter set RenderWidth/Height.
+	// The canvas + band crop must be in the lower render coords; the main
+	// graph (tested in the rewriter) HW-upscales the band back.
+	spec := &SubPrerenderSpec{
+		FIFOPath:     "/t/f.fifo",
+		Width:        3840,
+		Height:       1600,
+		BandHeight:   640,
+		RenderWidth:  1920,
+		RenderHeight: 800,
+	}
+	args := buildSubPrerenderArgs(spec, "/t/s.srt")
+	if !strings.Contains(argvVal(args, "-i"), "s=1920x800") {
+		t.Errorf("canvas must use the lower render dims: %q", argvVal(args, "-i"))
+	}
+	vf := argvVal(args, "-vf")
+	// band scaled by 800/1600 = 0.5 → 320; cropY = 800-320 = 480.
+	if !strings.Contains(vf, "crop=1920:320:0:480") {
+		t.Errorf("expected band crop in render coords: %q", vf)
+	}
+}
+
+func TestBuildSubPrerenderArgs_NativeWhenRenderDimsZero(t *testing.T) {
+	// RenderWidth/Height unset → render at full output res (current behaviour).
+	spec := &SubPrerenderSpec{
+		FIFOPath: "/t/f.fifo", Width: 3840, Height: 1600, BandHeight: 640,
+	}
+	args := buildSubPrerenderArgs(spec, "/t/s.srt")
+	if !strings.Contains(argvVal(args, "-i"), "s=3840x1600") {
+		t.Errorf("native render must use full output dims: %q", argvVal(args, "-i"))
+	}
+	if !strings.Contains(argvVal(args, "-vf"), "crop=3840:640:0:960") {
+		t.Errorf("native band crop in output coords: %q", argvVal(args, "-vf"))
+	}
+}
+
 func TestBuildSubPrerenderArgs_FullFrameWhenBandEqualsHeight(t *testing.T) {
 	// ASS → BandHeight == Height → no crop, full frame emitted.
 	spec := &SubPrerenderSpec{
