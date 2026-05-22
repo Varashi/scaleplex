@@ -90,8 +90,18 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	if spec.Bitmap {
 		return buildBitmapPrerenderArgs(spec)
 	}
+	// Render resolution. When SCALEPLEX_SUB_RENDER_HEIGHT capped the
+	// render below the output (rewriter set RenderWidth/RenderHeight), the
+	// canvas + band crop happen in those lower coords — libass and qtrle
+	// cost scale ~linearly with pixel area. The main graph HW-upscales the
+	// band back to the output size. RenderWidth/RenderHeight == 0 means
+	// render natively at the full output res (current behaviour).
+	rw, rh := spec.Width, spec.Height
+	if spec.RenderWidth > 0 && spec.RenderHeight > 0 {
+		rw, rh = spec.RenderWidth, spec.RenderHeight
+	}
 	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=rgba",
-		spec.Width, spec.Height, subPrerenderFPS)
+		rw, rh, subPrerenderFPS)
 
 	vf := ""
 	if spec.SeekOffsetSeconds > 0 {
@@ -127,8 +137,23 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	// rewriter places the band at y=Height-BandHeight via overlay_vaapi.
 	// BandHeight == Height (ASS, can be positioned anywhere) → no crop.
 	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
-		vf += fmt.Sprintf(",crop=%d:%d:0:%d",
-			spec.Width, spec.BandHeight, spec.Height-spec.BandHeight)
+		// Band crop in render coords: scale BandHeight down by the same
+		// factor as the canvas so the cropped slice still maps to the
+		// output band after the main graph's scale_vaapi upscale.
+		rBandH := spec.BandHeight
+		if rh != spec.Height {
+			rBandH = spec.BandHeight * rh / spec.Height
+			if rBandH%2 == 1 {
+				rBandH++
+			}
+			if rBandH < 2 {
+				rBandH = 2
+			}
+			if rBandH > rh {
+				rBandH = rh
+			}
+		}
+		vf += fmt.Sprintf(",crop=%d:%d:0:%d", rw, rBandH, rh-rBandH)
 	}
 	// qtrle encodes argb; the subtitles filter leaves the canvas rgba.
 	vf += ",format=argb"

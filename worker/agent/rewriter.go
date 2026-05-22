@@ -91,6 +91,14 @@ type SubPrerenderSpec struct {
 	// post-scale target resolution.
 	Width  int
 	Height int
+	// RenderWidth, RenderHeight — the (lower) resolution the pre-render
+	// actually rasterises libass at, when SCALEPLEX_SUB_RENDER_HEIGHT
+	// caps it below Height. The band is rendered + cropped in these
+	// coords, then the main graph HW-upscales (scale_vaapi) it back to
+	// Width × BandHeight before overlay_vaapi. 0 = render at full
+	// Width/Height (native, current behaviour). See subRenderDims.
+	RenderWidth  int
+	RenderHeight int
 	// BandHeight — the height of the bottom band the pre-render
 	// actually emits. SRT is always bottom-positioned, so only the
 	// bottom slice of the frame can carry text; emitting just that band
@@ -233,6 +241,62 @@ func parsePresetMapEnv() map[string]string {
 		out[name] = val
 	}
 	return out
+}
+
+// subRenderHeightDefault — the shipped default render-height cap. At 4K
+// it renders the sub band at 1920x1080 and HW-upscales 2× to the output
+// band: ~4.25× less pre-render CPU than full-4K libass, glyph edges only
+// marginally softer (validated live + A/B against native render). 1080p
+// and smaller outputs are unaffected (cap >= output height = native).
+const subRenderHeightDefault = 1080
+
+// subRenderHeightCap reads SCALEPLEX_SUB_RENDER_HEIGHT — the maximum
+// height (px) at which the subtitle pre-render rasterises libass. The
+// pre-render then renders the band at that lower resolution and the main
+// graph HW-upscales (scale_vaapi) it back to the output band before
+// overlay_vaapi. libass + qtrle cost scale ~linearly with rendered
+// pixel area, so capping the render height cuts the pre-render CPU
+// proportionally (and the FIFO + main-side hwupload bytes) at the price
+// of softer glyph edges after the upscale. Documented tiers: 720, 1080,
+// 1440. Unset = the 1080 default; "0" (or any non-positive value) opts
+// out to a native full-resolution render. A cap >= the output height is
+// a no-op (native) anyway. See project_scaleplex_libass_4k_render_cost.
+func subRenderHeightCap() int {
+	v := os.Getenv("SCALEPLEX_SUB_RENDER_HEIGHT")
+	if v == "" {
+		return subRenderHeightDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// subRenderDims returns the canvas (renderW, renderH) the subtitle
+// pre-render should rasterise at for an output frame of outW×outH, given
+// the SCALEPLEX_SUB_RENDER_HEIGHT cap. When the cap is unset or >= outH
+// it returns the output dims unchanged (down==false). Otherwise it
+// scales both dims by cap/outH, keeping aspect, rounding to even (encoders
+// and scale_vaapi require even dimensions). The main graph must add a
+// scale_vaapi back to the output band when down==true.
+func subRenderDims(outW, outH int) (renderW, renderH int, down bool) {
+	cap := subRenderHeightCap()
+	if cap <= 0 || outH <= 0 || cap >= outH {
+		return outW, outH, false
+	}
+	renderH = cap
+	if renderH%2 == 1 {
+		renderH++
+	}
+	renderW = outW * renderH / outH
+	if renderW%2 == 1 {
+		renderW++
+	}
+	if renderW <= 0 || renderH >= outH {
+		return outW, outH, false
+	}
+	return renderW, renderH, true
 }
 
 // encoderMap routes PMS's chosen software encoder to its VAAPI
@@ -2248,6 +2312,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					bandY := hInt - bandH
+					// Optional lower-resolution sub render
+					// (SCALEPLEX_SUB_RENDER_HEIGHT): the pre-render
+					// rasterises the band at renderW×renderH (cheaper libass
+					// + qtrle, ~linear in pixel area), and the main graph
+					// HW-upscales that band back to the output band
+					// (Width×bandH) with scale_vaapi before overlay_vaapi.
+					// Native (no cap) leaves the graph untouched.
+					// See subRenderDims / project_scaleplex_libass_4k_render_cost.
+					renderW, renderH, subDown := subRenderDims(wInt, hInt)
+					subUpscale := ""
+					if subDown {
+						subUpscale = fmt.Sprintf(",scale_vaapi=w=%d:h=%d", wInt, bandH)
+					}
 					// On a seek session the main video reaches the
 					// filtergraph at the seek offset (PTS N), but the
 					// overlay reaches overlay_vaapi's framesync at ~0 —
@@ -2271,19 +2348,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						args[vfIdx] = fmt.Sprintf(
 							"[0:0]hwupload[10];"+
 								"[10]%s,setpts=PTS-STARTPTS[11];"+
-								"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload[12];"+
+								"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload%s[12];"+
 								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[13];"+
 								"[13]setpts=PTS+%s/TB[4]",
-							scaleStep, fifoInput, bandY,
+							scaleStep, fifoInput, subUpscale, bandY,
 							strconv.FormatFloat(seekOff, 'f', 3, 64),
 						)
 					} else {
 						args[vfIdx] = fmt.Sprintf(
 							"[0:0]hwupload[10];"+
 								"[10]%s[11];"+
-								"[%d:v]format=bgra,hwupload[12];"+
+								"[%d:v]format=bgra,hwupload%s[12];"+
 								"[11][12]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1[4]",
-							scaleStep, fifoInput, bandY,
+							scaleStep, fifoInput, subUpscale, bandY,
 						)
 					}
 					// Drop `-map_inlineass <spec>` — no inlineass filter
@@ -2359,7 +2436,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						BandHeight: bandH,
 						ForceStyle: plexInlineassToForceStyle(m[assGroup]),
 					}
+					if subDown {
+						subPrerender.RenderWidth = renderW
+						subPrerender.RenderHeight = renderH
+					}
 					changes = append(changes, "hw-decode:filter:sub-prerender-overlay")
+					if subDown {
+						changes = append(changes,
+							fmt.Sprintf("sub-prerender:render=%dx%d", renderW, renderH))
+					}
 					if bandH < hInt {
 						changes = append(changes,
 							fmt.Sprintf("sub-prerender:band=%dx%d@y%d", wInt, bandH, bandY))
