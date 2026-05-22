@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Agent-side SRT band resolve — embedded SRT now gets the tight band
+
+v1.2.1 parsed sidecar SRT cues at rewrite time to size a tight pre-render
+band, but embedded SRT had no file on disk yet (the agent extracts it
+after rewrite) so it fell back to the static 40% band. This unifies both
+paths by **deferring band resolution to the agent**, post-extraction.
+
+- The rewriter seeds the static-fallback band, flags
+  `ResolveBandPostExtract`, and leaves sentinels in the main argv where
+  the band-dependent values belong: `overlay_vaapi y=__SP_BANDY__` and
+  (under a render-res cap) `scale_vaapi h=__SP_BANDH__`.
+- The agent runs `ResolveAgentBand` once the SRT is on disk (sidecar path
+  or extracted `.srt`), overwrites the band, builds the pre-render from
+  the final band, then `PatchMainArgsBand` substitutes both sentinels.
+- Rewriter change tag `sub-prerender:band:tight` → `sub-prerender:band:agent-resolve`
+  (the resolved band height is logged by the agent at resolve time).
+- Embedded SRT now gets the tight-band CPU savings; sidecar behaviour is
+  unchanged (same parse, same band, one extra hop). ASS / bitmap untouched.
+- New `worker/agent/band.go`; composes with the render-res knob (the
+  `h=` upscale target is patched alongside the `y=` offset). Salvaged from
+  the abandoned v1.2.2 stack (was PR #28), rebuilt on current main.
+
 ### Sub pre-render render-resolution knob (`SCALEPLEX_SUB_RENDER_HEIGHT`)
 
 The text sub-burn pre-render previously rasterised libass at the full output
