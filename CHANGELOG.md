@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v1.2.2 — 2026-05-22
+
+Two sub-burn efficiency features. Measured impact (flat-out, 4K HEVC HDR, one
+worker = 4 vCPU + Arc A310): sub-burn capacity ~5 concurrent streams, within
+1 of the no-sub ceiling of 6 — the bottleneck is the GPU video (codec) engine
+(HEVC decode+encode), not the subtitle pipeline. SRT (sidecar+embedded) and
+PGS all reach 5; static ASS still renders full-frame (tracked in KNOWN_ISSUES).
 
 ### Agent-side SRT band resolve — embedded SRT now gets the tight band
 
