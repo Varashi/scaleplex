@@ -1753,8 +1753,8 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 // the 4K upscale runs flat-out → ~2 cores, transcode collapses. The
 // rewriter must reroute the bitmap through the sub pre-render: swap
 // the SW-upscale branch for a read of the pre-render's CFR qtrle
-// FIFO, splice the FIFO -i, and return a bitmap SubPrerenderSpec.
-func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
+// the merged inlineass filter via a -map_inlineass feed + dvdsub decode-sink.
+func TestRewriter_HWDecode_PGS_Inlineass(t *testing.T) {
 	env := map[string]string{
 		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
 		"X_PLEX_TOKEN":           "tok123",
@@ -1782,9 +1782,6 @@ func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
 	if !containsString(out.Changes, "hw-decode:filter:bitmap-inlineass-vaapi") {
 		t.Fatalf("missing bitmap-inlineass-vaapi change; got %v", out.Changes)
 	}
-	if out.SubPrerender != nil {
-		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
-	}
 	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
 	if strings.Contains(gotVF, "overlay_vaapi") || strings.Contains(gotVF, "scale=3840:2160,hwupload[0]") {
 		t.Errorf("Plex overlay_vaapi sub2video graph must be replaced: %q", gotVF)
@@ -1806,7 +1803,7 @@ func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
 // seek offset before overlay_vaapi: `-start_at_zero` only zeroes the
 // muxer output, the filter still sees the main video at PTS seekOff+,
 // so a 0-based FIFO would drift cues forward by exactly seekOff.
-func TestRewriter_HWDecode_PGSOverlay_SeekShiftsFIFOUp(t *testing.T) {
+func TestRewriter_HWDecode_PGS_Seek(t *testing.T) {
 	env := map[string]string{
 		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
 		"X_PLEX_TOKEN":           "tok123",
@@ -1833,10 +1830,7 @@ func TestRewriter_HWDecode_PGSOverlay_SeekShiftsFIFOUp(t *testing.T) {
 		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
 	}
 	// Seek is native in the merged filter (real PTS): no FIFO, no setpts
-	// shift, no SubPrerender.
-	if out.SubPrerender != nil {
-		t.Fatalf("merged HW branch must not populate SubPrerender on seek: %+v", out.SubPrerender)
-	}
+	// shift — native seek in the merged filter.
 	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
 	if strings.Contains(gotVF, "setpts=") {
 		t.Errorf("merged HW branch needs no setpts seek dance: %q", gotVF)
@@ -2208,8 +2202,8 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 // HW-decode + SRT sidecar burn-in routes to the GPU-overlay
 // pre-render path: the inlineass bracket is replaced by an
 // overlay_vaapi graph, an overlay FIFO is appended as a third input,
-// -map_inlineass is dropped, and SubPrerender is populated.
-func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
+// the merged inlineass filter composites it on the VAAPI surface.
+func TestRewriter_HWText_SRT_Sidecar(t *testing.T) {
 	args := []string{
 		"-loglevel", "quiet",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -2233,9 +2227,6 @@ func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 	})
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
-	}
-	if out.SubPrerender != nil {
-		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
 	}
 	vfIdx := findFilterComplex(out.Args, "[0:0]")
 	if vfIdx < 0 {
@@ -2276,12 +2267,12 @@ func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 
 // Embedded ASS can't be scanned for animation tags (no sidecar file
 // on disk), so it conservatively keeps the per-frame inlineass path
-// and does not populate SubPrerender.
+// rendered per-frame by the merged inlineass filter (no pre-render).
 // On a seek session the overlay graph rebases both branches to 0
 // before overlay_vaapi and rebases the composite back to the seek
 // offset, so framesync gets a 0-based pair and the main-video
 // timeline reaching dashenc is unchanged.
-func TestRewriter_SubPrerender_HW_Seek(t *testing.T) {
+func TestRewriter_HWText_Seek(t *testing.T) {
 	args := []string{
 		"-loglevel", "quiet",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -2308,9 +2299,6 @@ func TestRewriter_SubPrerender_HW_Seek(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
 	}
-	if out.SubPrerender != nil {
-		t.Fatalf("merged HW branch must not populate SubPrerender on seek: %+v", out.SubPrerender)
-	}
 	vfIdx := findFilterComplex(out.Args, "[0:0]")
 	if vfIdx < 0 {
 		t.Fatal("missing -filter_complex")
@@ -2328,7 +2316,7 @@ func TestRewriter_SubPrerender_HW_Seek(t *testing.T) {
 	}
 }
 
-func TestRewriter_SubPrerender_HW_OpenCLTonemap(t *testing.T) {
+func TestRewriter_HWText_OpenCLTonemap(t *testing.T) {
 	// PMS emits this when HW tone mapping is ON: the video branch
 	// scale_vaapi(p010) → hwmap(opencl) → tonemap_opencl(<algo>) →
 	// hwdownload before inlineass. The sub pre-render rewrite must keep
@@ -2361,9 +2349,6 @@ func TestRewriter_SubPrerender_HW_OpenCLTonemap(t *testing.T) {
 	})
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
-	}
-	if out.SubPrerender != nil {
-		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
 	}
 	vfIdx := findFilterComplex(out.Args, "[0:0]")
 	if vfIdx < 0 {
@@ -2420,9 +2405,6 @@ func TestRewriter_InlineassPassthrough_HW_EmbeddedASS(t *testing.T) {
 	}
 	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
 		t.Errorf("inlineass should be kept for embedded ASS: %s", out.Args[vfIdx])
-	}
-	if out.SubPrerender != nil {
-		t.Errorf("SubPrerender should be nil on the inlineass path")
 	}
 	// Embedded ASS is conservatively treated as animated -> tier-down toggle.
 	if !strings.Contains(out.Args[vfIdx], "animated_tier_down=1") {

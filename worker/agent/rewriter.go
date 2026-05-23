@@ -48,84 +48,6 @@ type RewriteResult struct {
 	// The agent uses this to start `watchAndPatchMatroskaChunks`
 	// instead of the DASH-style chunk-renumber watcher.
 	IsMatroskaSegment bool
-	// SubPrerender — non-nil when the rewriter chose the pre-rendered
-	// GPU-overlay path for a text-subtitle burn-in (SRT / static ASS)
-	// instead of the per-frame inlineass filter. The agent uses it to
-	// spawn the subtitle pre-render alongside the main ffmpeg.
-	SubPrerender *SubPrerenderSpec
-}
-
-// SubPrerenderSpec, when set on a RewriteResult, tells the agent to
-// spawn a subtitle pre-render process alongside the main ffmpeg. The
-// pre-render rasterizes the text subtitle into a sparse transparent
-// video written to FIFOPath; the rewritten main filter graph reads
-// that FIFO as a second input and composites it with overlay_vaapi.
-// See project_scaleplex_srt_to_pgs_gpu.
-type SubPrerenderSpec struct {
-	// FIFOPath — the named pipe the agent creates and the pre-render
-	// writes Matroska/ffv1 to. The rewritten main argv already carries
-	// `-i FIFOPath`, so the two must agree.
-	FIFOPath string
-	// SourcePath — the file the pre-render's `subtitles` filter reads:
-	// a sidecar .srt path, or the source media container when the
-	// subtitle is an embedded stream.
-	SourcePath string
-	// StreamSpec — the raw `-map_inlineass` stream specifier (e.g.
-	// "0:3" for an embedded subtitle, "1:s:0" for a sidecar). The
-	// agent resolves it to a `subtitles` filter selector. Empty when
-	// SourcePath is a single-stream sidecar file.
-	StreamSpec string
-	// Embedded — true when SourcePath is the source media container
-	// and the subtitle is an embedded stream (the agent extracts it
-	// first); false when SourcePath is a standalone sidecar file the
-	// `subtitles` filter can read directly.
-	Embedded bool
-	// Bitmap — true when the subtitle is a bitmap format (PGS / VobSub
-	// / DVDSub). The pre-render then scales the sub2video stream
-	// directly (libavcodec rasterizes the bitmap; `scale` upscales it
-	// to the canvas) instead of rendering text via libass `subtitles=`.
-	// No extraction step: the pre-render reads the stream straight from
-	// SourcePath via StreamSpec. See buildSubPrerenderArgs.
-	Bitmap bool
-	// Width, Height — overlay canvas size; matches the transcode's
-	// post-scale target resolution.
-	Width  int
-	Height int
-	// RenderWidth, RenderHeight — the (lower) resolution the pre-render
-	// actually rasterises libass at, when SCALEPLEX_SUB_RENDER_HEIGHT
-	// caps it below Height. The band is rendered + cropped in these
-	// coords, then the main graph HW-upscales (scale_vaapi) it back to
-	// Width × BandHeight before overlay_vaapi. 0 = render at full
-	// Width/Height (native, current behaviour). See subRenderDims.
-	RenderWidth  int
-	RenderHeight int
-	// BandHeight — the height of the bottom band the pre-render
-	// actually emits. SRT is always bottom-positioned, so only the
-	// bottom slice of the frame can carry text; emitting just that band
-	// (instead of the full Height) cuts the canvas-size-proportional
-	// CPU (qtrle encode, format converts, the main transcode's overlay
-	// hwupload). The pre-render renders the full frame so libass keeps
-	// correct positioning, then crops to this band. Equal to Height
-	// when the full frame must be emitted (ASS subtitles, which can be
-	// positioned anywhere). The main graph composites the band at
-	// y = Height - BandHeight.
-	BandHeight int
-	// SeekOffsetSeconds — the pre-render timeline must start here so it
-	// aligns with a -ss seek session's main video. 0 on initial play.
-	SeekOffsetSeconds float64
-	// ForceStyle — optional `subtitles` filter force_style= string
-	// carrying Plex's burn-in styling. Empty until the style-mapping
-	// phase populates it.
-	ForceStyle string
-	// ResolveBandPostExtract — when true (SRT, sidecar + embedded), the
-	// rewriter seeded BandHeight with the static-fallback band and left
-	// `__SP_BANDY__`/`__SP_BANDH__` sentinels in the main argv. The agent
-	// calls ResolveAgentBand once the SRT file is on disk (sidecar path or
-	// post-extraction) to pick the real band, overwrites BandHeight in
-	// place, builds the pre-render from the final spec, then patches the
-	// sentinels via PatchMainArgsBand. False for ASS (fixed full-frame
-	// band at rewrite time) and the bitmap path. See worker/agent/band.go.
-	ResolveBandPostExtract bool
 }
 
 // RewriteOpts is for testability; production callers pass nil.
@@ -280,32 +202,6 @@ func subRenderHeightCap() int {
 		return 0
 	}
 	return n
-}
-
-// subRenderDims returns the canvas (renderW, renderH) the subtitle
-// pre-render should rasterise at for an output frame of outW×outH, given
-// the SCALEPLEX_SUB_RENDER_HEIGHT cap. When the cap is unset or >= outH
-// it returns the output dims unchanged (down==false). Otherwise it
-// scales both dims by cap/outH, keeping aspect, rounding to even (encoders
-// and scale_vaapi require even dimensions). The main graph must add a
-// scale_vaapi back to the output band when down==true.
-func subRenderDims(outW, outH int) (renderW, renderH int, down bool) {
-	cap := subRenderHeightCap()
-	if cap <= 0 || outH <= 0 || cap >= outH {
-		return outW, outH, false
-	}
-	renderH = cap
-	if renderH%2 == 1 {
-		renderH++
-	}
-	renderW = outW * renderH / outH
-	if renderW%2 == 1 {
-		renderW++
-	}
-	if renderW <= 0 || renderH >= outH {
-		return outW, outH, false
-	}
-	return renderW, renderH, true
 }
 
 // encoderMap routes PMS's chosen software encoder to its VAAPI
@@ -2010,7 +1906,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// supported (PMS likely doesn't request it when HW probe matches).
 	var rewritten *filterRewrite
 	var subSrc *subtitleSource
-	var subPrerender *SubPrerenderSpec
 	sourceIsHDR := false
 
 	if !isHWDecode {
@@ -2624,9 +2519,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// The subtitle pre-render timeline must start at the same offset as
 	// a seek session's main video, or overlay_vaapi framesync places
 	// the burned text at the wrong time.
-	if subPrerender != nil {
-		subPrerender.SeekOffsetSeconds = seekOffsetSeconds
-	}
 
 	// `-manifest_name <url>` — Plex's ffmpeg fork POSTs the manifest
 	// body to this URL whenever the .mpd is regenerated; PMS gates
@@ -2711,7 +2603,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		ProgressURL:       progressURL,
 		SeekOffsetSeconds: seekOffsetSeconds,
 		IsMatroskaSegment: isMatroskaSegment,
-		SubPrerender:      subPrerender,
 	}
 }
 

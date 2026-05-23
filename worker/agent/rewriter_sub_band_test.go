@@ -43,9 +43,6 @@ func TestRewriter_HWDecode_SRT_Sidecar_Inlineass(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
 	}
-	if out.SubPrerender != nil {
-		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
-	}
 	fc := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
 	if !strings.Contains(fc, "inlineass=") {
 		t.Errorf("filter graph missing inlineass: %q", fc)
@@ -65,34 +62,6 @@ func TestRewriter_HWDecode_SRT_Sidecar_Inlineass(t *testing.T) {
 	}
 	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
 		t.Errorf("missing hw-decode:filter:inlineass-vaapi tag: %v", out.Changes)
-	}
-}
-
-func TestSubRenderDims(t *testing.T) {
-	cases := []struct {
-		name         string
-		env          string
-		outW, outH   int
-		wantW, wantH int
-		wantDown     bool
-	}{
-		{"default-1080-on-4k", "", 3840, 2160, 1920, 1080, true},
-		{"explicit-720-on-4k", "720", 3840, 2160, 1280, 720, true},
-		{"explicit-1440-on-4k", "1440", 3840, 2160, 2560, 1440, true},
-		{"opt-out-native", "0", 3840, 2160, 3840, 2160, false},
-		{"1080p-output-native", "", 1920, 1080, 1920, 1080, false}, // cap >= outH
-		{"720p-output-native", "", 1280, 720, 1280, 720, false},
-		{"1440p-output-capped", "", 2560, 1440, 1920, 1080, true},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", c.env)
-			w, h, down := subRenderDims(c.outW, c.outH)
-			if w != c.wantW || h != c.wantH || down != c.wantDown {
-				t.Errorf("subRenderDims(%d,%d) env=%q = (%d,%d,%v), want (%d,%d,%v)",
-					c.outW, c.outH, c.env, w, h, down, c.wantW, c.wantH, c.wantDown)
-			}
-		})
 	}
 }
 
@@ -126,7 +95,7 @@ func TestRewriter_HWDecode_SRT_RenderHeightCap(t *testing.T) {
 		FSExists:           func(string) bool { return true },
 		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
 	})
-	if !out.Applied || out.SubPrerender != nil {
+	if !out.Applied {
 		t.Fatalf("expected merged inlineass branch (no pre-render); changes=%v", out.Changes)
 	}
 	fc := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
@@ -161,7 +130,7 @@ func TestRewriter_HWDecode_SRT_Embedded_Inlineass(t *testing.T) {
 		FSExists:           func(string) bool { return true },
 		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
 	})
-	if !out.Applied || out.SubPrerender != nil {
+	if !out.Applied {
 		t.Fatalf("expected merged inlineass branch (no pre-render); changes=%v", out.Changes)
 	}
 	fc := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
