@@ -1,0 +1,50 @@
+Description: libavfilter/inlineass: add `alpha` option for transparent-canvas compositing
+ vf_inlineass was written to overlay subtitles onto opaque decoded video
+ (the per-frame burn-in path). The unified-sub-filter / sub-prerender work
+ (docs/UNIFIED_SUB_FILTER.md, Phase A) needs it to render onto a
+ transparent RGBA/ARGB canvas instead, so the cue is composited with a
+ real alpha channel and the result can be qtrle-encoded into the overlay
+ FIFO the main transcode reads. Mirrors stock `subtitles=`'s `alpha=1`.
+ When alpha=1 the filter selects alpha-capable pixel formats and inits
+ FFDraw with FF_DRAW_PROCESS_ALPHA so ff_blend_mask writes the alpha
+ plane. Default 0 keeps the existing opaque-video behaviour unchanged.
+Author: scaleplex
+Last-Update: 2026-05-22
+---
+--- a/libavfilter/vf_inlineass.c
++++ b/libavfilter/vf_inlineass.c
+@@ -48,6 +48,7 @@
+     double font_scale;
+     double font_size;
+     int margin;
++    int alpha;
+ 
+     FFDrawContext draw;
+ 
+@@ -133,13 +134,16 @@
+ 
+ static int query_formats(AVFilterContext *ctx)
+ {
+-    return ff_set_common_formats(ctx, ff_draw_supported_pixel_formats(0));
++    AssContext *ass = ctx->priv;
++    return ff_set_common_formats(ctx, ff_draw_supported_pixel_formats(
++        ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0));
+ }
+ 
+ static int config_input(AVFilterLink *link)
+ {
+     AssContext *context = link->dst->priv;
+-    ff_draw_init(&context->draw, link->format, 0);
++    ff_draw_init(&context->draw, link->format,
++                 context->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
+ 
+     ass_set_frame_size(context->renderer, link->w, link->h);
+ 
+@@ -684,6 +688,7 @@
+     {"margin",         "default margin",                   OFFSET(margin),     AV_OPT_TYPE_INT64,  {.i64 = 20  }, INT64_MIN, INT64_MAX,FLAGS},
+     {"fonts_dir",      "directory to scan for fonts",      OFFSET(fonts_dir),  AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN,  CHAR_MAX, FLAGS},
+     {"fontconfig_file","fontconfig file to load",          OFFSET(fc_file),    AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN,  CHAR_MAX, FLAGS},
++    {"alpha",          "composite onto a transparent (alpha) canvas",  OFFSET(alpha), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
+     {NULL},
+ };
+ 

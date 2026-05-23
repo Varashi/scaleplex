@@ -1,0 +1,111 @@
+Description: scaleplex_inlineass: fix use-after-free of filter context on graph reconfig
+ valgrind (memcheck) on the canvas/separate-input -map_inlineass path caught
+ a use-after-free: the subtitle decoder thread calls
+ avfilter_inlineass_replay_chunk through a binding's flt_ctx that points at a
+ filter AVFilterContext freed by avfilter_graph_free during the probe->live
+ graph reconfigure. The window is between the probe graph being freed and the
+ live configure_filtergraph re-running link_graph (which resets flt_ctx).
+ .
+ Surfaced natively as a libass `n_events <= max_events` abort (the freed
+ context's libass track read as garbage); under valgrind as an "Invalid read
+ ... inside a block ... free'd by avfilter_graph_free" in replay_chunk.
+ .
+ Fix: vf_inlineass gains an uninit callback (avfilter_inlineass_set_uninit_cb).
+ scaleplex_inlineass registers it at link time; uninit() invokes it BEFORE
+ tearing the instance down, clearing any binding whose flt_ctx == this ctx
+ (under bindings_lock, serialising with handle_subtitle). After the clear,
+ handle_subtitle buffers chunks instead of replaying into freed memory, and
+ the live link_graph drains them once it rebinds.
+Author: scaleplex
+Last-Update: 2026-05-23
+---
+--- a/libavfilter/vf_inlineass.h
++++ b/libavfilter/vf_inlineass.h
+@@ -39,5 +39,11 @@
+ void avfilter_inlineass_add_attachment(AVFilterContext *context, AVStream *st);
+ void avfilter_inlineass_set_fonts(AVFilterContext *context);
+ void avfilter_inlineass_set_storage_size(AVFilterContext *context, int w, int h);
++/* scaleplex: register a callback invoked from uninit() when this filter
++ * instance is destroyed, so fftools can drop a stale -map_inlineass
++ * binding before the context is freed (UAF on probe->live reconfig). */
++void avfilter_inlineass_set_uninit_cb(AVFilterContext *context,
++                                      void (*cb)(void *opaque, AVFilterContext *ctx),
++                                      void *opaque);
+ 
+ #endif // AVFILTER_INLINEASS_H
+--- a/libavfilter/vf_inlineass.c
++++ b/libavfilter/vf_inlineass.c
+@@ -51,6 +51,8 @@
+     double font_size;
+     int margin;
+     int alpha;
++    void (*uninit_cb)(void *opaque, AVFilterContext *ctx);
++    void *uninit_opaque;
+ 
+     FFDrawContext draw;
+ 
+@@ -138,6 +140,13 @@
+ {
+     AssContext *ass = ctx->priv;
+ 
++    /* scaleplex: notify fftools to drop any -map_inlineass binding that
++     * points at this filter context BEFORE we tear it down, so the
++     * subtitle decoder thread can't replay into a freed context during a
++     * probe->live graph reconfigure (use-after-free; valgrind-confirmed). */
++    if (ass->uninit_cb)
++        ass->uninit_cb(ass->uninit_opaque, ctx);
++
+     /* scaleplex: serialise libass teardown against the decoder thread's
+      * append/replay and another instance's render. libass shares
+      * process-global state (fontconfig/freetype) that is NOT reentrant;
+@@ -602,6 +611,15 @@
+     },
+ };
+ 
++void avfilter_inlineass_set_uninit_cb(AVFilterContext *context,
++                                      void (*cb)(void *opaque, AVFilterContext *ctx),
++                                      void *opaque)
++{
++    AssContext *ass = (AssContext *)context->priv;
++    ass->uninit_cb     = cb;
++    ass->uninit_opaque = opaque;
++}
++
+ void avfilter_inlineass_set_storage_size(AVFilterContext *context, int w, int h)
+ {
+     AssContext *ass = (AssContext *)context->priv;
+--- a/fftools/scaleplex_inlineass.c
++++ b/fftools/scaleplex_inlineass.c
+@@ -225,6 +225,24 @@
+     return 0;
+ }
+ 
++/* scaleplex: invoked from vf_inlineass uninit() when a filter instance is
++ * destroyed (e.g. probe->live graph reconfigure). Clears any binding that
++ * still points at this context so handle_subtitle won't replay into freed
++ * memory. Runs under bindings_lock to serialise with handle_subtitle. */
++static void inlineass_filter_uninit_cb(void *opaque, AVFilterContext *ctx)
++{
++    pthread_mutex_lock(&bindings_lock);
++    for (int i = 0; i < nb_bindings; i++) {
++        if (bindings[i].flt_ctx == ctx) {
++            bindings[i].flt_ctx = NULL;
++            av_log(NULL, AV_LOG_VERBOSE,
++                   "scaleplex_inlineass: filter ctx %p destroyed, cleared bind#%d flt_ctx\n",
++                   (void *)ctx, i);
++        }
++    }
++    pthread_mutex_unlock(&bindings_lock);
++}
++
+ void scaleplex_inlineass_link_graph(struct AVFilterGraph *graph)
+ {
+     int cursor = 0;
+@@ -276,6 +294,7 @@
+         }
+ 
+         b->flt_ctx = fc;
++        avfilter_inlineass_set_uninit_cb(fc, inlineass_filter_uninit_cb, NULL);
+         b->dec_ctx = b->ist && b->ist->decoder ? dec_get_avctx(b->ist->decoder) : NULL;
+ 
+         /* Push font attachments from the same input file. */

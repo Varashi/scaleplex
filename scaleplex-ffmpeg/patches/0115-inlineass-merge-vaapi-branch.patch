@@ -1,0 +1,1035 @@
+scaleplex: merge overlay_sub_vaapi HW VAAPI branch into vf_inlineass
+
+Folds the former standalone overlay_sub_vaapi filter (patches 0112/0113)
+into vf_inlineass as a format-adaptive HW branch. One Plex-native
+`inlineass` node now serves both the GPU fast path (single-input VAAPI
+VPP composite, render-once-per-cue, text + PGS/DVD bitmap, render-res cap,
+animated tier-down) and the CPU fallback (original FFDraw blend), chosen
+from the negotiated input frame format. Drops 0112 (standalone filter) +
+0113 (fftools dual-dispatch); the fftools binding keeps a single inlineass
+target and routes bitmap codecs to avfilter_inlineass_replay_bitmap.
+
+Requires vaapi + VAProcPipelineCaps_blend_flags; links vaapi_vpp.o.
+
+--- a/libavfilter/vf_inlineass.h
++++ b/libavfilter/vf_inlineass.h
+@@ -35,6 +35,12 @@
+ void avfilter_inlineass_replay_chunk(AVFilterContext *link, AVCodecContext *dec_ctx,
+                                      int64_t start_ms, int64_t duration_ms,
+                                      const char *ass_line);
++/* scaleplex: feed a whole decoded BITMAP subtitle presentation (PGS/DVD/DVB)
++ * to the merged filter's HW (VAAPI) branch. Only the VAAPI branch can burn
++ * bitmap subs; the SW branch ignores this path. An empty presentation
++ * (num_rects == 0) is a clear. */
++void avfilter_inlineass_replay_bitmap(AVFilterContext *link, AVCodecContext *dec_ctx,
++                                      AVSubtitle *sub);
+ void avfilter_inlineass_set_aspect_ratio(AVFilterContext *context, double dar);
+ void avfilter_inlineass_add_attachment(AVFilterContext *context, AVStream *st);
+ void avfilter_inlineass_set_fonts(AVFilterContext *context);
+--- a/libavfilter/vf_inlineass.c
++++ b/libavfilter/vf_inlineass.c
+@@ -3,6 +3,26 @@
+  *
+  * Copyright (c) 2016 Plex, Inc.
+  *
++ * scaleplex: this filter has TWO format-adaptive branches that share one
++ * libass track + renderer (fed identically via the fftools -map_inlineass
++ * plumbing, patch 0100):
++ *
++ *   - SW branch (input pix fmt is a normal CPU format, e.g. nv12/yuv420p):
++ *     the original per-frame libass render + FFDraw CPU blend onto the
++ *     decoded video in place. This is the CPU / non-GPU fallback path.
++ *
++ *   - HW branch (input pix fmt is AV_PIX_FMT_VAAPI): a single-input VAAPI
++ *     VPP composite (merged from the former overlay_sub_vaapi filter). libass
++ *     renders a cue once-per-change to a premultiplied BGRA staging buffer
++ *     (NO vsfilter colour mangle), uploaded to a cached filter-owned VAAPI
++ *     overlay surface, then VPP-blended onto each video surface. Single input
++ *     => no framesync => no AV1 decoder surface-pool overrun (error-18).
++ *     Bitmap subs (PGS/DVD/DVB) feed the same path via replay_bitmap.
++ *
++ * The branch is chosen from the negotiated input frame format (the graph's
++ * HW/SW endpoints drive it), so one Plex-native `inlineass` node serves both
++ * the GPU fast path and the CPU fallback.
++ *
+  * This file is part of FFmpeg.
+  *
+  * FFmpeg is free software; you can redistribute it and/or
+@@ -29,17 +49,26 @@
+ #include "libavcodec/avcodec.h"
+ #include "libavfilter/avfilter.h"
+ #include "libavutil/avstring.h"
++#include "libavutil/mem.h"
+ #include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/hwcontext.h"
+ #include "libavformat/avformat.h"
+ #include "vf_inlineass.h"
+ #include "drawutils.h"
+ #include "formats.h"
+ #include "filters.h"
++#include "vaapi_vpp.h"
+ #include "video.h"
+ #include "libavutil/frame.h"
+ 
+ typedef struct {
+-    const AVClass *class;
++    /* scaleplex: VAAPIVPPContext MUST be the first field. Its own first
++     * field is `const AVClass *class`, so the av_opt class stays at priv
++     * offset 0, and the HW VPP helpers (which cast avctx->priv to
++     * VAAPIVPPContext*) alias &vpp transparently. */
++    VAAPIVPPContext vpp;
++
+     ASS_Library *library;
+     ASS_Renderer *renderer;
+     ASS_Track *track;
+@@ -61,6 +90,36 @@
+     int mangle_state;
+     float vs_rgb2yuv[3][4];
+     float vs2rgb[3][4];
++
++    /* ---- HW (VAAPI) branch state (merged from overlay_sub_vaapi) -------- */
++    char *filename;            /**< optional: render a sub FILE (ad-hoc validation) */
++    int   render_height;       /**< cap libass raster height; VPP upscales (0 = no cap) */
++    int   animated_tier_down;  /**< toggle: render animated cues one tier below render_height */
++    int   animated;            /**< an animated cue (\move/\t/\k/\fad) was seen */
++    int   anim_active;         /**< overlay is currently sized at the animated (lower) tier */
++    int   anim_ow, anim_oh;    /**< animated-tier overlay dims (precomputed) */
++    int   storage_w, storage_h;/**< sub script PlayResX/Y (feed mode) */
++
++    AVFrame     *overlay;            /**< cached filter-owned VAAPI overlay surface (text) */
++    AVBufferRef *overlay_frames_ref;
++    AVFrame     *cpu;                /**< reusable BGRA staging buffer for libass render */
++    int          have_overlay;      /**< cached surface currently holds a visible cue */
++    int          ow, oh;            /**< overlay (render) dimensions */
++
++    /* Bitmap (PGS/DVD/DVB) overlay path — additive to the libass text path.
++     * A sub stream is text XOR bitmap; this branch is dormant for text. */
++    AVFrame     *bmp_overlay;        /**< cached VAAPI bitmap surface (canvas size) */
++    AVBufferRef *bmp_frames_ref;
++    AVFrame     *bmp_cpu;            /**< BGRA staging (canvas size) */
++    uint8_t     *bmp_pending_buf;    /**< host BGRA written by replay_bitmap (decoder thread) */
++    int          bmp_pending_stride;
++    int          bmp_cw, bmp_ch;     /**< canvas dims (decoder presentation size) */
++    int          bmp_surf_w, bmp_surf_h; /**< current bmp_overlay surface dims */
++    int          bmp_pending;        /**< 1 = new presentation staged */
++    int          bmp_pending_clear;  /**< 1 = pending is a clear (no rects) */
++    int          have_bmp;           /**< a bitmap is currently visible */
++    int64_t      bmp_start_ms, bmp_end_ms;       /**< active display window */
++    int64_t      bmp_pend_start_ms, bmp_pend_end_ms;
+ } AssContext;
+ 
+ /* scaleplex: process-wide libass lock. libass is not reentrant across
+@@ -69,10 +128,10 @@
+  * call libass entry points concurrently. A per-filter mutex isn't
+  * enough — Plex 6.x runs the transcode loop single-threaded so the
+  * shared-state contention never surfaces. One file-scope mutex covers
+- * every libass call site below. Contention is negligible at homelab
+- * session counts because libass calls are sparse: process_header once
+- * per stream, append_data on each subtitle packet (few per second),
+- * render_frame on each video frame for ~hundreds of microseconds. */
++ * every libass call site below (both the SW and HW branches). Contention
++ * is negligible at homelab session counts because libass calls are sparse:
++ * process_header once per stream, append_data on each subtitle packet (few
++ * per second), render_frame on each video frame for ~hundreds of µs. */
+ static pthread_mutex_t inlineass_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ #define OFFSET(x) offsetof(AssContext, x)
+@@ -100,12 +159,426 @@
+     av_log(ctx, level, "\n");
+ }
+ 
++/* ======================================================================== *
++ *  HW (VAAPI) branch — merged from the former vf_overlay_sub_vaapi (0112).  *
++ *  All libass call sites run under inlineass_lock (shared with the SW       *
++ *  branch + the fftools feed). Field names match AssContext.                *
++ * ======================================================================== */
++
++static int inlineass_create_overlay(AVFilterContext *avctx);   /* fwd */
++
++static int inlineass_build_filter_params(AVFilterContext *avctx)
++{
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    VAStatus vas;
++    VAProcPipelineCaps caps;
++
++    memset(&caps, 0, sizeof(caps));
++    vas = vaQueryVideoProcPipelineCaps(vpp_ctx->hwctx->display,
++                                       vpp_ctx->va_context, NULL, 0, &caps);
++    if (vas != VA_STATUS_SUCCESS) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to query pipeline caps: %d (%s).\n",
++               vas, vaErrorStr(vas));
++        return AVERROR(EIO);
++    }
++    if (!caps.blend_flags) {
++        av_log(avctx, AV_LOG_ERROR, "VAAPI driver doesn't support overlay blend.\n");
++        return AVERROR(EINVAL);
++    }
++    return 0;
++}
++
++/* Composite the libass image list into the (cleared) premultiplied BGRA
++ * staging buffer. Plain source-over with per-pixel alpha — no colour
++ * mangle. libass color is RRGGBBTT (TT = transparency, opacity = 255-TT). */
++static void render_ass_images(uint8_t *buf, int stride, int w, int h,
++                              const ASS_Image *img)
++{
++    for (; img; img = img->next) {
++        int rr = (img->color >> 24) & 0xFF;
++        int gg = (img->color >> 16) & 0xFF;
++        int bb = (img->color >>  8) & 0xFF;
++        int op = 255 - (img->color & 0xFF);   /* cue opacity */
++        int y, x;
++        if (op == 0)
++            continue;
++        for (y = 0; y < img->h; y++) {
++            int dy = img->dst_y + y;
++            const uint8_t *src;
++            uint8_t *dst;
++            if (dy < 0 || dy >= h)
++                continue;
++            src = img->bitmap + (ptrdiff_t)y * img->stride;
++            dst = buf + (ptrdiff_t)dy * stride;
++            for (x = 0; x < img->w; x++) {
++                int dx = img->dst_x + x;
++                int a, ia;
++                uint8_t *p;
++                if (dx < 0 || dx >= w)
++                    continue;
++                a = op * src[x] / 255;          /* src alpha 0..255 */
++                if (a == 0)
++                    continue;
++                ia = 255 - a;
++                p = dst + (ptrdiff_t)dx * 4;     /* BGRA, premultiplied */
++                p[0] = (bb * a + p[0] * ia) / 255;
++                p[1] = (gg * a + p[1] * ia) / 255;
++                p[2] = (rr * a + p[2] * ia) / 255;
++                p[3] = (a * 255 + p[3] * ia) / 255;
++            }
++        }
++    }
++}
++
++/* Aspect-preserving even dims for a target raster height (target_h<=0 or
++ * >= in_h = no cap → full res). Shared by the static + animated tiers. */
++static void compute_cap_dims(int in_w, int in_h, int target_h, int *ow, int *oh)
++{
++    if (target_h <= 0 || target_h >= in_h) {
++        *oh = in_h;
++        *ow = in_w;
++    } else {
++        *oh = target_h & ~1;
++        *ow = ((int)((int64_t)in_w * (*oh) / in_h) + 1) & ~1;
++    }
++}
++
++/* One standard resolution tier below h (1080->720, 720->540, ...). */
++static int tier_down(int h)
++{
++    static const int tiers[] = { 2160, 1440, 1080, 720, 540, 480, 360 };
++    int n = (int)(sizeof(tiers) / sizeof(tiers[0])), i;
++    for (i = 0; i < n; i++)
++        if (h >= tiers[i])
++            return (i + 1 < n) ? tiers[i + 1] : tiers[i];
++    return h;
++}
++
++/* True when an ASS event line carries a per-frame animation override
++ * (\move, \t(...), karaoke \k*, \fad). Such cues defeat render-once-per-cue
++ * (libass reports change every frame), so they get the lower animated tier. */
++static int ass_line_is_animated(const char *s)
++{
++    return s && (strstr(s, "\\move") || strstr(s, "\\t(") ||
++                 strstr(s, "\\k")    || strstr(s, "\\fad"));
++}
++
++/* Switch the text overlay to the lower animated tier (one-shot, filter
++ * thread, caller holds inlineass_lock). Re-inits libass frame size + reallocs
++ * the cached overlay surface; the next render repopulates it. */
++static int switch_to_animated_tier(AVFilterContext *avctx)
++{
++    AssContext *ass = avctx->priv;
++    ass_set_frame_size(ass->renderer, ass->anim_ow, ass->anim_oh);
++    av_frame_free(&ass->overlay);
++    av_frame_free(&ass->cpu);
++    av_buffer_unref(&ass->overlay_frames_ref);
++    ass->ow = ass->anim_ow;
++    ass->oh = ass->anim_oh;
++    ass->have_overlay = 0;
++    ass->anim_active  = 1;
++    av_log(avctx, AV_LOG_VERBOSE,
++           "inlineass(hw): animation detected -> render %dx%d (tier down)\n",
++           ass->ow, ass->oh);
++    return inlineass_create_overlay(avctx);
++}
++
++/* Render the cue active at time_ms; on change, re-rasterise + re-upload the
++ * cached overlay surface. Sets have_overlay = whether a cue is visible.
++ * libass calls + the image-list read run under inlineass_lock (the decoder
++ * thread may be feeding chunks concurrently). */
++static int refresh_overlay(AVFilterContext *avctx, int64_t time_ms)
++{
++    AssContext *ass = avctx->priv;
++    int change = 0, err = 0, do_upload = 0, clear = 0;
++    ASS_Image *img;
++
++    pthread_mutex_lock(&inlineass_lock);
++    /* One-shot drop to the animated tier once an animated cue is seen. */
++    if (ass->animated && ass->animated_tier_down && !ass->anim_active &&
++        (ass->anim_ow != ass->ow || ass->anim_oh != ass->oh)) {
++        err = switch_to_animated_tier(avctx);
++        if (err < 0) {
++            pthread_mutex_unlock(&inlineass_lock);
++            return err;
++        }
++    }
++    img = ass_render_frame(ass->renderer, ass->track, time_ms, &change);
++    if (change) {
++        if (!img) {
++            clear = 1;
++        } else {
++            memset(ass->cpu->data[0], 0, (size_t)ass->cpu->linesize[0] * ass->oh);
++            render_ass_images(ass->cpu->data[0], ass->cpu->linesize[0],
++                              ass->ow, ass->oh, img);
++            do_upload = 1;
++        }
++    }
++    pthread_mutex_unlock(&inlineass_lock);
++
++    if (clear) {
++        ass->have_overlay = 0;
++        return 0;
++    }
++    if (do_upload) {
++        err = av_hwframe_transfer_data(ass->overlay, ass->cpu, 0);
++        if (err < 0) {
++            av_log(avctx, AV_LOG_ERROR, "Failed to upload overlay surface: %d.\n", err);
++            return err;
++        }
++        ass->have_overlay = 1;
++    }
++    return 0;
++}
++
++static int inlineass_create_overlay(AVFilterContext *avctx)
++{
++    AssContext        *ass     = avctx->priv;
++    VAAPIVPPContext   *vpp_ctx = avctx->priv;
++    AVHWFramesContext *frames;
++    int err;
++
++    ass->overlay_frames_ref = av_hwframe_ctx_alloc(vpp_ctx->device_ref);
++    if (!ass->overlay_frames_ref)
++        return AVERROR(ENOMEM);
++    frames = (AVHWFramesContext *)ass->overlay_frames_ref->data;
++    frames->format            = AV_PIX_FMT_VAAPI;
++    frames->sw_format         = AV_PIX_FMT_BGRA;
++    frames->width             = ass->ow;
++    frames->height            = ass->oh;
++    frames->initial_pool_size = 1;
++    err = av_hwframe_ctx_init(ass->overlay_frames_ref);
++    if (err < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to init overlay frames ctx: %d.\n", err);
++        return err;
++    }
++
++    ass->overlay = av_frame_alloc();
++    if (!ass->overlay)
++        return AVERROR(ENOMEM);
++    err = av_hwframe_get_buffer(ass->overlay_frames_ref, ass->overlay, 0);
++    if (err < 0)
++        return err;
++
++    ass->cpu = av_frame_alloc();
++    if (!ass->cpu)
++        return AVERROR(ENOMEM);
++    ass->cpu->format = AV_PIX_FMT_BGRA;
++    ass->cpu->width  = ass->ow;
++    ass->cpu->height = ass->oh;
++    return av_frame_get_buffer(ass->cpu, 0);
++}
++
++/* ---- bitmap (PGS/DVD/DVB) path ----------------------------------------- */
++
++/* Blit one decoded bitmap rect (palettised) into the canvas BGRA buffer as
++ * PREMULTIPLIED BGRA (the composite uses VA_BLEND_PREMULTIPLIED_ALPHA). The
++ * AVSubtitle palette (rect->data[1]) is 256 native-endian 0xAARRGGBB. */
++static void blit_pgs_rect(uint8_t *buf, int stride, int cw, int ch,
++                          const AVSubtitleRect *r)
++{
++    const uint32_t *pal = (const uint32_t *)r->data[1];
++    const uint8_t  *src = r->data[0];
++    int x, y;
++
++    for (y = 0; y < r->h; y++) {
++        int dy = r->y + y;
++        if (dy < 0 || dy >= ch)
++            continue;
++        for (x = 0; x < r->w; x++) {
++            int dx = r->x + x;
++            uint32_t v;
++            int a;
++            uint8_t *p;
++            if (dx < 0 || dx >= cw)
++                continue;
++            v = pal[src[(ptrdiff_t)y * r->linesize[0] + x]];
++            a = (v >> 24) & 0xFF;
++            if (a == 0)
++                continue;
++            p = buf + (ptrdiff_t)dy * stride + (ptrdiff_t)dx * 4;
++            p[0] = ( v        & 0xFF) * a / 255;   /* B premult */
++            p[1] = ((v >>  8) & 0xFF) * a / 255;   /* G */
++            p[2] = ((v >> 16) & 0xFF) * a / 255;   /* R */
++            p[3] = a;
++        }
++    }
++}
++
++/* (Re)allocate the bitmap overlay surface + staging at canvas size w x h.
++ * Filter thread only. No-op when already that size. */
++static int ensure_bmp_overlay(AVFilterContext *avctx, int w, int h)
++{
++    AssContext        *ass     = avctx->priv;
++    VAAPIVPPContext   *vpp_ctx = avctx->priv;
++    AVHWFramesContext *frames;
++    int err;
++
++    if (ass->bmp_overlay && ass->bmp_surf_w == w && ass->bmp_surf_h == h)
++        return 0;
++
++    av_frame_free(&ass->bmp_overlay);
++    av_frame_free(&ass->bmp_cpu);
++    av_buffer_unref(&ass->bmp_frames_ref);
++    ass->bmp_surf_w = ass->bmp_surf_h = 0;
++
++    ass->bmp_frames_ref = av_hwframe_ctx_alloc(vpp_ctx->device_ref);
++    if (!ass->bmp_frames_ref)
++        return AVERROR(ENOMEM);
++    frames = (AVHWFramesContext *)ass->bmp_frames_ref->data;
++    frames->format            = AV_PIX_FMT_VAAPI;
++    frames->sw_format         = AV_PIX_FMT_BGRA;
++    frames->width             = w;
++    frames->height            = h;
++    frames->initial_pool_size = 1;
++    err = av_hwframe_ctx_init(ass->bmp_frames_ref);
++    if (err < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to init bitmap frames ctx: %d.\n", err);
++        return err;
++    }
++
++    ass->bmp_overlay = av_frame_alloc();
++    if (!ass->bmp_overlay)
++        return AVERROR(ENOMEM);
++    err = av_hwframe_get_buffer(ass->bmp_frames_ref, ass->bmp_overlay, 0);
++    if (err < 0)
++        return err;
++
++    ass->bmp_cpu = av_frame_alloc();
++    if (!ass->bmp_cpu)
++        return AVERROR(ENOMEM);
++    ass->bmp_cpu->format = AV_PIX_FMT_BGRA;
++    ass->bmp_cpu->width  = w;
++    ass->bmp_cpu->height = h;
++    err = av_frame_get_buffer(ass->bmp_cpu, 0);
++    if (err < 0)
++        return err;
++
++    ass->bmp_surf_w = w;
++    ass->bmp_surf_h = h;
++    return 0;
++}
++
++/* Convert one decoded bitmap presentation to premultiplied BGRA at the sub
++ * canvas size; staged into bmp_pending_buf for the filter thread to upload.
++ * Decoder thread; mirrors replay_chunk's role for the text path. */
++void avfilter_inlineass_replay_bitmap(AVFilterContext *avctx,
++                                      AVCodecContext *dec_ctx,
++                                      AVSubtitle *sub)
++{
++    AssContext *ass;
++    int cw, ch, i;
++    int64_t base_ms;
++
++    if (!avctx || !avctx->priv || !sub)
++        return;
++    ass = avctx->priv;
++
++    /* canvas = decoder presentation size (pgssubdec sets it after the PCS);
++     * fall back to 1920x1080 (Blu-ray PGS standard) when unknown. */
++    cw = (dec_ctx && dec_ctx->width  > 0) ? dec_ctx->width  : 1920;
++    ch = (dec_ctx && dec_ctx->height > 0) ? dec_ctx->height : 1080;
++    base_ms = av_rescale_q(sub->pts, AV_TIME_BASE_Q, ASS_TIME_BASE);
++
++    pthread_mutex_lock(&inlineass_lock);
++
++    if (cw != ass->bmp_cw || ch != ass->bmp_ch || !ass->bmp_pending_buf) {
++        av_freep(&ass->bmp_pending_buf);
++        ass->bmp_pending_stride = cw * 4;
++        ass->bmp_pending_buf = av_mallocz((size_t)ass->bmp_pending_stride * ch);
++        ass->bmp_cw = cw;
++        ass->bmp_ch = ch;
++    }
++    if (!ass->bmp_pending_buf) {
++        pthread_mutex_unlock(&inlineass_lock);
++        return;
++    }
++
++    if (sub->num_rects == 0) {
++        ass->bmp_pending       = 1;
++        ass->bmp_pending_clear = 1;
++    } else {
++        memset(ass->bmp_pending_buf, 0,
++               (size_t)ass->bmp_pending_stride * ch);
++        for (i = 0; i < sub->num_rects; i++) {
++            AVSubtitleRect *r = sub->rects[i];
++            if (!r || r->type != SUBTITLE_BITMAP || !r->data[0] || !r->data[1])
++                continue;
++            blit_pgs_rect(ass->bmp_pending_buf, ass->bmp_pending_stride, cw, ch, r);
++        }
++        ass->bmp_pending       = 1;
++        ass->bmp_pending_clear = 0;
++    }
++    ass->bmp_pend_start_ms = base_ms + sub->start_display_time;
++    ass->bmp_pend_end_ms   = (sub->end_display_time > sub->start_display_time)
++                           ? base_ms + sub->end_display_time : -1;
++    pthread_mutex_unlock(&inlineass_lock);
++}
++
++/* Upload a newly-staged bitmap presentation (filter thread) and gate
++ * have_bmp by the current display window. */
++static int refresh_bitmap(AVFilterContext *avctx, int64_t time_ms)
++{
++    AssContext *ass = avctx->priv;
++    int err = 0, do_upload = 0, clear = 0, cw = 0, ch = 0, stride = 0, y;
++    int64_t start_ms = 0, end_ms = -1;
++
++    pthread_mutex_lock(&inlineass_lock);
++    if (ass->bmp_pending) {
++        ass->bmp_pending = 0;
++        if (ass->bmp_pending_clear) {
++            clear = 1;
++        } else {
++            cw = ass->bmp_cw;
++            ch = ass->bmp_ch;
++            stride = ass->bmp_pending_stride;
++            if (ensure_bmp_overlay(avctx, cw, ch) >= 0 && ass->bmp_cpu) {
++                for (y = 0; y < ch; y++)
++                    memcpy(ass->bmp_cpu->data[0] + (ptrdiff_t)y * ass->bmp_cpu->linesize[0],
++                           ass->bmp_pending_buf + (ptrdiff_t)y * stride,
++                           (size_t)cw * 4);
++                do_upload = 1;
++                start_ms = ass->bmp_pend_start_ms;
++                end_ms   = ass->bmp_pend_end_ms;
++            }
++        }
++    }
++    pthread_mutex_unlock(&inlineass_lock);
++
++    if (clear) {
++        ass->have_bmp = 0;
++        return 0;
++    }
++    if (do_upload) {
++        err = av_hwframe_transfer_data(ass->bmp_overlay, ass->bmp_cpu, 0);
++        if (err < 0) {
++            av_log(avctx, AV_LOG_ERROR, "Failed to upload bitmap overlay: %d.\n", err);
++            return err;
++        }
++        ass->bmp_start_ms = start_ms;
++        ass->bmp_end_ms   = end_ms;
++    }
++    if (ass->bmp_overlay)
++        ass->have_bmp = (time_ms >= ass->bmp_start_ms) &&
++                        (ass->bmp_end_ms < 0 || time_ms < ass->bmp_end_ms);
++    return 0;
++}
++
++/* ======================================================================== *
++ *  init / uninit / format negotiation / link config (format-adaptive)      *
++ * ======================================================================== */
++
+ static av_cold int init(AVFilterContext *ctx)
+ {
+-    AssContext *ass = ctx->priv;
++    AssContext      *ass     = ctx->priv;
++    VAAPIVPPContext *vpp_ctx = ctx->priv;
+ 
+-    ass->library = ass_library_init();
++    /* Benign for the SW branch (just zeroes the VPP ctx + sets INVALID ids);
++     * required so the HW branch's vaapi_vpp helpers + uninit are safe. */
++    ff_vaapi_vpp_ctx_init(ctx);
++    vpp_ctx->output_format = AV_PIX_FMT_NONE;
+ 
++    ass->library = ass_library_init();
+     if (!ass->library) {
+         av_log(ctx, AV_LOG_ERROR, "ass_library_init() failed!\n");
+         return AVERROR(EINVAL);
+@@ -125,10 +598,29 @@
+ 
+     ass_set_font_scale(ass->renderer, ass->font_scale);
+ 
+-    ass->track = ass_new_track(ass->library);
+-    if (!ass->track) {
+-        av_log(ctx, AV_LOG_ERROR, "ass_new_track() failed!\n");
+-        return AVERROR(EINVAL);
++    if (ass->filename) {
++        /* File mode (ad-hoc validation): load the whole track up front. */
++        ass->track = ass_read_file(ass->library, ass->filename, NULL);
++        if (!ass->track) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to read subtitle file '%s'.\n",
++                   ass->filename);
++            return AVERROR(EINVAL);
++        }
++        ass->got_header = 1;
++        if (ass->animated_tier_down) {
++            int i;
++            for (i = 0; i < ass->track->n_events; i++)
++                if (ass_line_is_animated(ass->track->events[i].Text)) {
++                    ass->animated = 1;
++                    break;
++                }
++        }
++    } else {
++        ass->track = ass_new_track(ass->library);
++        if (!ass->track) {
++            av_log(ctx, AV_LOG_ERROR, "ass_new_track() failed!\n");
++            return AVERROR(EINVAL);
++        }
+     }
+ 
+     ass->mangle_state = 0;
+@@ -147,44 +639,159 @@
+     if (ass->uninit_cb)
+         ass->uninit_cb(ass->uninit_opaque, ctx);
+ 
++    /* HW-branch surfaces (NULL/no-op on the SW branch). */
++    av_frame_free(&ass->overlay);
++    av_frame_free(&ass->cpu);
++    av_buffer_unref(&ass->overlay_frames_ref);
++    av_frame_free(&ass->bmp_overlay);
++    av_frame_free(&ass->bmp_cpu);
++    av_buffer_unref(&ass->bmp_frames_ref);
++    av_freep(&ass->bmp_pending_buf);
++
+     /* scaleplex: serialise libass teardown against the decoder thread's
+      * append/replay and another instance's render. libass shares
+      * process-global state (fontconfig/freetype) that is NOT reentrant;
+      * graph reconfig (probe->live) frees a stale instance here while the
+-     * sub decoder may still feed the live one. 0100 wrapped the runtime
+-     * libass entries but missed init/config_input/uninit. */
++     * sub decoder may still feed the live one. */
+     pthread_mutex_lock(&inlineass_lock);
+     if (ass->track)
+         ass_free_track(ass->track);
++    ass->track = NULL;
+     if (ass->renderer)
+         ass_renderer_done(ass->renderer);
++    ass->renderer = NULL;
+     if (ass->library)
+         ass_library_done(ass->library);
++    ass->library = NULL;
+     pthread_mutex_unlock(&inlineass_lock);
++
++    /* Safe even when the HW branch never configured (ctx_init set INVALID). */
++    ff_vaapi_vpp_ctx_uninit(ctx);
+ }
+ 
+ static int query_formats(AVFilterContext *ctx)
+ {
+     AssContext *ass = ctx->priv;
+-    return ff_set_common_formats(ctx, ff_draw_supported_pixel_formats(
+-        ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0));
++    AVFilterFormats *fmts;
++    int ret;
++
++    /* SW-drawable formats (the original per-frame FFDraw blend supports all
++     * of them) PLUS AV_PIX_FMT_VAAPI for the HW VPP branch. Negotiation with
++     * the graph endpoints picks VAAPI in a HW graph, an nv12-class format in
++     * a SW graph. */
++    fmts = ff_draw_supported_pixel_formats(ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
++    if (!fmts)
++        return AVERROR(ENOMEM);
++    ret = ff_add_format(&fmts, AV_PIX_FMT_VAAPI);
++    if (ret < 0)
++        return ret;
++    return ff_set_common_formats(ctx, fmts);
+ }
+ 
+ static int config_input(AVFilterLink *link)
+ {
+-    AssContext *context = link->dst->priv;
+-    ff_draw_init(&context->draw, link->format,
+-                 context->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
++    AVFilterContext *avctx  = link->dst;
++    AssContext      *ass    = avctx->priv;
+ 
+-    pthread_mutex_lock(&inlineass_lock);
+-    ass_set_frame_size(context->renderer, link->w, link->h);
++    if (link->format == AV_PIX_FMT_VAAPI)
++        return ff_vaapi_vpp_config_input(link);
+ 
+-    ass_set_pixel_aspect(context->renderer, av_q2d(link->sample_aspect_ratio));
++    /* SW branch (unchanged). */
++    ff_draw_init(&ass->draw, link->format,
++                 ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
++
++    pthread_mutex_lock(&inlineass_lock);
++    ass_set_frame_size(ass->renderer, link->w, link->h);
++    ass_set_pixel_aspect(ass->renderer, av_q2d(link->sample_aspect_ratio));
+     pthread_mutex_unlock(&inlineass_lock);
+ 
+     return 0;
+ }
+ 
++static int config_output(AVFilterLink *outlink)
++{
++    AVFilterContext *avctx   = outlink->src;
++    AssContext      *ass     = avctx->priv;
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    AVFilterLink    *inlink  = avctx->inputs[0];
++    int err;
++
++    if (inlink->format != AV_PIX_FMT_VAAPI) {
++        /* SW branch: geometry-preserving passthrough (previously implicit).
++         * frame_rate moved from AVFilterLink to the internal FilterLink in
++         * FFmpeg 7.x — propagate it there. */
++        FilterLink *il = ff_filter_link(inlink);
++        FilterLink *ol = ff_filter_link(outlink);
++        outlink->w                   = inlink->w;
++        outlink->h                   = inlink->h;
++        outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
++        outlink->time_base           = inlink->time_base;
++        ol->frame_rate               = il->frame_rate;
++        return 0;
++    }
++
++    /* HW (VAAPI) branch. */
++    outlink->time_base     = inlink->time_base;
++    vpp_ctx->output_width  = inlink->w;
++    vpp_ctx->output_height = inlink->h;
++
++    err = ff_vaapi_vpp_config_output(outlink);
++    if (err < 0)
++        return err;
++    err = inlineass_build_filter_params(avctx);
++    if (err < 0)
++        return err;
++
++    /* Render-res cap: rasterise libass at a capped height (ow x oh) and let
++     * VPP upscale the small overlay surface to the full frame during
++     * composite. libass cost ~ (render_h/in_h)^2 → 1080 on 4K is ~4x cheaper.
++     * render_w is kept proportional so the VPP upscale is uniform. Folds in
++     * the old SCALEPLEX_SUB_RENDER_HEIGHT knob. render_height<=0 or >= input
++     * height → no cap (full-res render). */
++    {
++        int in_w = inlink->w;
++        int in_h = inlink->h;
++        int rh   = ass->render_height;
++        int sw, sh;
++
++        compute_cap_dims(in_w, in_h, rh, &sw, &sh);   /* static tier */
++
++        if (ass->animated_tier_down) {
++            int eff = (rh > 0 && rh < in_h) ? rh : in_h;
++            compute_cap_dims(in_w, in_h, tier_down(eff), &ass->anim_ow, &ass->anim_oh);
++        } else {
++            ass->anim_ow = sw;
++            ass->anim_oh = sh;
++        }
++
++        /* File mode may have already flagged animation in init → start low. */
++        if (ass->animated && ass->animated_tier_down) {
++            ass->ow = ass->anim_ow;
++            ass->oh = ass->anim_oh;
++            ass->anim_active = 1;
++        } else {
++            ass->ow = sw;
++            ass->oh = sh;
++        }
++        av_log(avctx, AV_LOG_VERBOSE,
++               "inlineass(hw): render %dx%d -> output %dx%d (render_height=%d, anim_tier=%dx%d%s)\n",
++               ass->ow, ass->oh, in_w, in_h, rh, ass->anim_ow, ass->anim_oh,
++               ass->anim_active ? " active" : "");
++    }
++
++    pthread_mutex_lock(&inlineass_lock);
++    ass_set_frame_size(ass->renderer, ass->ow, ass->oh);
++    ass_set_pixel_aspect(ass->renderer, 1.0);
++    ass_set_font_scale(ass->renderer, ass->font_scale);
++    if (ass->storage_w > 0 && ass->storage_h > 0)
++        ass_set_storage_size(ass->renderer, ass->storage_w, ass->storage_h);
++    ass_set_fonts(ass->renderer, ass->font_path, "DejaVu Sans",
++                  ASS_FONTPROVIDER_AUTODETECT, ass->fc_file, 1);
++    pthread_mutex_unlock(&inlineass_lock);
++
++    return inlineass_create_overlay(avctx);
++}
++
+ // Bunch of nonsense from MPlayer
+ #define COL_Y 0
+ #define COL_U 1
+@@ -572,13 +1179,113 @@
+     }
+ }
+ 
++/* HW (VAAPI) per-frame composite: refresh the cached overlay (text/bitmap)
++ * then VPP-blend it onto the video surface. Single input → no framesync. */
++static int filter_frame_hw(AVFilterLink *inlink, AVFrame *input)
++{
++    AVFilterContext *avctx   = inlink->dst;
++    AVFilterLink    *outlink = avctx->outputs[0];
++    AssContext      *ass     = avctx->priv;
++    VAAPIVPPContext *vpp_ctx = avctx->priv;
++    AVFrame *output = NULL;
++    VAProcPipelineParameterBuffer params[2];
++    VABlendState blend = { 0 };
++    VARectangle output_region, overlay_region;
++    int64_t time_ms;
++    int err, nb_params;
++
++    if (vpp_ctx->va_context == VA_INVALID_ID) {
++        err = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    time_ms = av_rescale_q(input->pts, inlink->time_base, ASS_TIME_BASE);
++    err = refresh_overlay(avctx, time_ms);   /* libass text path */
++    if (err < 0)
++        goto fail;
++    err = refresh_bitmap(avctx, time_ms);    /* PGS/bitmap path (dormant for text) */
++    if (err < 0)
++        goto fail;
++
++    output = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!output) {
++        err = AVERROR(ENOMEM);
++        goto fail;
++    }
++    err = av_frame_copy_props(output, input);
++    if (err < 0)
++        goto fail;
++
++    err = ff_vaapi_vpp_init_params(avctx, &params[0], input, output);
++    if (err < 0)
++        goto fail;
++    output_region = (VARectangle) {
++        .x = 0, .y = 0, .width = output->width, .height = output->height,
++    };
++    params[0].output_region           = &output_region;
++    params[0].output_background_color = VAAPI_VPP_BACKGROUND_BLACK;
++
++    /* Always VPP-render to an output-pool frame. When a cue is visible, add
++     * the overlay surface as a premultiplied-alpha blended second layer;
++     * otherwise render the main only (count = 1). A stream is text XOR bitmap
++     * — prefer the bitmap overlay (PGS) if present, else the libass text
++     * overlay. Never pass the input frame straight through — its
++     * hw_frames_ctx differs from the output link's pool, which crashes the
++     * downstream HW encoder. */
++    nb_params = 1;
++    {
++        AVFrame *ov = ass->have_bmp     ? ass->bmp_overlay
++                    : ass->have_overlay ? ass->overlay
++                    : NULL;
++        if (ov) {
++            memcpy(&params[1], &params[0], sizeof(params[0]));
++            blend.flags = VA_BLEND_PREMULTIPLIED_ALPHA;   /* both buffers are premultiplied */
++            params[1].blend_state    = &blend;
++            params[1].surface        = ff_vaapi_vpp_get_surface_id(ov);
++            params[1].surface_region = NULL;   /* whole overlay (its native render/canvas size) */
++            overlay_region = (VARectangle) {
++                .x = 0, .y = 0, .width = output->width, .height = output->height,
++            };
++            params[1].output_region = &overlay_region;
++            nb_params = 2;
++        }
++    }
++
++    err = ff_vaapi_vpp_render_pictures(avctx, params, nb_params, output);
++    if (err < 0)
++        goto fail;
++
++    av_frame_free(&input);
++    return ff_filter_frame(outlink, output);
++
++fail:
++    av_frame_free(&input);
++    av_frame_free(&output);
++    return err;
++}
++
+ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+ {
+     AVFilterContext *ctx = inlink->dst;
+     AVFilterLink *outlink = ctx->outputs[0];
+     AssContext *ass = ctx->priv;
+     ASS_Image *image = NULL;
+-    long long time_ms = av_rescale_q(picref->pts, inlink->time_base, ASS_TIME_BASE);
++    long long time_ms;
++    int err;
++
++    if (inlink->format == AV_PIX_FMT_VAAPI)
++        return filter_frame_hw(inlink, picref);
++
++    /* SW branch (per-frame libass render + FFDraw CPU blend, in place). The
++     * input pad no longer requests NEEDS_WRITABLE (it would force a wasteful
++     * copy of HW frames), so make the frame writable here for the SW path. */
++    err = av_frame_make_writable(picref);
++    if (err < 0) {
++        av_frame_free(&picref);
++        return err;
++    }
++
++    time_ms = av_rescale_q(picref->pts, inlink->time_base, ASS_TIME_BASE);
+ 
+     if (!ass->mangle_state) {
+         calculate_mangle_table(ass, picref);
+@@ -600,14 +1307,14 @@
+         .type             = AVMEDIA_TYPE_VIDEO,
+         .filter_frame     = filter_frame,
+         .config_props     = config_input,
+-        .flags            = AVFILTERPAD_FLAG_NEEDS_WRITABLE,
+     },
+ };
+ 
+ static const AVFilterPad inlineass_outputs[] = {
+     {
+-        .name = "default",
+-        .type = AVMEDIA_TYPE_VIDEO,
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = config_output,
+     },
+ };
+ 
+@@ -624,6 +1331,10 @@
+ {
+     AssContext *ass = (AssContext *)context->priv;
+     pthread_mutex_lock(&inlineass_lock);
++    /* Stash for the HW config_output to re-apply, and apply now (SW path /
++     * already-initialised renderer). */
++    ass->storage_w = w;
++    ass->storage_h = h;
+     ass_set_storage_size(ass->renderer, w, h);
+     pthread_mutex_unlock(&inlineass_lock);
+ }
+@@ -691,6 +1402,11 @@
+                start_ms, duration_ms, ass_line);
+         ass_process_chunk(ass->track, ass_line, strlen(ass_line),
+                           start_ms, duration_ms);
++        /* HW branch: an animated cue defeats render-once-per-cue → drop the
++         * overlay to the lower animated tier (one-shot, applied by
++         * refresh_overlay). Harmless flag for the SW branch. */
++        if (ass->animated_tier_down && !ass->animated && ass_line_is_animated(ass_line))
++            ass->animated = 1;
+     }
+     pthread_mutex_unlock(&inlineass_lock);
+ }
+@@ -820,6 +1536,8 @@
+                "scaleplex_inlineass: process_chunk[%d] start=%" PRId64 " dur=%" PRId64 " line=\"%.60s\"\n",
+                i, start, duration, ass_line);
+         ass_process_chunk(ass->track, ass_line, strlen(ass_line), start, duration);
++        if (ass->animated_tier_down && !ass->animated && ass_line_is_animated(ass_line))
++            ass->animated = 1;
+     }
+ 
+     pthread_mutex_unlock(&inlineass_lock);
+@@ -833,6 +1551,10 @@
+     {"fonts_dir",      "directory to scan for fonts",      OFFSET(fonts_dir),  AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN,  CHAR_MAX, FLAGS},
+     {"fontconfig_file","fontconfig file to load",          OFFSET(fc_file),    AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN,  CHAR_MAX, FLAGS},
+     {"alpha",          "composite onto a transparent (alpha) canvas",  OFFSET(alpha), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
++    /* HW (VAAPI) branch options */
++    {"filename",       "subtitle file to render (ASS/SSA); omit to feed via -map_inlineass (HW ad-hoc)", OFFSET(filename), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
++    {"render_height",  "HW path: cap libass raster height (0=full); VPP upscales", OFFSET(render_height), AV_OPT_TYPE_INT, {.i64 = 1080}, 0, 4320, FLAGS},
++    {"animated_tier_down", "HW path: render animated cues (\\move/\\t/\\k/\\fad) one resolution tier below render_height", OFFSET(animated_tier_down), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
+     {NULL},
+ };
+ 
+@@ -840,7 +1562,7 @@
+ 
+ const AVFilter ff_vf_inlineass = {
+     .name          = "inlineass",
+-    .description   = NULL_IF_CONFIG_SMALL("Render subtitles onto input video using the libass library."),
++    .description   = NULL_IF_CONFIG_SMALL("Render subtitles onto input video using the libass library (SW FFDraw blend or single-input VAAPI VPP composite, by negotiated frame format)."),
+     .priv_size     = sizeof(AssContext),
+     .priv_class    = &inlineass_class,
+     .init          = init,
+@@ -848,4 +1570,5 @@
+     FILTER_INPUTS(inlineass_inputs),
+     FILTER_OUTPUTS(inlineass_outputs),
+     FILTER_QUERY_FUNC(query_formats),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+ };
+--- a/fftools/scaleplex_inlineass.c
++++ b/fftools/scaleplex_inlineass.c
+@@ -339,6 +339,22 @@
+     pthread_mutex_unlock(&bindings_lock);
+ }
+ 
++/* Bitmap subtitle codecs (PGS/DVD/DVB/XSUB) route to the merged inlineass
++ * filter's HW (VAAPI) branch via replay_bitmap; everything else is text
++ * (libass via replay_chunk). */
++static int codec_is_bitmap_sub(enum AVCodecID id)
++{
++    switch (id) {
++    case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
++    case AV_CODEC_ID_DVD_SUBTITLE:
++    case AV_CODEC_ID_DVB_SUBTITLE:
++    case AV_CODEC_ID_XSUB:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
+ void scaleplex_inlineass_handle_subtitle(AVCodecContext *dec_ctx, AVSubtitle *sub)
+ {
+     InlineAssBinding *b = NULL;
+@@ -377,6 +393,26 @@
+         pthread_mutex_unlock(&bindings_lock);
+         return;
+     }
++
++    /* Bitmap subs (PGS/DVD/DVB) feed the merged filter as a whole decoded
++     * presentation (incl. empty = clear), not the per-rect text path. Only
++     * the HW VAAPI branch can burn them; the SW (libass text) branch cannot.
++     * A presentation landing before the filter binds is dropped (PGS resends
++     * the next display set) — the text pending-queue holds ASS lines only. */
++    if (codec_is_bitmap_sub(dec_ctx->codec_id)) {
++        if (b->flt_ctx) {
++            av_log(NULL, AV_LOG_VERBOSE,
++                   "scaleplex_inlineass: handle_subtitle(bitmap) bind#%td flt_ctx=%p rects=%d\n",
++                   b - bindings, (void*)b->flt_ctx, sub->num_rects);
++            avfilter_inlineass_replay_bitmap(b->flt_ctx, dec_ctx, sub);
++        } else {
++            av_log(NULL, AV_LOG_VERBOSE,
++                   "scaleplex_inlineass: bitmap sub before bind (bind#%td) — dropped\n",
++                   b - bindings);
++        }
++        pthread_mutex_unlock(&bindings_lock);
++        return;
++    }
+ 
+     for (int i = 0; i < sub->num_rects; i++) {
+         AVSubtitleRect *rect = sub->rects[i];
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -355,7 +355,7 @@
+ OBJS-$(CONFIG_IDENTITY_FILTER)               += vf_identity.o framesync.o
+ OBJS-$(CONFIG_IDET_FILTER)                   += vf_idet.o
+ OBJS-$(CONFIG_IL_FILTER)                     += vf_il.o
+-OBJS-$(CONFIG_INLINEASS_FILTER)              += vf_inlineass.o
++OBJS-$(CONFIG_INLINEASS_FILTER)              += vf_inlineass.o vaapi_vpp.o
+ OBJS-$(CONFIG_INFLATE_FILTER)                += vf_neighbor.o
+ OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
+ OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
+--- a/configure
++++ b/configure
+@@ -3954,7 +3954,7 @@
+ sr_filter_deps="avformat swscale"
+ sr_filter_select="dnn"
+ stereo3d_filter_deps="gpl"
+-inlineass_filter_deps="avformat avcodec libass"
++inlineass_filter_deps="avformat avcodec libass vaapi VAProcPipelineCaps_blend_flags"
+ subtitles_filter_deps="avformat avcodec libass"
+ super2xsai_filter_deps="gpl"
+ pixfmts_super2xsai_test_deps="super2xsai_filter"

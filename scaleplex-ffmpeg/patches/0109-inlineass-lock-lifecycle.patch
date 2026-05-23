@@ -1,0 +1,59 @@
+Description: libavfilter/inlineass: take inlineass_lock in config_input + uninit
+ Patch 0100 promoted the per-filter libass mutex to a process-wide
+ inlineass_lock and claimed to wrap "every libass entry" — but it wrapped
+ only the runtime entries (filter_frame, append_data, replay_chunk,
+ set_fonts, add_attachment, set_storage_size) and MISSED the lifecycle
+ functions config_input (ass_set_frame_size / ass_set_pixel_aspect) and
+ uninit (ass_free_track / ass_renderer_done / ass_library_done).
+ .
+ On jellyfin-ffmpeg 7.x with a graph reconfigure (probe -> live), the main
+ thread tears down the stale filter instance via uninit() while the
+ subtitle decoder thread is still feeding the live instance via
+ replay_chunk -> ass_process_chunk. libass shares process-global state
+ (fontconfig, FreeType cache, font provider) that is not reentrant, so the
+ unlocked teardown corrupts it, surfacing as
+ `libass/ass.c:127: ass_alloc_event: Assertion 'track->n_events <=
+ track->max_events' failed` aborting the decoder thread. config_input has
+ the same exposure (runs at graph config, concurrent with an
+ already-running sub decoder on the separate-input -map_inlineass path).
+ .
+ Fix: wrap both lifecycle functions' libass calls in inlineass_lock, so
+ ALL libass entry points in vf_inlineass.c are serialised.
+Author: scaleplex
+Last-Update: 2026-05-23
+---
+--- a/libavfilter/vf_inlineass.c
++++ b/libavfilter/vf_inlineass.c
+@@ -138,12 +138,20 @@
+ {
+     AssContext *ass = ctx->priv;
+ 
++    /* scaleplex: serialise libass teardown against the decoder thread's
++     * append/replay and another instance's render. libass shares
++     * process-global state (fontconfig/freetype) that is NOT reentrant;
++     * graph reconfig (probe->live) frees a stale instance here while the
++     * sub decoder may still feed the live one. 0100 wrapped the runtime
++     * libass entries but missed init/config_input/uninit. */
++    pthread_mutex_lock(&inlineass_lock);
+     if (ass->track)
+         ass_free_track(ass->track);
+     if (ass->renderer)
+         ass_renderer_done(ass->renderer);
+     if (ass->library)
+         ass_library_done(ass->library);
++    pthread_mutex_unlock(&inlineass_lock);
+ }
+ 
+ static int query_formats(AVFilterContext *ctx)
+@@ -159,9 +167,11 @@
+     ff_draw_init(&context->draw, link->format,
+                  context->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
+ 
++    pthread_mutex_lock(&inlineass_lock);
+     ass_set_frame_size(context->renderer, link->w, link->h);
+ 
+     ass_set_pixel_aspect(context->renderer, av_q2d(link->sample_aspect_ratio));
++    pthread_mutex_unlock(&inlineass_lock);
+ 
+     return 0;
+ }
