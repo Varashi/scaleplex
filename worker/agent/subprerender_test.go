@@ -1,9 +1,76 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
+
+func argvHas(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildSubPrerenderArgs_InlineFeed(t *testing.T) {
+	t.Setenv("SCALEPLEX_SUB_INLINE_FEED", "1")
+	spec := &SubPrerenderSpec{
+		FIFOPath:   "/transcode/s/scaleplex-sub-overlay.fifo",
+		SourcePath: "/media/movie.mkv",
+		StreamSpec: "0:5",
+		Embedded:   true,
+		Width:      1920,
+		Height:     1080,
+	}
+	args := buildSubPrerenderArgs(spec, "")
+	fc := argvVal(args, "-filter_complex")
+	if !strings.Contains(fc, "inlineass=alpha=1") {
+		t.Errorf("inlineass filter missing: %q", fc)
+	}
+	if strings.Contains(fc, "subtitles=") {
+		t.Errorf("inline path must not use subtitles=: %q", fc)
+	}
+	// rewriter's main-argv spec ("0:5") remapped onto input 1.
+	if !argvHasPair(args, "-map_inlineass", "1:5") {
+		t.Errorf("map_inlineass spec wrong: %v", args)
+	}
+	// decode sink forces the bound stream to decode (drives the feed hook).
+	if !argvHasPair(args, "-c:s", "ass") || !argvHasPair(args, "-f", "null") {
+		t.Errorf("decode sink missing: %v", args)
+	}
+	// source opened sub-only as input 1, no extraction.
+	if !argvHasPair(args, "-discard:v", "all") || !argvHasPair(args, "-i", "/media/movie.mkv") {
+		t.Errorf("source input wrong: %v", args)
+	}
+	if got, err := resolveSubFile(context.Background(), spec); got != "" || err != nil {
+		t.Errorf("inline feed must skip extraction, got %q err %v", got, err)
+	}
+}
+
+func TestBuildSubPrerenderArgs_InlineFeedSeek(t *testing.T) {
+	t.Setenv("SCALEPLEX_SUB_INLINE_FEED", "1")
+	spec := &SubPrerenderSpec{
+		FIFOPath:          "/t/o.fifo",
+		SourcePath:        "/media/m.mkv",
+		StreamSpec:        "0:3",
+		Embedded:          true,
+		Width:             3840,
+		Height:            2160,
+		SeekOffsetSeconds: 1800,
+	}
+	args := buildSubPrerenderArgs(spec, "")
+	fc := argvVal(args, "-filter_complex")
+	if !strings.Contains(fc, "setpts=PTS+1800.000/TB") {
+		t.Errorf("seek setpts missing: %q", fc)
+	}
+	// input seek + copyts so fed cue PTS stay absolute vs the shifted canvas.
+	if !argvHasPair(args, "-ss", "1800.000") || !argvHas(args, "-copyts") {
+		t.Errorf("seek -ss/-copyts missing: %v", args)
+	}
+}
 
 func argvHasPair(args []string, flag, val string) bool {
 	for i := 0; i+1 < len(args); i++ {

@@ -26,6 +26,7 @@ import (
 // style. At both 4K and 1080p:
 //   - text bottom sits ~5% of H above canvas bottom
 //   - each rendered line takes ~5-6% of H (font + spacing)
+//
 // We use 6% per line + 5% bottom margin + 8% top safety (~1.3 lines).
 // These percentages stay valid at any frame height — libass scales the
 // script-coordinate font (16 pt at PlayResY=288) to the canvas.
@@ -48,13 +49,16 @@ const srtMinBandSavingsPct = 10
 //   - `\pos(...)` — absolute position
 //   - `\move(...)` — animated position
 //   - `\org(...)` — rotation origin (rare; conservatively bail)
+//
 // Cue-internal `{\an1}`, `{\an2}`, `{\an3}` keep the cue on the bottom
 // row so they DON'T trigger fallback.
 var srtPosTagPattern = regexp.MustCompile(
 	`\\(?:an[4-9]|a(?:[3-9]|1[01])\b|pos\s*\(|move\s*\(|org\s*\()`)
 
 // srtTimingPattern recognises an SRT timing line:
-//   00:00:01,000 --> 00:00:04,500
+//
+//	00:00:01,000 --> 00:00:04,500
+//
 // Coordinates after the timing (X1:Y1 X2:Y2) are tolerated and ignored.
 var srtTimingPattern = regexp.MustCompile(
 	`^\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}`)

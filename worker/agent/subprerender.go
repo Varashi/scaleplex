@@ -90,6 +90,9 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 	if spec.Bitmap {
 		return buildBitmapPrerenderArgs(spec)
 	}
+	if subInlineFeed() {
+		return buildSubPrerenderArgsInline(spec)
+	}
 	// Render resolution. When SCALEPLEX_SUB_RENDER_HEIGHT capped the
 	// render below the output (rewriter set RenderWidth/RenderHeight), the
 	// canvas + band crop happen in those lower coords — libass and qtrle
@@ -167,6 +170,106 @@ func buildSubPrerenderArgs(spec *SubPrerenderSpec, subFile string) []string {
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 		"-f", "mov", spec.FIFOPath,
 	}
+}
+
+// subInlineFeed reports whether the inline-feed text pre-render is enabled
+// (SCALEPLEX_SUB_INLINE_FEED=1). When on, the pre-render reads the subtitle
+// stream DIRECTLY from the source via the fork's vf_inlineass +
+// -map_inlineass (incremental ass_process_chunk), instead of pre-extracting
+// to a .srt and load-once subtitles=. This removes the embedded-extraction
+// cold-start cost (9-28s on long multi-sub remuxes -> ~1s; see
+// docs/UNIFIED_SUB_FILTER.md / docs/LATENCY.md). Default OFF — the
+// extraction path stays the safe default until validated end-to-end on
+// plex-test. Trade-off while on: no agent-side tight-band (no .srt to
+// parse) -> the static fallback band is used (render-res knob still applies).
+func subInlineFeed() bool {
+	return os.Getenv("SCALEPLEX_SUB_INLINE_FEED") == "1"
+}
+
+// buildSubPrerenderArgsInline builds the text pre-render argv for the
+// inline-feed path: a transparent argb canvas (input 0) onto which the
+// fork's `inlineass` filter composites libass cues fed incrementally from
+// the source's subtitle stream (input 1) via `-map_inlineass`. A decode
+// sink (`-map <sub> -c:s ass -f null`) forces the bound stream to decode,
+// which is what drives the inlineass feed hook (without a consumer the
+// stream is never decoded and no cues are fed). Output is the same
+// qtrle/MOV FIFO the main transcode reads, so the overlay/main graph is
+// unchanged. UAF on graph reconfig fixed by fork patch 0111.
+func buildSubPrerenderArgsInline(spec *SubPrerenderSpec) []string {
+	rw, rh := spec.Width, spec.Height
+	if spec.RenderWidth > 0 && spec.RenderHeight > 0 {
+		rw, rh = spec.RenderWidth, spec.RenderHeight
+	}
+	// argb up front: qtrle wants argb and an explicit argb canvas avoids an
+	// auto-inserted format/scale that would trigger a graph reconfigure.
+	canvas := fmt.Sprintf("color=c=black@0.0:s=%dx%d:r=%d,format=argb",
+		rw, rh, subPrerenderFPS)
+
+	fc := "[0:v]"
+	if spec.SeekOffsetSeconds > 0 {
+		// Shift the canvas timeline to the seek offset so overlay PTS match
+		// the seeked main video (same as the subtitles= path). The source
+		// is opened with -ss + -copyts below so fed cue PTS stay absolute
+		// and land at canvas PTS == cue PTS.
+		fc += "setpts=PTS+" +
+			strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64) + "/TB,"
+	}
+	fc += "inlineass=alpha=1"
+	// Bottom-band crop (render coords), matching the subtitles= path.
+	if spec.BandHeight > 0 && spec.BandHeight < spec.Height {
+		rBandH := spec.BandHeight
+		if rh != spec.Height {
+			rBandH = spec.BandHeight * rh / spec.Height
+			if rBandH%2 == 1 {
+				rBandH++
+			}
+			if rBandH < 2 {
+				rBandH = 2
+			}
+			if rBandH > rh {
+				rBandH = rh
+			}
+		}
+		fc += fmt.Sprintf(",crop=%d:%d:0:%d", rw, rBandH, rh-rBandH)
+	}
+	fc += ",format=argb[o]"
+
+	// The source is input 1; remap the rewriter's main-argv stream spec
+	// (e.g. "0:5") onto input 1, mirroring buildBitmapPrerenderArgs.
+	sel := spec.StreamSpec
+	if sel == "" {
+		sel = "1:s:0"
+	} else if strings.HasPrefix(sel, "0:") {
+		sel = "1:" + sel[2:]
+	}
+
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", canvas, // input 0: transparent canvas
+	}
+	// input 1: the source, subtitle-only. -discard:v/-discard:a stop the
+	// demuxer decoding the 4K video/audio. On a seek, -ss jumps the
+	// demuxer to the playhead (fast, no full-file walk) and -copyts keeps
+	// the fed cue PTS absolute to align with the shifted canvas.
+	if spec.SeekOffsetSeconds > 0 {
+		args = append(args, "-copyts",
+			"-ss", strconv.FormatFloat(spec.SeekOffsetSeconds, 'f', 3, 64))
+	}
+	args = append(args,
+		"-discard:v", "all", "-discard:a", "all",
+		"-i", spec.SourcePath,
+		"-filter_complex", fc,
+		"-map", "[o]",
+		"-map_inlineass", sel,
+		"-fps_mode", "vfr",
+		"-c:v", "qtrle",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mov", spec.FIFOPath,
+		// decode sink: transcoding the sub to a null output forces the
+		// bound stream to decode, driving the inlineass feed hook.
+		"-map", sel, "-c:s", "ass", "-f", "null", os.DevNull,
+	)
+	return args
 }
 
 // buildBitmapPrerenderArgs builds the pre-render argv for a bitmap
@@ -307,20 +410,29 @@ func resolveSubFile(ctx context.Context, spec *SubPrerenderSpec) (string, error)
 	if spec.Bitmap {
 		return spec.SourcePath, nil
 	}
+	// Inline-feed path reads the subtitle stream directly via -map_inlineass
+	// in buildSubPrerenderArgsInline — no .srt extraction, no subFile.
+	// ResolveAgentBand("") then keeps the static fallback band.
+	if subInlineFeed() {
+		return "", nil
+	}
 	if !spec.Embedded {
 		return spec.SourcePath, nil
 	}
 	extracted := filepath.Join(filepath.Dir(spec.FIFOPath), "scaleplex-sub-extracted.srt")
 	ectx, cancel := context.WithTimeout(ctx, subExtractTimeout)
 	defer cancel()
-	// `-vn -an` as INPUT options: tell the demuxer to skip the video
-	// and audio streams entirely. Without them ffmpeg reads (and sets
-	// up decoders for) the whole multi-GB 4K source just to reach the
-	// interleaved subtitle blocks — ~15s on a 4.8 GB file vs ~1s with
-	// the streams skipped (measured).
+	// `-discard:v all -discard:a all` as INPUT options drop the video and
+	// audio packets at the DEMUXER, so only the subtitle stream is read.
+	// This is the big extraction-latency win: `-vn -an` (the previous
+	// form) are OUTPUT options — the demuxer still parses every A/V packet
+	// while walking to the interleaved subtitle blocks. Measured on a 4K
+	// 36-embedded-sub remux: `-vn -an` 32.6s vs `-discard` 1.4s, identical
+	// 2465 cues. See docs/LATENCY.md. (The bitmap pre-render already used
+	// -discard for the same reason.)
 	cmd := exec.CommandContext(ectx, ffmpegBin,
 		"-hide_banner", "-loglevel", "error", "-y",
-		"-vn", "-an",
+		"-discard:v", "all", "-discard:a", "all",
 		"-i", spec.SourcePath,
 		"-map", spec.StreamSpec,
 		"-c:s", "srt",
