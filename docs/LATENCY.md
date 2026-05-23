@@ -31,6 +31,101 @@ budget on a node that has the image cached. Levers used everywhere:
   process startup is single-syscall ELF load, no glibc/musl version dance.
 - **`tini` as PID 1** to reap zombies cleanly without a full init system.
 
+## Measured baseline — scaleplex in prod (2026-05-22)
+
+> **CURRENT, measured.** This supersedes the speculative tables below for
+> the shipped system. Method: harvested the unconditional worker log
+> markers (`rewriter applied` → `agent band resolve` / `spawned subtitle
+> pre-render` → `spawned ffmpeg pid` → `first segment ready`) across all 3
+> prod + 3 plex-test workers, plus controlled extraction timing on the
+> idle media-toolkit pod (NFS media, jellyfin-ffmpeg).
+
+Time-to-first-segment (TTFS) splits into **two** parts:
+
+1. **Extraction (pre-spawn)** — `rewriter applied` → `spawned ffmpeg`. This
+   is the embedded-subtitle extraction step in `resolveSubFile`
+   (`-vn -an -i SRC -map SPEC -c:s srt`). It is the ONLY part that varies,
+   and it dominates the embedded-subtitle paths.
+2. **Pipeline fill** — `spawned ffmpeg` → first segment file. This is the
+   `scaleplex_worker_first_segment_seconds` metric. **≈ 1s (0.5–2s) for
+   every path**, with libass first-render folded in. Not a target.
+
+| sub type | extraction (pre-spawn) | pipeline fill | cold TTFS | seek |
+|---|---|---|---|---|
+| no-sub | 0 | ~1s | **~1s** | ~1s |
+| sidecar SRT | 0 (file on disk) | ~1s | **~1s** | ~1s |
+| PGS / bitmap | 0 (read source direct, no extract) | ~1s | **~1s** | ~1s |
+| embedded SRT — TV episode | 1–5s | ~1s | **2–6s** | re-pays extraction |
+| embedded SRT — long multi-sub 4K | **8–27s** | ~1s | **9–28s** | **re-pays FULL extraction every seek** |
+| embedded ASS | = embedded SRT (flattened `-c:s srt` first) | ~1s | same | same |
+
+**The bottleneck is embedded-subtitle extraction**, and its cost is
+`∝ duration × sub-stream-count × interleave sparseness` — **not** raw file
+size. Examples (controlled, idle worker):
+
+| file | size | embedded subrip streams | duration | full extract |
+|---|---|---|---|---|
+| Ghosts (US) S05E21 | 2.1 GB | 2 | 22 min | 1–5s (live) |
+| F1 The Movie (2025) | 3.4 GB | 61 | ~2.5 h | 8.3s (warm) |
+| Avatar: Fire and Ash | 8.7 GB | 36 | ~2.5 h | 27.6s (cold), 23s (live) |
+
+Long movies with many embedded SRT tracks are the worst case (a single
+stream's packets are sparsely interleaved across the whole container, so
+the demuxer walks every cluster). PGS, sidecar, no-sub, and libass-init
+are all ~1s and are **not** worth optimising.
+
+### Fix: windowed extraction (validated, not yet built)
+
+Extract only the cues near the playhead instead of the whole file. The
+working recipe (measured): **input-side `-ss <playhead>` (fast Cues-index
+seek) + OUTPUT-side `-to`/`-t <window>` placed AFTER `-map` (bounds the
+write).** Output-side placement is required — an input-side `-to` (before
+`-i`) does NOT early-stop subtitle extraction.
+
+| pattern | time | notes |
+|---|---|---|
+| full extract (today) | 8–27s | reads/walks whole container |
+| `-to 120` output-side (cold start) | **0.40–0.53s** | reads only file front |
+| `-ss <T>` + `-t 120` output-side (seek) | **0.34–0.55s** | Cues-index jump |
+
+~16–65× faster, cache-independent (window emits only that window's cues —
+verified by cue counts; F1 cold-window 0.34s beat warm-full 8.3s).
+
+### Simplest fix (SHIPPED in the agent): `-discard` extraction
+
+`resolveSubFile` extracted with `-vn -an`, which are OUTPUT options — the
+demuxer still parses every video/audio packet while walking to the
+interleaved subtitle blocks. Switching to input-level `-discard:v all
+-discard:a all` (skip A/V at the demuxer) cut extraction **WARM** from
+32.6 s → 1.4 s (identical 2465 cues), and the bitmap pre-render already
+used `-discard` for this reason.
+
+> **CORRECTION (plex-test, 2026-05-23): `-discard` does NOT fix
+> cold-start.** On the worker with a COLD NFS cache the same Avatar
+> extraction took **18 s**, not 1.4 s. `-discard` only saves the A/V
+> *decode* CPU — the demuxer still has to READ the whole file's clusters
+> (8.7 GB ÷ ~480 MB/s NFS ≈ 18 s) to collect every interleaved subtitle
+> packet, because one stream's packets span the whole timeline. So
+> `-discard` ~halves cold (18 vs 32 s) and is a big win on warm/re-reads,
+> but the *synchronous whole-file* extraction still blocks first-segment
+> ~18 s cold on a big multi-sub remux. The 1.4 s was a warm-cache
+> artifact.
+
+**The real cold-start fix is reading LESS of the file**, not skipping A/V
+decode: either windowed extraction (`-ss`+output-`-to`) or the inline-feed
+path (incremental — first cues from the file front, the rest in the
+background, so first-segment doesn't wait for the full read). Validated on
+plex-test: inline-feed spawns in ~0 s vs `-discard`'s 18 s.
+
+### Inline-feed (fork) path — the strategic alternative
+
+The non-trivial part is the **window lifecycle**: the pre-render consumes
+one `.srt` for the whole session, so a finite window must be extended as
+playback advances (extract a generous first window, e.g. 300–600s, and
+extend lazily; a seek extracts a fresh window at the new playhead). Per
+extract is now ~0.5s so re-extraction is cheap. Code: `resolveSubFile` /
+`spawnSubPrerender` in `worker/agent/subprerender.go`.
+
 ## Where latency comes from in the current clusterplex stack
 
 Measured during the 2026-05-05 sessions:

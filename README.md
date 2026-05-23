@@ -20,10 +20,10 @@ Concretely this unlocks:
 
 - HW HDR→SDR tone-mapping — honored from Plex's argv (OpenCL,
   algorithm-selectable; `tonemap_vaapi` via the `SCALEPLEX_TONEMAP` knob)
-- HW subtitle burn-in: SRT / static ASS pre-rendered and composited via
-  `overlay_vaapi` (no fork patch — ~4.7× realtime at 4K HDR vs ~2.2× on
-  the per-frame CPU path), animated ASS via a fork-native port of Plex's
-  `inlineass` filter, bitmap subs via `overlay_vaapi`
+- HW subtitle burn-in: one fork-native `inlineass` filter with a
+  single-input VAAPI VPP branch — text (SRT/ASS), animated ASS, and bitmap
+  (PGS/DVD) all burned on the GPU (render-once-per-cue, no framesync), with a
+  CPU FFDraw fallback selected by the negotiated frame format
 - HDR Main10 passthrough where the client supports it
 - Direct NFS segment writes — no `LOCAL_RELAY` HTTP hop
 - First-frame latency as a first-class design goal (see [docs/LATENCY.md](docs/LATENCY.md))
@@ -33,6 +33,18 @@ PMS still sees a normal local transcoder via a thin shim. Plex session
 bookkeeping is unchanged.
 
 ## Status
+
+**v1.3.0 — subtitle burn-in unification.** All HW sub burn-in moves into one
+fork-native `inlineass` filter with a single-input VAAPI VPP branch (merged
+from the `overlay_sub_vaapi` prototype): libass renders each cue once on-change
+to a cached VAAPI surface and VPP-blends it onto the video — no second ffmpeg
+process, no qtrle FIFO, no `overlay_vaapi` framesync, no `__SP_BAND*` sentinel
+machinery. Text (SRT/ASS), animated ASS (`animated_tier_down`), PGS/DVD bitmap
+(in-filter `replay_bitmap`), and native seek are all handled in-filter; the SW
+FFDraw path is the CPU fallback, chosen by negotiated frame format. The
+rewriter shed ~427 lines (the whole pre-render orchestration). Validated at 4K
+on plex-test (HW SRT / PGS / animated ASS, SW fallback) — ~0.13 core (4K SRT) /
+~0.44 core (4K PGS) per session. See [docs/UNIFIED_SUB_FILTER.md](docs/UNIFIED_SUB_FILTER.md).
 
 **v1.2.1 — tight pre-render band for sidecar SRT.** On top of v1.2's
 PGS HW-decode pre-render + HDR pass-through + ffmpeg base v7.1.3-6,

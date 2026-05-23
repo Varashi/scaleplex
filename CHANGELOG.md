@@ -1,5 +1,55 @@
 # Changelog
 
+## v1.3.0 — 2026-05-24
+
+Subtitle burn-in unification. The separate GPU-overlay pre-render path (a
+second ffmpeg process writing a qtrle FIFO that the main graph composited with
+`overlay_vaapi`) is gone. All HW subtitle burn-in now runs inside one
+fork-native filter — `inlineass`, extended with a single-input VAAPI VPP
+branch (merged from the `overlay_sub_vaapi` prototype). One Plex-native
+`inlineass` node serves both the GPU fast path and the CPU fallback, chosen
+from the negotiated input frame format.
+
+### Merged `inlineass` filter (scaleplex-ffmpeg patch 0115)
+
+- `vf_inlineass` gains a HW (VAAPI) branch: libass renders each cue once
+  on-change to a premultiplied BGRA buffer (no vsfilter colour mangle),
+  uploads it to a cached filter-owned VAAPI surface, then VPP-blends it onto
+  the video. Single input → no framesync → no AV1 decoder surface-pool
+  overrun (the "error-18" lineage that forced the 2-process split).
+- Text (SRT/ASS), PGS/DVD bitmap (via `replay_bitmap`), animated ASS
+  (`animated_tier_down` toggle, one resolution tier below `render_height`),
+  native seek (real PTS) and the `render_height` raster cap (folds in
+  `SCALEPLEX_SUB_RENDER_HEIGHT`) are all handled in-filter.
+- The SW branch is the original FFDraw per-frame blend, unchanged — the
+  non-GPU / CPU-fallback path. The filter picks HW vs SW from the negotiated
+  input frame format.
+- Prototype patches 0112/0113 (standalone `overlay_sub_vaapi`) dropped; the
+  fftools `-map_inlineass` binding gains a bitmap route (no `is_osv` dispatch).
+
+### Rewriter
+
+- HW-decode sub burn now emits `inlineass=…:render_height=N[:animated_tier_down=1]`
+  straight on the VAAPI surface — the `hwdownload → inlineass(SW) → hwupload`
+  bracket is stripped. No more `SubPrerenderSpec` / FIFO splice / `__SP_BAND*`
+  sentinels / setpts-seek dance. PGS: the rewriter now adds `-map_inlineass`
+  + a `dvdsub` decode-sink and drops Plex's `overlay_vaapi` sub2video graph.
+- SW-decode path unchanged (CPU `inlineass` fallback).
+- Change tags: `hw-decode:filter:inlineass-vaapi` (text),
+  `hw-decode:filter:bitmap-inlineass-vaapi` (PGS). Net −427 lines.
+
+### Fixes
+
+- `probeSubtitleCodec` passed the `-map_inlineass` `input:stream` value (e.g.
+  `0:3`) to ffprobe `-select_streams`, which wants the in-file specifier (`3`)
+  → the probe always failed (`Invalid stream specifier`) → every sub defaulted
+  to text, so bitmap detection and `animated_tier_down` never fired. Strip the
+  leading input index.
+
+Validated on plex-test at 4K: HW SRT, HW PGS, HW animated ASS, SW fallback —
+all render correctly with seek, no crashes/restarts. ~0.13 core (4K SRT) /
+~0.44 core (4K PGS) per session.
+
 ## v1.2.2 — 2026-05-22
 
 Two sub-burn efficiency features. Measured impact (flat-out, 4K HEVC HDR, one

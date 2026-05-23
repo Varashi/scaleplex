@@ -162,239 +162,96 @@ The map-label update is needed because we add `hwupload` inside the
 existing chain, which can shift `[N]` labels — the rewriter walks the
 graph, increments labels mentioned later in the argv (`-map "[1]"` etc.).
 
-### Text sub burn-in
+### Sub burn-in (merged `inlineass` filter, v1.3.0)
 
-A text-sub burn-in session takes one of two routes, picked per session
-by `subtitleIsAnimated()`:
+All subtitle burn-in runs through the fork's `inlineass` filter, which has
+two format-adaptive branches sharing one libass track (fed via the
+`-map_inlineass` side-channel, patch 0100). The branch is chosen from the
+**negotiated input frame format**, not from the argv:
 
-- **SRT / static ASS → GPU overlay pre-render** — the default for
-  effectively all text subs (new in v1.1).
-- **Animated ASS → `inlineass` pass-through** — ASS carrying karaoke /
-  `\t` / `\move` / `\fad` tags needs per-frame rendering and can't be
-  pre-rendered, so it keeps the per-frame `inlineass` filter.
+- **VAAPI surface in → HW branch** (single-input VAAPI VPP): libass renders
+  each cue once on-change to a premultiplied BGRA buffer, uploads it to a
+  cached filter-owned VAAPI surface, then VPP-blends it onto the video. One
+  input → no framesync → no AV1 decoder surface-pool overrun. Text, PGS/DVD
+  bitmap, animated ASS, seek and the `render_height` raster cap are all
+  handled in-filter (patch 0115).
+- **CPU frame in → SW branch**: the original per-frame libass + FFDraw blend.
+  The non-GPU / CPU-fallback path.
 
-`subtitleIsAnimated()`: SRT carries no override tags so it is never
-animated; ASS is scanned for animation tags, and an unreadable file is
-treated as animated (conservative — falls back to the safe `inlineass`
-path).
+> **History.** Through v1.2.x, SRT/static-ASS/PGS burn ran a *second* ffmpeg
+> (the GPU-overlay pre-render) writing a qtrle FIFO that the main graph
+> composited with `overlay_vaapi`, and only animated ASS used `inlineass`.
+> v1.3.0 collapsed all of that into the merged filter — `SubPrerenderSpec`,
+> the FIFO splice, the `__SP_BAND*` sentinels and the setpts-seek dance are
+> gone. See `CHANGELOG.md` (v1.3.0) and `docs/UNIFIED_SUB_FILTER.md`.
 
-#### GPU overlay pre-render (SRT / static ASS)
+#### HW-decode text (SRT / ASS)
 
-The rewriter replaces Plex's per-frame CPU `inlineass` bracket
-(`hwdownload` → libass → `hwupload`) with a GPU `overlay_vaapi`
-composite. The agent spawns a second ffmpeg — the *pre-render* — from
-the `SubPrerenderSpec` the rewriter returns: it rasterises the subtitle
-onto a transparent canvas (`subtitles` → `qtrle` / fragmented MOV) and
-streams it through a FIFO. The main transcode reads that FIFO as a
-second video input and composites it on the GPU. All filters are stock
-scaleplex-ffmpeg7 — **no fork patch involved**.
-
-Graph (initial play):
+Plex sends `[0:0]hwupload[0];[0]scale_vaapi=W:H[1];[1]hwdownload,format=nv12[2];[2]inlineass=…[3];[3]hwupload[4]`
+(`reFilterHWAss`, or `reFilterHWOpenCLAss` with an OpenCL tonemap). The
+rewriter **strips the `hwdownload → inlineass → hwupload` bracket** so the
+filter composites directly on the VAAPI surface:
 
 ```
-[0:0]hwupload[10];
-[10]scale_vaapi=...[11];
-[N:v]format=bgra,hwupload[12];          # N = the FIFO input index
-[11][12]overlay_vaapi=x=0:y=Y:eof_action=pass:repeatlast=1[4]
+[0:0]hwupload[0];
+[0]scale_vaapi=w=W:h=H:format=nv12[1];     # (+ tonemap stage if Plex sent one)
+[1]inlineass=<stripped-params>:render_height=N[:animated_tier_down=1][4]
 ```
 
-Key constraints on the pre-render (hard-won — see
-`project_scaleplex_av1_decode_corruption`):
+- `render_height=N` is `SCALEPLEX_SUB_RENDER_HEIGHT` (default 1080) as a filter
+  option — libass rasterises at the cap and the VPP blend upscales.
+- `animated_tier_down=1` is added when `subtitleIsAnimated()` is true (ASS with
+  `\move`/`\t`/`\k`/`\fad`); the filter then renders animated cues one
+  resolution tier below `render_height`. Static cues are unaffected.
+- Plex's `-map_inlineass <spec>` and its `-map <spec> -f null -codec ass`
+  decode-sink are **kept** — they drive the libass feed.
+- Four Plex-only AVOption keys (`language`, `overrides`, `outline`, `shadow`)
+  are stripped (the fork's `inlineass` doesn't parse them); `font_scale`,
+  `font_path`, `fontconfig_file`, `font_size` are kept.
+- OpenCL-tonemap variant: the tonemap is preserved and PMS's `-map [6]` is
+  retargeted to `[4]`.
 
-- **The overlay stream must be steady, never decimated.** `overlay_vaapi`
-  framesync holds each decoded main-video frame until it has an overlay
-  frame past that PTS; a gap pins the main AV1 decoder's VAAPI surfaces
-  and overruns the pool (`Failed to upload decode parameters: 18`). The
-  pre-render emits a steady 5 fps — `mpdecimate` (even bounded) is
-  forbidden.
-- **Codec is `qtrle` (QuickTime Animation) in fragmented MOV.** qtrle is
-  lossless, carries alpha, and is inter-frame, so the long runs of
-  identical transparent frames encode as near-empty deltas (~9× cheaper
-  than the intra-only ffv1 it replaced). qtrle in Matroska/NUT/AVI
-  mis-decodes — fragmented MOV (`empty_moov`) is the working container.
-- **Band optimisation (SRT only).** SRT is always bottom-positioned, so
-  the pre-render renders the full frame (libass needs it for correct
-  positioning) then crops to a bottom band; `overlay_vaapi` places it
-  at `y = Height - BandHeight`. Cuts the canvas-size-proportional CPU
-  by ~2.5× over the fallback static 40% band, ~4× when the tight band
-  fires (v1.2.1). Sidecar ASS can be positioned anywhere → keeps the
-  full frame (`BandHeight == Height`, `y = 0`).
-- **Tight band for sidecar SRT (v1.2.1+).** When the rewriter sees a
-  sidecar SRT (`-i <path>.srt`), it parses the cues at rewrite time
-  (`worker/agent/subparse.go`). If every cue is plain bottom-aligned
-  the band shrinks to fit the actual max-lines-per-cue plus safety
-  (`5% + lines*6% + 8%` of frame height, even-rounded); rewriter tag
-  `sub-prerender:band:tight` is emitted. Bails to the static 40%
-  fallback band when the parser finds positional cues (`\anN` with
-  N>3, `\pos(...)`, `\move(...)`, `\org(...)`), the savings would be
-  under 10% of the fallback band, or the file is unreadable.
-  Embedded SRT keeps the static fallback band (extraction happens
-  post-rewrite; embedded-side tight band is tracked for v1.2.2).
-- **HDR tonemap is preserved.** When Plex's argv carries an OpenCL
-  tonemap, the rewrite keeps it (scale step → `scale_vaapi(p010)` + the
-  resolved tonemap stage) — dropping it rendered HDR washed/dim.
+**Label:** `hw-decode:filter:inlineass-vaapi`.
 
-The rewriter also:
+#### HW-decode bitmap (PGS / DVD / DVB)
 
-- **Drops `-map_inlineass <spec>`** — no `inlineass` filter consumes it
-  on this path; the pre-render reads the subtitle itself.
-- **Appends the FIFO `-i`** immediately after the last real input's
-  path (never just before `-filter_complex` — Plex parks output-side
-  options like `-start_at_zero` / `-copyts` / `-fps_mode` there, and a
-  new `-i` would mis-parse them as input options). FIFO input flags:
-  `-copyts -probesize 32 -analyzeduration 0` — `-copyts` keeps the
-  overlay timestamps; the minimal probe stops `find_stream_info` from
-  reading the FIFO at startup (~5 s grind → ~0.8 s).
+Plex burns bitmap subs with a `sub2video` bridge + `overlay_vaapi` and emits
+**no** `-map_inlineass` (`reFilterHWBitmapOverlay`). The rewriter replaces
+that graph with the merged filter and feeds the bitmap through the same
+side-channel:
 
-**Seek:** the main video reaches the filtergraph at the seek offset
-(PTS N) but the overlay starts at ~0, so `overlay_vaapi` framesync would
-drain the overlay 0→N hunting for a pair. The rewriter rebases both
-branches to zero with `setpts=PTS-STARTPTS` around `overlay_vaapi`, then
-rebases the composite back with `setpts=PTS+offset` so dashenc and the
-seek-chunk/tfdt machinery see the unchanged source timeline (client
-playhead unaffected). Initial play (offset 0) keeps the plain graph.
+```
+[0:0]hwupload[0];
+[0]scale_vaapi=w=W:h=H:format=nv12[1];
+[1]inlineass=render_height=N[4]
+```
 
-**Label:** `hw-decode:filter:sub-prerender-overlay`. See
-[`SEEK.md`](SEEK.md) and `project_scaleplex_srt_to_pgs_gpu`.
+- **Adds `-map_inlineass <spec>`** (before `-filter_complex`) so the fftools
+  binding routes the decoded bitmap presentation to the filter's
+  `replay_bitmap` (it blits palettised rects to a cached VAAPI surface).
+- **Adds a decode-sink** `-map <spec> -f null -codec dvdsub nullfile` at the
+  end (PGS can't encode to `ass`, so `dvdsub`) to trigger the sub decode.
+- Drops Plex's `overlay_vaapi` sub2video graph. Seek is native (real PTS).
 
-#### inlineass pass-through (animated ASS)
+**Label:** `hw-decode:filter:bitmap-inlineass-vaapi`.
 
-Plex's `-map_inlineass 0:N` + `inlineass=...` filter is **Plex-private**
-in stock ffmpeg, but scaleplex-ffmpeg7 ports it directly
-(patches 0099-0101: `libavfilter/vf_inlineass.c`, fftools wiring, and
-the pre-graph sub-chunk buffer). The fork's `scaleplex_inlineass`
-binding consumes the sub stream via `-map_inlineass` side-channel and
-renders glyphs onto CPU NV12 frames via libass under a process-wide
-mutex.
+#### SW-decode (CPU fallback) — unchanged
 
-The rewriter keeps Plex's argv shape intact and only:
+When Plex sends a software-decode shape (`reFilterAss` / `reFilterHDRAss`,
+e.g. HW acceleration disabled), the rewriter reshapes scale + encode to VAAPI
+but keeps `inlineass` on an nv12 (CPU) frame between `hwdownload`/`hwupload`,
+exercising the filter's **SW FFDraw branch**:
 
-1. **Rewrites the filter chain** to insert the hwdownload→inlineass→
-   hwupload sandwich at the right place. For SW-decode (PMS sent SW
-   shape) the chain becomes:
-
-   ```
-   [0:0]hwupload[10];
-   [10]scale_vaapi=w=W:h=H:format=nv12[11];
-   [11]hwdownload[12];
-   [12]format=pix_fmts=nv12[13];
-   [13]inlineass=<stripped-params>[14];
-   [14]hwupload[15]
-   ```
-
-   For HW-decode (PMS already hwaccel'd) the chain is similar but
-   shorter — the source is already on the GPU.
-
-2. **Strips four Plex-only AVOption keys** from the `inlineass=`
-   filter args: `language`, `overrides`, `outline`, `shadow`. These
-   aren't AVOptions on `vf_inlineass` in the fork; PMS emits them but
-   the filter rejects them at init. Keeps `font_scale`, `font_path`,
-   `fontconfig_file`, `font_size`.
-
-3. **Keeps everything else** — sidecar `-i`, `-map_inlineass`,
-   trailing `-f null -codec ass` null-sub output. The fork's binding
-   owns those.
+```
+[0:0]hwupload[10];[10]scale_vaapi=W:H:format=nv12[11];[11]hwdownload[12];
+[12]format=pix_fmts=nv12[13];[13]inlineass=<stripped>[14];[14]hwupload[15]
+```
 
 **Labels:** `filter:passthrough-inlineass` (SDR) /
-`filter:passthrough-inlineass-hdr` (HDR) /
-`hw-decode:filter:inlineass-passthrough` (HW-decode path),
-`map-label-update`.
-
-### Bitmap sub burn-in (overlay_vaapi) — SW-decode path
-
-PGS / VobSub / DVDSub streams are bitmap images; libass can't render
-them. On SW-decode sessions the rewriter routes them through
-`overlay_vaapi` directly:
-
-```
-[0:0]hwupload[10];
-[10]scale_vaapi=w=W:h=H:format=nv12[11];
-[streamSpec]format=bgra[12];
-[12]hwupload[13];
-[11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]
-```
-
-Strips `-map_inlineass` (the fork's text-sub binding doesn't apply
-here; the bitmap stream is referenced directly via its stream spec in
-the filter graph).
-
-**Labels:** `filter:overlay-vaapi-bitmap`, `subtitle:bitmap:<spec>(<codec>)`.
-
-### Bitmap sub burn-in (HW-decode pre-render path)
-
-When the session is HW-decode AND PMS emits its own
-`overlay_vaapi` graph for a bitmap sub (regex
-`reFilterHWBitmapOverlay`), the raw graph is:
-
-```
-[0:5]scale=W:H,hwupload[0];           # SW-upscale of the sub2video bridge
-[0:0]hwupload[1];
-[1]scale_vaapi=w=W:h=H:format=p010[2];
-[2][0]overlay_vaapi,scale_vaapi=format=p010[3];
-[3]hwupload[4]
-```
-
-The sparse `sub2video` bridge fed straight into `overlay_vaapi` lets
-framesync drain it at the main-frame rate, re-running the 4K SW
-upscale per pulled frame (~2 cores). The transcode collapses to
-~0.25× realtime mid-stream. Symptom: smooth for 30–60 s, then a hard
-hitch into buffering. Reproduces on Avatar 4K HDR + PGS.
-
-**Fix.** Route the bitmap stream through a separate `buildBitmapPrerenderArgs`
-process (canvas + sub2video composited with SW `overlay`, encoded as
-qtrle into a fragmented MOV streamed via FIFO). The main graph reads
-the FIFO and composes via `overlay_vaapi` — no SW upscale on the
-framesync hot path. The pre-render runs `~0.3-0.5 core total` flat.
-See `project_scaleplex_pgs_prerender` (auto-memory) for the iteration
-history.
-
-The rewritten main graph:
-
-```
-[fifoInput:v](setpts=PTS+SEEK_OFF/TB,)format=bgra,hwupload[0];
-[0:0]hwupload[1];
-[1]scale_vaapi=w=W:h=H:format=p010[2];
-[2][0]overlay_vaapi=x=0:y=H-BandH:eof_action=pass:repeatlast=1,
-   scale_vaapi=format=p010[3];
-[3]hwupload[4]
-```
-
-The pre-render's FIFO is spliced as a second `-i` after the source
-with `-copyts -probesize 32 -analyzeduration 0` so `find_stream_info`
-does not grind on the sparse stream at startup.
-
-**Seek alignment.** Plex's HW-decode bitmap argv carries
-`-start_at_zero -copyts`. `-start_at_zero` only zeroes the muxer-side
-output PTS — it does **not** shift the filter input (verified offline
-against Avatar Fire and Ash AV1 with `-ss 540`: the source's first
-frame arrives in `-filter_complex` at `pts_time:540.003`).
-The pre-render's FIFO arrives in the filter at PTS 0+ (its overlay
-canvas is necessarily 0-based, and the sub branch is rebased by
-`setpts=PTS-N/TB` so the canvas can drive output through dialogue
-gaps). Without compensation `overlay_vaapi` pairs FIFO PTS T with
-main PTS T → cues drift forward by exactly `seekOff` seconds. The
-rewriter splices `setpts=PTS+<seekOff>/TB` onto the FIFO branch ahead
-of `format=bgra,hwupload[0]` so both meet on the absolute-PTS timeline
-the filter already uses for the main video.
-
-> An earlier attempt (`sha-a451466`) put `setpts=PTS-STARTPTS` on BOTH
-> the `[0:0]hwupload[1]` main branch AND the FIFO branch — mirroring
-> the SRT pre-render's seek handling. The FIFO half was a no-op (the
-> FIFO is already 0+), the main-branch setpts caused constant
-> forward-skipping in real playback; reverted in `sha-3d3efb5`. The
-> right place is a `setpts=PTS+seekOff/TB` on the FIFO branch alone —
-> shift the FIFO up onto main's already-540+ filter timeline rather
-> than try to rebase main downwards.
-
-**Bottom-band optimisation.** The sub is composited onto a band
-the height of `subPrerenderBandHeight(H)` (2/5 of the frame),
-positioned at `y=H-BandHeight` by the overlay rewrite. Halves the
-qtrle encode + main-side hwupload + overlay blend area. Trade-off:
-clips top-positioned bitmap signs / forced narrative. PGS is
-overwhelmingly bottom SDH/dialogue; accepted.
-
-**Labels:** `hw-decode:filter:bitmap-sub-prerender`,
-`bitmap-prerender:band=WxH@yY`, `seek-offset:captured=<T>s`.
+`filter:passthrough-inlineass-hdr` (HDR). The merged filter renders these
+nv12 frames via the same libass code on CPU. *(Known gap: `reFilterHDRAss`
+matches only `tonemap=hable`; a SW-decode HDR session with another tonemap
+algorithm skips the reshape — tracked separately.)*
 
 ### HDR tonemap (HDR source → SDR output)
 
