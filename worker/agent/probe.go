@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -64,9 +65,21 @@ func probeSubtitleCodec(source, streamSpec string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// `-map_inlineass` uses the input:stream form ("0:3", "1:s:0"), but
+	// ffprobe runs against a single `source`, so its `-select_streams`
+	// wants the in-file specifier only ("3", "s:0"). Strip a leading
+	// integer input index; ffprobe rejects "0:3" as an invalid stream
+	// specifier (exit 1) → the codec read silently failed and every sub
+	// was treated as text (no bitmap detection, no animated tier-down).
+	sel := streamSpec
+	if i := strings.IndexByte(sel, ':'); i > 0 {
+		if _, err := strconv.Atoi(sel[:i]); err == nil {
+			sel = sel[i+1:]
+		}
+	}
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
-		"-select_streams", streamSpec,
+		"-select_streams", sel,
 		"-show_entries", "stream=codec_name",
 		"-of", "default=nokey=1:noprint_wrappers=1",
 		source,
