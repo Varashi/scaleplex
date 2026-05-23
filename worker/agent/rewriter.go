@@ -2220,264 +2220,55 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					changes = append(changes,
 						"hw-decode-sub:tonemap-preserved("+m[3]+")")
 				}
-				// Animated ASS (karaoke / transform / move / fade) can't
-				// be pre-rasterized once per cue — keep the per-frame
-				// inlineass path. SRT and static ASS route to the GPU
-				// overlay pre-render path in the else branch.
+				// Merged inlineass HW branch (vf_inlineass VAAPI path, patch 0115).
+				// scale_vaapi keeps the VAAPI surface and the fork's inlineass renders
+				// the cue ONTO it: render-once-per-cue for static SRT/ASS, per-frame for
+				// animated (libass detect_change). No hwdownload->inlineass(SW)->hwupload
+				// bracket, no FIFO pre-render, no overlay_vaapi second input. Plex's argv
+				// already carries `-map_inlineass <spec>` + the `-map <spec> -f null
+				// -codec ass` decode sink that drives the scaleplex_inlineass feed - both
+				// kept untouched. render_height folds in the old SCALEPLEX_SUB_RENDER_HEIGHT
+				// worker knob (now a filter option); animated_tier_down lets the filter
+				// drop animated cues one resolution tier (a no-op for static cues).
+				assParams := m[assGroup]
+				strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
+				strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+				inlineArgs := fmt.Sprintf("%s:render_height=%d", strippedAss, subRenderHeightCap())
 				if subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile) {
-					// Keep Plex's inlineass= filter; strip the 4 Plex-only
-					// AVOption keys vf_inlineass doesn't parse. Sidecar -i,
-					// -map_inlineass, and null-sub output all stay — the
-					// fork's scaleplex_inlineass binding owns those.
-					assParams := m[assGroup]
-					strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
-					strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
-					args[vfIdx] = fmt.Sprintf(
-						"[0:0]hwupload[0];"+
-							"[0]%s[1];"+
-							"[1]hwdownload,format=nv12[2];"+
-							"[2]inlineass=%s[3];"+
-							"[3]hwupload[4]",
-						scaleStep, strippedAss,
-					)
-					modeTag := "hw-decode:filter:inlineass-passthrough"
-					oldMapLabel := "[4]"
-					if openclMode {
-						modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-passthrough"
-						// reFilterHWOpenCLAss matches a graph that ends at
-						// label [6] (extra hwmap→opencl + tonemap_opencl +
-						// hwdownload + inlineass + hwupload). Our rewrite
-						// collapses to label [4]; PMS's `-map [6]` must
-						// retarget or ffmpeg bails with "Output with label
-						// '6' does not exist".
-						oldMapLabel = "[6]"
-					}
-					changes = append(changes, modeTag)
-					if oldMapLabel != "[4]" {
-						for i := vfIdx + 1; i < len(args)-1; i++ {
-							if args[i] != "-map" {
-								continue
-							}
-							v := args[i+1]
-							if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
-								if strings.HasPrefix(v, `"`) {
-									args[i+1] = `"[4]"`
-								} else {
-									args[i+1] = "[4]"
-								}
-								changes = append(changes, "hw-decode:map-label-update")
-								break
-							}
+					inlineArgs += ":animated_tier_down=1"
+				}
+				args[vfIdx] = fmt.Sprintf(
+					"[0:0]hwupload[0];"+
+						"[0]%s[1];"+
+						"[1]inlineass=%s[4]",
+					scaleStep, inlineArgs,
+				)
+				modeTag := "hw-decode:filter:inlineass-vaapi"
+				oldMapLabel := "[4]"
+				if openclMode {
+					// reFilterHWOpenCLAss argv ends at label [6] (extra hwmap->opencl +
+					// tonemap_opencl + hwdownload + inlineass + hwupload). Our graph
+					// outputs [4]; PMS's `-map [6]` must retarget or ffmpeg bails
+					// ("Output with label '6' does not exist").
+					modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi"
+					oldMapLabel = "[6]"
+				}
+				changes = append(changes, modeTag)
+				if oldMapLabel != "[4]" {
+					for i := vfIdx + 1; i < len(args)-1; i++ {
+						if args[i] != "-map" {
+							continue
 						}
-					}
-				} else {
-					// SRT / static ASS → pre-render the subtitle once per
-					// cue into a sparse transparent video and composite it
-					// on the GPU with overlay_vaapi, replacing the per-frame
-					// CPU inlineass bracket. The agent spawns the pre-render
-					// (writing to FIFOPath) from SubPrerenderSpec; the graph
-					// reads that FIFO as a second video input.
-					// See project_scaleplex_srt_to_pgs_gpu.
-					fifoDir := sessionDir
-					if fifoDir == "" {
-						fifoDir = "/tmp/scaleplex"
-					}
-					fifoPath := fifoDir + "/scaleplex-sub-overlay.fifo"
-					fifoInput := 0
-					for _, a := range args {
-						if a == "-i" {
-							fifoInput++
-						}
-					}
-					// Band optimisation. SRT is always bottom-positioned, so
-					// the pre-render only needs to emit the bottom slice of
-					// the frame — the agent renders the full frame (libass
-					// keeps correct positioning) then crops to BandHeight,
-					// and overlay_vaapi composites that band at y=bandY.
-					// Cuts the canvas-size-proportional CPU ~2.5x. ASS can
-					// be positioned anywhere → full frame.
-					//
-					// Band resolution is DEFERRED to the agent for both
-					// sidecar AND embedded SRT: the cue parse needs the file
-					// on disk, but embedded SRT is only extracted by the
-					// agent after rewrite. The rewriter seeds the static
-					// fallback band + emits `y=__SP_BANDY__` (and, under a
-					// render-res cap, `h=__SP_BANDH__`) sentinels; the agent
-					// runs resolveSRTBand post-extraction, overwrites the
-					// band, and patches the sentinels. This unifies the two
-					// paths and gets embedded SRT into the tight band too.
-					// See worker/agent/band.go + subparse.go.
-					wInt, _ := strconv.Atoi(w)
-					hInt, _ := strconv.Atoi(h)
-					bandH := hInt
-					resolveAgent := false
-					isSRT := hInt > 0 && (subSrc.FilePath == "" || subSrc.Codec == "subrip")
-					if isSRT {
-						// Band height is data-driven from the SRT cues, but
-						// embedded SRT isn't on disk until the agent extracts
-						// it. Defer the resolve to the agent (post-extraction)
-						// for BOTH sidecar and embedded so the two paths are
-						// identical and embedded gets the tight band too. Seed
-						// the static-fallback band and emit sentinels the agent
-						// patches once it knows the real band.
-						// See worker/agent/band.go.
-						bandH = subPrerenderBandHeight(hInt)
-						resolveAgent = true
-					}
-					bandY := hInt - bandH
-					bandYStr := strconv.Itoa(bandY)
-					if resolveAgent {
-						bandYStr = BandYSentinel
-					}
-					// Optional lower-resolution sub render
-					// (SCALEPLEX_SUB_RENDER_HEIGHT): the pre-render
-					// rasterises the band at renderW×renderH (cheaper libass
-					// + qtrle, ~linear in pixel area), and the main graph
-					// HW-upscales that band back to the output band
-					// (Width×bandH) with scale_vaapi before overlay_vaapi.
-					// Native (no cap) leaves the graph untouched.
-					// See subRenderDims / project_scaleplex_libass_4k_render_cost.
-					renderW, renderH, subDown := subRenderDims(wInt, hInt)
-					subUpscale := ""
-					if subDown {
-						bandHStr := strconv.Itoa(bandH)
-						if resolveAgent {
-							// bandH is decided by the agent post-extraction;
-							// the scale_vaapi upscale target height is patched
-							// alongside the overlay y-offset.
-							bandHStr = BandHSentinel
-						}
-						subUpscale = fmt.Sprintf(",scale_vaapi=w=%d:h=%s", wInt, bandHStr)
-					}
-					// On a seek session the main video reaches the
-					// filtergraph at the seek offset (PTS N), but the
-					// overlay reaches overlay_vaapi's framesync at ~0 —
-					// framesync then drains the overlay 0→N hunting for a
-					// frame to pair, and the pre-render grinds out N
-					// seconds of overlay (startup latency scales with
-					// seek distance). Fix: rebase BOTH branches to 0 with
-					// setpts=PTS-STARTPTS so framesync sees a 0-based
-					// pair (identical to initial-play, which works), then
-					// rebase the composite back to +offset so dashenc and
-					// the seek-chunk/tfdt machinery see the unchanged
-					// source timeline. Initial play (offset 0) keeps the
-					// plain graph untouched.
-					seekOff := 0.0
-					if si := indexOfArg(args, "-ss", 0); si >= 0 && si+1 < len(args) {
-						if v, err := strconv.ParseFloat(args[si+1], 64); err == nil && v > 0 {
-							seekOff = v
-						}
-					}
-					if seekOff > 0 {
-						args[vfIdx] = fmt.Sprintf(
-							"[0:0]hwupload[10];"+
-								"[10]%s,setpts=PTS-STARTPTS[11];"+
-								"[%d:v]setpts=PTS-STARTPTS,format=bgra,hwupload%s[12];"+
-								"[11][12]overlay_vaapi=x=0:y=%s:eof_action=pass:repeatlast=1[13];"+
-								"[13]setpts=PTS+%s/TB[4]",
-							scaleStep, fifoInput, subUpscale, bandYStr,
-							strconv.FormatFloat(seekOff, 'f', 3, 64),
-						)
-					} else {
-						args[vfIdx] = fmt.Sprintf(
-							"[0:0]hwupload[10];"+
-								"[10]%s[11];"+
-								"[%d:v]format=bgra,hwupload%s[12];"+
-								"[11][12]overlay_vaapi=x=0:y=%s:eof_action=pass:repeatlast=1[4]",
-							scaleStep, fifoInput, subUpscale, bandYStr,
-						)
-					}
-					// Drop `-map_inlineass <spec>` — no inlineass filter
-					// consumes it on this path; the pre-render reads the
-					// subtitle itself.
-					if mi := indexOfArg(args, "-map_inlineass", 0); mi >= 0 && mi+1 < len(args) {
-						args = removeArgs(args, mi, 2)
-					}
-					// Append the overlay FIFO immediately after the last
-					// existing input's path. It must NOT go just before
-					// -filter_complex: Plex puts output-side options
-					// (-start_at_zero, -copyts, -fps_mode) between the last
-					// input and the filtergraph, and a new -i there makes
-					// ffmpeg mis-parse those as input options for the FIFO.
-					//
-					// `-copyts` on the FIFO input is required: ffmpeg
-					// rebases a plain input's timestamps to start at zero,
-					// but on a seek session the main video keeps its real
-					// (non-zero) PTS via its own -copyts. Without -copyts
-					// here the overlay would rebase to 0 while the main
-					// video stays at the seek offset — overlay_vaapi
-					// framesync never aligns and the transcode stalls.
-					//
-					// `-probesize 32 -analyzeduration 0`: without them
-					// find_stream_info reads up to probesize (5 MB) of the
-					// FIFO before returning, and since the overlay is
-					// sparse that forces the pre-render to grind seconds
-					// of timeline ahead while the main ffmpeg blocks —
-					// ~5 s of startup latency. The Matroska header alone
-					// gives the codec and dimensions, so a minimal probe
-					// returns in ~0.8 s (measured).
-					lastInput := -1
-					for i := 0; i+1 < len(args); i++ {
-						if args[i] == "-i" {
-							lastInput = i
-						}
-					}
-					if lastInput >= 0 {
-						args = spliceArgs(args, lastInput+2,
-							"-copyts", "-probesize", "32", "-analyzeduration", "0",
-							"-i", fifoPath)
-					}
-					// reFilterHWOpenCLAss argv ends at label [6] with
-					// `-map [6]`; our overlay graph outputs [4]. Retarget.
-					if openclMode {
-						for i := 0; i+1 < len(args); i++ {
-							if args[i] != "-map" {
-								continue
-							}
-							if args[i+1] == "[6]" {
-								args[i+1] = "[4]"
-								break
-							}
-							if args[i+1] == `"[6]"` {
+						v := args[i+1]
+						if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
+							if strings.HasPrefix(v, `"`) {
 								args[i+1] = `"[4]"`
-								break
+							} else {
+								args[i+1] = "[4]"
 							}
+							changes = append(changes, "hw-decode:map-label-update")
+							break
 						}
-					}
-					srcPath := subSrc.FilePath
-					if srcPath == "" {
-						if ii := indexOfArg(args, "-i", 0); ii >= 0 && ii+1 < len(args) {
-							srcPath = args[ii+1]
-						}
-					}
-					subPrerender = &SubPrerenderSpec{
-						FIFOPath:               fifoPath,
-						SourcePath:             srcPath,
-						StreamSpec:             subSrc.StreamSpec,
-						Embedded:               subSrc.FilePath == "",
-						Width:                  wInt,
-						Height:                 hInt,
-						BandHeight:             bandH,
-						ForceStyle:             plexInlineassToForceStyle(m[assGroup]),
-						ResolveBandPostExtract: resolveAgent,
-					}
-					if subDown {
-						subPrerender.RenderWidth = renderW
-						subPrerender.RenderHeight = renderH
-					}
-					changes = append(changes, "hw-decode:filter:sub-prerender-overlay")
-					if subDown {
-						changes = append(changes,
-							fmt.Sprintf("sub-prerender:render=%dx%d", renderW, renderH))
-					}
-					// Band is resolved by the agent post-extraction (SRT) or
-					// fixed at rewrite time (ASS full frame). The actual band
-					// height is logged by the agent at resolve time.
-					if resolveAgent {
-						changes = append(changes, "sub-prerender:band:agent-resolve")
-					} else if bandH < hInt {
-						changes = append(changes,
-							fmt.Sprintf("sub-prerender:band=%dx%d@y%d", wInt, bandH, bandY))
 					}
 				}
 				newInputIdx = indexOfArg(args, "-i", 0)
@@ -2507,84 +2298,27 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				break
 			}
 			streamSpec, w, h := m[1], m[2], m[3]
-			fifoDir := sessionDir
-			if fifoDir == "" {
-				fifoDir = "/tmp/scaleplex"
-			}
-			fifoPath := fifoDir + "/scaleplex-sub-overlay.fifo"
-			fifoInput := 0
-			for _, a := range args {
-				if a == "-i" {
-					fifoInput++
-				}
-			}
-			seekOff := 0.0
-			if si := indexOfArg(args, "-ss", 0); si >= 0 && si+1 < len(args) {
-				if v, err := strconv.ParseFloat(args[si+1], 64); err == nil && v > 0 {
-					seekOff = v
-				}
-			}
-			// Swap the SW-upscale bitmap branch for a read of the
-			// pre-render's CFR qtrle FIFO; rewrite the overlay_vaapi
-			// to position the band at the bottom and add eof_action+
-			// repeatlast for the band-sized FIFO stream.
-			wInt0, _ := strconv.Atoi(w)
-			hInt0, _ := strconv.Atoi(h)
-			bandH0 := subPrerenderBandHeight(hInt0)
-			bandY0 := hInt0 - bandH0
-			old := fmt.Sprintf("[%s]scale=%s:%s,hwupload[0]", streamSpec, w, h)
-			neu := fmt.Sprintf("[%d:v]format=bgra,hwupload[0]", fifoInput)
-			// On a seek session the pre-render's FIFO arrives in the
-			// filter at PTS 0+ (canvas-driven, sub branch rebased by
-			// -seekOff), while Plex's main video reaches the filter at
-			// PTS seekOff+ — `-start_at_zero` only zeroes the muxer-
-			// side timestamps, not the filter input (verified offline:
-			// at -ss 540 the main video shows up in -filter_complex at
-			// pts_time:540.003). Without compensation overlay_vaapi
-			// pairs FIFO PTS T with main PTS T, putting the cue from
-			// movie (seekOff + T) over the frame at movie seekOff —
-			// i.e. subs run seekOff seconds ahead of dialogue. Shift
-			// the FIFO branch up by seekOff so both meet on the
-			// absolute-PTS timeline.
-			if seekOff > 0 {
-				neu = fmt.Sprintf(
-					"[%d:v]setpts=PTS+%.3f/TB,format=bgra,hwupload[0]",
-					fifoInput, seekOff)
-			}
-			args[i+1] = strings.Replace(args[i+1], old, neu, 1)
-			oldOv := "[2][0]overlay_vaapi,"
-			newOv := fmt.Sprintf(
-				"[2][0]overlay_vaapi=x=0:y=%d:eof_action=pass:repeatlast=1,", bandY0)
-			args[i+1] = strings.Replace(args[i+1], oldOv, newOv, 1)
-			_ = wInt0 // (kept for symmetry; used below)
-			// Append the FIFO input after the last existing -i. -copyts
-			// keeps its PTS; -probesize 32/-analyzeduration 0 stops
-			// find_stream_info grinding the sparse stream at startup.
-			lastInput := -1
-			for j := 0; j+1 < len(args); j++ {
-				if args[j] == "-i" {
-					lastInput = j
-				}
-			}
-			if lastInput >= 0 {
-				args = spliceArgs(args, lastInput+2,
-					"-copyts", "-probesize", "32", "-analyzeduration", "0",
-					"-i", fifoPath)
-			}
-			subPrerender = &SubPrerenderSpec{
-				FIFOPath:          fifoPath,
-				SourcePath:        mediaPath,
-				StreamSpec:        streamSpec,
-				Embedded:          true,
-				Bitmap:            true,
-				Width:             wInt0,
-				Height:            hInt0,
-				BandHeight:        bandH0,
-				SeekOffsetSeconds: seekOff,
-			}
-			changes = append(changes, "hw-decode:filter:bitmap-sub-prerender")
-			changes = append(changes,
-				fmt.Sprintf("bitmap-prerender:band=%dx%d@y%d", wInt0, bandH0, bandY0))
+			rh := subRenderHeightCap()
+			// Reshape to the merged inlineass HW branch: main video stays on the
+			// VAAPI surface; inlineass composites the bitmap presentation fed via
+			// -map_inlineass (the binding routes bitmap codecs to replay_bitmap).
+			// Drops Plex's overlay_vaapi sub2video second input + the FIFO
+			// pre-render entirely; seek is native (the filter sees real PTS).
+			args[i+1] = fmt.Sprintf(
+				"[0:0]hwupload[0];"+
+					"[0]scale_vaapi=w=%s:h=%s:format=nv12[1];"+
+					"[1]inlineass=render_height=%d[4]",
+				w, h, rh,
+			)
+			// Plex's bitmap argv carries no -map_inlineass; add it (before
+			// -filter_complex, matching Plex's text placement) so the fork feeds
+			// the decoded presentation to replay_bitmap.
+			args = spliceArgs(args, i, "-map_inlineass", streamSpec)
+			// Add the bitmap decode sink at the end (mirrors Plex's text
+			// `-map <spec> -f null -codec ass`; PGS can't encode to ass -> dvdsub).
+			// Forces the sub to decode -> handle_subtitle -> replay_bitmap.
+			args = append(args, "-map", streamSpec, "-f", "null", "-codec", "dvdsub", "nullfile")
+			changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
 			// The splice shifted indices; relocate the encoder.
 			newInputIdx = indexOfArg(args, "-i", 0)
 			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)

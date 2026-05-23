@@ -1777,52 +1777,28 @@ func TestRewriter_HWDecode_PGSOverlay_RoutesToPrerender(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
 	}
-	if !containsString(out.Changes, "hw-decode:filter:bitmap-sub-prerender") {
-		t.Fatalf("missing bitmap-sub-prerender change; got %v", out.Changes)
+	// Merged inlineass HW branch (patch 0115): the PGS bitmap routes through
+	// inlineass (replay_bitmap feed), NOT the FIFO pre-render.
+	if !containsString(out.Changes, "hw-decode:filter:bitmap-inlineass-vaapi") {
+		t.Fatalf("missing bitmap-inlineass-vaapi change; got %v", out.Changes)
 	}
-	sp := out.SubPrerender
-	if sp == nil {
-		t.Fatalf("no SubPrerenderSpec returned")
+	if out.SubPrerender != nil {
+		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
 	}
-	if !sp.Bitmap {
-		t.Errorf("SubPrerenderSpec.Bitmap = false, want true")
-	}
-	if sp.StreamSpec != "0:5" {
-		t.Errorf("StreamSpec = %q, want 0:5", sp.StreamSpec)
-	}
-	if sp.Width != 3840 || sp.Height != 2160 {
-		t.Errorf("W/H = %dx%d, want 3840x2160", sp.Width, sp.Height)
-	}
-	if !sp.Embedded {
-		t.Errorf("Embedded = false, want true")
-	}
-
 	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
-	if strings.Contains(gotVF, "scale=3840:2160,hwupload[0]") {
-		t.Errorf("SW bitmap upscale survived: %q", gotVF)
+	if strings.Contains(gotVF, "overlay_vaapi") || strings.Contains(gotVF, "scale=3840:2160,hwupload[0]") {
+		t.Errorf("Plex overlay_vaapi sub2video graph must be replaced: %q", gotVF)
 	}
-	if !strings.Contains(gotVF, "format=bgra,hwupload[0]") {
-		t.Errorf("FIFO bitmap branch not wired: %q", gotVF)
+	if !strings.Contains(gotVF, "inlineass=render_height=") {
+		t.Errorf("inlineass bitmap composite missing: %q", gotVF)
 	}
-	// Overlay rewritten to position the band at y=H-BandH with
-	// eof_action=pass:repeatlast=1 for the band-sized FIFO stream.
-	// 2160 -> band 864 -> y=1296.
-	if !strings.Contains(gotVF,
-		"[2][0]overlay_vaapi=x=0:y=1296:eof_action=pass:repeatlast=1,scale_vaapi=format=p010[3];[3]hwupload[4]") {
-		t.Errorf("overlay_vaapi band positioning not applied: %q", gotVF)
+	// -map_inlineass added for the bitmap stream (Plex emits none for PGS).
+	if mi := indexOfArg(out.Args, "-map_inlineass", 0); mi < 0 || out.Args[mi+1] != "0:5" {
+		t.Errorf("-map_inlineass 0:5 must be added for the PGS feed; args=%v", out.Args)
 	}
-	if sp.BandHeight != 864 {
-		t.Errorf("BandHeight = %d, want 864 (2/5 of 2160)", sp.BandHeight)
-	}
-	// FIFO input spliced as a real -i
-	found := false
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-i" && out.Args[i+1] == sp.FIFOPath {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("FIFO -i %q not spliced into argv", sp.FIFOPath)
+	// Bitmap decode sink appended: -map 0:5 -f null -codec dvdsub nullfile.
+	if !strings.Contains(strings.Join(out.Args, " "), "-map 0:5 -f null -codec dvdsub nullfile") {
+		t.Errorf("bitmap decode sink not appended: %v", out.Args)
 	}
 }
 
@@ -1856,13 +1832,20 @@ func TestRewriter_HWDecode_PGSOverlay_SeekShiftsFIFOUp(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
 	}
-	if out.SubPrerender == nil || out.SubPrerender.SeekOffsetSeconds != 540 {
-		t.Fatalf("seek offset not propagated to SubPrerenderSpec; got %+v", out.SubPrerender)
+	// Seek is native in the merged filter (real PTS): no FIFO, no setpts
+	// shift, no SubPrerender.
+	if out.SubPrerender != nil {
+		t.Fatalf("merged HW branch must not populate SubPrerender on seek: %+v", out.SubPrerender)
 	}
 	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
-	want := "setpts=PTS+540.000/TB,format=bgra,hwupload[0]"
-	if !strings.Contains(gotVF, want) {
-		t.Errorf("FIFO branch missing seek shift %q: %q", want, gotVF)
+	if strings.Contains(gotVF, "setpts=") {
+		t.Errorf("merged HW branch needs no setpts seek dance: %q", gotVF)
+	}
+	if !strings.Contains(gotVF, "inlineass=render_height=") {
+		t.Errorf("inlineass bitmap composite missing: %q", gotVF)
+	}
+	if !containsString(out.Changes, "hw-decode:filter:bitmap-inlineass-vaapi") {
+		t.Errorf("missing bitmap-inlineass-vaapi change; got %v", out.Changes)
 	}
 }
 
@@ -2251,19 +2234,28 @@ func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
 	}
+	if out.SubPrerender != nil {
+		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
+	}
 	vfIdx := findFilterComplex(out.Args, "[0:0]")
 	if vfIdx < 0 {
 		t.Fatal("missing -filter_complex")
 	}
 	graph := out.Args[vfIdx]
-	if strings.Contains(graph, "inlineass=") {
-		t.Errorf("inlineass should be gone on the pre-render path: %s", graph)
+	if !strings.Contains(graph, "inlineass=") {
+		t.Errorf("inlineass missing on merged HW branch: %s", graph)
 	}
-	if !strings.Contains(graph, "overlay_vaapi=") {
-		t.Errorf("overlay_vaapi missing: %s", graph)
+	if strings.Contains(graph, "overlay_vaapi") || strings.Contains(graph, "hwdownload") {
+		t.Errorf("overlay_vaapi + hwdownload/hwupload bracket must be gone: %s", graph)
 	}
-	if indexOfArg(out.Args, "-map_inlineass", 0) >= 0 {
-		t.Errorf("-map_inlineass should be dropped on the pre-render path")
+	if strings.Contains(graph, "language=") || strings.Contains(graph, "overrides=") {
+		t.Errorf("Plex-private inlineass keys not stripped: %s", graph)
+	}
+	if !strings.Contains(graph, ":render_height=") {
+		t.Errorf("render_height option missing: %s", graph)
+	}
+	if mi := indexOfArg(out.Args, "-map_inlineass", 0); mi < 0 || out.Args[mi+1] != "1:s:0" {
+		t.Error("-map_inlineass 1:s:0 must be kept")
 	}
 	iCount := 0
 	for _, a := range out.Args {
@@ -2271,74 +2263,14 @@ func TestRewriter_SubPrerender_HW_SRT_Sidecar(t *testing.T) {
 			iCount++
 		}
 	}
-	if iCount != 3 {
-		t.Errorf("expected 3 -i (source + sidecar + overlay FIFO), got %d", iCount)
-	}
-	if out.SubPrerender == nil {
-		t.Fatal("SubPrerender not populated")
-	}
-	sp := out.SubPrerender
-	if sp.SourcePath != "/transcode/Sub/temp-0.srt" {
-		t.Errorf("SourcePath = %q", sp.SourcePath)
-	}
-	if sp.StreamSpec != "1:s:0" {
-		t.Errorf("StreamSpec = %q", sp.StreamSpec)
-	}
-	if sp.Width != 1280 || sp.Height != 720 {
-		t.Errorf("WxH = %dx%d want 1280x720", sp.Width, sp.Height)
-	}
-	if sp.FIFOPath == "" {
-		t.Error("FIFOPath empty")
-	}
-	// SRT → band resolution deferred to the agent: the rewriter seeds the
-	// static-fallback band, flags ResolveBandPostExtract, and emits the
-	// __SP_BANDY__ sentinel in overlay_vaapi (the agent patches the final
-	// y after parsing the on-disk SRT). 720p output ≤ the 1080 render cap
-	// → native, so no scale_vaapi / __SP_BANDH__ sentinel.
-	if sp.BandHeight != subPrerenderBandHeight(720) {
-		t.Errorf("BandHeight = %d, want %d (seeded fallback)", sp.BandHeight, subPrerenderBandHeight(720))
-	}
-	if !sp.ResolveBandPostExtract {
-		t.Error("ResolveBandPostExtract = false, want true (SRT defers to agent)")
-	}
-	if !strings.Contains(graph, "overlay_vaapi=x=0:y="+BandYSentinel+":") {
-		t.Errorf("overlay_vaapi missing band-y sentinel: %s", graph)
-	}
-	// The overlay FIFO input must sit immediately after the last real
-	// input, ahead of Plex's output-side options (-start_at_zero,
-	// -copyts, -fps_mode) — otherwise ffmpeg mis-parses those as input
-	// options for the FIFO. It is inserted as
-	// `-copyts -probesize 32 -analyzeduration 0 -i <fifo>`: -copyts
-	// keeps the overlay's (non-zero, on seek) timestamps; the minimal
-	// probe stops find_stream_info from grinding the FIFO at startup.
-	srtIdx := indexOfArg(out.Args, "/transcode/Sub/temp-0.srt", 0)
-	wantFIFO := []string{"-copyts", "-probesize", "32", "-analyzeduration", "0", "-i", sp.FIFOPath}
-	ok := srtIdx >= 0 && srtIdx+len(wantFIFO) < len(out.Args)
-	for i, w := range wantFIFO {
-		if !ok || out.Args[srtIdx+1+i] != w {
-			ok = false
-		}
-	}
-	if !ok {
-		t.Errorf("overlay FIFO not inserted as `-copyts -probesize 32 -analyzeduration 0 -i <fifo>`: %v", out.Args)
-	}
-	if fps := indexOfArg(out.Args, "-fps_mode", 0); fps >= 0 && fps < srtIdx+1 {
-		t.Errorf("-fps_mode precedes the overlay FIFO input — will be mis-parsed")
-	}
-	if !strings.Contains(graph, "format=bgra") {
-		t.Errorf("overlay branch should consume the FIFO input: %s", graph)
+	if iCount != 2 {
+		t.Errorf("expected 2 -i (source + sidecar, no FIFO), got %d", iCount)
 	}
 	if indexOfArg(out.Args, "nullfile", 0) < 0 {
-		t.Error("null-sub output dropped (should pass through)")
+		t.Error("decode sink (nullfile) dropped")
 	}
-	gotTag := false
-	for _, c := range out.Changes {
-		if c == "hw-decode:filter:sub-prerender-overlay" {
-			gotTag = true
-		}
-	}
-	if !gotTag {
-		t.Errorf("missing sub-prerender-overlay tag: %v", out.Changes)
+	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
+		t.Errorf("missing inlineass-vaapi tag: %v", out.Changes)
 	}
 }
 
@@ -2376,21 +2308,23 @@ func TestRewriter_SubPrerender_HW_Seek(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
 	}
+	if out.SubPrerender != nil {
+		t.Fatalf("merged HW branch must not populate SubPrerender on seek: %+v", out.SubPrerender)
+	}
 	vfIdx := findFilterComplex(out.Args, "[0:0]")
 	if vfIdx < 0 {
 		t.Fatal("missing -filter_complex")
 	}
 	graph := out.Args[vfIdx]
-	// Both branches rebased to 0 ahead of overlay_vaapi.
-	if strings.Count(graph, "setpts=PTS-STARTPTS") != 2 {
-		t.Errorf("expected both branches rebased with setpts=PTS-STARTPTS: %s", graph)
+	// Native seek: the merged filter sees real PTS - no setpts rebase dance.
+	if strings.Contains(graph, "setpts=") {
+		t.Errorf("merged HW branch needs no setpts seek dance: %s", graph)
 	}
-	// Composite rebased back to the seek offset.
-	if !strings.Contains(graph, "setpts=PTS+1800.000/TB[4]") {
-		t.Errorf("composite not rebased back to the seek offset: %s", graph)
+	if !strings.Contains(graph, "inlineass=") {
+		t.Errorf("inlineass missing: %s", graph)
 	}
-	if !strings.Contains(graph, "overlay_vaapi=") {
-		t.Errorf("overlay_vaapi missing: %s", graph)
+	if strings.Contains(graph, "overlay_vaapi") {
+		t.Errorf("overlay_vaapi must be gone: %s", graph)
 	}
 }
 
@@ -2428,31 +2362,32 @@ func TestRewriter_SubPrerender_HW_OpenCLTonemap(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("expected rewrite; changes=%v", out.Changes)
 	}
+	if out.SubPrerender != nil {
+		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
+	}
 	vfIdx := findFilterComplex(out.Args, "[0:0]")
 	if vfIdx < 0 {
 		t.Fatal("missing -filter_complex")
 	}
 	graph := out.Args[vfIdx]
-	if strings.Contains(graph, "inlineass=") {
-		t.Errorf("inlineass should be gone on the pre-render path: %s", graph)
+	if !strings.Contains(graph, "inlineass=") {
+		t.Errorf("inlineass missing on merged HW branch: %s", graph)
 	}
-	if !strings.Contains(graph, "overlay_vaapi=") {
-		t.Errorf("overlay_vaapi missing: %s", graph)
+	if strings.Contains(graph, "overlay_vaapi") {
+		t.Errorf("overlay_vaapi must be gone: %s", graph)
 	}
-	// The tone map must survive — default mode preserves Plex's algo.
+	// The tone map must survive - default mode preserves Plex's algo.
 	if !strings.Contains(graph, "tonemap_opencl=tonemap=mobius") {
-		t.Errorf("tonemap dropped — HDR would render washed: %s", graph)
+		t.Errorf("tonemap dropped - HDR would render washed: %s", graph)
 	}
 	if !strings.Contains(graph, "scale_vaapi=w=1280:h=720:format=p010") {
 		t.Errorf("scale must target p010 ahead of the tonemap: %s", graph)
 	}
-	gotTag := false
-	for _, c := range out.Changes {
-		if c == "hw-decode-sub:tonemap-preserved(mobius)" {
-			gotTag = true
-		}
+	// PMS map [6] must retarget to the merged graph output [4].
+	if containsString(out.Args, "[6]") {
+		t.Errorf("-map [6] not retargeted to [4]: %v", out.Args)
 	}
-	if !gotTag {
+	if !containsString(out.Changes, "hw-decode-sub:tonemap-preserved(mobius)") {
 		t.Errorf("missing tonemap-preserved tag: %v", out.Changes)
 	}
 }
@@ -2489,13 +2424,11 @@ func TestRewriter_InlineassPassthrough_HW_EmbeddedASS(t *testing.T) {
 	if out.SubPrerender != nil {
 		t.Errorf("SubPrerender should be nil on the inlineass path")
 	}
-	gotTag := false
-	for _, c := range out.Changes {
-		if c == "hw-decode:filter:inlineass-passthrough" {
-			gotTag = true
-		}
+	// Embedded ASS is conservatively treated as animated -> tier-down toggle.
+	if !strings.Contains(out.Args[vfIdx], "animated_tier_down=1") {
+		t.Errorf("embedded ASS should enable animated_tier_down: %s", out.Args[vfIdx])
 	}
-	if !gotTag {
-		t.Errorf("missing inlineass-passthrough tag: %v", out.Changes)
+	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
+		t.Errorf("missing inlineass-vaapi tag: %v", out.Changes)
 	}
 }

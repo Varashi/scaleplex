@@ -7,13 +7,12 @@ import (
 	"testing"
 )
 
-// HW-decode + sidecar SRT at 4K: the rewriter now DEFERS band resolution
-// to the agent — it seeds the static-fallback band, flags
-// ResolveBandPostExtract, emits the __SP_BANDY__ overlay sentinel, and
-// tags `sub-prerender:band:agent-resolve` (no rewrite-time `band:tight`).
-// The actual tight-band decision is tested agent-side in band_test.go.
-func TestRewriter_SubPrerender_SRT_DefersBand_Sidecar(t *testing.T) {
-	t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", "0") // native: only the y sentinel, no h sentinel
+// HW-decode + sidecar SRT at 4K, native render height (cap opted out): the
+// merged inlineass HW branch (patch 0115) keeps the VAAPI surface and burns
+// via the fork's inlineass — no FIFO pre-render, no overlay_vaapi, no band
+// sentinels. -map_inlineass + the decode sink stay; render_height=0 (no cap).
+func TestRewriter_HWDecode_SRT_Sidecar_Inlineass(t *testing.T) {
+	t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", "0") // native render, no cap
 	dir := t.TempDir()
 	srt := filepath.Join(dir, "temp-0.srt")
 	if err := os.WriteFile(srt, []byte("1\n00:00:01,000 --> 00:00:04,000\nHello world\n\n"), 0o644); err != nil {
@@ -41,37 +40,31 @@ func TestRewriter_SubPrerender_SRT_DefersBand_Sidecar(t *testing.T) {
 		FSExists:           func(string) bool { return true },
 		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
 	})
-	if !out.Applied || out.SubPrerender == nil {
-		t.Fatalf("expected rewrite + SubPrerender; changes=%v", out.Changes)
+	if !out.Applied {
+		t.Fatalf("expected rewrite; changes=%v", out.Changes)
 	}
-	sp := out.SubPrerender
-	if !sp.ResolveBandPostExtract {
-		t.Error("ResolveBandPostExtract = false, want true")
-	}
-	if sp.BandHeight != subPrerenderBandHeight(2160) {
-		t.Errorf("BandHeight = %d, want seeded fallback %d", sp.BandHeight, subPrerenderBandHeight(2160))
+	if out.SubPrerender != nil {
+		t.Fatalf("merged HW branch must NOT use the FIFO pre-render: %+v", out.SubPrerender)
 	}
 	fc := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
-	if !strings.Contains(fc, "overlay_vaapi=x=0:y="+BandYSentinel+":") {
-		t.Errorf("filter graph missing y sentinel: %q", fc)
+	if !strings.Contains(fc, "inlineass=") {
+		t.Errorf("filter graph missing inlineass: %q", fc)
 	}
-	if strings.Contains(fc, BandHSentinel) {
-		t.Errorf("native render must not emit the h sentinel: %q", fc)
+	if !strings.Contains(fc, ":render_height=0") {
+		t.Errorf("filter graph missing render_height=0 (native): %q", fc)
 	}
-	gotAgent, gotTight := false, false
-	for _, c := range out.Changes {
-		if c == "sub-prerender:band:agent-resolve" {
-			gotAgent = true
-		}
-		if c == "sub-prerender:band:tight" {
-			gotTight = true
-		}
+	if strings.Contains(fc, "overlay_vaapi") || strings.Contains(fc, "hwdownload") {
+		t.Errorf("merged HW branch must drop overlay_vaapi + the hwdownload/hwupload bracket: %q", fc)
 	}
-	if !gotAgent {
-		t.Errorf("missing sub-prerender:band:agent-resolve tag: %v", out.Changes)
+	// The fork's feed must survive: -map_inlineass + the decode sink.
+	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
+		t.Error("-map_inlineass must be kept (drives the scaleplex_inlineass feed)")
 	}
-	if gotTight {
-		t.Errorf("rewriter must not emit band:tight (agent decides now): %v", out.Changes)
+	if !containsString(out.Args, "ass") || indexOfArg(out.Args, "-codec", 0) < 0 {
+		t.Error("decode sink (-map 1:s:0 -f null -codec ass nullfile) must be kept")
+	}
+	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
+		t.Errorf("missing hw-decode:filter:inlineass-vaapi tag: %v", out.Changes)
 	}
 }
 
@@ -103,11 +96,9 @@ func TestSubRenderDims(t *testing.T) {
 	}
 }
 
-// SCALEPLEX_SUB_RENDER_HEIGHT=1080 on a 4K session: the pre-render
-// renders the band at 1920x1080 and the main graph adds a scale_vaapi
-// upscale (to Width × BandHeight) before overlay_vaapi. The overlay
-// y-offset and BandHeight stay in output coords.
-func TestRewriter_SubPrerender_SRT_LowRes(t *testing.T) {
+// SCALEPLEX_SUB_RENDER_HEIGHT=1080 on a 4K session: the cap is now a filter
+// option (render_height=1080) — the fork rasterises libass low + VPP-upscales.
+func TestRewriter_HWDecode_SRT_RenderHeightCap(t *testing.T) {
 	t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", "1080")
 	dir := t.TempDir()
 	srt := filepath.Join(dir, "temp-0.srt")
@@ -135,47 +126,23 @@ func TestRewriter_SubPrerender_SRT_LowRes(t *testing.T) {
 		FSExists:           func(string) bool { return true },
 		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
 	})
-	if !out.Applied || out.SubPrerender == nil {
-		t.Fatalf("expected rewrite + SubPrerender; changes=%v", out.Changes)
-	}
-	sp := out.SubPrerender
-	if sp.RenderWidth != 1920 || sp.RenderHeight != 1080 {
-		t.Errorf("render dims = %dx%d, want 1920x1080", sp.RenderWidth, sp.RenderHeight)
-	}
-	if !sp.ResolveBandPostExtract {
-		t.Error("ResolveBandPostExtract = false, want true")
+	if !out.Applied || out.SubPrerender != nil {
+		t.Fatalf("expected merged inlineass branch (no pre-render); changes=%v", out.Changes)
 	}
 	fc := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
-	// Both band-dependent values are sentinels the agent patches post-resolve:
-	// the scale_vaapi upscale target height and the overlay y-offset.
-	if !strings.Contains(fc, "hwupload,scale_vaapi=w=3840:h="+BandHSentinel+"[12]") {
-		t.Errorf("filter graph missing sub upscale h sentinel: %q", fc)
+	if !strings.Contains(fc, "inlineass=") || !strings.Contains(fc, ":render_height=1080") {
+		t.Errorf("filter graph missing inlineass render_height=1080: %q", fc)
 	}
-	if !strings.Contains(fc, "overlay_vaapi=x=0:y="+BandYSentinel+":") {
-		t.Errorf("filter graph missing overlay y sentinel: %q", fc)
-	}
-	gotRender, gotAgent := false, false
-	for _, c := range out.Changes {
-		if c == "sub-prerender:render=1920x1080" {
-			gotRender = true
-		}
-		if c == "sub-prerender:band:agent-resolve" {
-			gotAgent = true
-		}
-	}
-	if !gotRender || !gotAgent {
-		t.Errorf("missing render/agent-resolve tags: %v", out.Changes)
+	if strings.Contains(fc, "overlay_vaapi") {
+		t.Errorf("merged HW branch must drop overlay_vaapi: %q", fc)
 	}
 }
 
-// Embedded SRT (no sidecar file path) now ALSO defers to the agent — the
-// key win of agent-side resolve. At rewrite time the file isn't on disk,
-// so the rewriter seeds the fallback band + flags ResolveBandPostExtract
-// + emits the y sentinel; the agent extracts the SRT and runs the tight
-// resolve post-extraction (covered in band_test.go). Previously embedded
-// was stuck on the static band.
-func TestRewriter_SubPrerender_SRT_EmbeddedDefersBand(t *testing.T) {
-	t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", "0") // native: only the y sentinel
+// Embedded SRT (no sidecar file path, -map_inlineass 0:3): same merged HW
+// branch. The fork's binding reads the stream directly via -map_inlineass —
+// no extraction, no pre-render.
+func TestRewriter_HWDecode_SRT_Embedded_Inlineass(t *testing.T) {
+	t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", "0")
 	args := []string{
 		"-loglevel", "quiet",
 		"-init_hw_device", "vaapi=vaapi:",
@@ -188,32 +155,20 @@ func TestRewriter_SubPrerender_SRT_EmbeddedDefersBand(t *testing.T) {
 		"-map", "[4]",
 		"-codec:0", "hevc_vaapi",
 		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "0:3", "-f", "null", "-codec", "ass", "nullfile",
 	}
 	out := Rewrite(args, nil, &RewriteOpts{
 		FSExists:           func(string) bool { return true },
 		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
 	})
-	if !out.Applied || out.SubPrerender == nil {
-		t.Fatalf("expected rewrite + SubPrerender; changes=%v", out.Changes)
-	}
-	sp := out.SubPrerender
-	if !sp.Embedded {
-		t.Error("Embedded = false, want true")
-	}
-	if !sp.ResolveBandPostExtract {
-		t.Error("ResolveBandPostExtract = false, want true (embedded SRT now defers to agent)")
+	if !out.Applied || out.SubPrerender != nil {
+		t.Fatalf("expected merged inlineass branch (no pre-render); changes=%v", out.Changes)
 	}
 	fc := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
-	if !strings.Contains(fc, "overlay_vaapi=x=0:y="+BandYSentinel+":") {
-		t.Errorf("filter graph missing y sentinel for embedded SRT: %q", fc)
+	if !strings.Contains(fc, "inlineass=") {
+		t.Errorf("filter graph missing inlineass: %q", fc)
 	}
-	gotAgent := false
-	for _, c := range out.Changes {
-		if c == "sub-prerender:band:agent-resolve" {
-			gotAgent = true
-		}
-	}
-	if !gotAgent {
-		t.Errorf("missing sub-prerender:band:agent-resolve tag: %v", out.Changes)
+	if mi := indexOfArg(out.Args, "-map_inlineass", 0); mi < 0 || out.Args[mi+1] != "0:3" {
+		t.Errorf("-map_inlineass 0:3 must be kept for embedded SRT feed")
 	}
 }
