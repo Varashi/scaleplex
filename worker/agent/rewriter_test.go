@@ -674,6 +674,79 @@ func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
 // HW for every stage except the libass render step. Live argv
 // captured 2026-05-13 23:19Z on session ee6xs0g12mq5k6bcdom62ju9-
 // ed6ea7eb-03b4-4f81-b640-5aa9580b3978.
+// Dolby Vision RPU round-trip: PMS emits `-bsf:0 dovi_rpu=strip=1` on DoVi
+// HEVC sources (strips the RPU from the encoded stream). The rewriter has no
+// bsf/dovi handling, so it must pass the bitstream filter through untouched —
+// flag + value preserved and adjacent. Closes the argv-corpus dovi gap
+// (~6 entries, e.g. Legend (2015) Remux DoVi).
+func TestRewriter_DoviRPU_BSF_PreservedRoundTrip(t *testing.T) {
+	args := []string{
+		"-codec:0", "hevc",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi", "-hwaccel_device:0", "vaapi",
+		"-i", "/media/Movies/Legend.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1];[1]hwupload[2]",
+		"-map", "[2]",
+		"-codec:0", "hevc_vaapi", "-qp:0", "22",
+		"-bsf:0", "dovi_rpu=strip=1",
+		"-force_key_frames:0", "expr:gte(t,n_forced*1)",
+		"-segment_format", "mpegts", "-f", "ssegment", "-segment_time", "1",
+		"-segment_start_number", "0", "media-%05d.ts",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	i := indexOfArg(out.Args, "-bsf:0", 0)
+	if i < 0 {
+		t.Fatalf("-bsf:0 dropped — DoVi RPU strip lost: %v", out.Args)
+	}
+	if i+1 >= len(out.Args) {
+		t.Fatalf("-bsf:0 has no value (truncated): %v", out.Args)
+	}
+	if out.Args[i+1] != "dovi_rpu=strip=1" {
+		t.Fatalf("-bsf:0 value mangled, got %q", out.Args[i+1])
+	}
+}
+
+// reFilterHDRAss must match ANY tonemap algo, not just `hable` — a non-hable
+// SW-HDR sub-burn session (e.g. tonemap=mobius) used to miss the regex and
+// bail (exit 8). The generalized capture reshapes it like the hable case.
+func TestRewriter_SWHDR_InlineAss_Reshape_NonHable(t *testing.T) {
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi")
+	args := []string{
+		"-codec:0", "hevc",
+		"-codec:1", "dca",
+		"-i", "/media/m.mkv",
+		"-i", "/transcode/sess/temp-0.srt",
+		"-start_at_zero", "-copyts", "-fps_mode", "cfr",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex",
+		"[0:0]scale=w=1920:h=1080:force_divisible_by=4[0];" +
+			"[0]format=p010,tonemap=mobius[1];" +
+			"[1]format=pix_fmts=yuv420p|nv12[2];" +
+			"[2]inlineass=font_scale=1.000000:font_size=54[3]",
+		"-map", "[3]",
+		"-codec:0", "libx264", "-crf:0", "21", "-preset:0", "veryfast",
+		"-segment_format", "mpegts", "-f", "ssegment", "-segment_time", "1",
+		"-segment_start_number", "0", "media-%05d.ts",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, map[string]string{}, &RewriteOpts{
+		ProbeVideoColor: func(string) (string, string, string) {
+			return "smpte2084", "bt2020nc", "bt2020"
+		},
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "filter:hdr-tonemap-vaapi-passthrough-inlineass") {
+		t.Fatalf("non-hable SW-HDR must reshape (not bail on tonemap algo): %v", out.Changes)
+	}
+}
+
 func TestRewriter_SWHDR_InlineAss_Reshape(t *testing.T) {
 	t.Setenv("SCALEPLEX_TONEMAP", "vaapi") // assert the fixed-curve fallback shape
 	args := []string{

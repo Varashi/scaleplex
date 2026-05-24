@@ -54,8 +54,10 @@ type RewriteResult struct {
 type RewriteOpts struct {
 	FSExists func(string) bool
 	// SessionDir — Plex's per-session transcode dir (the agent's
-	// req.Cwd). Used as the staging path for embedded-subtitle
-	// extraction. When empty, falls back to /tmp/scaleplex.
+	// req.Cwd). Vestigial since the pre-render/extraction path was
+	// removed (v1.3.0): subtitles now feed incrementally via the fork's
+	// -map_inlineass binding, with no on-disk extraction. Kept for API
+	// shape; detectSubtitleSource discards it.
 	SessionDir string
 	// ProbeSubtitleCodec — when non-nil, the rewriter calls this to
 	// learn the codec_name of the subtitle stream Plex's
@@ -189,9 +191,14 @@ var (
 	//   [0]format=p010,tonemap=hable[1];
 	//   [1]format=pix_fmts=yuv420p|nv12[2];
 	//   [2]inlineass=...[3]
+	// Group 3 captures Plex's tonemap algorithm (any algo, not just
+	// `hable` — a non-hable session used to miss this regex and bail with
+	// exit 8). On the default VAAPI backend tonemap_vaapi is fixed-curve
+	// so the algo is moot; on the OpenCL backend tm.stage(algo) preserves
+	// Plex's choice. Group 4 is the inlineass params.
 	reFilterHDRAss = regexp.MustCompile(
 		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
-			`\[0\]format=p010,tonemap=hable\[1\];` +
+			`\[0\]format=p010,tonemap=([A-Za-z0-9]+)\[1\];` +
 			`\[1\]format=pix_fmts=[^\[]*nv12\[2\];` +
 			`\[2\]inlineass=([^\[]*)\[3\]$`)
 	// HW VAAPI decode + OpenCL tonemap + inlineass burn-in. PMS first-
@@ -514,10 +521,9 @@ func detectSubtitleSource(args []string, sessionDir string, probe func(source, s
 	}
 	kind := subtitleKind(codec)
 	if kind == "unknown" {
-		// No probe (test path) or probe failed. Default to text since
-		// it's the common case and the agent's extraction step will
-		// fail loud on bitmap inputs (so the operator still gets a
-		// signal, just without the cleaner overlay_vaapi path).
+		// No probe (test path) or probe failed. Default to text — the
+		// common case; a bitmap mis-detected as text fails loud at the
+		// fork's inlineass decode-sink (operator still gets a signal).
 		kind = "text"
 	}
 
@@ -638,7 +644,13 @@ func (tm tonemapConfig) stage(algo string) string {
 // Used by the reFilterHDR/HDRAss reshapes — i.e. only where Plex's argv
 // already declared a tonemap.
 func (tm tonemapConfig) hdrScale(w, h string) string {
-	return "scale_vaapi=w=" + w + ":h=" + h + ":format=p010," + tm.stage("")
+	return tm.hdrScaleAlgo(w, h, "")
+}
+
+// hdrScaleAlgo is hdrScale with an explicit tonemap algo (Plex's captured
+// algo on the SW-HDR reshape path). Empty algo falls back to tm.algo.
+func (tm tonemapConfig) hdrScaleAlgo(w, h, algo string) string {
+	return "scale_vaapi=w=" + w + ":h=" + h + ":format=p010," + tm.stage(algo)
 }
 
 func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sourceIsHDR bool, tm tonemapConfig) *filterRewrite {
@@ -743,7 +755,7 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 		// chain; we force HW reshape with libass on CPU between
 		// hwdownload/hwupload brackets. Mirrors reFilterAss text branch
 		// but with the tonemap step PMS's SW pattern declared inline.
-		w, h, assParams := m[1], m[2], m[3]
+		w, h, algo, assParams := m[1], m[2], m[3], m[4]
 		if subSrc == nil || subSrc.Kind != "text" {
 			// Bitmap subs reach us via reFilterAss (PGS uses
 			// `format=nv12 + inlineass` without the separate tonemap
@@ -760,7 +772,7 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 					"[12]format=pix_fmts=nv12[13];"+
 					"[13]inlineass=%s[14];"+
 					"[14]hwupload[15]",
-				tm.hdrScale(w, h), strippedAss),
+				tm.hdrScaleAlgo(w, h, algo), strippedAss),
 			OldLabel: "[3]",
 			NewLabel: "[15]",
 			Mode:     "hdr-tonemap-vaapi-passthrough-inlineass",
