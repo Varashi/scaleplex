@@ -1,0 +1,82 @@
+Description: vaapi_encode: accept libx264-style -crf and map it to QP
+ Plex Media Server emits `-crf:N` (plus `-maxrate`/`-bufsize`) on what it
+ believes is a libx264/libx265 session. The scaleplex worker swaps the
+ encoder to h264_vaapi/hevc_vaapi, after which the stock VAAPI encoder
+ rejects `-crf` ("Option crf not found"). Until now the Go rewriter
+ translated `-crf:N` to `-qp:(N+offset)` on every spawn.
+ .
+ This adds a `crf` option (and `crf_qp_offset`, default 6) to the VAAPI
+ encoder common options. When `crf >= 0` and no explicit `-qp` was given,
+ vaapi_encode maps it to `explicit_qp = clamp(crf + crf_qp_offset, 0, 51)`
+ just before rate-control mode selection. Patch 0105 then routes the
+ resulting QP (+ `-maxrate`) to QVBR, exactly as before — behaviour is
+ byte-identical, only relocated from the rewriter into the encoder.
+ .
+ The offset default (6) lines the VAAPI literal quantizer up with x264's
+ effective per-frame QP at the same CRF (empirical, Balls Up 4K HDR
+ bench). Override at the argv level via `-crf_qp_offset N`; the rewriter's
+ HW_QP_CRF_OFFSET env knob is retired. An explicit `-qp` still wins.
+ .
+ Effect: PMS's `-crf` argv reaches a VAAPI encoder unchanged, removing the
+ crf->qp translation from the rewriter.
+Origin: scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-24
+---
+--- a/libavcodec/vaapi_encode.h
++++ b/libavcodec/vaapi_encode.h
+@@ -166,6 +166,13 @@
+     // (Forces CQP mode when set, overriding everything else.)
+     int             explicit_qp;
+ 
++    // scaleplex: libx264-style constant rate factor. When >= 0 it is
++    // mapped to explicit_qp = crf + crf_qp_offset just before RC-mode
++    // selection, so PMS's `-crf:N` argv reaches a VAAPI encoder
++    // unchanged (the Go rewriter no longer translates it). -1 = unset.
++    int             crf;
++    int             crf_qp_offset;
++
+     // Desired packed headers.
+     unsigned int    desired_packed_headers;
+ 
+@@ -356,7 +363,15 @@
+     { "max_frame_size", \
+       "Maximum frame size (in bytes)",\
+       OFFSET(common.max_frame_size), AV_OPT_TYPE_INT, \
+-      { .i64 = 0 }, 0, INT_MAX, FLAGS }
++      { .i64 = 0 }, 0, INT_MAX, FLAGS }, \
++    { "crf", \
++      "Constant rate factor (libx264-style); mapped to QP = crf + crf_qp_offset", \
++      OFFSET(common.crf), AV_OPT_TYPE_INT, \
++      { .i64 = -1 }, -1, 51, FLAGS }, \
++    { "crf_qp_offset", \
++      "Offset added to crf to derive the VAAPI QP", \
++      OFFSET(common.crf_qp_offset), AV_OPT_TYPE_INT, \
++      { .i64 = 6 }, -51, 51, FLAGS }
+ 
+ #define VAAPI_ENCODE_RC_MODE(name, desc) \
+     { #name, desc, 0, AV_OPT_TYPE_CONST, { .i64 = RC_MODE_ ## name }, \
+--- a/libavcodec/vaapi_encode.c
++++ b/libavcodec/vaapi_encode.c
+@@ -1252,6 +1252,20 @@
+         } \
+     } while (0)
+ 
++    // scaleplex: map libx264-style -crf:N onto explicit_qp before RC
++    // selection so PMS argv reaches the VAAPI encoder unchanged. The
++    // Go rewriter used to do crf->qp (+offset); 0105 then routes the
++    // resulting -qp (+ -maxrate) to QVBR. -1 = unset; an explicit -qp
++    // still wins.
++    if (ctx->crf >= 0 && !ctx->explicit_qp) {
++        int q = ctx->crf + ctx->crf_qp_offset;
++        if (q < 0)  q = 0;
++        if (q > 51) q = 51;
++        ctx->explicit_qp = q;
++        av_log(avctx, AV_LOG_INFO, "scaleplex: crf %d -> qp %d "
++               "(offset %d)\n", ctx->crf, q, ctx->crf_qp_offset);
++    }
++
+     if (ctx->explicit_rc_mode)
+         TRY_RC_MODE(ctx->explicit_rc_mode, 1);
+ 

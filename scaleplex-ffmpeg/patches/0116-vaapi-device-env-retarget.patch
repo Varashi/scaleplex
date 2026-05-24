@@ -1,0 +1,52 @@
+Description: libavutil/hwcontext_vaapi: retarget the VAAPI device from SCALEPLEX_RENDER_DEVICE
+ In a distributed scaleplex transcode worker the GPU lives on a different
+ node than PMS, so the DRM render-node path Plex bakes into its
+ `-init_hw_device vaapi=vaapi:<path>` argv (the PMS host's
+ HardwareDevicePath) does not resolve on the worker. Until now the Go
+ rewriter overwrote that path on every spawn.
+ .
+ This moves device retargeting into the binary: vaapi_device_create reads
+ SCALEPLEX_RENDER_DEVICE and, when set, ignores whatever path the caller
+ passed and binds that node instead. An empty caller path
+ (`vaapi=vaapi:`) with no env set falls through to stock auto-detection
+ (renderD128..) rather than failing on open(""). The `,driver=` opt and
+ LIBVA_DRIVER_NAME continue to select the VA driver unchanged.
+ .
+ Effect: any caller's argv lands on the worker's GPU without rewriter
+ intervention, shrinking the rewriter toward a drop-in transcoder.
+Author: scaleplex
+Last-Update: 2026-05-24
+---
+--- a/libavutil/hwcontext_vaapi.c
++++ b/libavutil/hwcontext_vaapi.c
+@@ -44,6 +44,7 @@
+ #endif
+ 
+ #include <fcntl.h>
++#include <stdlib.h>
+ #if HAVE_UNISTD_H
+ #   include <unistd.h>
+ #endif
+@@ -1699,6 +1700,22 @@
+     const AVDictionaryEntry *ent;
+     int try_drm, try_x11, try_win32, try_all;
+ 
++    /* scaleplex: in a distributed transcode worker the GPU lives on a
++     * different node than PMS, so the DRM path Plex bakes into
++     * -init_hw_device (its host's HardwareDevicePath) does not resolve
++     * here. When SCALEPLEX_RENDER_DEVICE is set, ignore the caller's
++     * path and bind the worker's GPU; an empty caller path
++     * ("vaapi=vaapi:") falls back to stock auto-detection rather than
++     * open(""). Moves device retargeting out of the scaleplex Go
++     * rewriter into the binary. */
++    {
++        const char *sp_dev = getenv("SCALEPLEX_RENDER_DEVICE");
++        if (sp_dev && *sp_dev)
++            device = sp_dev;
++        else if (device && !*device)
++            device = NULL;
++    }
++
+     priv = av_mallocz(sizeof(*priv));
+     if (!priv)
+         return AVERROR(ENOMEM);

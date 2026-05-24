@@ -1,0 +1,112 @@
+Description: libavfilter/inlineass: implement Plex style overrides (overrides/outline/shadow/language)
+ The scaleplex port of vf_inlineass (0099-0101) omitted 4 AVOption keys
+ that Plex Media Server emits on its `inlineass` node to carry the user's
+ subtitle-appearance settings: `overrides` (an ASS [Style.]Param=Value CSV
+ with FontName/Bold/PrimaryColour/OutlineColour/BackColour/
+ ScaledBorderAndShadow), `outline`, `shadow`, and `language`. The worker
+ rewriter compensated by STRIPPING those keys from the filtergraph
+ (stripPlexInlineassFilterArgs) — which both lost the user's styling
+ (burn-in fell back to a hardcoded white/DejaVu default, incl. the
+ fontselect "Arial -> DejaVu" fallback) and meant any path that passed
+ Plex's inlineass node verbatim (honor-SW, bail) crashed with
+ "Option 'language' not found".
+ .
+ This implements them in the filter so Plex's argv is accepted as-is:
+   * overrides -> ass_set_style_overrides() (libass parses the ASS colours
+     /bools itself; bare Param=Value applies to every style)
+   * outline/shadow -> folded into the override list as Outline=/Shadow=
+   * language     -> accepted, unused for burn-in
+ ass_process_force_style() is called after the (synthesised SRT) style is
+ built so the overrides reach it too; embedded-ASS styles get them at
+ parse time. Lets the rewriter drop stripPlexInlineassFilterArgs entirely
+ (HW + SW/honor paths) and restores the user's subtitle styling fidelity.
+Origin: scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-24
+---
+--- a/libavfilter/vf_inlineass.c
++++ b/libavfilter/vf_inlineass.c
+@@ -80,6 +80,16 @@
+     double font_size;
+     int margin;
+     int alpha;
++    /* scaleplex: Plex user subtitle-appearance styling. `overrides` is an
++     * ASS [Style.]Param=Value CSV (FontName/colours/Bold/ScaledBorderAndShadow,
++     * libass parses the &H.. colours itself); outline/shadow are separate
++     * Plex options folded in as Outline=/Shadow= overrides; language is a
++     * hint accepted but unused for burn-in. Fed to libass via
++     * ass_set_style_overrides() so they apply to every style. */
++    char *overrides;
++    double outline;
++    double shadow;
++    char *language;
+     void (*uninit_cb)(void *opaque, AVFilterContext *ctx);
+     void *uninit_opaque;
+ 
+@@ -590,6 +600,39 @@
+     if (ass->fonts_dir)
+         ass_set_fonts_dir(ass->library, ass->fonts_dir);
+ 
++    /* scaleplex: register Plex's style overrides (user appearance settings)
++     * on the library so libass applies them to every style at parse time
++     * (embedded ASS) and via ass_process_force_style() (synthesised SRT).
++     * libass copies the list, so we free ours right after. */
++    if ((ass->overrides && *ass->overrides) || ass->outline > 0 || ass->shadow > 0) {
++        char **list = NULL;
++        int n = 0;
++        if (ass->overrides && *ass->overrides) {
++            char *dup = av_strdup(ass->overrides);
++            if (dup) {
++                char *saveptr = NULL;
++                char *tok = av_strtok(dup, ",", &saveptr);
++                while (tok) {
++                    av_dynarray_add(&list, &n, av_strdup(tok));
++                    tok = av_strtok(NULL, ",", &saveptr);
++                }
++                av_free(dup);
++            }
++        }
++        if (ass->outline > 0)
++            av_dynarray_add(&list, &n, av_asprintf("Outline=%g", ass->outline));
++        if (ass->shadow > 0)
++            av_dynarray_add(&list, &n, av_asprintf("Shadow=%g", ass->shadow));
++        if (list) {
++            int i;
++            av_dynarray_add(&list, &n, NULL); /* NULL-terminate for libass */
++            ass_set_style_overrides(ass->library, list);
++            for (i = 0; i < n - 1; i++)
++                av_free(list[i]);
++            av_freep(&list);
++        }
++    }
++
+     ass->renderer = ass_renderer_init(ass->library);
+     if (!ass->renderer) {
+         av_log(ctx, AV_LOG_ERROR, "ass_renderer_init() failed!\n");
+@@ -1479,6 +1522,13 @@
+         track->default_style = sid;
+     }
+ 
++    /* scaleplex: apply the registered Plex style overrides to this track's
++     * styles. Required for the synthesised SRT style above (built by hand,
++     * so libass's parse-time override pass never reached it); a harmless
++     * re-apply for the embedded-ASS branch. */
++    if ((ass->overrides && *ass->overrides) || ass->outline > 0 || ass->shadow > 0)
++        ass_process_force_style(track);
++
+     ass->got_header = 1;
+ }
+ 
+@@ -1555,6 +1605,11 @@
+     {"filename",       "subtitle file to render (ASS/SSA); omit to feed via -map_inlineass (HW ad-hoc)", OFFSET(filename), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
+     {"render_height",  "HW path: cap libass raster height (0=full); VPP upscales", OFFSET(render_height), AV_OPT_TYPE_INT, {.i64 = 1080}, 0, 4320, FLAGS},
+     {"animated_tier_down", "HW path: render animated cues (\\move/\\t/\\k/\\fad) one resolution tier below render_height", OFFSET(animated_tier_down), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
++    /* scaleplex: Plex user subtitle-appearance styling (parsed by libass) */
++    {"overrides",      "ASS style overrides ([Style.]Param=Value CSV; Plex appearance)", OFFSET(overrides), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
++    {"outline",        "outline (border) width override (0=unset)", OFFSET(outline), AV_OPT_TYPE_DOUBLE, {.dbl = 0.0}, 0.0, 100.0, FLAGS},
++    {"shadow",         "shadow depth override (0=unset)",           OFFSET(shadow),  AV_OPT_TYPE_DOUBLE, {.dbl = 0.0}, 0.0, 100.0, FLAGS},
++    {"language",       "subtitle language hint (accepted; unused for burn-in)", OFFSET(language), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
+     {NULL},
+ };
+ 

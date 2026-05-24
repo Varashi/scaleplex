@@ -1,0 +1,116 @@
+Description: vaapi_encode: accept libx264 -preset names and swallow x264/x265 opt blobs
+ Companion to 0117. Plex Media Server emits `-preset NAME` (libx264 preset
+ names like "veryfast") plus encoder-private `-x264opts` / `-x265-params`
+ blobs on what it believes is a SW encode. After the scaleplex worker swaps
+ the encoder to h264_vaapi/hevc_vaapi the stock VAAPI encoder rejects all
+ three ("Option ... not found"). Until now the Go rewriter translated
+ `-preset` to `-compression_level` and dropped the opt blobs.
+ .
+ Adds to the VAAPI encoder common options: `preset` (libx264 name -> iHD
+ compression_level/TargetUsage at init, only when compression_level wasn't
+ set directly; baked Arc bench map; unknown -> fastest; replaces the retired
+ SCALEPLEX_PRESET_MAP env knob), and `x264opts` / `x265-params` (accepted
+ and ignored). Pulls in libavutil/avstring.h for av_strcasecmp.
+ .
+ Effect: PMS's `-preset` / `-x264opts` / `-x265-params` argv reaches a VAAPI
+ encoder without error, removing the preset translation and opt-blob drop
+ from the rewriter. Depends on 0117 (shared option block).
+Origin: scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-24
+---
+--- a/libavcodec/vaapi_encode.h
++++ b/libavcodec/vaapi_encode.h
+@@ -173,6 +173,16 @@
+     int             crf;
+     int             crf_qp_offset;
+ 
++    // scaleplex: libx264-style -preset name (e.g. "veryfast"). Mapped to
++    // avctx->compression_level (iHD TargetUsage) at init when the caller
++    // did not set compression_level directly. NULL = unset.
++    char           *preset;
++    // scaleplex: swallow the libx264/libx265 private option blobs PMS
++    // emits on what it believes is a SW encode. Accepted and ignored so
++    // the VAAPI encoder does not error on unknown options.
++    char           *x264opts;
++    char           *x265_params;
++
+     // Desired packed headers.
+     unsigned int    desired_packed_headers;
+ 
+@@ -371,7 +381,19 @@
+     { "crf_qp_offset", \
+       "Offset added to crf to derive the VAAPI QP", \
+       OFFSET(common.crf_qp_offset), AV_OPT_TYPE_INT, \
+-      { .i64 = 6 }, -51, 51, FLAGS }
++      { .i64 = 6 }, -51, 51, FLAGS }, \
++    { "preset", \
++      "libx264-style preset name; mapped to compression_level (iHD TargetUsage)", \
++      OFFSET(common.preset), AV_OPT_TYPE_STRING, \
++      { .str = NULL }, 0, 0, FLAGS }, \
++    { "x264opts", \
++      "Accepted and ignored (libx264 passthrough compatibility)", \
++      OFFSET(common.x264opts), AV_OPT_TYPE_STRING, \
++      { .str = NULL }, 0, 0, FLAGS }, \
++    { "x265-params", \
++      "Accepted and ignored (libx265 passthrough compatibility)", \
++      OFFSET(common.x265_params), AV_OPT_TYPE_STRING, \
++      { .str = NULL }, 0, 0, FLAGS }
+ 
+ #define VAAPI_ENCODE_RC_MODE(name, desc) \
+     { #name, desc, 0, AV_OPT_TYPE_CONST, { .i64 = RC_MODE_ ## name }, \
+--- a/libavcodec/vaapi_encode.c
++++ b/libavcodec/vaapi_encode.c
+@@ -22,6 +22,7 @@
+ #include "config.h"
+ 
+ #include "libavutil/avassert.h"
++#include "libavutil/avstring.h"
+ #include "libavutil/common.h"
+ #include "libavutil/internal.h"
+ #include "libavutil/log.h"
+@@ -2125,6 +2126,26 @@
+     return ff_hw_base_encode_receive_packet(avctx->priv_data, avctx, pkt);
+ }
+ 
++// scaleplex: map a libx264-style preset name onto the iHD VAAPI
++// TargetUsage scale (1 = quality .. 7 = fastest). Mirrors the values the
++// scaleplex Go rewriter used before this moved into the encoder
++// (on-cluster Arc A310 bench 2026-05-05). Unknown -> fastest, since the
++// worker only runs under the orchestrator and playback latency wins.
++static int vaapi_encode_preset_to_quality(const char *preset)
++{
++    static const struct { const char *name; int q; } presets[] = {
++        { "ultrafast", 7 }, { "superfast", 7 }, { "veryfast", 6 },
++        { "faster",    5 }, { "fast",      4 }, { "medium",   4 },
++        { "slow",      3 }, { "slower",    2 }, { "veryslow", 1 },
++        { "placebo",   1 },
++    };
++    int i;
++    for (i = 0; i < (int)FF_ARRAY_ELEMS(presets); i++)
++        if (!av_strcasecmp(preset, presets[i].name))
++            return presets[i].q;
++    return 7;
++}
++
+ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
+ {
+     FFHWBaseEncodeContext *base_ctx = avctx->priv_data;
+@@ -2182,6 +2203,16 @@
+     if (err < 0)
+         goto fail;
+ 
++    // scaleplex: derive compression_level from a libx264-style -preset
++    // when the caller did not set it directly, so PMS's `-preset NAME`
++    // argv reaches the VAAPI encoder unchanged (the Go rewriter no longer
++    // translates it).
++    if (ctx->preset && avctx->compression_level < 0) {
++        avctx->compression_level = vaapi_encode_preset_to_quality(ctx->preset);
++        av_log(avctx, AV_LOG_INFO, "scaleplex: preset %s -> "
++               "compression_level %d.\n", ctx->preset, avctx->compression_level);
++    }
++
+     if (avctx->compression_level >= 0) {
+         err = vaapi_encode_init_quality(avctx);
+         if (err < 0)
