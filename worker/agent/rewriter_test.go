@@ -2,9 +2,19 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
+
+// The homelab's all-GPU worker fleet runs SCALEPLEX_FORCE_HW=1
+// (docs/HW_PROFILE.md): always re-accelerate, never honor a SW argv. Most
+// tests here validate that reshape behaviour, so model the fleet default
+// for the whole package. Honor-SW tests opt out with t.Setenv(...,"0").
+func TestMain(m *testing.M) {
+	os.Setenv("SCALEPLEX_FORCE_HW", "1")
+	os.Exit(m.Run())
+}
 
 // AV1→H264 SW pattern captured from PMS log 2026-05-05 ~12:34Z
 // (Superman 2025, GPU-less PMS, mode=remote, libdav1d/libx264).
@@ -121,6 +131,124 @@ func findFilterComplex(args []string, prefix string) int {
 	return -1
 }
 
+// Honor-Plex-SW (docs/HW_PROFILE.md phase 1): with SCALEPLEX_FORCE_HW off,
+// a fully-SW PMS argv (no -hwaccel + SW encoder) runs SW on the worker —
+// no decoder swap, no VAAPI device, no encoder swap, no filter reshape —
+// while the transport/audio scrubs still apply.
+func TestRewriter_HonorSW_FullSoftwarePassthrough(t *testing.T) {
+	t.Setenv("SCALEPLEX_FORCE_HW", "0")
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "honor:plex-sw") {
+		t.Fatalf("expected honor:plex-sw tag, got %v", out.Changes)
+	}
+	// Decoder untouched (SW).
+	dIdx := indexOfArg(out.Args, "-codec:0", 0)
+	if out.Args[dIdx+1] != "libdav1d" {
+		t.Errorf("decoder=%q want libdav1d (untouched)", out.Args[dIdx+1])
+	}
+	// No HW reshape.
+	if containsString(out.Args, "-hwaccel:0") {
+		t.Error("must not inject -hwaccel:0 when honoring SW")
+	}
+	if containsString(out.Args, "-init_hw_device") || containsString(out.Args, "-filter_hw_device") {
+		t.Error("must strip/skip HW device init when honoring SW")
+	}
+	if containsString(out.Args, "scale_vaapi") || containsString(out.Args, "h264_vaapi") {
+		t.Errorf("must not reshape to VAAPI when honoring SW: %v", out.Args)
+	}
+	// Encoder stays libx264.
+	encIdx := indexOfArg(out.Args, "-codec:0", indexOfArg(out.Args, "-i", 0)+1)
+	if out.Args[encIdx+1] != "libx264" {
+		t.Errorf("encoder=%q want libx264 (untouched)", out.Args[encIdx+1])
+	}
+	// Transport/audio scrubs still apply.
+	if !containsString(out.Changes, "audio:eac3_eae->eac3") {
+		t.Errorf("audio scrub should still apply under honor-SW: %v", out.Changes)
+	}
+}
+
+// With SCALEPLEX_FORCE_HW=1 the same SW argv is re-accelerated (the homelab
+// fleet mode, and TestMain's package default).
+func TestRewriter_HonorSW_ForceHWReaccelerates(t *testing.T) {
+	t.Setenv("SCALEPLEX_FORCE_HW", "1")
+	out := Rewrite(swArgsAV1H264, nil, nil)
+	if containsString(out.Changes, "honor:plex-sw") {
+		t.Fatalf("FORCE_HW=1 must re-accelerate, not honor: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "encode:libx264->h264_vaapi") {
+		t.Errorf("expected encoder reshape under FORCE_HW: %v", out.Changes)
+	}
+}
+
+// Honor only applies to fully-SW argv. A HW argv (PMS emitted -hwaccel +
+// vaapi encoder) is never "honored as SW" even with FORCE_HW off — it takes
+// the HW-passthrough path.
+func TestRewriter_HonorSW_HWArgvNotHonored(t *testing.T) {
+	t.Setenv("SCALEPLEX_FORCE_HW", "0")
+	args := []string{
+		"-codec:0", "hevc", "-hwaccel:0", "vaapi",
+		"-hwaccel_output_format:0", "vaapi", "-hwaccel_device:0", "vaapi",
+		"-i", "/media/Movies/HEVCSource.mkv",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=nv12[1];[1]hwupload[2]",
+		"-map", "[2]", "-codec:0", "h264_vaapi", "-qp:0", "22",
+	}
+	out := Rewrite(args, nil, nil)
+	if containsString(out.Changes, "honor:plex-sw") {
+		t.Fatalf("HW argv must not be honored as SW: %v", out.Changes)
+	}
+	encIdx := indexOfArg(out.Args, "-codec:0", indexOfArg(out.Args, "-i", 0)+1)
+	if out.Args[encIdx+1] != "h264_vaapi" {
+		t.Errorf("HW encoder should pass through: %q", out.Args[encIdx+1])
+	}
+}
+
+// Per-axis honor (docs/HW_PROFILE.md): HW-decode + SW-encode (PMS "HW accel
+// on, encoding off") is honored under FORCE_HW=0 — keep HW decode + device +
+// Plex's SW filtergraph (incl. inlineass keys, fork 0119), keep the SW
+// encoder, no reshape, no bail. Live repro 2026-05-24 (Avatar, encode off).
+func TestRewriter_HonorHybrid_HWDecodeSWEncode(t *testing.T) {
+	t.Setenv("SCALEPLEX_FORCE_HW", "0")
+	args := []string{
+		"-codec:0", "av1", "-hwaccel:0", "vaapi",
+		"-hwaccel_output_format:0", "vaapi", "-hwaccel_device:0", "vaapi",
+		"-i", "/media/m.mkv",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-map_inlineass", "0:3",
+		"-filter_complex", "[0:0]scale_vaapi=w=1920:h=1080:format=p010[1];[1]hwdownload,format=p010[2];" +
+			"[2]inlineass=font_scale=1.0:language=en:overrides=foo:outline=2.6:shadow=1.7:font_size=54[3]",
+		"-map", "[3]", "-codec:0", "libx264", "-crf:0", "16", "-preset:0", "veryfast",
+		"-map", "0:3", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied || !containsString(out.Changes, "honor:plex-hwdec-swenc") {
+		t.Fatalf("expected honor:plex-hwdec-swenc, got applied=%v changes=%v", out.Applied, out.Changes)
+	}
+	if !containsString(out.Args, "-hwaccel:0") {
+		t.Error("HW decode (-hwaccel:0) must be kept under hybrid honor")
+	}
+	if !containsString(out.Args, "-init_hw_device") {
+		t.Error("HW device must be kept (fork 0116 retargets it)")
+	}
+	encIdx := indexOfArg(out.Args, "-codec:0", indexOfArg(out.Args, "-i", 0)+1)
+	if out.Args[encIdx+1] != "libx264" {
+		t.Errorf("encoder must stay libx264 (hybrid SW encode), got %q", out.Args[encIdx+1])
+	}
+	if containsString(out.Args, "h264_vaapi") {
+		t.Errorf("must not reshape encoder to vaapi under hybrid honor: %v", out.Args)
+	}
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-filter_complex" && strings.Contains(out.Args[i+1], "inlineass=") {
+			if !strings.Contains(out.Args[i+1], "overrides=") {
+				t.Errorf("inlineass keys must pass through under hybrid honor: %s", out.Args[i+1])
+			}
+		}
+	}
+}
+
 func TestRewriter_AV1H264_AppliedAndChanges(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, map[string]string{}, nil)
 	if !out.Applied {
@@ -128,15 +256,13 @@ func TestRewriter_AV1H264_AppliedAndChanges(t *testing.T) {
 	}
 	expectChanges := []string{
 		"decode:libdav1d->av1",
-		"init_hw_device",
 		"filter:plain",
 		"map-label-update",
 		"encode:libx264->h264_vaapi",
-		// CRF=16 → QP=22 with +6 offset (CRF and VAAPI QP scales differ;
-		// see rewriter.go for empirical bench).
-		"crf16->qp22(off=6)",
-		"preset:veryfast->compression_level:6",
-		"drop:-x264opts:0",
+		// -crf:0 / -preset:0 / -x264opts:0 are left untouched — the fork's
+		// VAAPI encoder maps crf->qp (0117) and preset->compression_level
+		// + swallows x264opts (0118), so no crf/preset/x264opts changes
+		// here anymore.
 		"inject:sei+a53_cc",
 		"env:LIBVA",
 	}
@@ -166,11 +292,15 @@ func TestRewriter_AV1H264_DecoderFollowedByHwaccel(t *testing.T) {
 	}
 }
 
-func TestRewriter_AV1H264_InitHwDeviceGetsRenderDeviceAndDriver(t *testing.T) {
+// The rewriter no longer rewrites the device path Plex emitted — the
+// scaleplex-ffmpeg fork retargets it from SCALEPLEX_RENDER_DEVICE at
+// device-open (patch 0116). Plex's `-init_hw_device vaapi=vaapi:` is left
+// verbatim; an empty path is filled by the fork's env override.
+func TestRewriter_AV1H264_InitHwDeviceLeftForForkRetarget(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	i := indexOfArg(out.Args, "-init_hw_device", 0)
-	if got := out.Args[i+1]; got != "vaapi=vaapi:/dev/dri/renderD128,driver=iHD" {
-		t.Fatalf("init_hw_device=%q", got)
+	if got := out.Args[i+1]; got != "vaapi=vaapi:" {
+		t.Fatalf("init_hw_device=%q want untouched vaapi=vaapi:", got)
 	}
 }
 
@@ -199,11 +329,18 @@ func TestRewriter_AV1H264_MapLabelUpdated(t *testing.T) {
 
 func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, nil, nil)
-	if containsString(out.Args, "-preset:0") {
-		t.Error("preset:0 not consumed (should translate to -compression_level:v)")
+	// -preset:0 and -x264opts:0 are left untouched — the fork's VAAPI
+	// encoder maps the preset to compression_level and swallows the
+	// x264opts blob (patch 0118). The rewriter no longer translates or
+	// drops them, and never injects -compression_level:v.
+	if !containsString(out.Args, "-preset:0") {
+		t.Error("-preset:0 should survive verbatim (fork patch 0118 maps it)")
 	}
-	if containsString(out.Args, "-x264opts:0") {
-		t.Error("x264opts:0 not dropped")
+	if !containsString(out.Args, "-x264opts:0") {
+		t.Error("-x264opts:0 should survive verbatim (fork patch 0118 swallows it)")
+	}
+	if containsString(out.Args, "-compression_level:v") {
+		t.Error("rewriter must not inject -compression_level:v (fork derives it from -preset)")
 	}
 	fkfIdx := indexOfArg(out.Args, "-force_key_frames:0", 0)
 	if out.Args[fkfIdx-2] != "-sei:0" || out.Args[fkfIdx-1] != "-a53_cc" {
@@ -214,57 +351,21 @@ func TestRewriter_AV1H264_EncoderEtc(t *testing.T) {
 	if out.Args[encIdx+1] != "h264_vaapi" {
 		t.Fatalf("encoder=%q want h264_vaapi", out.Args[encIdx+1])
 	}
-	// veryfast → compression_level 6
-	clIdx := indexOfArg(out.Args, "-compression_level:v", encIdx)
-	if clIdx <= 0 {
-		t.Fatal("missing -compression_level:v")
+	// -crf:0 is left untouched: the fork's VAAPI encoder accepts it and
+	// maps crf->qp internally (patch 0117). The rewriter no longer emits
+	// -qp:0 on the SW->HW path.
+	crfIdx := indexOfArg(out.Args, "-crf:0", 0)
+	if crfIdx <= 0 || out.Args[crfIdx+1] != "16" {
+		t.Fatalf("expected -crf:0 16 to survive verbatim, got args=%v", out.Args)
 	}
-	if out.Args[clIdx+1] != "6" {
-		t.Fatalf("compression_level=%q want 6 (veryfast)", out.Args[clIdx+1])
-	}
-	// CQP path: -crf:0 16 → -qp:0 22 (CRF + 6 offset). The offset
-	// compensates for libx264 CRF being a quality target that floats
-	// QP per-frame around the value, while VAAPI's -qp is the literal
-	// quantizer. Mapping CRF→QP 1:1 produced near-lossless output and
-	// 5× over-budget segments on Balls Up (4K HDR); +6 lands closer to
-	// libx264's effective per-frame QP at the same perceptual quality.
-	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
-	if qpIdx <= 0 {
-		t.Fatal("missing -qp:0")
-	}
-	if out.Args[qpIdx+1] != "22" {
-		t.Errorf("qp=%q want 22 (CRF=16 + offset=6)", out.Args[qpIdx+1])
+	if containsString(out.Args, "-qp:0") {
+		t.Errorf("rewriter must not convert -crf:0 to -qp:0 (fork patch 0117 maps it), got: %v", out.Args)
 	}
 }
 
-// HW_QP_CRF_OFFSET overrides the +6 default.
-func TestRewriter_QPOffset_EnvOverride(t *testing.T) {
-	t.Setenv("HW_QP_CRF_OFFSET", "0")
-	out := Rewrite(swArgsAV1H264, nil, nil)
-	if !out.Applied {
-		t.Fatalf("not applied: %v", out.Changes)
-	}
-	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
-	if qpIdx <= 0 {
-		t.Fatal("missing -qp:0")
-	}
-	if out.Args[qpIdx+1] != "16" {
-		t.Errorf("qp=%q want 16 (offset 0 → 1:1 mapping)", out.Args[qpIdx+1])
-	}
-}
-
-// Negative or oversized result clamps to [0, 51].
-func TestRewriter_QPOffset_Clamping(t *testing.T) {
-	t.Setenv("HW_QP_CRF_OFFSET", "100")
-	out := Rewrite(swArgsAV1H264, nil, nil)
-	qpIdx := indexOfArg(out.Args, "-qp:0", 0)
-	if qpIdx <= 0 {
-		t.Fatal("missing -qp:0")
-	}
-	if out.Args[qpIdx+1] != "51" {
-		t.Errorf("qp=%q want 51 (clamped)", out.Args[qpIdx+1])
-	}
-}
+// crf->qp translation (and its HW_QP_CRF_OFFSET / clamp knobs) moved into
+// the fork's VAAPI encoder (patch 0117); the rewriter no longer touches
+// -crf. Offset override is now the encoder's -crf_qp_offset argv option.
 
 // Rewriter no longer converts CQP→VBR/CBR. scaleplex-ffmpeg7 patch 0105
 // makes vaapi_encode auto-select QVBR (preserving PMS's quality target
@@ -275,8 +376,8 @@ func TestRewriter_RC_PassthroughCQPandMaxrate(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Args, "-qp:0") {
-		t.Errorf("expected -qp:0 to pass through to encoder (fork patch 0105 handles RC mode), got: %v", out.Args)
+	if !containsString(out.Args, "-crf:0") {
+		t.Errorf("expected -crf:0 to pass through to encoder (fork 0117 maps crf->qp, 0105 handles RC mode), got: %v", out.Args)
 	}
 	if !containsString(out.Args, "-maxrate:0") {
 		t.Error("expected -maxrate:0 to pass through")
@@ -291,9 +392,10 @@ func TestRewriter_RC_PassthroughCQPandMaxrate(t *testing.T) {
 	}
 }
 
-// Without -maxrate, the encoder runs in CQP (fork patch 0105 only flips
-// to QVBR when both -qp AND -maxrate are present). -qp:0 must survive.
-func TestRewriter_RateControl_CRFOnly_KeepsCQP(t *testing.T) {
+// Without -maxrate the fork encoder runs CQP off the crf-derived QP
+// (patch 0105 only flips to QVBR when both -qp/-crf AND -maxrate are
+// present). The rewriter leaves -crf:0 untouched either way.
+func TestRewriter_RateControl_CRFOnly_PassesThrough(t *testing.T) {
 	args := append([]string(nil), swArgsAV1H264...)
 	// Strip -maxrate:0 and -bufsize:0
 	for i := 0; i < len(args); {
@@ -307,18 +409,11 @@ func TestRewriter_RateControl_CRFOnly_KeepsCQP(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	hasMapping := false
-	for _, c := range out.Changes {
-		if strings.HasPrefix(c, "crf16->qp22(off=") || c == "crf->qp" {
-			hasMapping = true
-			break
-		}
+	if !containsString(out.Args, "-crf:0") {
+		t.Errorf("expected -crf:0 to survive, got %v", out.Args)
 	}
-	if !hasMapping {
-		t.Errorf("expected crf→qp mapping, got %v", out.Changes)
-	}
-	if !containsString(out.Args, "-qp:0") {
-		t.Error("CQP path must keep -qp:0")
+	if containsString(out.Args, "-qp:0") {
+		t.Errorf("rewriter must not synthesize -qp:0 (fork maps crf), got %v", out.Args)
 	}
 }
 
@@ -378,8 +473,10 @@ func TestRewriter_InitHwDevice_Inject(t *testing.T) {
 	if i < 4 {
 		t.Fatalf("-i too early; injection should precede it. args=%v", out.Args)
 	}
+	// Injected device path is empty; the fork fills it from
+	// SCALEPLEX_RENDER_DEVICE (patch 0116) at device-open.
 	want := []string{
-		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_hw_device", "vaapi",
 	}
 	for k, w := range want {
@@ -468,57 +565,36 @@ func TestRewriter_Bail_SubtitlesBurnIn(t *testing.T) {
 	}
 }
 
-// HDR PMS-shape filter — synthetic mirror of Plex's SW HDR→SDR chain.
-// Real captures may differ in label numbering and filter args; the
-// matcher is intentionally flexible (zscale + tonemap + final nv12 label).
-func TestRewriter_PresetMapping(t *testing.T) {
-	cases := []struct {
-		x264  string
-		vaapi string
-	}{
-		{"ultrafast", "7"},
-		{"superfast", "7"},
-		{"veryfast", "6"},
-		{"faster", "5"},
-		{"fast", "4"},
-		{"medium", "4"},
-		{"slow", "3"},
-		{"slower", "2"},
-		{"veryslow", "1"},
-		{"placebo", "1"},
-		{"VeryFast", "6"},   // case-insensitive
-		{"unknownish", "7"}, // unknown → fastest
-	}
-	for _, c := range cases {
-		got := mapX264PresetToVAAPI(c.x264)
-		if got != c.vaapi {
-			t.Errorf("preset %q → cl=%q, want %q", c.x264, got, c.vaapi)
-		}
-	}
-}
-
-func TestRewriter_PresetMapping_FullArgRewrite(t *testing.T) {
+// preset->compression_level mapping moved into the fork's VAAPI encoder
+// (patch 0118); there is no longer a Go map to unit-test. The rewriter
+// just leaves -preset / -x264opts / -x265-params untouched.
+func TestRewriter_PresetAndOptBlobs_PassThrough(t *testing.T) {
 	args := []string{
 		"-codec:0", "libdav1d", "-i", "m.mkv",
 		"-init_hw_device", "vaapi=vaapi:",
 		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
 		"-map", "[1]",
 		"-codec:0", "libx264", "-crf:0", "16", "-preset:0", "ultrafast",
+		"-x264opts:0", "subme=0:me=dia",
 	}
 	out := Rewrite(args, nil, nil)
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "preset:ultrafast->compression_level:7") {
-		t.Fatalf("missing preset translation change: %v", out.Changes)
+	// Encoder swapped, but preset + x264opts survive for the fork to consume.
+	if !containsString(out.Args, "-preset:0") {
+		t.Error("-preset:0 should pass through (fork patch 0118 maps it)")
 	}
-	encIdx := indexOfArg(out.Args, "-codec:0", indexOfArg(out.Args, "-i", 0))
-	if out.Args[encIdx+2] != "-compression_level:v" || out.Args[encIdx+3] != "7" {
-		t.Fatalf("expected -compression_level:v 7 right after encoder swap, got %q %q",
-			out.Args[encIdx+2], out.Args[encIdx+3])
+	if !containsString(out.Args, "-x264opts:0") {
+		t.Error("-x264opts:0 should pass through (fork patch 0118 swallows it)")
 	}
-	if containsString(out.Args, "-preset:0") {
-		t.Fatal("-preset:0 should be consumed")
+	if containsString(out.Args, "-compression_level:v") {
+		t.Errorf("rewriter must not inject -compression_level:v: %v", out.Args)
+	}
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "preset:") || strings.HasPrefix(c, "drop:-x264opts") {
+			t.Errorf("unexpected preset/x264opts rewrite tag (moved to fork): %q", c)
+		}
 	}
 }
 
@@ -660,11 +736,13 @@ func TestRewriter_SWHDR_InlineAss_Reshape(t *testing.T) {
 			t.Errorf("filter chain missing %q\n  got: %s", mustHave, got)
 		}
 	}
-	// Plex's 4 unknown AVOption keys must be stripped (language/
-	// overrides/outline/shadow) — fork's vf_inlineass rejects them.
-	for _, mustStrip := range []string{"language=", "overrides=", "outline=", "shadow="} {
-		if strings.Contains(got, mustStrip) {
-			t.Errorf("Plex AVOption %q must be stripped from inlineass=", mustStrip)
+	// Plex's 4 styling keys (language/overrides/outline/shadow) are now
+	// passed through verbatim — the fork's vf_inlineass parses them
+	// (patch 0119); the rewriter no longer strips, preserving the user's
+	// subtitle styling.
+	for _, mustKeep := range []string{"language=", "overrides=", "outline=", "shadow="} {
+		if !strings.Contains(got, mustKeep) {
+			t.Errorf("Plex styling key %q must pass through inlineass= (fork 0119 parses it)", mustKeep)
 		}
 	}
 	// -map [3] should be rewritten to -map [15].
@@ -2069,60 +2147,9 @@ func TestIsHDRTransfer(t *testing.T) {
 	}
 }
 
-func TestStripPlexInlineassFilterArgs(t *testing.T) {
-	cases := []struct {
-		name, in, want string
-	}{
-		{
-			name: "no inlineass",
-			in:   "[0:0]scale=w=1280:h=720[v]",
-			want: "[0:0]scale=w=1280:h=720[v]",
-		},
-		{
-			name: "minimal 6-key — unchanged",
-			in:   "inlineass=font_scale=1.0:font_path=/x:font_size=54[3]",
-			want: "inlineass=font_scale=1.0:font_path=/x:font_size=54[3]",
-		},
-		{
-			name: "full Plex 10-key — strip 4",
-			in:   "[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Foo,Bold=500:outline=2.6:shadow=1.7:font_size=54[2]",
-			want: "[1]inlineass=font_scale=1.0:font_path=/x:fontconfig_file=/y:font_size=54[2]",
-		},
-		{
-			name: "overrides with embedded comma + ampersand value (real Plex)",
-			in:   "[1]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:language=en:overrides=ScaledBorderAndShadow=yes,FontName=Noto Sans Medium,Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000:outline=2.6:shadow=1.7:font_size=54[2]",
-			want: "[1]inlineass=font_scale=1.000000:font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:font_size=54[2]",
-		},
-		{
-			name: "language at start (no leading colon)",
-			in:   "[1]inlineass=language=en:font_size=54[2]",
-			want: "[1]inlineass=font_size=54[2]",
-		},
-		{
-			name: "all 4 strip-keys at end",
-			in:   "[1]inlineass=font_scale=1.0:language=en:overrides=foo:outline=2.6:shadow=1.7[2]",
-			want: "[1]inlineass=font_scale=1.0[2]",
-		},
-		{
-			name: "idempotent — second pass is no-op",
-			in:   "[1]inlineass=font_scale=1.0:font_size=54[2]",
-			want: "[1]inlineass=font_scale=1.0:font_size=54[2]",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := stripPlexInlineassFilterArgs(tc.in)
-			if got != tc.want {
-				t.Errorf("got:\n  %s\nwant:\n  %s", got, tc.want)
-			}
-			// Idempotency
-			got2 := stripPlexInlineassFilterArgs(got)
-			if got2 != got {
-				t.Errorf("not idempotent: %q → %q", got, got2)
-			}
-		})
-	}
-}
+// TestStripPlexInlineassFilterArgs removed in patch 0119: the strip helper
+// is gone — the fork's vf_inlineass now parses Plex's overrides/outline/
+// shadow/language keys directly, so the rewriter passes them through.
 
 func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 	// pass-through is hardcoded since B6 (PR #4); no env knob
@@ -2163,9 +2190,10 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 	if !strings.Contains(out.Args[vfIdx], "inlineass=") {
 		t.Errorf("inlineass= dropped from filter: %s", out.Args[vfIdx])
 	}
+	// Plex's styling keys now pass through (fork 0119 parses them).
 	for _, key := range []string{":language=", ":overrides=", ":outline=", ":shadow="} {
-		if strings.Contains(out.Args[vfIdx], key) {
-			t.Errorf("Plex-only key %q not stripped: %s", key, out.Args[vfIdx])
+		if !strings.Contains(out.Args[vfIdx], key) {
+			t.Errorf("Plex styling key %q must pass through: %s", key, out.Args[vfIdx])
 		}
 	}
 	// 2. -map_inlineass kept.
@@ -2239,8 +2267,8 @@ func TestRewriter_HWText_SRT_Sidecar(t *testing.T) {
 	if strings.Contains(graph, "overlay_vaapi") || strings.Contains(graph, "hwdownload") {
 		t.Errorf("overlay_vaapi + hwdownload/hwupload bracket must be gone: %s", graph)
 	}
-	if strings.Contains(graph, "language=") || strings.Contains(graph, "overrides=") {
-		t.Errorf("Plex-private inlineass keys not stripped: %s", graph)
+	if !strings.Contains(graph, "language=") || !strings.Contains(graph, "overrides=") {
+		t.Errorf("Plex styling keys must pass through (fork 0119 parses them): %s", graph)
 	}
 	if !strings.Contains(graph, ":render_height=") {
 		t.Errorf("render_height option missing: %s", graph)

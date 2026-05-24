@@ -100,79 +100,9 @@ var hwDecodeShortCodecs = map[string]struct{}{
 	"vp9":  {},
 }
 
-// x264PresetToVAAPI maps Plex's libx264 -preset names onto iHD's VAAPI
-// TargetUsage scale (compression_level 1..7, where 7 = fastest /
-// "ultrafast" and 1 = highest quality / "veryslow"). The bucketing is
-// approximate — VAAPI has 7 levels vs x264's 9 named presets.
-//
-// Source: Intel iHD driver TargetUsage docs + on-cluster benchmark
-// (3× Arc A310, 2026-05-05): cl=7 yielded +30-70% throughput over cl=2
-// on no-sub workloads, with no quality difference visible at QP=22.
-var x264PresetToVAAPI = map[string]string{
-	"ultrafast": "7",
-	"superfast": "7",
-	"veryfast":  "6",
-	"faster":    "5",
-	"fast":      "4",
-	"medium":    "4",
-	"slow":      "3",
-	"slower":    "2",
-	"veryslow":  "1",
-	"placebo":   "1",
-}
-
-// mapX264PresetToVAAPI maps Plex's libx264 -preset name onto iHD's
-// VAAPI TargetUsage scale (1..7, 7 = fastest). Looks up
-// `SCALEPLEX_PRESET_MAP` env first for per-deployment overrides, then
-// falls back to the on-cluster-tuned defaults above.
-//
-// Env format: comma-separated `name=N` pairs (case-insensitive), e.g.
-//
-//	SCALEPLEX_PRESET_MAP=veryfast=5,fast=3,medium=2
-//
-// Missing names keep their default mapping; entries with unparsable
-// values are silently ignored.
-func mapX264PresetToVAAPI(preset string) string {
-	key := strings.ToLower(preset)
-	if v, ok := parsePresetMapEnv()[key]; ok {
-		return v
-	}
-	if v, ok := x264PresetToVAAPI[key]; ok {
-		return v
-	}
-	// Unknown preset → fastest. Worker only runs when called by orch;
-	// playback latency wins over an unfamiliar quality knob.
-	return "7"
-}
-
-// parsePresetMapEnv reads `SCALEPLEX_PRESET_MAP` and returns the
-// overrides as a lowercased map. Parsed per call (env reads are cheap
-// and rewriting is rare). Returns nil when env is empty so callers can
-// skip lookups.
-func parsePresetMapEnv() map[string]string {
-	v := os.Getenv("SCALEPLEX_PRESET_MAP")
-	if v == "" {
-		return nil
-	}
-	out := map[string]string{}
-	for _, pair := range strings.Split(v, ",") {
-		eq := strings.IndexByte(pair, '=')
-		if eq < 1 {
-			continue
-		}
-		name := strings.TrimSpace(strings.ToLower(pair[:eq]))
-		val := strings.TrimSpace(pair[eq+1:])
-		if name == "" || val == "" {
-			continue
-		}
-		// Validate val is 1..7 — VAAPI TargetUsage range.
-		if n, err := strconv.Atoi(val); err != nil || n < 1 || n > 7 {
-			continue
-		}
-		out[name] = val
-	}
-	return out
-}
+// libx264 preset -> VAAPI compression_level (iHD TargetUsage) mapping
+// moved into the fork's VAAPI encoder (patch 0118); the rewriter leaves
+// `-preset` untouched. The SCALEPLEX_PRESET_MAP env override is retired.
 
 // subRenderHeightDefault — the shipped default render-height cap. At 4K
 // it renders the sub band at 1920x1080 and HW-upscales 2× to the output
@@ -317,14 +247,6 @@ var (
 			`\[1\]scale_vaapi=w=[0-9]+:h=[0-9]+(?::format=[A-Za-z0-9]+)?\[2\];` +
 			`\[2\]\[0\]overlay_vaapi[^\[]*\[3\];` +
 			`\[3\]hwupload\[4\]$`)
-	// reInitHW accepts both PMS argv shapes for `-init_hw_device`:
-	//   `vaapi=vaapi:`                                — SW-decode, PMS
-	//   doesn't know the device because the worker chooses it.
-	//   `vaapi=vaapi:/dev/dri/renderDNNN[,driver=NAME]` — HW-decode,
-	//   PMS reads HardwareDevicePath + iHD driver from its own probe.
-	// In either case the rewriter overwrites with HW_RENDER_DEVICE +
-	// HW_VAAPI_DRIVER defaults so the worker pod's device wins.
-	reInitHW = regexp.MustCompile(`^vaapi=vaapi:(?:/dev/dri/[A-Za-z0-9_]+(?:,driver=[A-Za-z0-9_]+)?)?$`)
 )
 
 func envOr(k, dflt string) string {
@@ -334,72 +256,21 @@ func envOr(k, dflt string) string {
 	return dflt
 }
 
-// stripPlexInlineassFilterArgs removes the 4 AVOption keys that Plex's
-// argv emits on its `inlineass=` filter but scaleplex-ffmpeg7's
-// vf_inlineass does not parse: `language`, `overrides`, `outline`,
-// `shadow`. Operates on a full -filter_complex graph string and is
-// idempotent + leaves graphs without `inlineass=` untouched.
-//
-// Without this strip, the fork's AVOption parser rejects Plex's filter
-// argv at filter init time. We omitted the stub options in patch 0100
-// to sidestep an unexplained LTO/AVFILTER_DEFINE_CLASS table-truncation
-// (see project_scaleplex_inlineass_port.md). The strip is the
-// rewriter's half of that bargain.
-//
-// Plex's argv shape inside the filter graph:
-//
-//	[1]inlineass=font_scale=1.0:font_path=...:fontconfig_file=...:
-//	  language=en:overrides=ScaledBorderAndShadow=yes,FontName=...,...:
-//	  outline=2.6:shadow=1.7:font_size=54[2]
-//
-// Top-level pairs are `:`-separated. The `overrides=` value contains
-// `,` and `=` but never a top-level `:` (verified across argv corpus
-// 2026-05-12 — 6 PMS-emitted inlineass= argv samples, none have
-// embedded `:` inside any of the 4 keys).
-func stripPlexInlineassFilterArgs(filterStr string) string {
-	if !strings.Contains(filterStr, "inlineass=") {
-		return filterStr
+// envBool reads a boolean env var (1/true/yes/on, case-insensitive).
+// Unset/empty/anything else = false.
+func envBool(k string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(k))) {
+	case "1", "true", "yes", "on":
+		return true
 	}
-	stripKeys := map[string]bool{
-		"language":  true,
-		"overrides": true,
-		"outline":   true,
-		"shadow":    true,
-	}
-	var out strings.Builder
-	i := 0
-	for {
-		j := strings.Index(filterStr[i:], "inlineass=")
-		if j < 0 {
-			out.WriteString(filterStr[i:])
-			break
-		}
-		j += i
-		out.WriteString(filterStr[i : j+len("inlineass=")])
-		k := j + len("inlineass=")
-		// Segment ends at next graph terminator: `[` (label), `;`, or
-		// end of string. Output labels like [2] always follow the
-		// filter args.
-		end := strings.IndexAny(filterStr[k:], "[;")
-		segEnd := len(filterStr)
-		if end >= 0 {
-			segEnd = k + end
-		}
-		segment := filterStr[k:segEnd]
-		pairs := strings.Split(segment, ":")
-		kept := pairs[:0]
-		for _, p := range pairs {
-			kv := strings.SplitN(p, "=", 2)
-			if len(kv) == 2 && stripKeys[kv[0]] {
-				continue
-			}
-			kept = append(kept, p)
-		}
-		out.WriteString(strings.Join(kept, ":"))
-		i = segEnd
-	}
-	return out.String()
+	return false
 }
+
+// stripPlexInlineassFilterArgs was removed in patch 0119: the fork's
+// vf_inlineass now parses Plex's `overrides`/`outline`/`shadow`/`language`
+// keys directly (ass_set_style_overrides), so the rewriter passes Plex's
+// inlineass node through verbatim on every path (HW reshape + SW/honor)
+// and the user's subtitle styling is preserved instead of dropped.
 
 // assStyleKeys is the subset of ASS [V4+ Styles] field names accepted
 // in a `subtitles` filter force_style= value. Plex's inlineass
@@ -830,8 +701,9 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 			if sourceIsHDR {
 				mode = "passthrough-inlineass-hdr"
 			}
-			strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
-			strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+			// 0119: fork vf_inlineass parses Plex's overrides/outline/shadow/
+			// language keys, so pass the params verbatim (no strip).
+			strippedAss := assParams
 			return &filterRewrite{
 				Filter: fmt.Sprintf(
 					"[0:0]hwupload[10];"+
@@ -879,8 +751,8 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 			// see anything else.
 			return nil
 		}
-		strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
-		strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+		// 0119: fork vf_inlineass parses Plex's keys; pass params verbatim.
+		strippedAss := assParams
 		return &filterRewrite{
 			Filter: fmt.Sprintf(
 				"[0:0]hwupload[10];[10]%s[11];"+
@@ -1594,7 +1466,6 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		sessionDir = opts.SessionDir
 	}
 
-	renderDevice := envOr("HW_RENDER_DEVICE", "/dev/dri/renderD128")
 	vaapiDriver := envOr("HW_VAAPI_DRIVER", "iHD")
 	// Image-resident defaults: Ubuntu's intel-media-va-driver-non-free
 	// installs iHD_drv_video.so under /usr/lib/x86_64-linux-gnu/dri and
@@ -1802,8 +1673,30 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	swDecoder := args[decCodecIdx+1]
 
+	// Honor Plex's HW/SW decision PER AXIS (docs/HW_PROFILE.md). Plex picks
+	// decode and encode independently; we honor both unless SCALEPLEX_FORCE_HW
+	// is set (the homelab's all-GPU fleet sets it → always re-accelerate, so
+	// honor is a no-op there). Backend targeting (which GPU) stays node-local
+	// regardless (patch 0116) — these flags are only the HW-vs-SW axis.
+	//   - honorSW     = no `-hwaccel:0` + SW encoder → full SW on the worker.
+	//   - honorHybrid = `-hwaccel:0` (HW decode) + SW encoder → keep HW decode
+	//     (+ device) and SW-encode on CPU. The smart CPU-offload mode: the
+	//     heavy decode stays on the GPU, only the encode is CPU (realtime even
+	//     for 4K sources, unlike full SW which is decode-bound).
+	forceHW := envBool("SCALEPLEX_FORCE_HW")
+	plexSWEncoder := false
+	if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
+		_, plexSWEncoder = encoderMap[args[peer+1]]
+	}
+	noHwaccel := indexOfArg(args, "-hwaccel:0", 0) < 0
+	honorSW := plexSWEncoder && noHwaccel && !forceHW
+	honorHybrid := plexSWEncoder && !noHwaccel && !forceHW
+
 	isHWDecode := false
-	if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
+	if honorSW {
+		// Honoring Plex's SW pipeline: leave the decoder as PMS emitted it
+		// (no VAAPI swap, no -hwaccel inject). isHWDecode stays false.
+	} else if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
 		if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
 			isHWDecode = true
 			changes = append(changes, "decode:hw-passthrough:"+swDecoder)
@@ -1845,7 +1738,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// Pass-through is hardcoded: the fork's scaleplex_inlineass binding
 	// owns the sidecar -i + null-sub output, so we never drop them.
 	var earlySubSrc *subtitleSource
-	if !isHWDecode {
+	if !isHWDecode && !honorSW {
 		var probe func(string, string) string
 		if opts != nil && opts.ProbeSubtitleCodec != nil {
 			probe = opts.ProbeSubtitleCodec
@@ -1853,19 +1746,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		earlySubSrc = detectSubtitleSource(args, sessionDir, probe)
 	}
 
-	// 2. -init_hw_device patch or inject (now safe — second -i and
-	// its option block already gone for SW sub-burn sessions).
-	initIdx := indexOfArg(args, "-init_hw_device", 0)
-	if initIdx >= 0 {
-		if !reInitHW.MatchString(args[initIdx+1]) {
-			return bail("init_hw_device-pattern:" + args[initIdx+1])
-		}
-		args[initIdx+1] = "vaapi=vaapi:" + renderDevice + ",driver=" + vaapiDriver
-		// PMS always pairs -init_hw_device with -filter_hw_device in
-		// the 286-entry argv corpus (0 mismatches). No defensive
-		// inject needed; we only patch the device path.
-		changes = append(changes, "init_hw_device")
-	} else {
+	// 2. -init_hw_device. The scaleplex-ffmpeg fork retargets the VAAPI
+	// device at open time from SCALEPLEX_RENDER_DEVICE (patch
+	// 0116-vaapi-device-env-retarget); the driver comes from
+	// LIBVA_DRIVER_NAME, which the rewriter injects into the subprocess
+	// env below. So the device path Plex baked in (its own host's
+	// HardwareDevicePath) is irrelevant on the worker — we leave Plex's
+	// -init_hw_device untouched and only inject the option when Plex
+	// emitted none (a pure SW session being HW-accelerated). The empty
+	// `vaapi=vaapi:` is filled by the fork's env override at device-open.
+	// Skipped entirely when honoring a SW session — no VAAPI device needed.
+	if !honorSW && indexOfArg(args, "-init_hw_device", 0) < 0 {
 		// Inject -init_hw_device + -filter_hw_device BEFORE the first
 		// -i so they're parsed as global options. Placing them after
 		// -i puts them in ffmpeg's per-output option scope, where
@@ -1881,7 +1772,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// to global position.
 		newInputIdx := indexOfArg(args, "-i", 0)
 		args = spliceArgs(args, newInputIdx,
-			"-init_hw_device", "vaapi=vaapi:"+renderDevice+",driver="+vaapiDriver,
+			"-init_hw_device", "vaapi=vaapi:",
 			"-filter_hw_device", "vaapi",
 		)
 		changes = append(changes, "inject:init_hw_device+filter_hw_device")
@@ -1908,7 +1799,25 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	var subSrc *subtitleSource
 	sourceIsHDR := false
 
-	if !isHWDecode {
+	if honorSW {
+		// Honor Plex's full software pipeline: decoder, filter chain, and
+		// encoder stay exactly as PMS emitted them — SW decode, SW filters
+		// (scale=/tonemap=/format=), and libx264/libx265 run on the worker
+		// CPU. The fork's merged inlineass SW (FFDraw nv12) branch renders
+		// any `-inlineass` burn-in. Plex's native `-crf`/`-preset`/`-x264opts`
+		// are honoured by libx264 directly. Only the transport/audio/flag
+		// scrubs below apply. See docs/HW_PROFILE.md.
+		//
+		// A fully-SW pipeline uses no VAAPI device, so drop the HW device
+		// init PMS pairs with every spawn — otherwise a GPU-less /
+		// CPU-fallback node would fail trying to open VAAPI.
+		for _, flag := range []string{"-init_hw_device", "-filter_hw_device"} {
+			if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
+				args = removeArgs(args, i, 2)
+			}
+		}
+		changes = append(changes, "honor:plex-sw")
+	} else if !isHWDecode {
 		// 3. Video -filter_complex rewrite
 		vfIdx := -1
 		for i := 0; i < len(args); i++ {
@@ -2019,6 +1928,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 		args[encCodecIdx+1] = hwEncoder
 		changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
+	} else if honorHybrid {
+		// HW decode + SW encode (per-axis honor, docs/HW_PROFILE.md). PMS
+		// emitted `-hwaccel:0 vaapi` decode + a libx264/libx265 encode (its
+		// "HW accel on, HW encoding off" config). Keep the pipeline exactly:
+		// HW decode (device retargeted by the fork, patch 0116), Plex's SW
+		// filter chain incl. its `inlineass` node (fork parses the keys,
+		// patch 0119), and the SW encoder on CPU. No reshape, no VAAPI
+		// encoder validation. The smart CPU-offload mode — the heavy decode
+		// stays on the GPU, only the encode is CPU (realtime even at 4K,
+		// unlike full SW which is decode-bound). Only the transport/audio
+		// scrubs below apply.
+		changes = append(changes, "honor:plex-hwdec-swenc")
 	} else {
 		// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
 		// that, but leave the filter chain, map labels, and encoder
@@ -2126,8 +2047,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// worker knob (now a filter option); animated_tier_down lets the filter
 				// drop animated cues one resolution tier (a no-op for static cues).
 				assParams := m[assGroup]
-				strippedAss := stripPlexInlineassFilterArgs("inlineass=" + assParams)
-				strippedAss = strings.TrimPrefix(strippedAss, "inlineass=")
+				// 0119: fork vf_inlineass parses Plex's keys; pass verbatim.
+				strippedAss := assParams
 				inlineArgs := fmt.Sprintf("%s:render_height=%d", strippedAss, subRenderHeightCap())
 				if subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile) {
 					inlineArgs += ":animated_tier_down=1"
@@ -2221,87 +2142,26 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// 6. -crf:0 <Q> → -qp:0 <Q + HW_QP_CRF_OFFSET> (CQP mode).
-	//
-	// Plex emits `-crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>`. With libx264
-	// this is "VBR with quality target Q, bitrate capped at R". h264_vaapi
-	// has no clean equivalent — when `-qp:0` is set the encoder runs in
-	// CQP and ignores -maxrate. We accept that compromise (over budget
-	// on complex 4K HDR scenes) because the alternative (force VBR via
-	// `-rc_mode VBR -b:v <R>`) breaks rate control on -ss seek: live
-	// bench 2026-05-06 showed iHD producing 100 Mbps segments after a
-	// seek even when -rc_mode VBR + -b:v 20Mbps + -bufsize 40Mb were
-	// all explicit on the encoder context.
-	//
-	// CRF and QP aren't the same scale even though both are 0-51:
-	// libx264 CRF=16 averages ~QP 20-22 in practice (CRF adjusts QP per
-	// frame around its target), while VAAPI's `-qp` is the literal
-	// quantizer. Mapping CRF=16 → QP=16 produces near-lossless output —
-	// 4K HDR segments came in at 14 MB / 1 second on Balls Up
-	// (~110 Mbps, 5× over Plex's 20 Mbps target). Add an offset so the
-	// VAAPI QP lands closer to libx264's effective QP:
-	//
-	//   target_qp = clamp(crf + offset, 0, 51)
-	//
-	// Default offset is 6: empirically lines QP up with x264's average
-	// at the same perceptual quality level (Balls Up isolated bench
-	// 2026-05-06: QP=22 produced 5 MB + 3 MB / 1 second segments,
-	// ~40 Mbps — closer to budget while still better than Plex's
-	// 20 Mbps target nominal). Override via HW_QP_CRF_OFFSET if the
-	// quality/bitrate trade-off needs tuning.
-	if crfIdx := indexOfArg(args, "-crf:0", encCodecIdx+1); crfIdx >= 0 && crfIdx+1 < len(args) {
-		args[crfIdx] = "-qp:0"
-		offset := 6
-		if v := os.Getenv("HW_QP_CRF_OFFSET"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				offset = n
-			}
-		}
-		if crf, err := strconv.Atoi(args[crfIdx+1]); err == nil {
-			qp := crf + offset
-			if qp < 0 {
-				qp = 0
-			}
-			if qp > 51 {
-				qp = 51
-			}
-			args[crfIdx+1] = strconv.Itoa(qp)
-			changes = append(changes, fmt.Sprintf("crf%d->qp%d(off=%d)", crf, qp, offset))
-		} else {
-			changes = append(changes, "crf->qp")
-		}
-	}
+	// 6. -crf:0 is left untouched. The scaleplex-ffmpeg fork's VAAPI
+	// encoder accepts libx264-style `-crf:N` directly and maps it to
+	// QP = crf + crf_qp_offset (default 6) before rate-control
+	// selection (patch 0117-vaapi-encode-accept-crf); patch 0105 then
+	// routes the resulting QP + `-maxrate` to QVBR. So Plex's
+	// `-crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>` argv reaches the
+	// encoder verbatim — no crf->qp translation here. The
+	// HW_QP_CRF_OFFSET env knob is retired; override via the encoder's
+	// `-crf_qp_offset` argv option.
 
-	// 7. Translate -preset:0 <x264-name> → -compression_level:v <N>
-	// (Plex emits x264 preset names; iHD VAAPI uses a 1-7 TargetUsage
-	// scale where 7 = fastest, 1 = highest quality.)
-	//
-	// When PMS doesn't emit a preset (e.g. x265 path with
-	// `-x265-params` instead), do nothing — let stock vaapi_encode
-	// leave `compression_level == FF_COMPRESSION_DEFAULT`, which
-	// dispatches to the iHD driver's intrinsic default (~TU=4
-	// balanced). Matches Plex Transcoder's prod behaviour (their
-	// `-quality` AVOption defaults to 0 → driver-vendor-default).
-	// We previously injected `cl=7` (max speed) here, which was
-	// +30-70% throughput vs cl=2 on no-sub workloads but more
-	// aggressive than Plex on the quality axis. Bandaid B5 retired
-	// 2026-05-15.
-	if i := indexOfArg(args, "-preset:0", encCodecIdx+1); i >= 0 && i+1 < len(args) {
-		preset := args[i+1]
-		cl := mapX264PresetToVAAPI(preset)
-		args = removeArgs(args, i, 2)
-		// Inject right after the encoder so the encoder context picks it up.
-		args = spliceArgs(args, encCodecIdx+2, "-compression_level:v", cl)
-		changes = append(changes, "preset:"+preset+"->compression_level:"+cl)
-	}
-
-	// Drop the remaining SW-encoder-specific flags.
-	for _, flag := range []string{"-x264opts:0", "-x265-params:0"} {
-		if i := indexOfArg(args, flag, encCodecIdx+1); i >= 0 {
-			args = removeArgs(args, i, 2)
-			changes = append(changes, "drop:"+flag)
-		}
-	}
+	// 7. -preset:0, -x264opts:0 and -x265-params:0 are left untouched.
+	// The fork's VAAPI encoder accepts a libx264-style `-preset NAME`
+	// and maps it to compression_level (iHD TargetUsage) at init, and
+	// swallows the `-x264opts` / `-x265-params` private blobs as no-ops
+	// (patch 0118-vaapi-encode-accept-preset-and-stubs). So Plex's
+	// libx264 encoder argv reaches the VAAPI encoder verbatim — no
+	// preset translation or opt-blob dropping here. When PMS omits a
+	// preset, the encoder leaves compression_level at the driver default
+	// (~TU=4). The SCALEPLEX_PRESET_MAP env knob is retired; override by
+	// passing -compression_level directly.
 
 	// 8. Match Plex prod's "no a53_cc SEI in HW-encoded output" convention.
 	//
@@ -2321,7 +2181,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// libx264-swapped-to-h264_vaapi sessions — diverging from Plex
 	// prod. Inject keeps libx264 sessions consistent with the libx265
 	// majority. Tag stays for replay-corpus diagnostics.
-	if indexOfArg(args, "-sei:0", 0) < 0 {
+	//
+	// Skipped when honoring a SW session: the encoder stays libx264, where
+	// a53_cc isn't default-injected, so PMS's own omission already matches.
+	if !honorSW && !honorHybrid && indexOfArg(args, "-sei:0", 0) < 0 {
 		if fkfIdx := indexOfArg(args, "-force_key_frames:0", encCodecIdx+1); fkfIdx >= 0 {
 			args = spliceArgs(args, fkfIdx, "-sei:0", "-a53_cc")
 			changes = append(changes, "inject:sei+a53_cc")
