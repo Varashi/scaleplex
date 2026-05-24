@@ -19,7 +19,6 @@ agent logs the comma-joined labels at task start:
 session Balls_Up...c11a7e73: rewriter applied:
   decode:libdav1d->av1, inject:init_hw_device+filter_hw_device,
   filter:plain, map-label-update, encode:libx264->h264_vaapi,
-  crf->qp, preset:veryfast->compression_level:6, drop:-x264opts:0,
   inject:sei+a53_cc, audio:eac3_eae->eac3, drop:-eae_prefix:1,
   hls:segment_list:rewrite-to-relay, seek-offset:captured=888.000s,
   progress:append-X-Plex-Token,
@@ -90,16 +89,21 @@ The whole point. Plex passes its libx264 invocation; we replace with
 the VAAPI HW encoder.
 
 Side effects:
-- `-crf:0 N` → `-qp:0 N`. **Label:** `crf->qp`.
-- `-preset:0 <name>` → `-compression_level:0 N`. iHD's TargetUsage scale
-  has 7 levels (1=quality, 7=fastest); x264 has 9 named presets. The
-  bucketing maps `ultrafast/superfast/veryfast → 7/6/6`, `faster/fast →
-  5/4`, `medium/slow → 3/2`, `slower/veryslow → 1/1`. Picked from
-  on-cluster benchmark (3× Arc A310, 2026-05-05): cl=7 yielded
-  +30-70% throughput over cl=2 on no-sub workloads with no visible
-  quality difference at QP=22. **Label:** `preset:veryfast->compression_level:6`.
-- `-x264opts:0 <stuff>` is dropped — those options are libx264-specific,
-  not portable to VAAPI. **Label:** `drop:-x264opts:0`.
+- `-crf:0 N` is left untouched. The fork's VAAPI encoder accepts
+  libx264-style `-crf` and maps it to `QP = crf + crf_qp_offset`
+  (default 6) before rate-control selection (patch `0117`); patch `0105`
+  then routes the QP + `-maxrate` to QVBR. No rewriter label.
+- `-preset:0 <name>` is left untouched. The fork's VAAPI encoder accepts
+  libx264 preset names and maps them to `compression_level` (iHD
+  TargetUsage 1=quality..7=fastest) at init when `compression_level`
+  wasn't set directly (patch `0118`). The baked map (`ultrafast/superfast/
+  veryfast → 7/6/6`, `faster/fast → 5/4`, `medium/slow → 4/3`,
+  `slower/veryslow → 2/1`) comes from on-cluster bench (3× Arc A310,
+  2026-05-05). The `SCALEPLEX_PRESET_MAP` env knob is retired; override by
+  passing `-compression_level` directly. No rewriter label.
+- `-x264opts:0` / `-x265-params:0` are left untouched — the fork's VAAPI
+  encoder accepts and ignores them (patch `0118`), so Plex's libx264/x265
+  argv reaches the encoder without error. No rewriter label.
 - `-sei:0 -a53_cc` is injected to match Plex prod's convention. PMS
   emits `-sei:0 -a53_cc` on HEVC/libx265 sessions but omits it on
   libx264 ones; in `AV_OPT_TYPE_FLAGS` syntax `-a53_cc` *removes* the
@@ -154,8 +158,14 @@ becomes (rewriter mode `plain`):
 [0]format=pix_fmts=yuv420p|nv12,hwupload[1]
 ```
 
-Plus we inject `-init_hw_device "vaapi=va:/dev/dri/renderD128,kernel_driver=i915,driver=iHD"`
-and `-filter_hw_device va` ahead of the input. **Labels:** `filter:plain`,
+Plus, when Plex emitted no `-init_hw_device`, we inject a bare
+`-init_hw_device "vaapi=vaapi:"` and `-filter_hw_device vaapi` ahead of the
+input. We no longer bake a device path here: the scaleplex-ffmpeg fork
+retargets the VAAPI device from `SCALEPLEX_RENDER_DEVICE` at device-open
+(patch `0116-vaapi-device-env-retarget`), and the driver comes from
+`LIBVA_DRIVER_NAME` (injected into the subprocess env). When Plex *did*
+emit `-init_hw_device`, we leave it untouched — the fork overrides the
+path regardless. **Labels:** `filter:plain`,
 `inject:init_hw_device+filter_hw_device`, `map-label-update`.
 
 The map-label update is needed because we add `hwupload` inside the
@@ -205,9 +215,13 @@ filter composites directly on the VAAPI surface:
   resolution tier below `render_height`. Static cues are unaffected.
 - Plex's `-map_inlineass <spec>` and its `-map <spec> -f null -codec ass`
   decode-sink are **kept** — they drive the libass feed.
-- Four Plex-only AVOption keys (`language`, `overrides`, `outline`, `shadow`)
-  are stripped (the fork's `inlineass` doesn't parse them); `font_scale`,
-  `font_path`, `fontconfig_file`, `font_size` are kept.
+- Plex's full `inlineass` node is passed through **verbatim** — including
+  the styling keys `language`/`overrides`/`outline`/`shadow`. As of patch
+  `0119` the fork's `inlineass` parses them (`overrides` →
+  `ass_set_style_overrides`, libass parses the ASS colours/bools), so the
+  user's subtitle appearance (font/colour/border/shadow) is preserved.
+  Earlier builds stripped them (`stripPlexInlineassFilterArgs`, removed in
+  0119), which lost the styling and crashed any verbatim path.
 - OpenCL-tonemap variant: the tonemap is preserved and PMS's `-map [6]` is
   retargeted to `[4]`.
 

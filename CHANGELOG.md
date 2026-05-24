@@ -1,5 +1,80 @@
 # Changelog
 
+## v1.4.0 — 2026-05-24
+
+Rewriter→fork migration + honor-Plex-HW/SW. Per-session argv-reshaping that
+the Go rewriter did on every spawn moves into the scaleplex-ffmpeg fork, so
+Plex's argv reaches the binary largely verbatim — shrinking the rewriter and
+moving toward a drop-in transcoder. The rewriter also stops force-accelerating:
+it now honors Plex's HW/SW decision by default, with a per-node override.
+
+> **Behavior change.** Honor-Plex-HW/SW is now the **default**. Set
+> `SCALEPLEX_FORCE_HW=1` (per-node worker env) to keep the v1.3.0
+> always-re-accelerate behavior — the all-GPU homelab fleet sets this, so its
+> behavior is unchanged (aside from the subtitle-styling fidelity below).
+>
+> **Env:** new `SCALEPLEX_RENDER_DEVICE`, `SCALEPLEX_FORCE_HW`; retired
+> `HW_QP_CRF_OFFSET` and `SCALEPLEX_PRESET_MAP` (now encoder argv options
+> `-crf_qp_offset` / `-compression_level`).
+
+### Moved into the fork (scaleplex-ffmpeg patches 0116–0119)
+
+- **0116 — device retarget.** `vaapi_device_create` reads
+  `SCALEPLEX_RENDER_DEVICE` and binds that node regardless of the DRM path the
+  caller baked into `-init_hw_device` (which is PMS-host-local and meaningless
+  on a distributed worker). Empty path + no env → stock auto-detect.
+- **0117 — `crf`.** The VAAPI encoder accepts libx264-style `-crf` and maps it
+  to `QP = clamp(crf + crf_qp_offset, 0, 51)` (default offset 6) before
+  rate-control selection; patch 0105 then routes QP + `-maxrate` to QVBR.
+- **0118 — `preset` + opt stubs.** The VAAPI encoder accepts libx264 `-preset`
+  names → `compression_level` (iHD TargetUsage; baked Arc bench map) and
+  accepts-and-ignores `-x264opts` / `-x265-params`.
+- **0119 — `inlineass` styling keys.** `vf_inlineass` implements Plex's
+  `overrides` (→ `ass_set_style_overrides`, libass parses the ASS
+  colours/bools), `outline`, `shadow`, and `language`. Plex's subtitle
+  appearance (font/colour/border/shadow) is now honored instead of dropped.
+
+### Rewriter
+
+- No longer rewrites the device path, `crf→qp`, or `preset→compression_level`,
+  and no longer strips the 4 Plex-only `inlineass` keys
+  (`stripPlexInlineassFilterArgs` removed) — the fork handles all of these, so
+  Plex's argv passes through verbatim on every path. Net deletion of the
+  device-overwrite, blocks 6/7, the opt-blob drop, and the preset map/env
+  helpers.
+- **honor-Plex-HW/SW (per-axis).** Honors Plex's decode and encode choices
+  independently unless `SCALEPLEX_FORCE_HW=1`:
+  - `honor:plex-sw` — no `-hwaccel` + SW encoder → runs fully on CPU (no VAAPI
+    device, no reshape). The CPU / non-GPU fallback.
+  - `honor:plex-hwdec-swenc` — `-hwaccel` (HW decode) + SW encoder → keeps HW
+    decode + device, SW-encodes on CPU. The CPU-offload mode: the heavy decode
+    stays on the GPU (e.g. 4K AV1 HW-decode → 720p libx264 ≈ 7× realtime,
+    vs ~0.5× for full SW). Previously this hybrid bailed.
+  - Backend targeting (which GPU) is always node-local (0116); these flags are
+    only the HW-vs-SW axis.
+
+### Subtitle styling fidelity
+
+Burn-in now reflects the user's Plex appearance settings (font/colour/border/
+shadow) on **all** paths, including the HW path — a visible change even under
+`FORCE_HW=1`. Previously the rewriter stripped those keys, so burn-in fell back
+to a hardcoded white/DejaVu default (and a per-cue Arial→DejaVu fontselect).
+
+### Known issues
+
+- **HW-decode/SW-encode hybrid — 4K HDR corruption (under investigation).**
+  `honor:plex-hwdec-swenc` runs Plex's verbatim SW filter chain
+  (`tonemap=mobius` + libass) on HW-decoded frames; on 4K HDR AV1 this shows
+  graphical corruption (and buffering on heavy output res). Only reachable
+  with `FORCE_HW=0`. **Ship with `FORCE_HW=1`** (honor paths inactive); don't
+  rely on the hybrid until this is root-caused.
+
+Validated on plex-test (`FORCE_HW=0`): exit-8 on Plex sub-burn fixed, honor-SW
+runs on CPU, the hybrid reaches realtime at sane output res, fork accepts
+Plex's styling keys (in-pod rc=0). Device/crf/preset confirmed in-pod (incl.
+override beating a bogus argv device path). The HW prod path is unchanged
+(intermittent skips on a marginal 4K-HDR session did not reproduce on retest).
+
 ## v1.3.0 — 2026-05-24
 
 Subtitle burn-in unification. The separate GPU-overlay pre-render path (a

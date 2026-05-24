@@ -1,0 +1,143 @@
+# Per-node HW profile + honor-Plex-HW/SW (future feature)
+
+> **Status: PROPOSED (2026-05-24). Design target, not yet built.** Phase 1
+> (honor-default + per-node `SCALEPLEX_FORCE_HW` override, single VAAPI
+> backend) is the near-term, low-risk slice. Phases 2–3 (multi-backend
+> node profiles, capability-aware dispatch) are deliberately deferred until
+> cluster heterogeneity is real — building the abstraction speculatively
+> would guess the wrong seams. See `REWRITER.md` for today's behaviour.
+
+## Problem
+
+Today the rewriter **always re-accelerates**: any session Plex emits as SW
+(libx264/libx265, SW decode, SW filters) is reshaped to the worker's VAAPI
+HW pipeline (decoder hwaccel inject, `libx264→h264_vaapi`, `scale→scale_vaapi`,
+tonemap/sub-burn to HW). The HW backend is hardcoded to Intel iHD/VAAPI.
+
+Two limits follow:
+
+1. **No way to honor a genuine SW choice.** If a session should run SW
+   (a codec/profile the node's HW can't do — e.g. 10-bit H.264 on Intel —
+   or a deliberate quality choice), the rewriter has no path for it; it
+   forces HW and either over-reshapes or fails.
+2. **Single-backend assumption.** A non-Intel node (NVENC/QSV/AMF/RKMPP)
+   cannot be added — the reshape emits vaapi graphs unconditionally.
+
+### Why this is subtle here (corpus evidence, 2026-05-24)
+
+1089 captured pre-rewrite PMS argv (`~/scaleplex-corpus`), 899 video
+transcodes:
+
+| What Plex emits | Count |
+|---|---|
+| HW-encode (vaapi) | 880 (98%) |
+| **SW-encode (libx264/5) despite HW enabled** | **19 (2%)** |
+| HW-decode (`-hwaccel:0`) | 834 |
+| SW-decode | 65 (46 pair with HW-encode, 19 fully SW) |
+
+The 19 fully-SW cases break down as: 8× subtitle burn-in (`inlineass`),
+7× HDR tonemap (`tonemap=hable`), 5× plain AV1 downscale (`libdav1d`).
+**Every one is a capability PMS's own container lacks but the Arc worker
+has** (AV1 HW-decode, HW HDR-tonemap, HW sub-burn). So here the forced
+re-acceleration *is* scaleplex's core value — honoring Plex's SW choice
+would dump 4K HDR / AV1 / sub-burn onto the worker's 4-vCPU CPU.
+
+**Conclusion:** honor-by-default is correct as a *framework default*, but
+this homelab must run with force-HW on. The feature's local value is
+correctness/portability, not behaviour change. (Local wins came from the
+device/crf/preset fork patches, `0116`–`0118`.)
+
+## Design
+
+### Two orthogonal axes — do not conflate them
+
+"Honor Plex argv" splits into:
+
+1. **HW-vs-SW decision** — *default: honor Plex's choice.* Override:
+   force-HW per node (capability-gated, below).
+2. **Backend targeting** (vaapi / nvenc / qsv / device path) — **always
+   node-local, never Plex's.**
+
+The backend axis is load-bearing in a heterogeneous cluster: PMS emits
+**vaapi** HW argv (corpus: 880×). Dispatched to an NVIDIA node, "honoring"
+that vaapi graph *fails* — vaapi won't run on NVENC. So even the honor
+path must remap the backend to the node's. **Honor the *decision* (HW vs
+SW); the *implementation* (which GPU/backend) is always node-local.** This
+generalises what patch `0116` already did for the device path (retarget at
+device-open regardless of the path Plex baked in).
+
+### Force-HW is capability-gated, not unconditional
+
+"Force HW per node" must mean: *re-accelerate every session the node's HW
+supports; honor-SW otherwise.* A node that can't do a given operation
+(10-bit H.264 on Intel, an unsupported AV1 profile) keeps that session SW
+even under force-HW. The corpus's 19 SW cases are all Arc-capable → force-HW
+re-accelerates all; a genuine node-incapable case stays SW automatically.
+
+### The new primitive: per-node HW profile
+
+The real design object. Per node, **auto-detected at worker startup**
+(probe VA / NVENC entrypoints during pre-warm — the worker already
+pre-warms VAAPI), with config override for edge cases:
+
+```
+HWProfile {
+  backend:     vaapi | nvenc | qsv | amf | rkmpp | ...
+  device:      <node-local render node / CUDA index>
+  encoder_map: { libx264 -> h264_<backend>, libx265 -> hevc_<backend>, av1 -> ... }
+  filter_map:  { scale -> scale_<backend>, tonemap -> tonemap_<backend>,
+                 overlay -> overlay_<backend>, hwupload/hwdownload semantics }
+  caps:        [ hwdec_av1, hwdec_hevc, hwdec_vc1, enc_10bit_hevc,
+                 enc_10bit_h264, hw_tonemap, hw_subburn, ... ]
+  force_hw:    bool   # the per-node override
+}
+```
+
+The rewriter's HW-reshape phases become **parameterised by this profile**
+instead of hardcoded iHD/VAAPI. `force_hw` gates the HW-vs-SW decision;
+`caps` gates whether a forced session can actually be HW'd.
+
+### Capability-aware dispatch (phase 3)
+
+Once nodes carry `caps`, the orchestrator can route by capability: send an
+AV1 session only to AV1-decode-capable nodes; a 10-bit-H.264 session to a
+node that can (or to SW). This also subsumes the parked CPU-fallback idea —
+a node with no HW for a session honors SW → runs CPU.
+
+## How this unifies parked threads
+
+- **CPU fallback** (`project_scaleplex_cpu_fallback`, parked "no driver
+  while all nodes identical"): honor-SW + caps gating *is* the CPU-fallback
+  mechanism. The hetero-GPU plan is its driver.
+- **Blanket-trust Plex graph** (`hwdecode_blanket_trust`, "future general
+  SW-filter detection"): honor-default is exactly that.
+- **Drop-in direction** (rewriter→fork migration, `0116`–`0118`): honor by
+  default = the worker does less argv surgery; the binary already
+  self-targets the device.
+
+## Phasing
+
+- **Phase 1 — honor-default + `SCALEPLEX_FORCE_HW`, single backend (vaapi).**
+  Near-term. Gate the existing SW→HW reshape: when the session is fully-SW
+  and `!force_hw`, skip the HW-reshape phases (decoder hwaccel inject,
+  encoder swap, filter→vaapi, device inject) but keep the transport/audio
+  scrubs (progressurl/segment relay, eae→eac3, Plex-private flag strip) so
+  the SW transcode still runs correctly on the worker. **Deploy gotcha:
+  ship the default-flip and the homelab worker DS `SCALEPLEX_FORCE_HW=1` in
+  the same change — otherwise all 19 HDR/AV1/sub-burn jobs (+46 SW-decode
+  partials) regress to CPU.** Also sidesteps the `reFilterHDRAss`
+  hardcoded-`hable` exit-8 bug (the SW-HDR reshape path stops being forced).
+
+- **Phase 2 — node HW profile abstraction + multi-backend reshape.**
+  Parameterise encoder_map / filter_map / device by backend; auto-detect at
+  startup. Build **when a non-Arc node actually exists**, not before.
+
+- **Phase 3 — capability-aware dispatch + CPU-fallback unification.**
+
+## Override semantics (phase 1)
+
+- `SCALEPLEX_FORCE_HW=1` (worker DS env, per-node) → re-accelerate every
+  node-HW-supported session (today's behaviour). The homelab sets this.
+- unset / `0` → honor Plex's HW-vs-SW decision; SW stays SW (CPU on worker).
+- Backend is always the node's (device already via `SCALEPLEX_RENDER_DEVICE`
+  / patch `0116`).
