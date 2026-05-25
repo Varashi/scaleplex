@@ -2064,8 +2064,8 @@ func TestRewriter_HWDecode_PGS_HDR_Tonemap_Inlineass(t *testing.T) {
 	if !containsString(out.Changes, "tonemap:ocl:inject-opencl-device") {
 		t.Errorf("opencl device must be injected for the tonemap: %v", out.Changes)
 	}
-	if indexOfArg(out.Args, "-hwaccel_output_format:0", 0) < 0 {
-		t.Errorf("-hwaccel_output_format:0 vaapi must be present (VA-resident decode)")
+	if of := indexOfArg(out.Args, "-hwaccel_output_format:0", 0); of < 0 || of+1 >= len(out.Args) || out.Args[of+1] != "vaapi" {
+		t.Errorf("expected -hwaccel_output_format:0 vaapi (VA-resident decode); args=%v", out.Args)
 	}
 	if mi := indexOfArg(out.Args, "-map_inlineass", 0); mi < 0 || out.Args[mi+1] != "0:5" {
 		t.Errorf("-map_inlineass 0:5 must be added for the PGS feed: %v", out.Args)

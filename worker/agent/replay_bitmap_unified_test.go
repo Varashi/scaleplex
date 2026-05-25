@@ -17,6 +17,11 @@ import (
 // and burn via inlineass instead. Proves the unification holds against real
 // captures, not just the hand-built fixtures. Run with -tags replay; honors
 // REPLAY_CORPUS_DIR (default ~/scaleplex-corpus).
+//
+// A bitmap-overlay argv is expected to either reshape (the unified inlineass
+// path) or take a recognized non-reshape route (honor-SW/hybrid passthrough, or
+// a skip: bail). An UNEXPECTED bail — no skip reason, no honor — is surfaced as
+// a failure so a regression in this branch can't pass silently.
 func TestReplayCorpus_BitmapOverlayUnified(t *testing.T) {
 	dir := os.Getenv("REPLAY_CORPUS_DIR")
 	if dir == "" {
@@ -27,7 +32,7 @@ func TestReplayCorpus_BitmapOverlayUnified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read corpus dir %s: %v", dir, err)
 	}
-	var checked, hdr int
+	var reshaped, hdr, honored, skipped int
 	for _, ent := range entries {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
 			continue
@@ -40,9 +45,10 @@ func TestReplayCorpus_BitmapOverlayUnified(t *testing.T) {
 		if json.Unmarshal(body, &c) != nil || len(c.Argv) == 0 || c.SessionID == "" {
 			continue
 		}
-		// Only entries whose INPUT graph is a bitmap overlay burn.
-		inVF := filterComplexValue(c.Argv)
-		if !strings.Contains(inVF, "overlay_vaapi") {
+		// Only entries whose INPUT has a bitmap overlay burn (scan ALL
+		// -filter_complex graphs, not just the first — the first can be audio).
+		inVF := overlayGraph(c.Argv)
+		if inVF == "" {
 			continue
 		}
 		isHDR := strings.Contains(inVF, "tonemap_opencl") || strings.Contains(inVF, "tonemap_vaapi")
@@ -51,41 +57,74 @@ func TestReplayCorpus_BitmapOverlayUnified(t *testing.T) {
 			SessionDir: filepath.Join("/tmp/replay", c.SessionID),
 		})
 		if !out.Applied {
-			// A bail is reported by the main replay test; not this test's job.
+			if r := changePrefix(out.Changes, "skip:"); r != "" {
+				skipped++ // legit non-reshape (e.g. no input) — tolerate
+				continue
+			}
+			t.Errorf("%s: overlay argv bailed without a skip reason: %v", ent.Name(), out.Changes)
 			continue
 		}
-		checked++
+		// Honor modes pass Plex's filter through unchanged (overlay survives by
+		// design) — out of scope for the reshape assertion.
+		if changePrefix(out.Changes, "honor:") != "" {
+			honored++
+			continue
+		}
+
+		reshaped++
 		if isHDR {
 			hdr++
 		}
-		outVF := filterComplexValue(out.Args)
-		if strings.Contains(outVF, "overlay_vaapi") {
-			t.Errorf("%s: overlay_vaapi survived the unification:\n%s", ent.Name(), outVF)
+		// Output: overlay gone from EVERY graph, burn routed to inlineass.
+		var outBurn string
+		for i := 0; i+1 < len(out.Args); i++ {
+			if out.Args[i] != "-filter_complex" {
+				continue
+			}
+			g := out.Args[i+1]
+			if strings.Contains(g, "overlay_vaapi") {
+				t.Errorf("%s: overlay_vaapi survived the unification:\n%s", ent.Name(), g)
+			}
+			if strings.Contains(g, "inlineass") {
+				outBurn = g
+			}
 		}
-		if !strings.Contains(outVF, "inlineass") {
-			t.Errorf("%s: bitmap burn did not route to inlineass:\n%s", ent.Name(), outVF)
+		if outBurn == "" {
+			t.Errorf("%s: bitmap burn did not route to inlineass: %v", ent.Name(), out.Args)
+			continue
 		}
 		// HDR variant must keep the tonemap (honored) and stay VA-resident.
 		if isHDR {
-			if !strings.Contains(outVF, "tonemap_opencl") && !strings.Contains(outVF, "tonemap_vaapi") {
-				t.Errorf("%s: HDR bitmap burn dropped the tonemap:\n%s", ent.Name(), outVF)
+			if !strings.Contains(outBurn, "tonemap_opencl") && !strings.Contains(outBurn, "tonemap_vaapi") {
+				t.Errorf("%s: HDR bitmap burn dropped the tonemap:\n%s", ent.Name(), outBurn)
 			}
-			if strings.HasPrefix(outVF, "[0:0]hwupload") {
-				t.Errorf("%s: HDR bitmap burn kept the decode->sysmem round-trip:\n%s", ent.Name(), outVF)
+			if strings.HasPrefix(outBurn, "[0:0]hwupload") {
+				t.Errorf("%s: HDR bitmap burn kept the decode->sysmem round-trip:\n%s", ent.Name(), outBurn)
 			}
 		}
 	}
-	t.Logf("bitmap-overlay corpus entries reshaped: %d (HDR-tonemap variant: %d)", checked, hdr)
-	if checked == 0 {
-		t.Skip("no overlay_vaapi entries in corpus")
+	t.Logf("bitmap-overlay corpus: reshaped=%d (HDR=%d) honored=%d skipped=%d", reshaped, hdr, honored, skipped)
+	if reshaped == 0 {
+		t.Skip("no reshaped overlay_vaapi entries in corpus")
 	}
 }
 
-// filterComplexValue returns the value following -filter_complex, or "".
-func filterComplexValue(args []string) string {
+// overlayGraph returns the first -filter_complex value containing overlay_vaapi,
+// scanning every graph (the first -filter_complex may be audio), or "".
+func overlayGraph(args []string) string {
 	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "-filter_complex" {
+		if args[i] == "-filter_complex" && strings.Contains(args[i+1], "overlay_vaapi") {
 			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// changePrefix returns the first change with the given prefix, or "".
+func changePrefix(changes []string, prefix string) string {
+	for _, ch := range changes {
+		if strings.HasPrefix(ch, prefix) {
+			return ch
 		}
 	}
 	return ""
