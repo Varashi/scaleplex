@@ -213,8 +213,12 @@ filter composites directly on the VAAPI surface:
 - `animated_tier_down=1` is added when `subtitleIsAnimated()` is true (ASS with
   `\move`/`\t`/`\k`/`\fad`); the filter then renders animated cues one
   resolution tier below `render_height`. Static cues are unaffected.
-- Plex's `-map_inlineass <spec>` and its `-map <spec> -f null -codec ass`
-  decode-sink are **kept** — they drive the libass feed.
+- Plex's `-map_inlineass <spec>` is **kept** — it drives the libass feed.
+- Plex's `-map <spec> -f null -codec ass` decode-sink is **stripped**
+  (`stripInlineassDecodeSink`, gated on `-map_inlineass` still being present).
+  As of fork patch `0120` (v1.5.0) the `-map_inlineass` binding self-decodes
+  via a sink-less decoder paced by the demux, so the null-mux is redundant —
+  see `docs/PACED_SELF_DECODE.md`.
 - Plex's full `inlineass` node is passed through **verbatim** — including
   the styling keys `language`/`overrides`/`outline`/`shadow`. As of patch
   `0119` the fork's `inlineass` parses them (`overrides` →
@@ -243,8 +247,10 @@ side-channel:
 - **Adds `-map_inlineass <spec>`** (before `-filter_complex`) so the fftools
   binding routes the decoded bitmap presentation to the filter's
   `replay_bitmap` (it blits palettised rects to a cached VAAPI surface).
-- **Adds a decode-sink** `-map <spec> -f null -codec dvdsub nullfile` at the
-  end (PGS can't encode to `ass`, so `dvdsub`) to trigger the sub decode.
+- **No decode-sink.** Adds `-map_inlineass <spec>` (Plex emits none for PGS);
+  fork patch `0120` (v1.5.0) self-decodes that binding, so the rewriter no
+  longer appends a `-map <spec> -f null -codec dvdsub nullfile` sink to trigger
+  the bitmap decode.
 - Drops Plex's `overlay_vaapi` sub2video graph. Seek is native (real PTS).
 
 **Label:** `hw-decode:filter:bitmap-inlineass-vaapi`.

@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.5.0 — 2026-05-25
+
+Paced self-decode for `-map_inlineass`. The subtitle stream that feeds
+`vf_inlineass` now decodes via a **sink-less decoder** created from the binding
+— no output stream, no encoder, no muxer — paced by the single demux thread's
+video-read backpressure. The Go rewriter drops Plex's
+`-map <spec> -f null -codec ass|dvdsub nullfile` decode-sink (gated on
+`-map_inlineass` still being present).
+
+> **Fixes the embedded-sub startup-skip burst.** The old null-mux was an
+> unthrottled extra reader/encoder/muxer (canThrottle sleeps only the video
+> encoder) that pulled the demuxer through the file during the pre-throttle
+> buffer fill, competing with the video read → brief playback skips on long
+> embedded-sub 4K titles. Sidecar-sub sessions never burst; now neither do
+> embedded ones.
+
+- Fork patch `0120-inlineass-paced-self-decode`: `SchDec.sink_less` +
+  `sch_dec_set_sinkless()`; `start_prepare` tolerates the unconnected output;
+  `sch_dec_send` discards when `nb_dst==0`; `unchoke_downstream` guards the
+  NULL dst; `ist_inlineass_add()` + `scaleplex_inlineass_setup_decoders()`
+  (runs before `sch_start()`).
+- Rewriter: `stripInlineassDecodeSink()`; bitmap path no longer appends a
+  dvdsub sink.
+- Live-validated on plex-test (4K HDR, play + seek): no startup skips, subs
+  render + synced, no crash, single paced ffmpeg. See
+  [`docs/PACED_SELF_DECODE.md`](docs/PACED_SELF_DECODE.md).
+
 ## v1.4.0 — 2026-05-24
 
 Rewriter→fork migration + honor-Plex-HW/SW. Per-session argv-reshaping that

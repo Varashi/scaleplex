@@ -34,6 +34,15 @@ bookkeeping is unchanged.
 
 ## Status
 
+**v1.5.0 — paced self-decode for `-map_inlineass`.** The subtitle stream that
+feeds `inlineass` decodes via a **sink-less decoder** (no output stream/encoder/
+muxer), paced by the demux's video-read backpressure; the rewriter drops Plex's
+`-f null` decode-sink. This removes the embedded-sub **startup-skip burst** (the
+old null-mux was an unthrottled reader that pulled the demuxer through the file
+during buffer fill). Live in prod, validated at 4K HDR (play + seek). See
+[`docs/PACED_SELF_DECODE.md`](docs/PACED_SELF_DECODE.md). *(v1.4.0: rewriter→fork
+migration + honor-Plex-HW/SW — see CHANGELOG.)*
+
 **v1.3.0 — subtitle burn-in unification.** All HW sub burn-in moves into one
 fork-native `inlineass` filter with a single-input VAAPI VPP branch (merged
 from the `overlay_sub_vaapi` prototype): libass renders each cue once on-change

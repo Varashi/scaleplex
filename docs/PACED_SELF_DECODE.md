@@ -1,6 +1,17 @@
 # Paced self-decode for `-map_inlineass` (v1.5.0)
 
-Status: DESIGN + IMPLEMENTATION (2026-05-25). Fork patch `0120`.
+Status: **SHIPPED v1.5.0 (2026-05-25).** Fork patch `0120`. Live-validated on
+plex-test (4K HDR Avatar, play + seek): no startup skips, subs render + synced,
+no crash, single paced ffmpeg, 0 worker restarts. Worker image
+`v1.5.0` = `sha-2fff55b` (`sha256:9de3363c`).
+
+> **Implementation note (bug found + fixed during rollout).** The sink-less
+> decoder's auto-created output 0 has `nb_dst==0` and a NULL `dst`.
+> `schedule_update_locked`→`unchoke_downstream` walked every dec output and
+> dereferenced `outputs[i].dst->type` → deterministic NULL-deref SIGSEGV on the
+> main thread (reached via the demux→dec edge, so it fired even with no
+> inlineass filter in the graph). Fixed by guarding the recursion on `nb_dst`.
+> Included below in the patch description.
 
 ## Problem
 

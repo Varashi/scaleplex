@@ -19,20 +19,21 @@ difference). **Do not rely on the hybrid until root-caused** — keep
 `FORCE_HW=1` (re-accelerate). Follow-up: retest with extra worker vCPUs to
 separate a buffering/starvation cause from a graph bug.
 
-## Sub-burn startup I/O burst (decode-sink read-ahead)
+## Sub-burn startup I/O burst (decode-sink read-ahead) — RESOLVED in v1.5.0
 
-**Severity:** transient, embedded-sub burn-in sessions only; self-resolves
-once the client buffer fills and canThrottle engages.
-
-`-map_inlineass` triggers subtitle decoding via an unbounded
+Was: `-map_inlineass` triggered subtitle decoding via an unbounded
 `-map <spec> -f null -codec ass` decode-sink. As an independent, unrate-limited
-consumer it pulls the demuxer through the whole file to collect the sparse,
-interleaved sub packets → a one-time startup I/O burst that competes with the
-buffer-fill read and can cause brief playback skips during the flat-out fill.
-Sidecar-sub sessions (small file) don't burst. **Fix (planned, v1.5.0):**
-decode-sink-free paced self-decode — create the sub decoder from the
-`-map_inlineass` binding, scheduled to the side-channel and paced by the demux
-interleave, then drop the null sink. See `docs/LATENCY.md`.
+consumer it pulled the demuxer through the whole file to collect the sparse,
+interleaved sub packets → a one-time startup I/O burst that competed with the
+buffer-fill read and caused brief playback skips during the flat-out fill
+(embedded-sub burn-in only; sidecar-sub sessions never burst).
+
+**Fixed (v1.5.0):** decode-sink-free paced self-decode. The sub decoder is
+created from the `-map_inlineass` binding as a **sink-less decoder** (no output
+stream/encoder/muxer) and paced by the single demux thread's video-read
+backpressure; the rewriter drops the null sink. No independent consumer, no
+read-ahead. Fork patch `0120`; see `docs/PACED_SELF_DECODE.md` and
+`docs/LATENCY.md`. Live-validated on plex-test (4K HDR, play + seek).
 
 ## Sub-burn band-sizing issues — RESOLVED in v1.3.0
 
