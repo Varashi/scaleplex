@@ -1594,10 +1594,34 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			args, hintChanges = dropInputAudioDecoderHints(args)
 			merged = append(merged, hintChanges...)
 		}
+		// EAE safety net on EVERY bail. A bail returns before the main
+		// path's swapEAEAudioDecoders (step 9), so any `-codec:N <X>_eae`
+		// PMS emitted survives into the bailed argv. The fork has no
+		// `*_eae` decoder/encoder (Plex's EasyAudioEncoder is a
+		// Plex-Transcoder-only socket engine) → ffmpeg exits 8 "Unknown
+		// decoder 'eac3_eae'" → client transcoder error. Most exposed: a
+		// FORCE_HW=1 hybrid bail (`hw-decode:unexpected-encoder:libx264`)
+		// on HDR-remux content (~all EAC3/TrueHD/Atmos). Swap to stock
+		// codecs + drop the orphaned `-eae_prefix:N` so the bailed session
+		// degrades to "plays" instead of erroring. For no-decoder the
+		// input hints (incl. eae) are already gone above; this then only
+		// catches any output-side eae and is otherwise a no-op.
+		var eaeSwapped [][2]string
+		args, eaeSwapped = swapEAEAudioDecoders(args)
+		for _, p := range eaeSwapped {
+			merged = append(merged, "audio:"+p[0]+"->"+p[1]+"(bail)")
+		}
+		var eaeDropped []string
+		args, eaeDropped = dropEAEPrefixFlags(args)
+		for _, d := range eaeDropped {
+			merged = append(merged, "drop:"+d+"(bail)")
+		}
 		merged = append(merged, "skip:"+reason)
-		// Applied=true whenever we mutated argv (scrub OR hint drops),
-		// so the worker uses our rewritten copy instead of the input.
-		applied := len(scrub) > 0 || len(hintChanges) > 0
+		// Applied=true whenever we mutated argv (scrub, hint drops, or
+		// EAE swap/prefix-drop), so the worker uses our rewritten copy
+		// instead of the input.
+		applied := len(scrub) > 0 || len(hintChanges) > 0 ||
+			len(eaeSwapped) > 0 || len(eaeDropped) > 0
 		return RewriteResult{
 			Args:    args,
 			Env:     cloneEnv(inputEnv),
@@ -1729,6 +1753,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	honorSW := plexSWEncoder && noHwaccel && !forceHW
 	honorHybrid := plexSWEncoder && !noHwaccel && !forceHW
 
+	// Counterfactual logging: when FORCE_HW=1 masks a session we WOULD
+	// have honored (Plex staged a SW encoder), emit a diagnostic tag so
+	// prod logs quantify real SW exposure before flipping FORCE_HW off
+	// (docs/HW_PROFILE.md). No behaviour change — purely observational.
+	// The session still re-accelerates to HW below.
+	if forceHW && plexSWEncoder {
+		if noHwaccel {
+			changes = append(changes, "force-hw:would-honor-sw")
+		} else {
+			changes = append(changes, "force-hw:would-honor-hwdec-swenc")
+		}
+	}
+
 	isHWDecode := false
 	if honorSW {
 		// Honoring Plex's SW pipeline: leave the decoder as PMS emitted it
@@ -1771,11 +1808,27 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		return bail("unknown-decoder:" + swDecoder)
 	}
 
+	// FORCE_HW=1 + Plex hybrid (HW decode + SW encode): under the homelab's
+	// force-HW intent we honor neither (honorHybrid is off when forceHW) nor
+	// bail — we reshape the SW filter+encode tail to VAAPI. Plex's hybrid
+	// argv HW-decodes but runs the filter chain AND encoder in software
+	// (`[0:0]scale=...`, `tonemap=...`, `inlineass=...`, libx264 — captured
+	// live 2026-05-24, Avatar 4K HDR with PMS "HW encoding" off). That tail
+	// is shape-identical to a SW-decode session's, so it reshapes through the
+	// same path (rewriteVideoFilter + encoder swap) while keeping the
+	// existing HW decode. Removes the `hw-decode:unexpected-encoder:libx264`
+	// bail landmine and honors force-HW (GPU encode, not CPU). A hybrid whose
+	// graph is already partly-VAAPI (no matching SW regex) falls through to
+	// the bail, which now degrades to "plays" via the EAE safety net.
+	// NOTE: zero argv-corpus coverage (homelab PMS never emits hybrid) —
+	// validate on plex-test with PMS "HW encoding" unchecked before prod.
+	hybridForceHW := isHWDecode && forceHW && plexSWEncoder
+
 	// Detect subtitle source up-front so later phases can act on it.
 	// Pass-through is hardcoded: the fork's scaleplex_inlineass binding
 	// owns the sidecar -i + null-sub output, so we never drop them.
 	var earlySubSrc *subtitleSource
-	if !isHWDecode && !honorSW {
+	if (!isHWDecode || hybridForceHW) && !honorSW {
 		var probe func(string, string) string
 		if opts != nil && opts.ProbeSubtitleCodec != nil {
 			probe = opts.ProbeSubtitleCodec
@@ -1854,7 +1907,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 		}
 		changes = append(changes, "honor:plex-sw")
-	} else if !isHWDecode {
+	} else if !isHWDecode || hybridForceHW {
+		if hybridForceHW {
+			// HW decode already in place (kept); only the SW filter+encode
+			// tail is reshaped to VAAPI below. See hybridForceHW comment.
+			changes = append(changes, "force-hw:reshape-hybrid:"+swDecoder)
+		}
 		// 3. Video -filter_complex rewrite
 		vfIdx := -1
 		for i := 0; i < len(args); i++ {
