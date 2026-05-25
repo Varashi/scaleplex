@@ -740,6 +740,101 @@ func retargetMapLabel(args []string, oldLabel, newLabel string) {
 	}
 }
 
+// graphFacts are the orthogonal axes extracted from ANY recognized Plex video
+// filtergraph — the input side of the orthogonal rewriter. composeBurn turns
+// them back into a canonical graph, so one extractor + the composer can replace
+// the per-shape reFilter* regex zoo. vaResident is NOT here: it's decided by the
+// presence of `-hwaccel:0` in the argv, not the graph.
+type graphFacts struct {
+	w, h      string
+	hdr       bool   // a tonemap stage is present
+	algo      string // honored tonemap algo ("" = none / fixed-curve)
+	subKind   string // "", "text", "bitmap"
+	subParams string // inlineass params (text)
+	subSpec   string // sub stream spec (bitmap overlay)
+	ok        bool   // recognized AND every node is modeled (safe to recompose)
+}
+
+var (
+	// reGraphScaleWH: the main-video scale (scale= or scale_vaapi=) target.
+	reGraphScaleWH = regexp.MustCompile(`scale(?:_vaapi)?=w=(\d+):h=(\d+)`)
+	// reGraphTonemapSW: a bare `tonemap=<algo>` filter (Plex's SW HDR chain),
+	// excluding tonemap_opencl=/tonemap_vaapi= (those are matched separately).
+	reGraphTonemapSW = regexp.MustCompile(`(?:^|[,;\]])tonemap=([A-Za-z0-9]+)`)
+	reGraphInlineass = regexp.MustCompile(`inlineass=([^\[]*)`)
+	// reGraphFilterName: a filtergraph node name — an identifier preceded by a
+	// chain boundary (start, ';', ',', ']') and followed by '=', '[', ',', ';'
+	// or end. Arg values (after '=' or ':') are not preceded by a boundary, so
+	// they aren't matched.
+	reGraphFilterName = regexp.MustCompile(`(?:^|[;,\]])([a-z_][a-z0-9_]*)(?:[=\[,;]|$)`)
+)
+
+// modeledFilterNodes is every filtergraph node composeBurn / the rewriter
+// understands. extractGraphFacts bails (ok=false) on a graph carrying anything
+// else, so an unrecognized shape falls through to the existing bail/SW path
+// instead of being mis-recomposed — preserving the strict reFilter* behavior.
+var modeledFilterNodes = map[string]bool{
+	"scale": true, "scale_vaapi": true, "hwupload": true, "hwdownload": true,
+	"hwmap": true, "format": true, "setparams": true, "tonemap": true,
+	"tonemap_opencl": true, "tonemap_vaapi": true, "zscale": true,
+	"inlineass": true, "overlay_vaapi": true,
+}
+
+// graphNodesModeled reports whether every filter node in the graph is in
+// modeledFilterNodes.
+func graphNodesModeled(graph string) bool {
+	for _, m := range reGraphFilterName.FindAllStringSubmatch(graph, -1) {
+		if !modeledFilterNodes[m[1]] {
+			return false
+		}
+	}
+	return true
+}
+
+// extractGraphFacts pulls the orthogonal axes from a Plex filtergraph. It
+// recognizes the same shapes the reFilter* regexes do — text/bitmap × SDR/HDR
+// × scale — keyed on the semantic nodes rather than one rigid layout, and bails
+// (ok=false) on any graph with an unmodeled node. subSrc supplies the
+// authoritative sub kind/spec (from -map_inlineass / probe); the graph supplies
+// w/h, tonemap algo, and the text inlineass params.
+func extractGraphFacts(graph string, subSrc *subtitleSource) graphFacts {
+	var f graphFacts
+	// Bitmap sub2video→overlay_vaapi burn (with/without an intervening
+	// tonemap) — already a fact extractor.
+	if spec, w, h, algo, hdr, ok := detectBitmapOverlayBurn(graph); ok {
+		if !graphNodesModeled(graph) {
+			return f
+		}
+		f.w, f.h, f.algo, f.hdr = w, h, algo, hdr
+		f.subKind, f.subSpec, f.ok = "bitmap", spec, true
+		return f
+	}
+	m := reGraphScaleWH.FindStringSubmatch(graph)
+	if m == nil {
+		return f // no main scale → not a shape we recompose
+	}
+	f.w, f.h = m[1], m[2]
+	switch {
+	case reTonemapOpenCLAlgo.MatchString(graph):
+		f.hdr, f.algo = true, reTonemapOpenCLAlgo.FindStringSubmatch(graph)[1]
+	case reGraphTonemapSW.MatchString(graph):
+		f.hdr, f.algo = true, reGraphTonemapSW.FindStringSubmatch(graph)[1]
+	case strings.Contains(graph, "tonemap_vaapi"):
+		f.hdr = true
+	}
+	if (subSrc != nil && subSrc.Kind == "text") || strings.Contains(graph, "inlineass=") {
+		f.subKind = "text"
+		if im := reGraphInlineass.FindStringSubmatch(graph); im != nil {
+			f.subParams = im[1]
+		}
+	}
+	if !graphNodesModeled(graph) {
+		return f
+	}
+	f.ok = true
+	return f
+}
+
 // detectBitmapOverlayBurn recognizes Plex's bitmap (PGS/VobSub/DVDSub)
 // sub2video→overlay_vaapi burn graph — with OR without an intervening
 // tonemap_opencl chain — and extracts the orthogonal facts needed to recompose
