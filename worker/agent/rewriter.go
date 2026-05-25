@@ -975,19 +975,24 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 	}
 	args[vfIdx] = g
 
-	// 1: inject the OpenCL device, derived from the VAAPI device, before -i.
+	// 1: inject the OpenCL device, derived from the VAAPI device. It MUST be
+	// parsed AFTER the `-init_hw_device vaapi=<name>:...` it derives from
+	// (`opencl=ocl@<name>` otherwise fails "invalid source device name"), so
+	// splice it immediately after that pair — wherever it sits. Plex places
+	// its own -init_hw_device AFTER -i; the rewriter's injected one sits
+	// before -i. Either way opencl lands right after vaapi.
 	if !hasOpenCLInitDevice(args) {
-		vaName := "vaapi"
+		vaName, vaIdx := "vaapi", -1
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] == "-init_hw_device" {
 				if m := reInitHwDeviceVaapiName.FindStringSubmatch(args[i+1]); m != nil {
-					vaName = m[1]
+					vaName, vaIdx = m[1], i
 					break
 				}
 			}
 		}
-		if iIdx := indexOfArg(args, "-i", 0); iIdx >= 0 {
-			args = spliceArgs(args, iIdx, "-init_hw_device", "opencl=ocl@"+vaName)
+		if vaIdx >= 0 {
+			args = spliceArgs(args, vaIdx+2, "-init_hw_device", "opencl=ocl@"+vaName)
 			changes = append(changes, "tonemap:ocl:inject-opencl-device")
 		}
 	}

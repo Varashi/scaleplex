@@ -59,17 +59,24 @@ func TestGPUResidentOpenCLTonemap_HDRAssShape(t *testing.T) {
 	if !hasOpenCLInitDevice(out) {
 		t.Errorf("opencl device must be injected: %v", out)
 	}
-	oclIdx, iIdx := -1, indexOfArg(out, "-i", 0)
+	oclIdx, vaIdx := -1, -1
 	for i := 0; i+1 < len(out); i++ {
-		if out[i] == "-init_hw_device" && strings.HasPrefix(out[i+1], "opencl=") {
+		if out[i] != "-init_hw_device" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(out[i+1], "opencl="):
 			oclIdx = i
 			if out[i+1] != "opencl=ocl@vaapi" {
 				t.Errorf("opencl device should derive from vaapi: %q", out[i+1])
 			}
+		case strings.HasPrefix(out[i+1], "vaapi="):
+			vaIdx = i
 		}
 	}
-	if oclIdx < 0 || oclIdx > iIdx {
-		t.Errorf("opencl device must be injected before -i (oclIdx=%d iIdx=%d)", oclIdx, iIdx)
+	// opencl derives from vaapi → must be parsed AFTER the vaapi device.
+	if oclIdx < 0 || vaIdx < 0 || oclIdx <= vaIdx {
+		t.Errorf("opencl device must be injected after the vaapi device (oclIdx=%d vaIdx=%d)", oclIdx, vaIdx)
 	}
 	// VA-resident decode forced.
 	if indexOfArg(out, "-hwaccel_output_format:0", 0) < 0 {
