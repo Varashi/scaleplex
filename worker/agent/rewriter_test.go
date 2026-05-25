@@ -307,7 +307,9 @@ func TestRewriter_AV1H264_InitHwDeviceLeftForForkRetarget(t *testing.T) {
 func TestRewriter_AV1H264_FilterIsVaapiPlain(t *testing.T) {
 	out := Rewrite(swArgsAV1H264, nil, nil)
 	idx := findFilterComplex(out.Args, "[0:0]")
-	want := "[0:0]hwupload[0];[0]scale_vaapi=w=2276:h=1280:format=nv12[1];[1]hwupload[2]"
+	// composeBurn: scale_vaapi output is already a VA surface for the encoder —
+	// no trailing hwupload (the old emit re-uploaded a VA frame redundantly).
+	want := "[0:0]hwupload[0];[0]scale_vaapi=w=2276:h=1280:format=nv12[1]"
 	if out.Args[idx] != want {
 		t.Fatalf("filter=%q want %q", out.Args[idx], want)
 	}
@@ -318,8 +320,8 @@ func TestRewriter_AV1H264_MapLabelUpdated(t *testing.T) {
 	idx := findFilterComplex(out.Args, "[0:0]")
 	for i := idx + 1; i < len(out.Args); i++ {
 		if out.Args[i] == "-map" {
-			if out.Args[i+1] != "[2]" {
-				t.Fatalf("map=%q want [2]", out.Args[i+1])
+			if out.Args[i+1] != "[1]" {
+				t.Fatalf("map=%q want [1]", out.Args[i+1])
 			}
 			return
 		}
@@ -652,14 +654,15 @@ func TestRewriter_HDR_TonemapVAAPI(t *testing.T) {
 		t.Fatalf("missing hdr-tonemap-vaapi: %v", out.Changes)
 	}
 	idx := findFilterComplex(out.Args, "[0:0]")
-	want := "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=p010,tonemap_vaapi=transfer=bt709:format=nv12[1];[1]hwupload[2]"
+	// composeBurn: tonemap output is a VA surface for the encoder — no trailing hwupload.
+	want := "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=p010,tonemap_vaapi=transfer=bt709:format=nv12[1]"
 	if out.Args[idx] != want {
 		t.Fatalf("filter=%q\nwant   %q", out.Args[idx], want)
 	}
 	for i := idx + 1; i < len(out.Args); i++ {
 		if out.Args[i] == "-map" {
-			if out.Args[i+1] != "[2]" {
-				t.Fatalf("map=%q want [2]", out.Args[i+1])
+			if out.Args[i+1] != "[1]" {
+				t.Fatalf("map=%q want [1]", out.Args[i+1])
 			}
 			return
 		}
@@ -742,7 +745,7 @@ func TestRewriter_SWHDR_InlineAss_Reshape_NonHable(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:hdr-tonemap-vaapi-passthrough-inlineass") {
+	if !containsString(out.Changes, "filter:text-inlineass-vaapi") {
 		t.Fatalf("non-hable SW-HDR must reshape (not bail on tonemap algo): %v", out.Changes)
 	}
 }
@@ -781,7 +784,7 @@ func TestRewriter_SWHDR_InlineAss_Reshape(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:hdr-tonemap-vaapi-passthrough-inlineass") {
+	if !containsString(out.Changes, "filter:text-inlineass-vaapi") {
 		t.Fatalf("missing hdr-tonemap-vaapi-passthrough-inlineass tag: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "encode:libx264->h264_vaapi") {
@@ -793,21 +796,23 @@ func TestRewriter_SWHDR_InlineAss_Reshape(t *testing.T) {
 	if !containsString(out.Changes, "map-label-update") {
 		t.Fatalf("expected map-label-update to retarget -map [3]->[15]: %v", out.Changes)
 	}
-	// Filter chain must use the HW reshape — scale_vaapi + tonemap_vaapi
-	// + hwdownload/hwupload bracket around inlineass.
+	// Unified composeBurn HW reshape — scale_vaapi + tonemap_vaapi → inlineass
+	// ON the VA surface (no hwdownload/hwupload bracket), render_height band.
 	idx := findFilterComplex(out.Args, "[0:0]")
 	got := out.Args[idx]
 	for _, mustHave := range []string{
-		"[0:0]hwupload[10]",
+		"[0:0]hwupload[0]",
 		"scale_vaapi=w=1920:h=1080:format=p010",
 		"tonemap_vaapi=transfer=bt709:format=nv12",
-		"hwdownload",
 		"inlineass=",
-		"hwupload[15]",
+		"render_height=",
 	} {
 		if !strings.Contains(got, mustHave) {
 			t.Errorf("filter chain missing %q\n  got: %s", mustHave, got)
 		}
+	}
+	if strings.Contains(got, "hwdownload") {
+		t.Errorf("inlineass-on-VA: no hwdownload bracket expected\n  got: %s", got)
 	}
 	// Plex's 4 styling keys (language/overrides/outline/shadow) are now
 	// passed through verbatim — the fork's vf_inlineass parses them
@@ -2231,30 +2236,26 @@ func TestRewriter_SWDecode_HDR_SubBurn_MapLabelUpdated(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("rewriter NOT applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:passthrough-inlineass-hdr") {
-		t.Fatalf("expected filter:passthrough-inlineass-hdr; got %v", out.Changes)
+	if !containsString(out.Changes, "filter:text-inlineass-vaapi") {
+		t.Fatalf("expected filter:text-inlineass-vaapi; got %v", out.Changes)
 	}
 	if !containsString(out.Changes, "map-label-update") {
 		t.Fatalf("MAP NOT UPDATED — this is the bug. changes=%v", out.Changes)
 	}
-	// `-map [2]` (the OldLabel) must be replaced with `-map [15]` (the
-	// NewLabel for passthrough-inlineass).
+	// composeBurn's text output is [2]; the input's trailing label is also [2],
+	// so the retarget is a no-op and the video -map stays [2] — now pointing at
+	// the inlineass output. Assert it resolves (no orphaned label).
+	foundVideoMap := false
 	for i := 0; i+1 < len(out.Args); i++ {
 		if out.Args[i] == "-map" && out.Args[i+1] == "[2]" {
-			t.Fatalf("stale -map [2] survived rewrite at idx=%d", i)
-		}
-	}
-	found15 := false
-	for i := 0; i+1 < len(out.Args); i++ {
-		if out.Args[i] == "-map" && out.Args[i+1] == "[15]" {
-			found15 = true
+			foundVideoMap = true
 			break
 		}
 	}
-	if !found15 {
-		t.Fatalf("expected -map [15] (NewLabel for passthrough-inlineass); not found. args=%v", out.Args)
+	if !foundVideoMap {
+		t.Fatalf("video -map should resolve to composeBurn's [2] output: %v", out.Args)
 	}
-	// Pass-through mode keeps -map_inlineass + the sidecar -i. The fork
+	// Unified text reshape keeps -map_inlineass + the sidecar -i. The fork
 	// reads sub packets via that side-channel; we must NOT strip them.
 	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
 		t.Errorf("-map_inlineass should be kept in pass-through mode")
@@ -2372,16 +2373,9 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
 		t.Errorf("null-sub decode sink must be stripped (0120 self-decodes): %v", out.Args)
 	}
-	// 5. Mode tag.
-	gotPassthroughTag := false
-	for _, c := range out.Changes {
-		if strings.HasPrefix(c, "filter:passthrough-inlineass") {
-			gotPassthroughTag = true
-			break
-		}
-	}
-	if !gotPassthroughTag {
-		t.Errorf("missing passthrough-inlineass change tag: %v", out.Changes)
+	// 5. Mode tag — unified text sub-burn via composeBurn.
+	if !containsString(out.Changes, "filter:text-inlineass-vaapi") {
+		t.Errorf("missing text-inlineass-vaapi change tag: %v", out.Changes)
 	}
 }
 
