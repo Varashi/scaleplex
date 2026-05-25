@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.6.0 — 2026-05-25
+
+GPU-resident OpenCL HDR tonemap fix (regression) + FORCE_HW=0 readiness.
+
+> **Fixes algo-honoring HDR→SDR tonemap on the jellyfin-ffmpeg 7.x base.** On
+> ffmpeg-7, inside a `-filter_complex` the `hwmap=derive_device=opencl` va→opencl
+> derive fails ENOSYS ("hardware pixel format 'opencl' is not supported by the
+> device type 'VAAPI'", exit 218) unless the OpenCL device is created explicitly,
+> the input is a real VA surface (no leading `hwupload`), and there's no
+> reverse-map→download round-trip — all of which ffmpeg-6 handled implicitly.
+> This silently broke HDR-with-HW-tonemap (latent: only full-HW HDR→SDR sessions
+> hit it; Plex masks it by retrying in software). NOT compiled-out and NOT the
+> driver — a graph/device-wiring regression.
+
+- **fix(worker): GPU-resident OpenCL tonemap** (#36). `gpuResidentOpenCLTonemap`
+  post-pass on any emitted `tonemap_opencl` graph (VA-resident decode): inject
+  `-init_hw_device opencl=ocl@vaapi` (after the vaapi device), force
+  `-hwaccel_output_format:0 vaapi`, drop a leading `[0:0]hwupload`, collapse the
+  `hwmap=vaapi:reverse=1→hwdownload→hwupload` round-trip into a direct
+  opencl→sysmem `hwdownload`. Fully GPU-resident — no sysmem bounce, algo
+  preserved. Live-validated across AV1/HEVC/H.264 × HDR/SDR × text/PGS/no-sub
+  burn × seek × TrueHD/EAC3, on Plex-Web + Android.
+- **feat(worker): FORCE_HW=0 readiness** (#35). EAE-swap on *every* bail (bailed
+  sessions degrade to "plays" instead of exit-8 on `*_eae` audio);
+  `force-hw:would-honor-{sw,hwdec-swenc}` counterfactual logging to quantify SW
+  exposure before flipping `FORCE_HW` off; FORCE_HW=1 reshapes a HW-decode +
+  SW-encode hybrid to full HW instead of bailing.
+
 ## v1.5.0 — 2026-05-25
 
 Paced self-decode for `-map_inlineass`. The subtitle stream that feeds
