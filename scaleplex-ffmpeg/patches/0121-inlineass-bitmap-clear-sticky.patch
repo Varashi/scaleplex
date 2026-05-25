@@ -1,0 +1,33 @@
+Description: vf_inlineass: make the burned-bitmap (PGS) clear sticky
+ refresh_bitmap() recomputes have_bmp every frame from the last uploaded
+ bitmap's [bmp_start_ms, bmp_end_ms) window. PGS cues carry
+ end_display_time=0, so bmp_end_ms stays -1 and the window is open-ended.
+ .
+ An empty presentation segment (num_rects==0) sets bmp_pending_clear, and the
+ clear frame correctly drops have_bmp and returns early -- but it never closes
+ the window. So the VERY NEXT frame skips the pending block and re-runs
+ have_bmp = (time_ms >= bmp_start_ms) && (bmp_end_ms < 0 || time_ms < bmp_end_ms)
+ = true: the cue resurrects one frame after the clear and hangs on screen until
+ the next cue replaces the window. (Found live 2026-05-26: a burned PGS cue
+ stayed up until the following cue appeared.)
+ .
+ Fix: on clear, set bmp_end_ms = time_ms so the per-frame recompute yields
+ have_bmp=false until a new bitmap's do_upload resets the window.
+Forwarded: not-yet
+Last-Update: 2026-05-26
+
+--- a/libavfilter/vf_inlineass.c
++++ b/libavfilter/vf_inlineass.c
+@@ -1180,6 +1180,12 @@ static int refresh_bitmap(AVFilterContext *avctx, int64_t time_ms)
+     pthread_mutex_unlock(&inlineass_lock);
+
+     if (clear) {
++        /* scaleplex: close the display window so the per-frame have_bmp
++         * recompute below cannot resurrect the cue. PGS cues carry
++         * end_display_time=0 -> bmp_end_ms stays -1; without this the frame
++         * after the clear re-sets have_bmp=(time>=start && end<0)=true and the
++         * cue hangs on screen until the next cue. */
++        ass->bmp_end_ms = time_ms;
+         ass->have_bmp = 0;
+         return 0;
+     }

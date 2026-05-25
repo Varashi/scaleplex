@@ -62,7 +62,7 @@ jobs:
           mkdir -p scaleplex-ffmpeg/dist
           run_id=$(gh run list \
             --workflow=build-ffmpeg.yaml \
-            --branch=main \
+            --branch=${{ github.ref_name }} \
             --status=success \
             --limit=1 \
             --json databaseId \
