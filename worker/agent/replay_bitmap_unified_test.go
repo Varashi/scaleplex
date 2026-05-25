@@ -32,7 +32,7 @@ func TestReplayCorpus_BitmapOverlayUnified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read corpus dir %s: %v", dir, err)
 	}
-	var reshaped, hdr, honored, skipped int
+	var candidates, reshaped, hdr, honored, skipped int
 	for _, ent := range entries {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
 			continue
@@ -51,6 +51,7 @@ func TestReplayCorpus_BitmapOverlayUnified(t *testing.T) {
 		if inVF == "" {
 			continue
 		}
+		candidates++
 		isHDR := strings.Contains(inVF, "tonemap_opencl") || strings.Contains(inVF, "tonemap_vaapi")
 
 		out := Rewrite(c.Argv, c.Env, &RewriteOpts{
@@ -103,9 +104,12 @@ func TestReplayCorpus_BitmapOverlayUnified(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("bitmap-overlay corpus: reshaped=%d (HDR=%d) honored=%d skipped=%d", reshaped, hdr, honored, skipped)
+	t.Logf("bitmap-overlay corpus: candidates=%d reshaped=%d (HDR=%d) honored=%d skipped=%d", candidates, reshaped, hdr, honored, skipped)
+	if candidates == 0 {
+		t.Skip("no overlay_vaapi candidates in corpus")
+	}
 	if reshaped == 0 {
-		t.Skip("no reshaped overlay_vaapi entries in corpus")
+		t.Errorf("%d overlay candidate(s) but none reshaped (honored=%d skipped=%d) — branch regression?", candidates, honored, skipped)
 	}
 }
 
