@@ -134,7 +134,7 @@ index 8135432..a5d8201 100644
                     const ViewSpecifier *vs, InputFilterOptions *opts,
                     SchedulerNode *src)
 diff --git a/fftools/ffmpeg_sched.c b/fftools/ffmpeg_sched.c
-index 6b33840..93a86a9 100644
+index 6b33840..c787e58 100644
 --- a/fftools/ffmpeg_sched.c
 +++ b/fftools/ffmpeg_sched.c
 @@ -85,6 +85,10 @@ typedef struct SchDec {
@@ -163,7 +163,20 @@ index 6b33840..93a86a9 100644
  static const AVClass sch_dec_class = {
      .class_name                = "SchDec",
      .version                   = LIBAVUTIL_VERSION_INT,
-@@ -1496,6 +1508,11 @@ static int start_prepare(Scheduler *sch)
+@@ -1255,7 +1267,11 @@ static void unchoke_downstream(Scheduler *sch, SchedulerNode *dst)
+     case SCH_NODE_TYPE_DEC:
+         dec = &sch->dec[dst->idx];
+         for (int i = 0; i < dec->nb_outputs; i++)
+-            unchoke_downstream(sch, dec->outputs[i].dst);
++            /* scaleplex: a sink-less decoder output (the vf_inlineass
++             * side-channel) has nb_dst==0 and a NULL dst array — skip it,
++             * otherwise unchoke_downstream() dereferences NULL->type. */
++            if (dec->outputs[i].nb_dst)
++                unchoke_downstream(sch, dec->outputs[i].dst);
+         break;
+     case SCH_NODE_TYPE_ENC:
+         enc = &sch->enc[dst->idx];
+@@ -1496,6 +1512,11 @@ static int start_prepare(Scheduler *sch)
              return AVERROR(EINVAL);
          }
  
@@ -175,7 +188,7 @@ index 6b33840..93a86a9 100644
          for (unsigned j = 0; j < dec->nb_outputs; j++) {
              SchDecOutput *o = &dec->outputs[j];
  
-@@ -2268,6 +2285,16 @@ int sch_dec_send(Scheduler *sch, unsigned dec_idx,
+@@ -2268,6 +2289,16 @@ int sch_dec_send(Scheduler *sch, unsigned dec_idx,
      av_assert0(out_idx < dec->nb_outputs);
      o = &dec->outputs[out_idx];
  
