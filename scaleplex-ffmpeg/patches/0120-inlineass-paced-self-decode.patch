@@ -1,0 +1,276 @@
+Description: fftools: paced self-decode for -map_inlineass (drop the null-mux decode-sink)
+ vf_inlineass only receives cues while the bound subtitle stream is actively
+ decoded (scaleplex_inlineass_handle_subtitle fires from transcode_subtitles,
+ patch 0100). Until now the worker rewriter forced that by appending a throwaway
+ output `-map <spec> -f null -codec ass|dvdsub nullfile`, which spins up a full
+ demux->subdec->subenc->null-mux chain on its own scheduler threads.
+ .
+ That output is an independent, throttle-exempt consumer of the input. The
+ canThrottle sleep (patch 0097) lands only in the video encoder thread, so once
+ PMS asserts throttle the single demux thread blocks on the video queue and the
+ sub path paces with it — fine. But during the pre-throttle flat-out buffer
+ fill, the redundant sub decode + ass/dvdsub re-encode + null-mux threads
+ compete with the video path for the NFS read and CPU at exactly the moment the
+ client buffer is being filled. On long embedded-sub 4K titles this surfaces as
+ regular playback skips during fill that vanish once throttle equilibrates
+ (embedded subs only — sidecar subs are a small separate file). The sub
+ re-encode to /dev/null is pure waste; we only ever wanted the decoder to RUN.
+ .
+ Fix: decode the -map_inlineass stream with a sink-less decoder created directly
+ from the binding. No output stream, no encoder, no muxer. Pacing is correct by
+ construction: the decoder has no downstream, so sch_dec_send discards each
+ frame immediately and its input queue never blocks the demux; the demux is a
+ single sequential thread, so it advances in file order at video pace (the only
+ stream that blocks it is video, gated by the canThrottle sleep). No independent
+ consumer => no extra read-ahead during fill. This mirrors Plex 6.x's
+ single-threaded loop (sub decoded inline with video) inside jellyfin 7.x's
+ split-thread scheduler.
+ .
+ Scheduler support for a sink-less decoder (sch_add_dec auto-creates output 0,
+ and two sites assume an output has a sink):
+ .
+   - SchDec gains `sink_less`; sch_dec_set_sinkless() sets it.
+   - start_prepare() skips the "Decoder output not connected to any sink" check
+     for a sink-less decoder (the source check still applies).
+   - sch_dec_send() discards the frame and returns 0 when the target output has
+     nb_dst == 0 (otherwise it returns AVERROR_EOF -> process_subtitle returns
+     AVERROR_EXIT -> the decoder thread would stop after the first subtitle).
+ .
+ ist_inlineass_add() in ffmpeg_demux.c drives ist_use() (idempotent: allocs the
+ decoder + connects demux->dec exactly like the normal decode path), drops the
+ returned decoder-output node (connects it to nothing), and marks the decoder
+ sink-less. scaleplex_inlineass_setup_decoders() calls it for every binding;
+ ffmpeg.c invokes that just before sch_start().
+ .
+ Worker rewriter change (separate commit): stop emitting the
+ `-map <spec> -f null -codec ass|dvdsub nullfile` sink in every path; keep
+ `-map_inlineass <spec>`, which now drives the decode on its own.
+Origin: scaleplex; design ref docs/PACED_SELF_DECODE.md, Plex Transcoder plex.c
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-25
+---
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index c5f7419..7476b47 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -80,6 +80,7 @@
+ #include "cmdutils.h"
+ #include "ffmpeg.h"
+ #include "ffmpeg_sched.h"
++#include "scaleplex_inlineass.h"
+ #include "ffmpeg_utils.h"
+ 
+ const char program_name[] = "ffmpeg";
+@@ -944,6 +945,14 @@ static int transcode(Scheduler *sch)
+ 
+     atomic_store(&transcode_init_done, 1);
+ 
++    /* scaleplex: create sink-less decoders for every -map_inlineass binding
++     * so embedded subtitle streams decode (feeding vf_inlineass via the
++     * side-channel) without a throwaway null-mux output. Must run before
++     * sch_start() validates the graph. No-op when -map_inlineass unused. */
++    ret = scaleplex_inlineass_setup_decoders();
++    if (ret < 0)
++        return ret;
++
+     ret = sch_start(sch);
+     if (ret < 0)
+         return ret;
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 507b4db..dea63b7 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -899,6 +899,12 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
+ void ifile_close(InputFile **f);
+ 
+ int ist_output_add(InputStream *ist, OutputStream *ost);
++
++/* scaleplex: ensure an embedded subtitle stream is decoded for the
++ * vf_inlineass side-channel feed, with no output stream. Creates a
++ * sink-less decoder + connects the demuxer stream to it. Idempotent on
++ * the underlying stream's decoder. Returns the decoder's sch index. */
++int ist_inlineass_add(InputStream *ist);
+ int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple,
+                    const ViewSpecifier *vs, InputFilterOptions *opts,
+                    SchedulerNode *src);
+diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
+index 8135432..a5d8201 100644
+--- a/fftools/ffmpeg_demux.c
++++ b/fftools/ffmpeg_demux.c
+@@ -1009,6 +1009,34 @@ int ist_output_add(InputStream *ist, OutputStream *ost)
+     return ost->enc ? ds->sch_idx_dec : ds->sch_idx_stream;
+ }
+ 
++int ist_inlineass_add(InputStream *ist)
++{
++    Demuxer      *d  = demuxer_from_ifile(ist->file);
++    DemuxStream  *ds = ds_from_ist(ist);
++    SchedulerNode src;
++    int ret;
++
++    /* scaleplex: create a decoder for an embedded subtitle stream that is
++     * consumed only through the vf_inlineass side-channel (no output
++     * stream). ist_use() is idempotent: it allocs the decoder + connects
++     * the demux stream to its input exactly like a normal decode path. We
++     * intentionally DROP `src` (the decoder output node) — connect it to
++     * nothing — then mark the decoder sink-less so the scheduler tolerates
++     * the unconnected output and discards decoded frames. The decode
++     * itself fires scaleplex_inlineass_handle_subtitle() in ffmpeg_dec.c,
++     * feeding the bound filter. Paced by the demux interleave (single demux
++     * thread, video-read backpressure) — no separate null-mux consumer to
++     * race the file read ahead during buffer fill. */
++    ret = ist_use(ist, DECODING_FOR_FILTER, NULL, &src);
++    if (ret < 0)
++        return ret;
++    (void)src;
++
++    sch_dec_set_sinkless(d->sch, ds->sch_idx_dec);
++
++    return ds->sch_idx_dec;
++}
++
+ int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple,
+                    const ViewSpecifier *vs, InputFilterOptions *opts,
+                    SchedulerNode *src)
+diff --git a/fftools/ffmpeg_sched.c b/fftools/ffmpeg_sched.c
+index 6b33840..93a86a9 100644
+--- a/fftools/ffmpeg_sched.c
++++ b/fftools/ffmpeg_sched.c
+@@ -85,6 +85,10 @@ typedef struct SchDec {
+     SchDecOutput       *outputs;
+     unsigned         nb_outputs;
+ 
++    // scaleplex: decoded frames consumed via side-channel; output 0 may
++    // be left unconnected. See sch_dec_set_sinkless().
++    int                 sink_less;
++
+     SchTask             task;
+     // Queue for receiving input packets, one stream.
+     ThreadQueue        *queue;
+@@ -739,6 +743,14 @@ int sch_add_dec_output(Scheduler *sch, unsigned dec_idx)
+     return dec->nb_outputs - 1;
+ }
+ 
++void sch_dec_set_sinkless(Scheduler *sch, unsigned dec_idx)
++{
++    SchDec *dec;
++    av_assert0(dec_idx < sch->nb_dec);
++    dec = &sch->dec[dec_idx];
++    dec->sink_less = 1;
++}
++
+ static const AVClass sch_dec_class = {
+     .class_name                = "SchDec",
+     .version                   = LIBAVUTIL_VERSION_INT,
+@@ -1496,6 +1508,11 @@ static int start_prepare(Scheduler *sch)
+             return AVERROR(EINVAL);
+         }
+ 
++        /* scaleplex: a sink-less decoder feeds a side-channel, not a
++         * scheduler output; its auto-created output 0 stays unconnected. */
++        if (dec->sink_less)
++            continue;
++
+         for (unsigned j = 0; j < dec->nb_outputs; j++) {
+             SchDecOutput *o = &dec->outputs[j];
+ 
+@@ -2268,6 +2285,16 @@ int sch_dec_send(Scheduler *sch, unsigned dec_idx,
+     av_assert0(out_idx < dec->nb_outputs);
+     o = &dec->outputs[out_idx];
+ 
++    /* scaleplex: sink-less output (e.g. the vf_inlineass side-channel
++     * decoder). Discard the frame and report success — falling through
++     * would return AVERROR_EOF (nb_done == o->nb_dst == 0), which
++     * process_subtitle() maps to AVERROR_EXIT and would terminate the
++     * decoder thread after the first decoded subtitle. */
++    if (!o->nb_dst) {
++        av_frame_unref(frame);
++        return 0;
++    }
++
+     for (unsigned i = 0; i < o->nb_dst; i++) {
+         uint8_t *finished = &o->dst_finished[i];
+         AVFrame *to_send  = frame;
+diff --git a/fftools/ffmpeg_sched.h b/fftools/ffmpeg_sched.h
+index c0c2892..edde3e2 100644
+--- a/fftools/ffmpeg_sched.h
++++ b/fftools/ffmpeg_sched.h
+@@ -191,6 +191,17 @@ int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx, int send_end_ts);
+  */
+ int sch_add_dec_output(Scheduler *sch, unsigned dec_idx);
+ 
++/**
++ * scaleplex: mark a decoder as sink-less.
++ *
++ * Its decoded frames are consumed via a side-channel (the vf_inlineass
++ * feed in transcode_subtitles), not through a scheduler output. The
++ * auto-created output 0 is left unconnected: start_prepare() tolerates it
++ * and sch_dec_send() discards frames sent to an output with no sink. The
++ * decoder must still be connected to a source (the demuxer stream).
++ */
++void sch_dec_set_sinkless(Scheduler *sch, unsigned dec_idx);
++
+ /**
+  * Add a filtergraph to the scheduler.
+  *
+diff --git a/fftools/scaleplex_inlineass.c b/fftools/scaleplex_inlineass.c
+index 52b98fc..594b3ed 100644
+--- a/fftools/scaleplex_inlineass.c
++++ b/fftools/scaleplex_inlineass.c
+@@ -441,6 +441,36 @@ void scaleplex_inlineass_handle_subtitle(AVCodecContext *dec_ctx, AVSubtitle *su
+     pthread_mutex_unlock(&bindings_lock);
+ }
+ 
++int scaleplex_inlineass_setup_decoders(void)
++{
++    int ret = 0;
++
++    pthread_mutex_lock(&bindings_lock);
++    for (int i = 0; i < nb_bindings; i++) {
++        InlineAssBinding *b = &bindings[i];
++
++        if (!b->ist)
++            continue;
++
++        ret = ist_inlineass_add(b->ist);
++        if (ret < 0) {
++            av_log(NULL, AV_LOG_FATAL,
++                   "scaleplex_inlineass: failed to create side-channel "
++                   "decoder for bind#%d (input #%d:%s): %s\n",
++                   i, b->file_idx, b->stream_spec, av_err2str(ret));
++            break;
++        }
++        av_log(NULL, AV_LOG_VERBOSE,
++               "scaleplex_inlineass: side-channel decoder ready for bind#%d "
++               "(input #%d:%s, sch_dec=%d)\n",
++               i, b->file_idx, b->stream_spec, ret);
++        ret = 0;
++    }
++    pthread_mutex_unlock(&bindings_lock);
++
++    return ret;
++}
++
+ void scaleplex_inlineass_uninit(void)
+ {
+     pthread_mutex_lock(&bindings_lock);
+diff --git a/fftools/scaleplex_inlineass.h b/fftools/scaleplex_inlineass.h
+index 35146cc..377d403 100644
+--- a/fftools/scaleplex_inlineass.h
++++ b/fftools/scaleplex_inlineass.h
+@@ -45,6 +45,14 @@ void scaleplex_inlineass_link_graph(struct AVFilterGraph *graph);
+ void scaleplex_inlineass_handle_subtitle(AVCodecContext *dec_ctx,
+                                          AVSubtitle *sub);
+ 
++/* Called from transcode() in ffmpeg.c just before sch_start(). For every
++ * queued -map_inlineass binding, creates a sink-less decoder on the
++ * referenced input stream (via ist_inlineass_add) so the stream decodes
++ * and feeds vf_inlineass through the side-channel — replacing the old
++ * `-map <spec> -f null -codec ass` decode-sink. Returns 0 on success (or
++ * when there are no bindings), AVERROR on failure. */
++int scaleplex_inlineass_setup_decoders(void);
++
+ /* Frees the binding registry. Currently unused (the registry lives
+  * for the lifetime of ffmpeg) but useful in case ffmpeg.c gains an
+  * explicit shutdown path that wants to assert no leaks. */
