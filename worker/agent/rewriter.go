@@ -624,8 +624,10 @@ func resolveTonemapConfig() tonemapConfig {
 //	opencl: hwmap→opencl, tonemap_opencl=<algo>, hwmap→vaapi:reverse=1
 //	vaapi:  tonemap_vaapi (iHD fixed BT.2390 EETF)
 //
-// The OpenCL device is self-derived by hwmap from the input frame's
-// VAAPI device — no `-init_hw_device opencl` is needed.
+// On ffmpeg-7 `hwmap=derive_device=opencl` does NOT self-create the OpenCL
+// device inside a -filter_complex (ffmpeg-6 did) — gpuResidentOpenCLTonemap
+// injects `-init_hw_device opencl=ocl@vaapi` and makes the surrounding graph
+// VA-resident so this fragment's va→opencl derive succeeds.
 func (tm tonemapConfig) stage(algo string) string {
 	if !tm.useOpenCL {
 		return "tonemap_vaapi=transfer=bt709:format=nv12"
@@ -905,6 +907,109 @@ func substituteOpenCLTonemap(args []string, tm tonemapConfig) ([]string, bool) {
 		return args, true
 	}
 	return args, false
+}
+
+// reLeadHwuploadOCL drops a leading `[0:0]hwupload[N];[N]` so scale_vaapi
+// reads the VA decode surface directly (see gpuResidentOpenCLTonemap).
+var reLeadHwuploadOCL = regexp.MustCompile(`^\[0:0\]hwupload\[\d+\];\[\d+\]`)
+
+// reRevmapBeforeDownloadOCL collapses the `hwmap=vaapi:reverse=1[X];[X]hwdownload`
+// round-trip (opencl→va→sysmem) into a direct opencl→sysmem hwdownload.
+var reRevmapBeforeDownloadOCL = regexp.MustCompile(`hwmap=derive_device=vaapi:reverse=1\[\d+\];\[\d+\]hwdownload`)
+
+// reInitHwDeviceVaapiName extracts the device NAME from `vaapi=<name>:...`.
+var reInitHwDeviceVaapiName = regexp.MustCompile(`^vaapi=([A-Za-z0-9_]+):`)
+
+// gpuResidentOpenCLTonemap makes an emitted `tonemap_opencl` filtergraph
+// valid + GPU-resident on jellyfin-ffmpeg 7.x. ffmpeg-6 auto-created the
+// OpenCL device for `hwmap=derive_device=opencl` and tolerated a leading
+// `[0:0]hwupload` / a `hwmap=vaapi:reverse=1→hwdownload→hwupload` round-trip;
+// ffmpeg-7 does NOT: in a `-filter_complex` the va→opencl frame derive then
+// fails ENOSYS (-38, "hardware pixel format 'opencl' is not supported by the
+// device type 'VAAPI'"), which silently broke HDR algo-honoring tonemap on
+// the 6→7 bump (latent in prod — full-HW HDR-with-HW-tonemap only). Recipe
+// proven on Arc A310 (uid 1000, real decode), no sysmem bounce — see
+// reference_scaleplex_tonemap_regression_test:
+//  1. inject `-init_hw_device opencl=ocl@<vaapi-dev>` (derive from the VA
+//     device → cl_intel_va_api_media_sharing) before the first -i.
+//  2. force `-hwaccel_output_format:0 vaapi` so the HW decode hands the
+//     filtergraph a real VA surface ([0:0] is VA, not SW).
+//  3. drop a leading `[0:0]hwupload[N];[N]` so scale_vaapi reads that VA
+//     surface directly (re-uploading an already-VA frame yields a
+//     frames-ctx that can't derive opencl).
+//  4. collapse `hwmap=vaapi:reverse=1[X];[X]hwdownload` → `hwdownload`
+//     (opencl→sysmem direct) when a SW step (libass) follows.
+//
+// Only fires when the decode is VA-resident (a `-hwaccel:0` is present —
+// either Plex's HW decode or the rewriter's libdav1d→VAAPI swap, both of
+// which carry `-hwaccel_output_format:0 vaapi` so [0:0] is a VA surface). A
+// genuinely SW-decoded HDR source ([0:0] in system memory) has no VA surface
+// to feed and is left untouched. No-op when SCALEPLEX_TONEMAP=vaapi (no
+// tonemap_opencl is ever emitted).
+func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
+	if indexOfArg(args, "-hwaccel:0", 0) < 0 {
+		return args, nil
+	}
+	// Locate a filter_complex carrying tonemap_opencl.
+	vfIdx := -1
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-filter_complex" && strings.Contains(args[i+1], "tonemap_opencl") {
+			vfIdx = i + 1
+			break
+		}
+	}
+	if vfIdx < 0 {
+		return args, nil
+	}
+	var changes []string
+
+	// 3 + 4: reshape the graph string.
+	g := args[vfIdx]
+	if reLeadHwuploadOCL.MatchString(g) {
+		g = reLeadHwuploadOCL.ReplaceAllString(g, "[0:0]")
+		changes = append(changes, "tonemap:ocl:drop-lead-hwupload")
+	}
+	if reRevmapBeforeDownloadOCL.MatchString(g) {
+		g = reRevmapBeforeDownloadOCL.ReplaceAllString(g, "hwdownload")
+		changes = append(changes, "tonemap:ocl:collapse-revmap-download")
+	}
+	args[vfIdx] = g
+
+	// 1: inject the OpenCL device, derived from the VAAPI device, before -i.
+	if !hasOpenCLInitDevice(args) {
+		vaName := "vaapi"
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-init_hw_device" {
+				if m := reInitHwDeviceVaapiName.FindStringSubmatch(args[i+1]); m != nil {
+					vaName = m[1]
+					break
+				}
+			}
+		}
+		if iIdx := indexOfArg(args, "-i", 0); iIdx >= 0 {
+			args = spliceArgs(args, iIdx, "-init_hw_device", "opencl=ocl@"+vaName)
+			changes = append(changes, "tonemap:ocl:inject-opencl-device")
+		}
+	}
+
+	// 2: force VA-resident decode so [0:0] is a VA surface.
+	if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 &&
+		indexOfArg(args, "-hwaccel_output_format:0", 0) < 0 {
+		args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+		changes = append(changes, "tonemap:ocl:force-output-format-vaapi")
+	}
+	return args, changes
+}
+
+// hasOpenCLInitDevice reports whether the argv already creates an OpenCL
+// hw device (`-init_hw_device opencl=...`).
+func hasOpenCLInitDevice(args []string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-init_hw_device" && strings.HasPrefix(args[i+1], "opencl=") {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneArgs(in []string) []string {
@@ -2177,6 +2282,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
 			break
 		}
+	}
+
+	// 5b. GPU-resident OpenCL tonemap fix-up (jellyfin-ffmpeg 7.x). Any
+	// emitted `tonemap_opencl` graph needs an explicit OpenCL device + a VA
+	// surface input + no hwupload/round-trip cruft, else the va→opencl
+	// derive fails ENOSYS on 7.x. Runs after all filter reshaping so it
+	// sees the final graph. See gpuResidentOpenCLTonemap.
+	{
+		var oclChanges []string
+		args, oclChanges = gpuResidentOpenCLTonemap(args)
+		changes = append(changes, oclChanges...)
+		newInputIdx = indexOfArg(args, "-i", 0)
+		encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
 	}
 
 	// 6. -crf:0 is left untouched. The scaleplex-ffmpeg fork's VAAPI
