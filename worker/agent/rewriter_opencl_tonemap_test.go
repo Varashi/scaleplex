@@ -12,7 +12,7 @@ import (
 // emitted tonemap_opencl graph to satisfy all three. See
 // reference_scaleplex_tonemap_regression_test.
 
-func ocl_filterValue(args []string) string {
+func oclFilterValue(args []string) string {
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == "-filter_complex" {
 			return args[i+1]
@@ -36,7 +36,7 @@ func TestGPUResidentOpenCLTonemap_HDRAssShape(t *testing.T) {
 		"-map", "[15]", "-codec:0", "h264_vaapi",
 	}
 	out, changes := gpuResidentOpenCLTonemap(args)
-	g := ocl_filterValue(out)
+	g := oclFilterValue(out)
 
 	if strings.HasPrefix(g, "[0:0]hwupload") {
 		t.Errorf("leading hwupload must be dropped: %q", g)
@@ -55,7 +55,7 @@ func TestGPUResidentOpenCLTonemap_HDRAssShape(t *testing.T) {
 	if !strings.Contains(g, "tonemap_opencl=") || !strings.Contains(g, "hwdownload") {
 		t.Errorf("expected opencl tonemap then direct hwdownload: %q", g)
 	}
-	// OpenCL device injected, derived from the vaapi device, before -i.
+	// OpenCL device injected, derived from the vaapi device (after it).
 	if !hasOpenCLInitDevice(out) {
 		t.Errorf("opencl device must be injected: %v", out)
 	}
@@ -108,7 +108,7 @@ func TestGPUResidentOpenCLTonemap_NoSubKeepsVAResident(t *testing.T) {
 		t.Error("output_format vaapi must be forced")
 	}
 	// No download tail here (ends at VA for encode) → reverse-map kept.
-	g := ocl_filterValue(out)
+	g := oclFilterValue(out)
 	if !strings.Contains(g, "hwmap=derive_device=vaapi:reverse=1") {
 		t.Errorf("reverse-map to VA must be kept when encode follows: %q", g)
 	}
