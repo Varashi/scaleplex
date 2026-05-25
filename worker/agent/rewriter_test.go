@@ -1517,14 +1517,15 @@ func TestRewriter_ForceKeyFrames_NoSeekUnchanged(t *testing.T) {
 
 // Plain `<base>.<lang>.srt` (the historical case) must still work.
 
-// Bitmap embedded burn-in (PGS in a Blu-ray remux). Filter graph must:
-//   - reference the subtitle stream by its specifier ([0:3])
-//   - convert PGS bitmap → bgra (libavcodec renders the bitmap)
-//   - hwupload the rendered surface to GPU
-//   - overlay_vaapi composite onto the scaled main video
+// Bitmap embedded burn-in (PGS in a Blu-ray remux). Bitmap now burns through
+// the SAME unified inlineass path as text (composeBurn) — no overlay_vaapi, no
+// full-frame sub2video. The fork's -map_inlineass binding routes the bitmap
+// codec to replay_bitmap and renders at render_height (band). Filter graph:
 //
-// And: NO extraction (the stream stays in -i 0).
-func TestRewriter_OverlayVAAPI_BitmapEmbedded_PGS(t *testing.T) {
+//	[0:0]hwupload → scale_vaapi(nv12) → inlineass(render_height)
+//
+// And: NO extraction (the stream stays in -i 0), -map_inlineass KEPT.
+func TestRewriter_BitmapInlineass_Embedded_PGS(t *testing.T) {
 	probe := func(source, spec string) string {
 		// Stand-in for ffprobe; report PGS for stream 0:3.
 		return "hdmv_pgs_subtitle"
@@ -1539,34 +1540,37 @@ func TestRewriter_OverlayVAAPI_BitmapEmbedded_PGS(t *testing.T) {
 	if !containsString(out.Changes, "subtitle:bitmap:0:3(hdmv_pgs_subtitle)") {
 		t.Fatalf("expected subtitle:bitmap label: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:overlay-vaapi-bitmap") {
-		t.Fatalf("expected overlay-vaapi-bitmap mode: %v", out.Changes)
+	if !containsString(out.Changes, "filter:bitmap-inlineass-vaapi") {
+		t.Fatalf("expected unified bitmap-inlineass-vaapi mode: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "drop:-map_inlineass") {
-		t.Errorf("missing drop:-map_inlineass: %v", out.Changes)
+	if containsString(out.Changes, "drop:-map_inlineass") {
+		t.Errorf("bitmap now burns via inlineass — -map_inlineass must be KEPT: %v", out.Changes)
+	}
+	if i := indexOfArg(out.Args, "-map_inlineass", 0); i < 0 || out.Args[i+1] != "0:3" {
+		t.Errorf("-map_inlineass 0:3 must remain for the replay_bitmap binding: %v", out.Args)
 	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
 	for _, must := range []string{
-		"[0:0]hwupload[10]",
-		"[10]scale_vaapi=w=3840:h=2160:format=nv12[11]",
-		"[0:3]format=bgra[12]",
-		"[12]hwupload[13]",
-		"[11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]",
+		"[0:0]hwupload[0]",
+		"[0]scale_vaapi=w=3840:h=2160:format=nv12[1]",
+		"[1]inlineass=render_height=1080[2]",
 	} {
 		if !strings.Contains(f, must) {
 			t.Errorf("filter missing %q\n%s", must, f)
 		}
 	}
-	if strings.Contains(f, "subtitles=filename=") {
-		t.Errorf("bitmap path must NOT use libass `subtitles=`:\n%s", f)
+	for _, banned := range []string{"overlay_vaapi", "format=bgra", "subtitles=filename="} {
+		if strings.Contains(f, banned) {
+			t.Errorf("unified bitmap burn must NOT use %q:\n%s", banned, f)
+		}
 	}
 }
 
-// Bitmap sidecar (.sup file as second -i). Rare but possible. The
-// rewriter must KEEP the second -i because the overlay_vaapi filter
-// pulls the stream from it via [1:s:0].
-func TestRewriter_OverlayVAAPI_BitmapSidecar_KeepsInput(t *testing.T) {
+// Bitmap sidecar (.sup file as second -i). Rare but possible. The rewriter
+// must KEEP the second -i — the fork's -map_inlineass binding reads the .sup
+// stream from it (1:s:0) — and route through inlineass, not overlay_vaapi.
+func TestRewriter_BitmapInlineass_Sidecar_KeepsInput(t *testing.T) {
 	probe := func(source, spec string) string {
 		return "hdmv_pgs_subtitle"
 	}
@@ -1576,11 +1580,11 @@ func TestRewriter_OverlayVAAPI_BitmapSidecar_KeepsInput(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("not applied: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "filter:overlay-vaapi-bitmap") {
-		t.Fatalf("expected overlay-vaapi-bitmap mode: %v", out.Changes)
+	if !containsString(out.Changes, "filter:bitmap-inlineass-vaapi") {
+		t.Fatalf("expected unified bitmap-inlineass-vaapi mode: %v", out.Changes)
 	}
 	if containsString(out.Changes, "drop:-i(sidecar-input)") {
-		t.Fatal("bitmap-sidecar must NOT drop second -i (filter consumes the stream)")
+		t.Fatal("bitmap-sidecar must NOT drop second -i (the binding reads the stream)")
 	}
 	iCount := 0
 	for _, a := range out.Args {
@@ -1591,10 +1595,18 @@ func TestRewriter_OverlayVAAPI_BitmapSidecar_KeepsInput(t *testing.T) {
 	if iCount != 2 {
 		t.Errorf("expected both -i to remain, got %d", iCount)
 	}
+	if i := indexOfArg(out.Args, "-map_inlineass", 0); i < 0 || out.Args[i+1] != "1:s:0" {
+		t.Errorf("-map_inlineass 1:s:0 must be present for the replay_bitmap binding: %v", out.Args)
+	}
 	idx := findFilterComplex(out.Args, "[0:0]")
 	f := out.Args[idx]
-	if !strings.Contains(f, "[1:s:0]format=bgra") {
-		t.Errorf("filter must reference the sidecar stream:\n%s", f)
+	if !strings.Contains(f, "inlineass=render_height=1080") {
+		t.Errorf("filter must burn via inlineass(render_height):\n%s", f)
+	}
+	for _, banned := range []string{"overlay_vaapi", "format=bgra"} {
+		if strings.Contains(f, banned) {
+			t.Errorf("unified bitmap burn must NOT use %q:\n%s", banned, f)
+		}
 	}
 }
 
@@ -1994,6 +2006,74 @@ func TestRewriter_HWDecode_PGS_Seek(t *testing.T) {
 	}
 	if !containsString(out.Changes, "hw-decode:filter:bitmap-inlineass-vaapi") {
 		t.Errorf("missing bitmap-inlineass-vaapi change; got %v", out.Changes)
+	}
+}
+
+// HDR variant of the PGS HW-decode burn — the shape that escaped every
+// optimizer before 2026-05-26 and ran sub-realtime (0.37x → the LG buffer
+// Frank hit 2026-05-25). Plex splices a tonemap_opencl between the scaled
+// video and overlay_vaapi; detectBitmapOverlayBurn matches regardless and
+// composeBurn recomposes VA-resident scale_vaapi(p010) → tonemap(honored algo)
+// → inlineass(render_height) — no full-frame overlay, no decode→sysmem→
+// re-upload round-trip. See project_scaleplex_perf_tuning.
+func TestRewriter_HWDecode_PGS_HDR_Tonemap_Inlineass(t *testing.T) {
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
+		"X_PLEX_TOKEN":           "tok123",
+	}
+	args := append([]string(nil), hwDecodeArgsAV1HEVC...)
+	vfIdx := indexOfArg(args, "-filter_complex", 0)
+	// The captured 4K HDR PGS passthrough graph (post tonemap-normalize).
+	args[vfIdx+1] = "[0:5]scale=3840:2160,hwupload[0];" +
+		"[0:0]hwupload[1];" +
+		"[1]scale_vaapi=w=3840:h=2160:format=p010[2];" +
+		"[2]hwmap=derive_device=opencl,tonemap_opencl=tonemap=mobius:transfer=bt709:matrix=bt709:primaries=bt709:format=nv12,hwmap=derive_device=vaapi:reverse=1[5];" +
+		"[5][0]overlay_vaapi,scale_vaapi=format=nv12[6];" +
+		"[6]hwupload[7]"
+	for i := vfIdx + 1; i+1 < len(args); i++ {
+		if args[i] == "-map" && args[i+1] == "[2]" {
+			args[i+1] = "[7]"
+			break
+		}
+	}
+
+	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("rewriter NOT applied; changes=%v", out.Changes)
+	}
+	if !containsString(out.Changes, "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap(mobius)") {
+		t.Fatalf("missing hdr-tonemap bitmap change; got %v", out.Changes)
+	}
+	gotVF := out.Args[indexOfArg(out.Args, "-filter_complex", 0)+1]
+	// The ~5x hog (full-frame overlay) + the sysmem round-trip are gone.
+	for _, banned := range []string{"overlay_vaapi", "scale=3840:2160,hwupload[0]", "[0:0]hwupload"} {
+		if strings.Contains(gotVF, banned) {
+			t.Errorf("graph must not contain %q: %q", banned, gotVF)
+		}
+	}
+	// VA-resident scale → p010 (HDR) → honored tonemap → inlineass(band).
+	for _, must := range []string{
+		"[0:0]scale_vaapi=w=3840:h=2160:format=p010",
+		"tonemap_opencl=tonemap=mobius",
+		"inlineass=render_height=1080",
+	} {
+		if !strings.Contains(gotVF, must) {
+			t.Errorf("graph missing %q: %q", must, gotVF)
+		}
+	}
+	if !containsString(out.Changes, "tonemap:ocl:inject-opencl-device") {
+		t.Errorf("opencl device must be injected for the tonemap: %v", out.Changes)
+	}
+	if indexOfArg(out.Args, "-hwaccel_output_format:0", 0) < 0 {
+		t.Errorf("-hwaccel_output_format:0 vaapi must be present (VA-resident decode)")
+	}
+	if mi := indexOfArg(out.Args, "-map_inlineass", 0); mi < 0 || out.Args[mi+1] != "0:5" {
+		t.Errorf("-map_inlineass 0:5 must be added for the PGS feed: %v", out.Args)
+	}
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-map" && out.Args[i+1] == "[7]" {
+			t.Errorf("stale -map [7] not retargeted to the new label: %v", out.Args)
+		}
 	}
 }
 
