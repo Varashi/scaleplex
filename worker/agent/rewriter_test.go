@@ -1904,7 +1904,8 @@ func TestRewriter_HWDecode_PassthroughWithPlexQuirkStrips(t *testing.T) {
 // the 4K upscale runs flat-out → ~2 cores, transcode collapses. The
 // rewriter must reroute the bitmap through the sub pre-render: swap
 // the SW-upscale branch for a read of the pre-render's CFR qtrle
-// the merged inlineass filter via a -map_inlineass feed + dvdsub decode-sink.
+// the merged inlineass filter via a -map_inlineass feed (self-decoded by the
+// fork, patch 0120 — no dvdsub decode-sink output).
 func TestRewriter_HWDecode_PGS_Inlineass(t *testing.T) {
 	env := map[string]string{
 		"SCALEPLEX_PMS_BASE_URL": "http://relay.svc:32499",
@@ -1944,9 +1945,11 @@ func TestRewriter_HWDecode_PGS_Inlineass(t *testing.T) {
 	if mi := indexOfArg(out.Args, "-map_inlineass", 0); mi < 0 || out.Args[mi+1] != "0:5" {
 		t.Errorf("-map_inlineass 0:5 must be added for the PGS feed; args=%v", out.Args)
 	}
-	// Bitmap decode sink appended: -map 0:5 -f null -codec dvdsub nullfile.
-	if !strings.Contains(strings.Join(out.Args, " "), "-map 0:5 -f null -codec dvdsub nullfile") {
-		t.Errorf("bitmap decode sink not appended: %v", out.Args)
+	// No decode sink appended: patch 0120 self-decodes the -map_inlineass
+	// binding (paced), so the old `-map 0:5 -f null -codec dvdsub nullfile`
+	// output is gone.
+	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
+		t.Errorf("bitmap decode sink must NOT be appended (0120 self-decodes): %v", out.Args)
 	}
 }
 
@@ -2283,9 +2286,11 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 	if iCount != 2 {
 		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
 	}
-	// 4. Null-sub output kept.
-	if indexOfArg(out.Args, "nullfile", 0) < 0 {
-		t.Errorf("null-sub output dropped (should pass through)")
+	// 4. Null-sub decode sink stripped: patch 0120 self-decodes the
+	//    -map_inlineass binding (the SW inlineass is fed via the side-channel),
+	//    so the `-map ... -f null -codec ass nullfile` output is removed.
+	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
+		t.Errorf("null-sub decode sink must be stripped (0120 self-decodes): %v", out.Args)
 	}
 	// 5. Mode tag.
 	gotPassthroughTag := false
@@ -2358,8 +2363,11 @@ func TestRewriter_HWText_SRT_Sidecar(t *testing.T) {
 	if iCount != 2 {
 		t.Errorf("expected 2 -i (source + sidecar, no FIFO), got %d", iCount)
 	}
-	if indexOfArg(out.Args, "nullfile", 0) < 0 {
-		t.Error("decode sink (nullfile) dropped")
+	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
+		t.Errorf("decode sink (nullfile) must be stripped (0120 self-decodes): %v", out.Args)
+	}
+	if !containsString(out.Changes, "drop:inlineass-decode-sink") {
+		t.Errorf("missing drop:inlineass-decode-sink tag: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
 		t.Errorf("missing inlineass-vaapi tag: %v", out.Changes)

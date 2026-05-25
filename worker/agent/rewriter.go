@@ -938,6 +938,31 @@ func removeArgs(s []string, at, n int) []string {
 	return out
 }
 
+// stripInlineassDecodeSink removes Plex's subtitle decode-sink output —
+// the trailing `-map <spec> -f null -codec ass|dvdsub nullfile` (7 tokens).
+// Plex emits it only to force the subtitle stream to decode so its private
+// inlineass filter gets fed. Fork patch 0120 makes the `-map_inlineass`
+// binding self-decode the stream (a sink-less decoder, paced by the demux's
+// video-read backpressure), so the separate null-mux output is redundant —
+// it only adds an unthrottled reader/encoder/muxer that competes for the
+// (NFS) input read during the pre-throttle buffer fill, the embedded-sub
+// startup skips. Gated on `-map_inlineass` still being present: if a path
+// dropped the binding (e.g. overlay_vaapi), the sink is the only thing
+// decoding the sub and must stay. Returns (args, stripped?).
+func stripInlineassDecodeSink(args []string) ([]string, bool) {
+	if indexOfArg(args, "-map_inlineass", 0) < 0 {
+		return args, false
+	}
+	for i := 0; i+6 < len(args); i++ {
+		if args[i] == "-map" && args[i+2] == "-f" && args[i+3] == "null" &&
+			args[i+4] == "-codec" && (args[i+5] == "ass" || args[i+5] == "dvdsub") &&
+			args[i+6] == "nullfile" {
+			return removeArgs(args, i, 7), true
+		}
+	}
+	return args, false
+}
+
 // ─── shared rewriter helpers ─────────────────────────────────────────
 //
 // Both the main rewriter and tryOptimizeRemux need to do the same
@@ -2142,10 +2167,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// -filter_complex, matching Plex's text placement) so the fork feeds
 			// the decoded presentation to replay_bitmap.
 			args = spliceArgs(args, i, "-map_inlineass", streamSpec)
-			// Add the bitmap decode sink at the end (mirrors Plex's text
-			// `-map <spec> -f null -codec ass`; PGS can't encode to ass -> dvdsub).
-			// Forces the sub to decode -> handle_subtitle -> replay_bitmap.
-			args = append(args, "-map", streamSpec, "-f", "null", "-codec", "dvdsub", "nullfile")
+			// No decode-sink: fork patch 0120 makes the -map_inlineass binding
+			// self-decode the stream (sink-less decoder, paced by the demux), so
+			// the old `-map <spec> -f null -codec dvdsub nullfile` output is no
+			// longer needed to drive handle_subtitle -> replay_bitmap.
 			changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
 			// The splice shifted indices; relocate the encoder.
 			newInputIdx = indexOfArg(args, "-i", 0)
@@ -2462,6 +2487,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	env = setWorkerHomeEnv(env)
 	changes = append(changes, "env:HOME")
+
+	// scaleplex (0120): drop Plex's subtitle decode-sink now that the
+	// -map_inlineass binding self-decodes. See stripInlineassDecodeSink.
+	if stripped, ok := stripInlineassDecodeSink(args); ok {
+		args = stripped
+		changes = append(changes, "drop:inlineass-decode-sink")
+	}
 
 	isMatroskaSegment := false
 	if outputFormat == "segment" {

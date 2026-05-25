@@ -10,7 +10,8 @@ import (
 // HW-decode + sidecar SRT at 4K, native render height (cap opted out): the
 // merged inlineass HW branch (patch 0115) keeps the VAAPI surface and burns
 // via the fork's inlineass — no FIFO pre-render, no overlay_vaapi, no band
-// sentinels. -map_inlineass + the decode sink stay; render_height=0 (no cap).
+// sentinels. -map_inlineass stays; the decode sink is stripped (patch 0120
+// self-decodes the binding); render_height=0 (no cap).
 func TestRewriter_HWDecode_SRT_Sidecar_Inlineass(t *testing.T) {
 	t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", "0") // native render, no cap
 	dir := t.TempDir()
@@ -53,12 +54,16 @@ func TestRewriter_HWDecode_SRT_Sidecar_Inlineass(t *testing.T) {
 	if strings.Contains(fc, "overlay_vaapi") || strings.Contains(fc, "hwdownload") {
 		t.Errorf("merged HW branch must drop overlay_vaapi + the hwdownload/hwupload bracket: %q", fc)
 	}
-	// The fork's feed must survive: -map_inlineass + the decode sink.
+	// The fork's feed must survive: -map_inlineass stays. The decode sink is
+	// stripped — patch 0120 makes the binding self-decode (paced by the demux).
 	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
 		t.Error("-map_inlineass must be kept (drives the scaleplex_inlineass feed)")
 	}
-	if !containsString(out.Args, "ass") || indexOfArg(out.Args, "-codec", 0) < 0 {
-		t.Error("decode sink (-map 1:s:0 -f null -codec ass nullfile) must be kept")
+	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
+		t.Errorf("decode sink (-map 1:s:0 -f null -codec ass nullfile) must be stripped: %v", out.Args)
+	}
+	if !containsString(out.Changes, "drop:inlineass-decode-sink") {
+		t.Errorf("missing drop:inlineass-decode-sink change tag: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
 		t.Errorf("missing hw-decode:filter:inlineass-vaapi tag: %v", out.Changes)
