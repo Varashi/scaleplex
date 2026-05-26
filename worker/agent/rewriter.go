@@ -233,27 +233,11 @@ var (
 			`\[3\]hwdownload,format=[A-Za-z0-9]+\[4\];` +
 			`\[4\]inlineass=([^\[]+)\[5\];` +
 			`\[5\]hwupload\[6\]$`)
-	// HW-decode bitmap-subtitle (PGS/VobSub/DVDSub) burn-in PMS pattern.
-	// When the decode probe matches and a bitmap sub must be burned, PMS
-	// emits its own overlay_vaapi graph that sub2video-bridges the
-	// subtitle stream and SW-upscales it inline. Feeding that sparse
-	// stream to overlay_vaapi lets framesync drain it at frame rate, so
-	// the 4K upscale runs flat-out (~2 cores, transcode collapses). The
-	// rewriter reroutes the bitmap through the sub pre-render instead.
-	//
-	// Filter shape (captured 2026-05-18; sub stream index varies):
-	//   [0:5]scale=W:H,hwupload[0];
-	//   [0:0]hwupload[1];
-	//   [1]scale_vaapi=w=W:h=H:format=p010[2];
-	//   [2][0]overlay_vaapi,scale_vaapi=format=p010[3];
-	//   [3]hwupload[4]
-	// Group 1 = the bitmap stream spec, groups 2/3 = the W/H.
-	reFilterHWBitmapOverlay = regexp.MustCompile(
-		`^\[(0:[0-9]+)\]scale=([0-9]+):([0-9]+),hwupload\[0\];` +
-			`\[0:0\]hwupload\[1\];` +
-			`\[1\]scale_vaapi=w=[0-9]+:h=[0-9]+(?::format=[A-Za-z0-9]+)?\[2\];` +
-			`\[2\]\[0\]overlay_vaapi[^\[]*\[3\];` +
-			`\[3\]hwupload\[4\]$`)
+	// Plex's HW-decode bitmap (PGS/VobSub/DVDSub) burn graph — `[0:N]scale,
+	// hwupload; [0:0]hwupload; scale_vaapi; [..][..]overlay_vaapi` with an
+	// optional tonemap spliced in on the HDR variant — is recognized by
+	// detectBitmapOverlayBurn (fact extraction, not a rigid shape regex) and
+	// recomposed onto the unified inlineass burn by composeBurn.
 )
 
 func envOr(k, dflt string) string {
@@ -563,7 +547,6 @@ type filterRewrite struct {
 	OldLabel string
 	NewLabel string
 	Mode     string
-	Sidecar  string
 }
 
 // rewriteVideoFilter translates Plex's filter graph into a scaleplex-ffmpeg7
@@ -655,52 +638,160 @@ func (tm tonemapConfig) hdrScaleAlgo(w, h, algo string) string {
 	return "scale_vaapi=w=" + w + ":h=" + h + ":format=p010," + tm.stage(algo)
 }
 
+// burnSpec captures the orthogonal axes of a HW scale / sub-burn graph. One
+// composer (composeBurn) emits every {SDR,HDR}×{none,text,bitmap}×{any
+// resolution} shape from these axes, instead of a bespoke target string per
+// Plex argv variant. Codec (encoder) and the decode swap stay orthogonal —
+// they're handled by encoderMap / the decode reshape, not here.
+type burnSpec struct {
+	// vaResident: [0:0] is already a VAAPI surface (HW decode with
+	// -hwaccel_output_format vaapi). false → the source is in system memory
+	// and the composer prepends an hwupload.
+	vaResident bool
+	w, h       string // target resolution
+	hdr        bool   // HDR source → insert the tonemap stage (p010→nv12)
+	algo       string // tonemap algo to honor (HDR only; "" = cfg default)
+	// burnSub + subParams: when burnSub, append an inlineass stage. subParams
+	// is the leading inlineass params (Plex's params for text, "" for bitmap);
+	// composeBurn appends render_height (the fork's libass/replay_bitmap band
+	// knob). The bitmap stream is fed via -map_inlineass by the caller.
+	burnSub   bool
+	subParams string
+}
+
+// composeBurn builds the orthogonal stage chain and returns the filtergraph
+// string + its final output label:
+//
+//	[0:0] → [hwupload]? → scale_vaapi(p010|nv12) → [tonemap]? → [inlineass]?
+//
+// Each stage is independent: hdr toggles the tonemap insert, burnSub toggles
+// inlineass, vaResident toggles the leading hwupload, w/h/algo are params.
+// scale_vaapi emits p010 when a tonemap follows and nv12 otherwise, and the
+// tonemap stage is a transparent p010→nv12 VAAPI insert, so inlineass always
+// receives an nv12 VAAPI surface whether or not HDR ran — the sub stage is
+// HDR-agnostic and the tonemap stage is sub-agnostic. gpuResidentOpenCLTonemap
+// later injects the OpenCL device + asserts VA-residency for the tonemap stage.
+func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
+	n := 0
+	next := func() string { l := strconv.Itoa(n); n++; return l }
+	var b strings.Builder
+	src := "[0:0]"
+	if !s.vaResident {
+		u := next()
+		fmt.Fprintf(&b, "%shwupload[%s];", src, u)
+		src = "[" + u + "]"
+	}
+	scaled := next()
+	if s.hdr {
+		fmt.Fprintf(&b, "%sscale_vaapi=w=%s:h=%s:format=p010,%s[%s]",
+			src, s.w, s.h, tm.stage(s.algo), scaled)
+	} else {
+		fmt.Fprintf(&b, "%sscale_vaapi=w=%s:h=%s:format=nv12[%s]",
+			src, s.w, s.h, scaled)
+	}
+	out := scaled
+	if s.burnSub {
+		o := next()
+		params := s.subParams
+		if params != "" {
+			params += ":"
+		}
+		params += fmt.Sprintf("render_height=%d", subRenderHeightCap())
+		fmt.Fprintf(&b, ";[%s]inlineass=%s[%s]", scaled, params, o)
+		out = o
+	}
+	return b.String(), "[" + out + "]"
+}
+
+// reBitmapSubBranch extracts the bitmap subtitle stream spec from Plex's
+// sub2video overlay branch: `[0:5]scale=W:H,hwupload[..]`.
+var reBitmapSubBranch = regexp.MustCompile(`\[(0:[0-9]+)\]scale=[0-9]+:[0-9]+,hwupload\[`)
+
+// reBitmapMainScale extracts the main-video target W/H from the overlay graph:
+// `[0:0]hwupload[..];[..]scale_vaapi=w=W:h=H`.
+var reBitmapMainScale = regexp.MustCompile(`\[0:0\]hwupload\[\d+\];\[\d+\]scale_vaapi=w=([0-9]+):h=([0-9]+)`)
+
+// reTonemapOpenCLAlgo extracts Plex's tonemap algorithm from an (already
+// substituteOpenCLTonemap-normalized) tonemap_opencl node.
+var reTonemapOpenCLAlgo = regexp.MustCompile(`tonemap_opencl=tonemap=([A-Za-z0-9]+)`)
+
+// reGraphTrailingLabel captures a filtergraph's final output label (the one
+// the video `-map` references), e.g. `…hwupload[7]` → "7".
+var reGraphTrailingLabel = regexp.MustCompile(`\[(\d+)\]$`)
+
+// retargetMapLabel points the video `-map oldLabel` at newLabel (quoted or
+// not). No-op when oldLabel is empty or absent.
+func retargetMapLabel(args []string, oldLabel, newLabel string) {
+	if oldLabel == "" {
+		return
+	}
+	for j := 0; j+1 < len(args); j++ {
+		if args[j] != "-map" {
+			continue
+		}
+		switch args[j+1] {
+		case oldLabel:
+			args[j+1] = newLabel
+			return
+		case `"` + oldLabel + `"`:
+			args[j+1] = `"` + newLabel + `"`
+			return
+		}
+	}
+}
+
+// detectBitmapOverlayBurn recognizes Plex's bitmap (PGS/VobSub/DVDSub)
+// sub2video→overlay_vaapi burn graph — with OR without an intervening
+// tonemap_opencl chain — and extracts the orthogonal facts needed to recompose
+// it as scale_vaapi→[tonemap]→inlineass (see composeBurn). It deliberately
+// does NOT match one rigid shape: it keys off the sub2video branch + the main
+// scale + (optionally) a tonemap node, so a tonemap spliced between the scaled
+// video and overlay_vaapi (the HDR variant) no longer escapes the optimizer.
+// Returns ok=false when the graph isn't a bitmap overlay burn.
+func detectBitmapOverlayBurn(graph string) (streamSpec, w, h, algo string, hdr, ok bool) {
+	if !strings.Contains(graph, "overlay_vaapi") {
+		return
+	}
+	sb := reBitmapSubBranch.FindStringSubmatch(graph)
+	ms := reBitmapMainScale.FindStringSubmatch(graph)
+	if sb == nil || ms == nil {
+		return
+	}
+	streamSpec, w, h = sb[1], ms[1], ms[2]
+	if m := reTonemapOpenCLAlgo.FindStringSubmatch(graph); m != nil {
+		algo, hdr = m[1], true
+	}
+	ok = true
+	return
+}
+
 func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sourceIsHDR bool, tm tonemapConfig) *filterRewrite {
 	_ = mediaPath
 	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
 		w, h, assParams := m[1], m[2], m[3]
 
-		// Bitmap subs (PGS / VobSub / DVDSub): overlay_vaapi the
-		// stream onto the scaled main video. The subtitle stream
-		// stays in the input(s); the filter graph references it via
-		// [streamSpec] (e.g. [0:3] for embedded, [1:s:0] for sidecar
-		// .sup) without going through any intermediate file.
+		// Bitmap subs (PGS / VobSub / DVDSub) burn through the SAME inlineass
+		// path as text — one unified sub stage, no overlay_vaapi anywhere. The
+		// fork's -map_inlineass binding routes bitmap codecs to replay_bitmap
+		// and renders at render_height (band), instead of Plex's full-frame
+		// sub2video→overlay_vaapi (the ~5x hog). -map_inlineass is KEPT (the
+		// mode is not "overlay-vaapi"), so the caller leaves the binding + the
+		// sidecar input in place for the fork to consume via StreamSpec.
 		//
-		//   [0:0]                                          source video
-		//     ↓ hwupload + scale_vaapi → nv12 surface     [main]
-		//   [streamSpec]                                  PGS stream
-		//     ↓ format=bgra (libavcodec renders bitmap)
-		//     ↓ hwupload                                   [sub]
-		//   [main][sub]overlay_vaapi
-		//
-		// Output stays NV12 throughout so the encoder gets what it
-		// expects. eof_action=pass keeps the stream open after the
-		// last subtitle event; repeatlast=1 holds the final caption
-		// until video ends (matches Plex's UX).
-		//
-		// No tonemap is injected here. If Plex wanted HDR→SDR tone
-		// mapping it would carry a tonemap filter in the argv (handled
-		// by reFilterHDRAss / reFilterHWOpenCLAss); a plain reFilterAss
-		// match means Plex emitted none, so scaleplex emits none either.
+		// No tonemap is composed: a plain reFilterAss match means Plex emitted
+		// none, so scaleplex emits none either (HDR-passthrough policy) — even
+		// when the source is HDR.
 		scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
 
 		if subSrc != nil && subSrc.Kind == "bitmap" && subSrc.StreamSpec != "" {
-			mode := "overlay-vaapi-bitmap"
-			if sourceIsHDR {
-				mode = "overlay-vaapi-bitmap-hdr"
-			}
+			f, newLabel := tm.composeBurn(burnSpec{
+				vaResident: false, w: w, h: h, burnSub: true,
+			})
 			return &filterRewrite{
-				Filter: fmt.Sprintf(
-					"[0:0]hwupload[10];"+
-						"[10]%s[11];"+
-						"[%s]format=bgra[12];"+
-						"[12]hwupload[13];"+
-						"[11][13]overlay_vaapi=eof_action=pass:repeatlast=1[15]",
-					scaleStep, subSrc.StreamSpec),
+				Filter:   f,
 				OldLabel: "[2]",
-				NewLabel: "[15]",
-				Mode:     mode,
-				Sidecar:  subSrc.Codec,
+				NewLabel: newLabel,
+				Mode:     "bitmap-inlineass-vaapi",
 			}
 		}
 
@@ -2102,19 +2193,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 		}
 
-		// Bitmap subs (overlay_vaapi) need the Plex-private
-		// `-map_inlineass <stream>` argv flag stripped. The text path is
-		// pass-through and keeps the flag (the fork's binding consumes
-		// it). Bitmap sidecar still strips because overlay_vaapi pulls
-		// the stream via its own [streamSpec] reference, not via
-		// -map_inlineass.
-		if strings.HasPrefix(rewritten.Mode, "overlay-vaapi") {
-			if miaIdx := indexOfArg(args, "-map_inlineass", 0); miaIdx >= 0 {
-				args = removeArgs(args, miaIdx, 2)
-				changes = append(changes, "drop:-map_inlineass")
-			}
-			if rewritten.Sidecar != "" {
-				changes = append(changes, "sidecar:"+rewritten.Sidecar)
+		// Bitmap subs now burn through the SAME inlineass binding as text
+		// (composeBurn, mode "bitmap-inlineass-vaapi") — no overlay_vaapi. The
+		// fork's `-map_inlineass <stream>` routes the bitmap codec to
+		// replay_bitmap; ensure the flag is present (Plex's overlay argv may
+		// not have carried it). The sidecar input is KEPT (SecondInputArgIdx
+		// stays -1 for bitmap sidecar) so the binding can read the .sup stream.
+		// The decode-sink is stripped later (stripInlineassDecodeSink).
+		if rewritten.Mode == "bitmap-inlineass-vaapi" {
+			if subSrc != nil && subSrc.StreamSpec != "" &&
+				indexOfArg(args, "-map_inlineass", 0) < 0 {
+				args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0),
+					"-map_inlineass", subSrc.StreamSpec)
+				changes = append(changes, "add:-map_inlineass")
 			}
 		}
 
@@ -2300,47 +2391,61 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 
 		// PGS / bitmap burn-in in HW-decode mode. PMS emits its own
-		// overlay_vaapi graph that sub2video-bridges the bitmap subtitle
-		// and SW-upscales it inline — no `-map_inlineass`, so the
-		// detectSubtitleSource switch above never sees it. Feeding that
-		// sparse stream to overlay_vaapi lets framesync drain it at
-		// frame rate, running the 4K upscale flat-out (~2 cores, the
-		// transcode collapses). Reroute the bitmap through the sub
-		// pre-render: a separate ffmpeg upscales it rate-bounded and
-		// streams a clean CFR qtrle FIFO; the main graph just reads
-		// that FIFO and overlay_vaapi-composites it.
-		// See project_scaleplex_pgs_prerender.
+		// overlay_vaapi graph that sub2video-bridges the bitmap subtitle and
+		// SW-upscales it to the full output resolution — no `-map_inlineass`,
+		// so the detectSubtitleSource switch above never sees it. That
+		// full-frame overlay (and, on the HDR variant, a decode→sysmem→
+		// re-upload round-trip from Plex's leading `[0:0]hwupload`) runs the
+		// transcode sub-realtime (measured 0.37x at 4K HDR; the buffer Frank
+		// hit 2026-05-25). Unify it onto the inlineass burn like every other
+		// sub path: detectBitmapOverlayBurn extracts the stream spec + target
+		// W/H + (optional) tonemap algo regardless of an intervening tonemap,
+		// and composeBurn re-emits VA-resident scale_vaapi → [tonemap] →
+		// inlineass(render_height) — the fork's replay_bitmap renders the
+		// bitmap at render_height (band), seek is native. See composeBurn /
+		// project_scaleplex_perf_tuning.
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] != "-filter_complex" {
 				continue
 			}
-			m := reFilterHWBitmapOverlay.FindStringSubmatch(args[i+1])
-			if m == nil {
+			streamSpec, w, h, algo, hdr, ok := detectBitmapOverlayBurn(args[i+1])
+			if !ok {
 				break
 			}
-			streamSpec, w, h := m[1], m[2], m[3]
-			rh := subRenderHeightCap()
-			// Reshape to the merged inlineass HW branch: main video stays on the
-			// VAAPI surface; inlineass composites the bitmap presentation fed via
-			// -map_inlineass (the binding routes bitmap codecs to replay_bitmap).
-			// Drops Plex's overlay_vaapi sub2video second input + the FIFO
-			// pre-render entirely; seek is native (the filter sees real PTS).
-			args[i+1] = fmt.Sprintf(
-				"[0:0]hwupload[0];"+
-					"[0]scale_vaapi=w=%s:h=%s:format=nv12[1];"+
-					"[1]inlineass=render_height=%d[4]",
-				w, h, rh,
-			)
+			oldLabel := ""
+			if m := reGraphTrailingLabel.FindStringSubmatch(args[i+1]); m != nil {
+				oldLabel = "[" + m[1] + "]"
+			}
+			// VA-resident only when Plex's argv actually HW-decodes; otherwise
+			// composeBurn prepends the hwupload itself.
+			vaResident := indexOfArg(args, "-hwaccel:0", 0) >= 0
+			newFilter, newLabel := tm.composeBurn(burnSpec{
+				vaResident: vaResident, w: w, h: h, hdr: hdr, algo: algo,
+				burnSub: true,
+			})
+			args[i+1] = newFilter
+			// Make [0:0] a real VA surface (Plex's bitmap argv decodes to
+			// sysmem) so the no-hwupload composer is valid + the round-trip is
+			// gone. Idempotent with gpuResidentOpenCLTonemap's own force.
+			if vaResident {
+				if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
+					args[ofIdx+1] = "vaapi"
+				} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
+					args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+				}
+			}
+			retargetMapLabel(args, oldLabel, newLabel)
 			// Plex's bitmap argv carries no -map_inlineass; add it (before
 			// -filter_complex, matching Plex's text placement) so the fork feeds
-			// the decoded presentation to replay_bitmap.
-			args = spliceArgs(args, i, "-map_inlineass", streamSpec)
-			// No decode-sink: fork patch 0120 makes the -map_inlineass binding
-			// self-decode the stream (sink-less decoder, paced by the demux), so
-			// the old `-map <spec> -f null -codec dvdsub nullfile` output is no
-			// longer needed to drive handle_subtitle -> replay_bitmap.
-			changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
-			// The splice shifted indices; relocate the encoder.
+			// the decoded presentation to replay_bitmap. No decode-sink: fork
+			// patch 0120's binding self-decodes the stream, paced by the demux.
+			args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0), "-map_inlineass", streamSpec)
+			if hdr {
+				changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap("+algo+")")
+			} else {
+				changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
+			}
+			// The splices shifted indices; relocate the encoder.
 			newInputIdx = indexOfArg(args, "-i", 0)
 			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
 			break
