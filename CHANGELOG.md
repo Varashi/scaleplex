@@ -1,5 +1,54 @@
 # Changelog
 
+## v1.6.1 — 2026-05-26
+
+Bitmap sub-burn unification + PGS cue-clear regression fix + orthogonal SW-reshape detector.
+
+> **The 4K HDR + burned PGS/bitmap sub + tonemap shape ran sub-realtime** (~0.37×
+> realtime → buffering) in the full-HW passthrough path because scaleplex
+> trusted Plex's `sub2video → scale-to-4K → overlay_vaapi` graph (+ a
+> decode→sysmem→re-upload round-trip from a leading `[0:0]hwupload`). The
+> existing reroute only matched the SDR shape; the HDR variant (tonemap_opencl
+> spliced before overlay) escaped every optimizer. **Separately**, the burned
+> PGS cue stayed on screen until the next cue (clear not sticky in the apply
+> path). Both fixed.
+
+- **feat(worker): unify bitmap sub-burn onto inlineass** (#37). All sub-burn now
+  routes through `inlineass` — zero `overlay_vaapi` emitters left. Introduces
+  an orthogonal-stage composer `composeBurn`:
+  `[0:0] → [hwupload]? → scale_vaapi(p010|nv12) → [tonemap]? → [inlineass]?`,
+  each stage independent. `detectBitmapOverlayBurn` extracts facts (stream
+  spec, W/H, optional tonemap algo) regardless of an intervening tonemap, so
+  the HDR variant no longer escapes. Live-validated on plex-test: 4K HDR PGS
+  burn **0.37× → 4.6× realtime**, deployed agent emits VA-resident
+  `scale_vaapi(p010)` → honored opencl tonemap → `inlineass(render_height)`
+  band — no full-frame overlay, no decode→sysmem→re-upload round-trip. Drops
+  the dead `reFilterHWBitmapOverlay` regex + unused `filterRewrite.Sidecar`
+  field. No fork change.
+- **fix(ffmpeg): PGS cue-clear sticky** (#38, patch 0121). `refresh_bitmap()`
+  recomputed `have_bmp` every frame from the last bitmap's window. PGS cues
+  carry `end_display_time=0` → `bmp_end_ms=-1`, so the empty-PCS clear (which
+  drops `have_bmp` and returns) was undone the next frame: the per-frame
+  recompute resurrected the cue. Fix: on clear, set `bmp_end_ms = time_ms` to
+  close the window. Cue clears at its end instead of hanging until the next
+  cue. (Regression lived in patch 0115 since v1.3.0 — affects all burned
+  PGS/VobSub/DVDSub.) Also makes `build-worker.yaml`'s deb-fetch use the
+  branch's own ffmpeg build artifact (`github.ref_name`, env-var + quoted) so
+  fork patches build per-branch.
+- **refactor(rewriter): orthogonal SW-reshape detector** (#39).
+  `rewriteVideoFilter` is now a thin adapter over `extractGraphFacts →
+  composeBurn`. The per-shape `reFilterAss/Plain/HDR/HDRAss` branches collapse
+  — **4 of 6 regexes removed**; `reFilterHWAss/HWOpenCLAss` stay for the
+  not-yet-swapped HW-decode-text path. Node-allow-list safety guard bails on
+  unmodeled nodes (`crop`, `eq`, `fps`, …); SW-decode-only prefix guard keeps
+  HW-shaped graphs falling through. Emit improvements: trailing redundant
+  hwupload dropped (scale/tonemap output is already a VA surface for the
+  encoder), SW-text moves from the `hwdownload/inlineass(SW)/hwupload` bracket
+  to inlineass-on-VA + render_height (mirrors the HW-decode-text path), mode
+  tags consolidated. Emit-parity harness vs the corpus: **considered=1369
+  parity=1369 other-diff=0** — lossless. Corpus replay: no new bails.
+  Live-validated SW-text on plex-test.
+
 ## v1.6.0 — 2026-05-25
 
 GPU-resident OpenCL HDR tonemap fix (regression) + FORCE_HW=0 readiness.
