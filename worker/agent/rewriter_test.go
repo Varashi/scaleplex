@@ -2681,3 +2681,87 @@ func TestRewriter_SWReshape_SidecarSRT_NoTierDown(t *testing.T) {
 		t.Errorf("sidecar SRT must NOT enable animated_tier_down: %s", out.Args[vfIdx])
 	}
 }
+
+// HDR-source change-tag must surface exactly ONCE per session, even
+// on the path that historically hit two emit sites: HW-decode +
+// text-sub-burn + HDR source. Pre-fix (sha-c53f4b4 / v1.7.0) the tag
+// fired from both the HW-decode passthrough block AND the
+// HW-decode-sub-burn text branch, so a single session emitted
+// `video:hdr-source(smpte2084),video:hdr-source(smpte2084),...`.
+// Hoisted to a session-level probe in the post-v1.7.0 dedupe;
+// this test pins the contract.
+//
+// `[KNOWN: DupHDRTag]` close — release-gate sweep 2026-05-26.
+func TestRewriter_HDRSource_EmittedExactlyOnce_HWDecodeTextBurnHDR(t *testing.T) {
+	probe := func(string) (transfer, primaries, space string) {
+		return "smpte2084", "bt2020", "bt2020nc"
+	}
+	// Same shape as TestRewriter_HWText_OpenCLTonemap (HW decode +
+	// embedded SRT burn + HDR), but with HDR probe wired so the tag
+	// flows through the SW-decode probe + the HW-decode-passthrough
+	// path + the HW-decode-text-sub-burn sub-branch.
+	args := []string{
+		"-loglevel", "quiet",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi",
+		"-codec:0", "hevc",
+		"-i", "/media/x.mkv",
+		"-codec:1", "subrip",
+		"-i", "/transcode/Sub/temp-0.srt",
+		"-start_at_zero", "-copyts",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=p010[1];" +
+			"[1]hwmap=derive_device=opencl[2];" +
+			"[2]tonemap_opencl=tonemap=mobius:format=nv12:m=bt709:p=bt709:r=tv[3];" +
+			"[3]hwdownload,format=nv12[4];" +
+			"[4]inlineass=font_scale=1.0:font_path=/x:language=en:overrides=foo:outline=2:shadow=1:font_size=54[5];" +
+			"[5]hwupload[6]",
+		"-map", "[6]",
+		"-codec:0", "hevc_vaapi",
+		"-f", "matroska", "/transcode/out.mkv",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, &RewriteOpts{
+		FSExists:           func(string) bool { return true },
+		ProbeVideoColor:    probe,
+		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	count := 0
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "video:hdr-source(") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 video:hdr-source(...) tag, got %d: %v", count, out.Changes)
+	}
+	if !containsString(out.Changes, "video:hdr-source(smpte2084)") {
+		t.Errorf("expected video:hdr-source(smpte2084): %v", out.Changes)
+	}
+}
+
+// Same single-emit contract for SW-reshape + sub-burn + HDR (the
+// "honor:plex-sw" + "force-hw:reshape-hybrid" + classic SW reshape
+// paths all share one hoisted probe).
+func TestRewriter_HDRSource_EmittedExactlyOnce_SWReshape(t *testing.T) {
+	probe := func(string) (string, string, string) {
+		return "smpte2084", "bt2020", "bt2020nc"
+	}
+	out := Rewrite(swArgsAV1H264, nil, &RewriteOpts{ProbeVideoColor: probe})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	count := 0
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "video:hdr-source(") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 video:hdr-source(...) tag, got %d: %v", count, out.Changes)
+	}
+}
