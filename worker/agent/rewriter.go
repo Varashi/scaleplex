@@ -1914,7 +1914,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		} else if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
 			if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
 				isHWDecode = true
-				changes = append(changes, "decode:hw-passthrough:"+swDecoder)
+				changes = append(changes, TagPrefixDecodeHWPassthrough+swDecoder)
 			} else {
 				// Bare short codec name (hevc/h264/av1/vp9) without -hwaccel:0.
 				// Only safe to auto-upgrade when the encoder side is genuinely
@@ -1935,7 +1935,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					"-hwaccel_output_format:0", "vaapi",
 					"-hwaccel_device:0", "vaapi",
 				)
-				changes = append(changes, "decode:bare-hw-upgrade:"+swDecoder)
+				changes = append(changes, TagPrefixDecodeBareHWUpgrade+swDecoder)
 			}
 		} else if hwDecoder, ok := decoderMap[swDecoder]; ok {
 			args[decCodecIdx+1] = hwDecoder
@@ -1944,7 +1944,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				"-hwaccel_output_format:0", "vaapi",
 				"-hwaccel_device:0", "vaapi",
 			)
-			changes = append(changes, "decode:"+swDecoder+"->"+hwDecoder)
+			changes = append(changes, TagPrefixDecode+swDecoder+"->"+hwDecoder)
 		} else {
 			return bail("unknown-decoder:" + swDecoder)
 		}
@@ -2097,7 +2097,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				transfer, _, _ := opts.ProbeVideoColor(mediaPath)
 				if isHDRTransfer(transfer) {
 					sourceIsHDR = true
-					changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+					changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
 				}
 			}
 
@@ -2106,7 +2106,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				return bail("filter-pattern:" + args[vfIdx])
 			}
 			args[vfIdx] = rewritten.Filter
-			changes = append(changes, "filter:"+rewritten.Mode)
+			changes = append(changes, TagPrefixFilter+rewritten.Mode)
 
 			// 4. Update -map output label following the video filter.
 			// MUST run BEFORE dropSidecarInput: that drop removes args
@@ -2128,7 +2128,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					} else {
 						args[i+1] = rewritten.NewLabel
 					}
-					changes = append(changes, "map-label-update")
+					changes = append(changes, TagMapLabelUpdate)
 					break
 				}
 			}
@@ -2145,7 +2145,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					indexOfArg(args, "-map_inlineass", 0) < 0 {
 					args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0),
 						"-map_inlineass", subSrc.StreamSpec)
-					changes = append(changes, "add:-map_inlineass")
+					changes = append(changes, TagAddMapInlineass)
 				}
 			}
 
@@ -2163,7 +2163,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				return bail("unknown-encoder:" + swEncoder)
 			}
 			args[encCodecIdx+1] = hwEncoder
-			changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
+			changes = append(changes, TagPrefixEncode+swEncoder+"->"+hwEncoder)
 		} else if honorHybrid {
 			// HW decode + SW encode (per-axis honor, docs/HW_PROFILE.md). PMS
 			// emitted `-hwaccel:0 vaapi` decode + a libx264/libx265 encode (its
@@ -2187,7 +2187,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			default:
 				return bail("hw-decode:unexpected-encoder:" + swEncoder)
 			}
-			changes = append(changes, "encode:hw-passthrough:"+swEncoder)
+			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
 
 			// HDR source detection (diagnostic only). scaleplex does NOT
 			// inject a tonemap: when Plex's HW-decode chain is the plain
@@ -2198,7 +2198,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 				if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
 					sourceIsHDR = true
-					changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+					changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
 				}
 			}
 
@@ -2255,7 +2255,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 						if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
 							sourceIsHDR = true
-							changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+							changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
 						}
 					}
 					oldLabel := ""
