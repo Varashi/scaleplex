@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **refactor(rewriter): orthogonal HW-decode-text branch** (#40). The
+  HW-decode-text path now runs through `extractGraphFacts +
+  composeBurn(burnSpec{vaResident:true, …})` — the same orthogonal core the
+  SW-reshape (#39) and HW-decode-bitmap (#37) branches already use. The
+  per-shape `reFilterHWAss` / `reFilterHWOpenCLAss` regex literals (the last
+  two of the original six `reFilter*` shape-keyed regexes) are deleted; every
+  reshape now sits behind the one fact-extractor + one composer. The HDR
+  variant (Plex's `tonemap_opencl` detour) is honored via `tm.stage(facts.algo)`
+  exactly as the SW-HDR path is — algorithm preserved, washed-HDR risk
+  eliminated by construction rather than by a dedicated regex branch.
+  `composeBurn` gains an `animatedTierDown` axis, so the SW-reshape path also
+  picks up the animated-cue tier-down knob (latent feature gain — embedded ASS
+  on SW reshape now tier-downs animated cues the same way the HW path always
+  did). Output graph is byte-equivalent up to label renumbering — Plex's
+  redundant leading `[0:0]hwupload[0]` drops out (the source is already
+  VA-tagged) and labels start at `[0]`/`[1]` instead of `[1]`/`[4]`. PMS's
+  `-map [4]` / `-map [6]` is retargeted via the shared `retargetMapLabel`.
+  Orthogonal parity harness 1369/1369 over the 1583-entry argv corpus, no
+  drift; 4 of the original `reFilter*` regex zoo gone in v1.6.1, last 2 gone
+  now. No fork change.
+
 ## v1.6.1 — 2026-05-26
 
 Bitmap sub-burn unification + PGS cue-clear regression fix + orthogonal SW-reshape detector.

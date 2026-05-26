@@ -147,61 +147,15 @@ var encoderMap = map[string]string{
 	"libx265": "hevc_vaapi",
 }
 
-var (
-	// SW-decode shapes (reFilterAss / reFilterPlain / reFilterHDR /
-	// reFilterHDRAss) collapsed into extractGraphFacts + composeBurn — see
-	// rewriteVideoFilter. Only the HW-decode-text regexes remain below.
-	//
-	// HW-decode + inlineass burn-in. PMS sends this when both
-	// HardwareAcceleratedCodecs=1 AND a force-burn subtitle target.
-	// Filter graph: GPU scale → CPU drop for libass → hwupload back.
-	// Phase 2c keeps Plex's `inlineass=` filter intact (fork's
-	// vf_inlineass binding renders via libass); rewriter only strips
-	// Plex-private AVOption keys vf_inlineass doesn't parse.
-	reFilterHWAss = regexp.MustCompile(
-		`^\[0:0\]hwupload\[0\];` +
-			`\[0\]scale_vaapi=w=(\d+):h=(\d+)(?::format=([A-Za-z0-9]+))?\[1\];` +
-			`\[1\]hwdownload,format=([A-Za-z0-9]+)\[2\];` +
-			`\[2\]inlineass=([^\[]+)\[3\];` +
-			`\[3\]hwupload\[4\]$`)
-	// HW VAAPI decode + OpenCL tonemap + inlineass burn-in. PMS first-
-	// choice when source is HDR AND text-sub burn-in is required AND
-	// PMS `Use hardware-accelerated tone mapping` is ON. Plex's argv
-	// keeps the GPU pipeline via the OpenCL ICD detour for tonemap,
-	// hwdownloads before inlineass, hwuploads after for encode.
-	// Captured 2026-05-13 on PS4 retry (PMS first ran this, ffmpeg
-	// exited 8 because our rewriter bailed, PMS fell back to the SW
-	// shape reFilterHDRAss handles).
-	//
-	// scaleplex-ffmpeg7 has tonemap_vaapi natively — no OpenCL detour
-	// needed. We reshape to the same target shape as reFilterHDRAss:
-	//   hwupload → scale_vaapi(p010) → tonemap_vaapi(nv12) →
-	//   hwdownload → inlineass → hwupload.
-	//
-	// Filter shape:
-	//   [0:0]hwupload[0];
-	//   [0]scale_vaapi=w=W:h=H:format=p010[1];
-	//   [1]hwmap=derive_device=opencl[2];
-	//   [2]tonemap_opencl=tonemap=...:format=nv12:m=...:p=...:r=...[3];
-	//   [3]hwdownload,format=nv12[4];
-	//   [4]inlineass=...[5];
-	//   [5]hwupload[6]
-	// Group 3 captures Plex's tonemap algorithm — the rewrite must
-	// preserve the tone map, not drop it (HDR would render washed).
-	reFilterHWOpenCLAss = regexp.MustCompile(
-		`^\[0:0\]hwupload\[0\];` +
-			`\[0\]scale_vaapi=w=(\d+):h=(\d+)(?::format=[A-Za-z0-9]+)?\[1\];` +
-			`\[1\]hwmap=derive_device=opencl\[2\];` +
-			`\[2\]tonemap_opencl=tonemap=([A-Za-z0-9]+)[^\[]*\[3\];` +
-			`\[3\]hwdownload,format=[A-Za-z0-9]+\[4\];` +
-			`\[4\]inlineass=([^\[]+)\[5\];` +
-			`\[5\]hwupload\[6\]$`)
-	// Plex's HW-decode bitmap (PGS/VobSub/DVDSub) burn graph — `[0:N]scale,
-	// hwupload; [0:0]hwupload; scale_vaapi; [..][..]overlay_vaapi` with an
-	// optional tonemap spliced in on the HDR variant — is recognized by
-	// detectBitmapOverlayBurn (fact extraction, not a rigid shape regex) and
-	// recomposed onto the unified inlineass burn by composeBurn.
-)
+// All per-shape reFilter* regexes (reFilterAss / reFilterPlain / reFilterHDR /
+// reFilterHDRAss for SW-decode + reFilterHWAss / reFilterHWOpenCLAss for
+// HW-decode-text) collapsed into extractGraphFacts + composeBurn — see
+// rewriteVideoFilter (SW-reshape entrypoint) and the HW-decode-text branch of
+// Rewrite(). Plex's HW-decode bitmap (PGS/VobSub/DVDSub) burn graph —
+// `[0:N]scale,hwupload; [0:0]hwupload; scale_vaapi; [..][..]overlay_vaapi`
+// with an optional tonemap spliced in on the HDR variant — is recognized by
+// detectBitmapOverlayBurn (fact extraction, not a rigid shape regex) and
+// recomposed onto the unified inlineass burn by composeBurn.
 
 func envOr(k, dflt string) string {
 	if v, ok := os.LookupEnv(k); ok && v != "" {
@@ -620,6 +574,12 @@ type burnSpec struct {
 	// knob). The bitmap stream is fed via -map_inlineass by the caller.
 	burnSub   bool
 	subParams string
+	// animatedTierDown: text-sub only. When set, append `animated_tier_down=1`
+	// to the inlineass node — the fork's libass renders animated cues
+	// (\move/\t/\k/\fad) one resolution tier below render_height. Static cues
+	// are unaffected. Caller computes via subtitleIsAnimated(); ignored on
+	// !burnSub.
+	animatedTierDown bool
 }
 
 // composeBurn builds the orthogonal stage chain and returns the filtergraph
@@ -660,6 +620,9 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 			params += ":"
 		}
 		params += fmt.Sprintf("render_height=%d", subRenderHeightCap())
+		if s.animatedTierDown {
+			params += ":animated_tier_down=1"
+		}
 		fmt.Fprintf(&b, ";[%s]inlineass=%s[%s]", scaled, params, o)
 		out = o
 	}
@@ -863,14 +826,22 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 	if m := reGraphTrailingLabel.FindStringSubmatch(filterStr); m != nil {
 		oldLabel = "[" + m[1] + "]"
 	}
+	// Animated-cue tier-down only applies to text subs (libass overrides);
+	// bitmap presentations are static per-cue. Embedded ASS with no readable
+	// file is conservatively treated as animated (matches HW-decode-text).
+	animated := false
+	if facts.subKind == "text" && subSrc != nil {
+		animated = subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile)
+	}
 	f, newLabel := tm.composeBurn(burnSpec{
-		vaResident: false,
-		w:          facts.w,
-		h:          facts.h,
-		hdr:        facts.hdr,
-		algo:       facts.algo,
-		burnSub:    facts.subKind != "",
-		subParams:  facts.subParams,
+		vaResident:       false,
+		w:                facts.w,
+		h:                facts.h,
+		hdr:              facts.hdr,
+		algo:             facts.algo,
+		burnSub:          facts.subKind != "",
+		subParams:        facts.subParams,
+		animatedTierDown: animated,
 	})
 	return &filterRewrite{
 		Filter:   f,
@@ -2241,96 +2212,74 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if vfIdx < 0 {
 						return bail("hw-decode-sub:no-inlineass-filter")
 					}
-					m := reFilterHWAss.FindStringSubmatch(args[vfIdx])
-					openclMode := false
-					assGroup := 5
-					if m == nil {
-						// HW VAAPI + OpenCL tonemap variant. PMS emits this
-						// when HW tonemap pref is ON. We can swap the OpenCL
-						// detour for tonemap_vaapi and keep the inlineass
-						// passthrough.
-						m = reFilterHWOpenCLAss.FindStringSubmatch(args[vfIdx])
-						if m == nil {
-							return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
-						}
-						openclMode = true
-						assGroup = 4
+					// Orthogonal core: extractGraphFacts + composeBurn — same
+					// path the SW-reshape and HW-decode-bitmap branches already
+					// take. Plex's HW-text argv shape (with OR without an
+					// intervening tonemap_opencl chain) is a modeled graph;
+					// extractGraphFacts lifts {w/h, hdr+algo, subKind=text,
+					// subParams} and the composer emits the merged-inlineass
+					// VAAPI graph in one shape — Plex's redundant leading
+					// `[0:0]hwupload[0]` is dropped (vaResident=true), and the
+					// hwdownload→inlineass(SW)→hwupload bracket / the OpenCL
+					// detour are absent by construction.
+					facts := extractGraphFacts(args[vfIdx], subSrc)
+					if !facts.ok || facts.subKind != "text" {
+						return bail("hw-decode-sub:unmodeled-graph:" + args[vfIdx])
 					}
-					w, h := m[1], m[2]
-					// Force nv12 across the libass step (matches the SW
-					// pass-through path). HDR-source detection is diagnostic
-					// only — no tonemap is injected here; if Plex wanted one
-					// it would carry a tonemap_opencl chain (reFilterHWOpenCLAss).
+					if facts.hdr {
+						sourceIsHDR = true
+					}
+					// HDR-source label is diagnostic; HW-tonemap-OFF plain shapes
+					// stay tonemap-free here (facts.hdr=false → no tonemap stage),
+					// matching Plex's own behavior.
 					if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 						if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
 							sourceIsHDR = true
 							changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
 						}
 					}
-					scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
-					if openclMode {
-						// Plex's argv carried scale_vaapi(p010) → hwmap(opencl)
-						// → tonemap_opencl(<algo>) → hwdownload. Preserve the
-						// tone map: scale to p010 then run the resolved tonemap
-						// stage (OpenCL passthrough honoring Plex's algorithm,
-						// or tonemap_vaapi under SCALEPLEX_TONEMAP=vaapi).
-						// Without this the HDR source is squashed straight to
-						// nv12 and renders washed.
-						scaleStep = "scale_vaapi=w=" + w + ":h=" + h +
-							":format=p010," + tm.stage(m[3])
-						changes = append(changes,
-							"hw-decode-sub:tonemap-preserved("+m[3]+")")
+					oldLabel := ""
+					if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
+						oldLabel = "[" + m[1] + "]"
 					}
-					// Merged inlineass HW branch (vf_inlineass VAAPI path, patch 0115).
-					// scale_vaapi keeps the VAAPI surface and the fork's inlineass renders
-					// the cue ONTO it: render-once-per-cue for static SRT/ASS, per-frame for
-					// animated (libass detect_change). No hwdownload->inlineass(SW)->hwupload
-					// bracket, no FIFO pre-render, no overlay_vaapi second input. Plex's argv
-					// already carries `-map_inlineass <spec>` + the `-map <spec> -f null
-					// -codec ass` decode sink that drives the scaleplex_inlineass feed - both
-					// kept untouched. render_height folds in the old SCALEPLEX_SUB_RENDER_HEIGHT
-					// worker knob (now a filter option); animated_tier_down lets the filter
-					// drop animated cues one resolution tier (a no-op for static cues).
-					assParams := m[assGroup]
-					// 0119: fork vf_inlineass parses Plex's keys; pass verbatim.
-					strippedAss := assParams
-					inlineArgs := fmt.Sprintf("%s:render_height=%d", strippedAss, subRenderHeightCap())
-					if subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile) {
-						inlineArgs += ":animated_tier_down=1"
+					// vaResident=true: Plex's argv carries `-hwaccel:0 vaapi
+					// -hwaccel_output_format:0 vaapi`, so [0:0] is already a VA
+					// surface — composeBurn skips the leading hwupload (Plex's
+					// own leading `[0:0]hwupload[0]` was a redundant passthrough
+					// on a VA-tagged frame). Force -hwaccel_output_format:0 vaapi
+					// defensively (parity with the HW-decode-bitmap branch).
+					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
+						args[ofIdx+1] = "vaapi"
+					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
+						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+						vfIdx = indexOfArg(args, "-filter_complex", 0) + 1
 					}
-					args[vfIdx] = fmt.Sprintf(
-						"[0:0]hwupload[0];"+
-							"[0]%s[1];"+
-							"[1]inlineass=%s[4]",
-						scaleStep, inlineArgs,
-					)
-					modeTag := "hw-decode:filter:inlineass-vaapi"
-					oldMapLabel := "[4]"
-					if openclMode {
-						// reFilterHWOpenCLAss argv ends at label [6] (extra hwmap->opencl +
-						// tonemap_opencl + hwdownload + inlineass + hwupload). Our graph
-						// outputs [4]; PMS's `-map [6]` must retarget or ffmpeg bails
-						// ("Output with label '6' does not exist").
-						modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi"
-						oldMapLabel = "[6]"
+					animated := subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile)
+					newFilter, newLabel := tm.composeBurn(burnSpec{
+						vaResident:       true,
+						w:                facts.w,
+						h:                facts.h,
+						hdr:              facts.hdr,
+						algo:             facts.algo,
+						burnSub:          true,
+						subParams:        facts.subParams,
+						animatedTierDown: animated,
+					})
+					args[vfIdx] = newFilter
+					retargetMapLabel(args, oldLabel, newLabel)
+					if facts.hdr {
+						// Plex's HW-tonemap-ON shape carries a tonemap_opencl chain;
+						// the rewrite preserves the algorithm (composeBurn routes it
+						// through tm.stage, which keeps the OpenCL chain by default
+						// or collapses to tonemap_vaapi under SCALEPLEX_TONEMAP=vaapi).
+						// Without this preservation HDR renders washed.
+						changes = append(changes, "hw-decode-sub:tonemap-preserved("+facts.algo+")")
+						changes = append(changes, "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi")
+					} else {
+						changes = append(changes, "hw-decode:filter:inlineass-vaapi")
 					}
-					changes = append(changes, modeTag)
-					if oldMapLabel != "[4]" {
-						for i := vfIdx + 1; i < len(args)-1; i++ {
-							if args[i] != "-map" {
-								continue
-							}
-							v := args[i+1]
-							if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
-								if strings.HasPrefix(v, `"`) {
-									args[i+1] = `"[4]"`
-								} else {
-									args[i+1] = "[4]"
-								}
-								changes = append(changes, "hw-decode:map-label-update")
-								break
-							}
-						}
+					if oldLabel != "" && oldLabel != newLabel {
+						changes = append(changes, "hw-decode:map-label-update")
 					}
 					newInputIdx = indexOfArg(args, "-i", 0)
 					encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
