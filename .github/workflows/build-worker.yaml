@@ -11,6 +11,7 @@ on:
     paths:
       - "worker/**"
       - "scaleplex-ffmpeg/**"
+      - ".github/workflows/build-worker.yaml"
   workflow_run:
     # Rebuild the worker image whenever a fresh ffmpeg deb is published.
     workflows: [build-ffmpeg]
@@ -34,6 +35,9 @@ jobs:
       - name: vet
         working-directory: worker/agent
         run: go vet ./...
+      - name: test
+        working-directory: worker/agent
+        run: go test -cover ./...
       - name: build
         working-directory: worker/agent
         run: go build ./...

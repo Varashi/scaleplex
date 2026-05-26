@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "orchestrator/**"
+      - ".github/workflows/build-orchestrator.yaml"
   workflow_dispatch:
 
 permissions:
@@ -28,7 +29,7 @@ jobs:
         run: go vet ./...
       - name: test
         working-directory: orchestrator
-        run: go test ./...
+        run: go test -cover ./...
       - name: build
         working-directory: orchestrator
         run: go build ./...
