@@ -1396,9 +1396,9 @@ func rewriteSegmentList(args []string, inputEnv map[string]string, segTime strin
 			// without the query param.
 		}
 		args[i+1] = rewritten
-		tag := "hls:segment_list:rewrite-to-relay"
+		tag := TagHLSSegmentListRewriteToRelay
 		if variant == "side-channel" {
-			tag = "subs:side-channel-segment_list:rewrite-to-relay"
+			tag = TagSubsSideChannelSegListToRelay
 		}
 		*changes = append(*changes, tag)
 		// -segment_list_size left untouched. scaleplex-ffmpeg7 patch 0106

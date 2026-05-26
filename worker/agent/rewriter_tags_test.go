@@ -140,7 +140,11 @@ func loadTagInventory() (full, prefixes, bailReasons map[string]bool) {
 //	              append(<*>Changes, ...). For `"prefix:"+x` the leading
 //	              literal is "prefix:"; for fmt.Sprintf("fmt-string", ...)
 //	              it's the format string; for a bare "literal" it's that
-//	              literal. Non-literal values contribute nothing.
+//	              literal. For a bare *ident* whose value was assigned
+//	              from a string literal (one or more times across the
+//	              file), the set of those literals is included — handles
+//	              the `tag := "A"; if cond { tag = "B" }; append(..., tag)`
+//	              shape. Non-literal values contribute nothing.
 //	bailReasons — the LEADING literal of the first arg to bail(...). Same
 //	              rules apply: bail("prefix:"+x) → "prefix:".
 //
@@ -158,6 +162,16 @@ func extractEmittedLiterals(t *testing.T, path string) (emitted, bailReasons map
 		t.Fatalf("parse %s: %v", path, err)
 	}
 
+	// Pre-pass: collect every `name := "lit"`, `name = "lit"`, and
+	// `var name = "lit"` so the second pass can resolve bare-ident
+	// emit sites like `tag := "..."; append(*changes, tag)`. Multiple
+	// literals per name accumulate (covers the `tag := "A"; tag = "B"`
+	// branching pattern). File-scoped, not function-scoped — collisions
+	// are deliberate: an unused literal in another function still
+	// counts as covered, which is the conservative behavior (false
+	// negatives in the test result only, never false positives).
+	varLiterals := collectVarLiterals(f)
+
 	ast.Inspect(f, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
@@ -170,14 +184,14 @@ func extractEmittedLiterals(t *testing.T, path string) (emitted, bailReasons map
 		switch fn.Name {
 		case "bail":
 			if len(call.Args) >= 1 {
-				if lit := leadingLiteral(call.Args[0]); lit != "" {
+				for _, lit := range allLeadingLiterals(call.Args[0], varLiterals) {
 					bailReasons[lit] = true
 				}
 			}
 		case "append":
 			if len(call.Args) >= 2 && isChangesIdent(call.Args[0]) {
 				for _, arg := range call.Args[1:] {
-					if lit := leadingLiteral(arg); lit != "" {
+					for _, lit := range allLeadingLiterals(arg, varLiterals) {
 						emitted[lit] = true
 					}
 				}
@@ -186,6 +200,110 @@ func extractEmittedLiterals(t *testing.T, path string) (emitted, bailReasons map
 		return true
 	})
 	return
+}
+
+// collectVarLiterals AST-walks f and returns a map of identifier name →
+// set of string-literal values ever assigned to it. Picks up:
+//
+//	tag := "literal"            (short var decl)
+//	tag = "literal"             (assignment)
+//	var tag = "literal"         (var decl with initializer)
+//
+// and assignments that look like `name := <known-tag-const>` or
+// `name = <known-tag-const>` (resolves package-level const idents to
+// their string value if they're TagPrefix*/Tag* in rewriter_tags.go).
+// File-scoped — same-named vars in different functions all funnel into
+// the same key. That's a deliberate over-collection: the inventory
+// test asks "is this string ever emitted?", and a literal assigned to
+// `tag` anywhere counts the moment we see `append(..., tag)`.
+func collectVarLiterals(f *ast.File) map[string][]string {
+	// First pass: pick up known const idents so `tag := TagFoo`
+	// resolves to TagFoo's value.
+	constLits := map[string]string{}
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Names) == 0 || len(vs.Values) == 0 {
+				continue
+			}
+			if lit, ok := vs.Values[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				constLits[vs.Names[0].Name] = strings.Trim(lit.Value, "`\"")
+			}
+		}
+	}
+
+	out := map[string][]string{}
+	add := func(name string, rhs ast.Expr) {
+		switch v := rhs.(type) {
+		case *ast.BasicLit:
+			if v.Kind == token.STRING {
+				out[name] = append(out[name], strings.Trim(v.Value, "`\""))
+			}
+		case *ast.Ident:
+			if lit, ok := constLits[v.Name]; ok {
+				out[name] = append(out[name], lit)
+			}
+		}
+	}
+
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch s := n.(type) {
+		case *ast.AssignStmt:
+			// `name := "lit"`, `name = "lit"`, or paired
+			// `name1, name2 := ...` (we only walk per-position pairs).
+			if len(s.Lhs) != len(s.Rhs) {
+				return true
+			}
+			for i := range s.Lhs {
+				if id, ok := s.Lhs[i].(*ast.Ident); ok {
+					add(id.Name, s.Rhs[i])
+				}
+			}
+		case *ast.ValueSpec:
+			// `var name = "lit"` (and same-position lists).
+			if len(s.Values) != len(s.Names) {
+				return true
+			}
+			for i, id := range s.Names {
+				add(id.Name, s.Values[i])
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// allLeadingLiterals returns every leading literal value of expr, looking
+// through the var map for bare *ast.Ident references. Returns nil if
+// none. Wrapper around leadingLiteral that adds the ident-resolution
+// step.
+func allLeadingLiterals(expr ast.Expr, varMap map[string][]string) []string {
+	if id, ok := expr.(*ast.Ident); ok {
+		if lits := varMap[id.Name]; len(lits) > 0 {
+			return lits
+		}
+	}
+	if lit := leadingLiteral(expr); lit != "" {
+		return []string{lit}
+	}
+	// Concat / Sprintf with a leading Ident: also resolve.
+	if be, ok := expr.(*ast.BinaryExpr); ok && be.Op == token.ADD {
+		return allLeadingLiterals(be.X, varMap)
+	}
+	if call, ok := expr.(*ast.CallExpr); ok {
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "fmt" {
+				if strings.HasPrefix(sel.Sel.Name, "Sprint") && len(call.Args) > 0 {
+					return allLeadingLiterals(call.Args[0], varMap)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // leadingLiteral returns the leftmost string literal value of expr, peeling
@@ -200,6 +318,9 @@ func extractEmittedLiterals(t *testing.T, path string) (emitted, bailReasons map
 //	fmt.Sprintf("foo=%s", x)         → "foo=%s"
 //	fmt.Sprintf("foo=%d", n)         → "foo=%d"
 //	x                                 → ""      (no literal anchor → skip)
+//
+// For ident-anchored shapes (`tag := "A"; append(..., tag)`), use
+// allLeadingLiterals with a populated var map instead.
 func leadingLiteral(expr ast.Expr) string {
 	switch e := expr.(type) {
 	case *ast.BasicLit:
@@ -223,10 +344,21 @@ func leadingLiteral(expr ast.Expr) string {
 	return ""
 }
 
-// isChangesIdent returns true if expr is an identifier whose name ends in
-// "Changes" or is "changes" — covers `changes`, `bailChanges`, `hintChanges`,
-// `oclChanges`, `manifestChanges`, `scrubChanges`, `merged` etc.
+// isChangesIdent returns true if expr is an identifier — or a deref
+// of one (`*changes`) — whose name ends in "Changes" or is "changes" /
+// "merged". Covers `changes`, `bailChanges`, `hintChanges`,
+// `oclChanges`, `manifestChanges`, `scrubChanges`, `merged`, and the
+// pointer-receiver form used by rewriteSegmentList:
+// `*changes = append(*changes, ...)`. The deref form was a v1.7.0
+// release-gate finding — the two segment-list change tags emitted via
+// `*changes = append(*changes, tag)` slipped past the walker.
 func isChangesIdent(expr ast.Expr) bool {
+	// Pointer deref `*changes` parses to *ast.StarExpr in Go AST,
+	// not UnaryExpr. (UnaryExpr covers `!x`, `-x`, `&x` etc; the `*`
+	// for pointer-deref-as-expression has its own node type.)
+	if s, ok := expr.(*ast.StarExpr); ok {
+		return isChangesIdent(s.X)
+	}
 	id, ok := expr.(*ast.Ident)
 	if !ok {
 		return false
@@ -282,6 +414,7 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagFilterTonemapOpenCLToVAAPI":       "filter:tonemap_opencl->tonemap_vaapi",
 		"TagForceHWWouldHonorHWDecSWEnc":      "force-hw:would-honor-hwdec-swenc",
 		"TagForceHWWouldHonorSW":              "force-hw:would-honor-sw",
+		"TagHLSSegmentListRewriteToRelay":     "hls:segment_list:rewrite-to-relay",
 		"TagHWDecodeFilterBitmapInlineassVA":  "hw-decode:filter:bitmap-inlineass-vaapi",
 		"TagHWDecodeFilterInlineassVA":        "hw-decode:filter:inlineass-vaapi",
 		"TagHWDecodeFilterOCLToVAAPIIA":       "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi",
@@ -295,6 +428,7 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagMapLabelUpdate":                   "map-label-update",
 		"TagProgressAppendXPlexToken":         "progress:append-X-Plex-Token",
 		"TagProgressURLCapturedForReporter":   "progressurl:captured-for-reporter",
+		"TagSubsSideChannelSegListToRelay":    "subs:side-channel-segment_list:rewrite-to-relay",
 		"TagTonemapOCLCollapseRevmapDownload": "tonemap:ocl:collapse-revmap-download",
 		"TagTonemapOCLDropLeadHWUpload":       "tonemap:ocl:drop-lead-hwupload",
 		"TagTonemapOCLForceOutputFormatVA":    "tonemap:ocl:force-output-format-vaapi",
@@ -387,3 +521,135 @@ func loadTagInventoryByName() map[string]string {
 	return out
 }
 
+
+// TestWalker_TracksAssignedLiterals exercises the := / = / var
+// assignment-tracking added to extractEmittedLiterals so an emit
+// site that goes through a local variable (`tag := "foo"; append(c,
+// tag)`) is still recognised as covered by the inventory.
+//
+// Reproduces the v1.7.0 release-gate finding: rewriter.go's
+// rewriteSegmentList emitted "hls:segment_list:rewrite-to-relay" and
+// "subs:side-channel-segment_list:rewrite-to-relay" through a local
+// `tag` that was conditionally reassigned — the walker missed both
+// because it only followed direct literals or `"prefix:" + x`.
+func TestWalker_TracksAssignedLiterals(t *testing.T) {
+	src := `package x
+
+const TagKnown = "known:const"
+
+func emit(changes *[]string) {
+	// 1. := literal
+	a := "shape-a:literal"
+	*changes = append(*changes, a)
+
+	// 2. := literal + later = literal reassignment
+	b := "shape-b:default"
+	if true {
+		b = "shape-b:override"
+	}
+	*changes = append(*changes, b)
+
+	// 3. := <const ident>
+	c := TagKnown
+	*changes = append(*changes, c)
+
+	// 4. var name = literal
+	var d = "shape-d:var"
+	*changes = append(*changes, d)
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic: %v", err)
+	}
+	varLits := collectVarLiterals(f)
+
+	for name, want := range map[string][]string{
+		"a": {"shape-a:literal"},
+		"b": {"shape-b:default", "shape-b:override"},
+		"c": {"known:const"},
+		"d": {"shape-d:var"},
+	} {
+		got := varLits[name]
+		// Compare as sets (order is collection-dependent).
+		gotSet := map[string]bool{}
+		for _, s := range got {
+			gotSet[s] = true
+		}
+		for _, w := range want {
+			if !gotSet[w] {
+				t.Errorf("var %q: missing literal %q (got %v)", name, w, got)
+			}
+		}
+		if len(got) != len(want) {
+			t.Errorf("var %q: literal count = %d, want %d (got %v)", name, len(got), len(want), got)
+		}
+	}
+
+	// Sweep every append(*changes, X) in the synthetic and assert
+	// all 5 distinct literals (1 + 2 + 1 + 1) surface in the
+	// emitted set.
+	emitted := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.Ident)
+		if !ok || fn.Name != "append" {
+			return true
+		}
+		if len(call.Args) < 2 || !isChangesIdent(call.Args[0]) {
+			return true
+		}
+		for _, arg := range call.Args[1:] {
+			for _, lit := range allLeadingLiterals(arg, varLits) {
+				emitted[lit] = true
+			}
+		}
+		return true
+	})
+
+	for _, want := range []string{
+		"shape-a:literal",
+		"shape-b:default",
+		"shape-b:override",
+		"known:const",
+		"shape-d:var",
+	} {
+		if !emitted[want] {
+			t.Errorf("emitted set missing %q (have %v)", want, emitted)
+		}
+	}
+}
+
+// TestWalker_LeadingLiteralUnchanged pins the simpler leadingLiteral
+// contract — bare ident still resolves to "" (the var-aware paths
+// live in allLeadingLiterals).
+func TestWalker_LeadingLiteralUnchanged(t *testing.T) {
+	src := `package x
+func f() string {
+	x := "tag-x"
+	_ = x
+	return ""
+}
+`
+	fset := token.NewFileSet()
+	f, _ := parser.ParseFile(fset, "synthetic2.go", src, 0)
+	var idents []*ast.Ident
+	ast.Inspect(f, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && id.Name == "x" {
+			idents = append(idents, id)
+		}
+		return true
+	})
+	if len(idents) == 0 {
+		t.Fatal("no x idents found in synthetic")
+	}
+	// leadingLiteral on a bare ident must still return "" (legacy
+	// contract — callers route ident shapes through allLeadingLiterals).
+	if got := leadingLiteral(idents[0]); got != "" {
+		t.Errorf("leadingLiteral on bare ident = %q, want \"\"", got)
+	}
+}
