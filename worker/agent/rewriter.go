@@ -148,13 +148,10 @@ var encoderMap = map[string]string{
 }
 
 var (
-	reFilterAss = regexp.MustCompile(
-		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
-			`\[0\]format=pix_fmts=[^\[]*nv12\[1\];` +
-			`\[1\]inlineass=([^\[]*)\[2\]$`)
-	reFilterPlain = regexp.MustCompile(
-		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
-			`\[0\]format=pix_fmts=[^\[]*nv12\[1\]$`)
+	// SW-decode shapes (reFilterAss / reFilterPlain / reFilterHDR /
+	// reFilterHDRAss) collapsed into extractGraphFacts + composeBurn — see
+	// rewriteVideoFilter. Only the HW-decode-text regexes remain below.
+	//
 	// HW-decode + inlineass burn-in. PMS sends this when both
 	// HardwareAcceleratedCodecs=1 AND a force-burn subtitle target.
 	// Filter graph: GPU scale → CPU drop for libass → hwupload back.
@@ -167,40 +164,6 @@ var (
 			`\[1\]hwdownload,format=([A-Za-z0-9]+)\[2\];` +
 			`\[2\]inlineass=([^\[]+)\[3\];` +
 			`\[3\]hwupload\[4\]$`)
-	// HDR→SDR PMS pattern: scale → zscale(linear) → format(gbrpf32le) →
-	// zscale(primaries=bt709) → tonemap → zscale(bt709) → format(nv12).
-	// Capture leading w/h and the final output label number; the middle is
-	// flexible because Plex tweaks the chain across versions.
-	reFilterHDR = regexp.MustCompile(
-		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[\d+\];` +
-			`.*zscale.*tonemap.*format=pix_fmts=[^\[]*nv12\[(\d+)\]$`)
-	// SW HDR + inlineass burn-in PMS pattern. PMS sends this when
-	// source is HDR (BT.2020 PQ), target is SDR, AND text-sub burn-in
-	// is required. Plex's transcoder collapses the whole pipeline to
-	// SW because its HW pipeline can't combine HW tonemap +
-	// inlineass(SW). scaleplex CAN: we reshape to
-	//   hwupload → scale_vaapi(p010) → tonemap_vaapi(nv12) →
-	//   hwdownload → inlineass → hwupload → hevc_vaapi,
-	// keeping the libass render step on CPU but everything else on
-	// the GPU. Net result: PS4-class clients (HDR source, SDR
-	// transcode, text-sub-burn) get HW transcode that Plex's prod
-	// transcoder can't produce.
-	//
-	// Filter shape captured 2026-05-13 on PS4 + FMJ 4K HDR + SRT burn:
-	//   [0:0]scale=w=W:h=H:force_divisible_by=4[0];
-	//   [0]format=p010,tonemap=hable[1];
-	//   [1]format=pix_fmts=yuv420p|nv12[2];
-	//   [2]inlineass=...[3]
-	// Group 3 captures Plex's tonemap algorithm (any algo, not just
-	// `hable` — a non-hable session used to miss this regex and bail with
-	// exit 8). On the default VAAPI backend tonemap_vaapi is fixed-curve
-	// so the algo is moot; on the OpenCL backend tm.stage(algo) preserves
-	// Plex's choice. Group 4 is the inlineass params.
-	reFilterHDRAss = regexp.MustCompile(
-		`^\[0:0\]scale=w=(\d+):h=(\d+)(?::force_divisible_by=\d+)?\[0\];` +
-			`\[0\]format=p010,tonemap=([A-Za-z0-9]+)\[1\];` +
-			`\[1\]format=pix_fmts=[^\[]*nv12\[2\];` +
-			`\[2\]inlineass=([^\[]*)\[3\]$`)
 	// HW VAAPI decode + OpenCL tonemap + inlineass burn-in. PMS first-
 	// choice when source is HDR AND text-sub burn-in is required AND
 	// PMS `Use hardware-accelerated tone mapping` is ON. Plex's argv
@@ -740,6 +703,110 @@ func retargetMapLabel(args []string, oldLabel, newLabel string) {
 	}
 }
 
+// graphFacts are the orthogonal axes extracted from ANY recognized Plex video
+// filtergraph — the input side of the orthogonal rewriter. composeBurn turns
+// them back into a canonical graph, so one extractor + the composer can replace
+// the per-shape reFilter* regex zoo. vaResident is NOT here: it's decided by the
+// presence of `-hwaccel:0` in the argv, not the graph.
+type graphFacts struct {
+	w, h      string
+	hdr       bool   // a tonemap stage is present
+	algo      string // honored tonemap algo ("" = none / fixed-curve)
+	subKind   string // "", "text", "bitmap"
+	subParams string // inlineass params (text)
+	subSpec   string // sub stream spec (bitmap overlay)
+	ok        bool   // recognized AND every node is modeled (safe to recompose)
+}
+
+var (
+	// reGraphScaleWH: the main-video scale (scale= or scale_vaapi=) target.
+	reGraphScaleWH = regexp.MustCompile(`scale(?:_vaapi)?=w=(\d+):h=(\d+)`)
+	// reGraphTonemapSW: a bare `tonemap=<algo>` filter (Plex's SW HDR chain),
+	// excluding tonemap_opencl=/tonemap_vaapi= (those are matched separately).
+	reGraphTonemapSW = regexp.MustCompile(`(?:^|[,;\]])tonemap=([A-Za-z0-9]+)`)
+	reGraphInlineass = regexp.MustCompile(`inlineass=([^\[]*)`)
+	// reGraphFilterName: a filtergraph node name — an identifier preceded by a
+	// chain boundary (start, ';', ',', ']') possibly followed by whitespace,
+	// and followed by '=', '[', ',', ';' or end. Arg values (after '=' or ':')
+	// are not preceded by a boundary, so they aren't matched. The `\s*` after
+	// the boundary lets the matcher catch nodes after whitespace (Plex emits
+	// e.g. `; [1]crop=...` in places) — without it, an unmodeled node could
+	// bypass graphNodesModeled and silently skip the safety bail.
+	reGraphFilterName = regexp.MustCompile(`(?:^|[;,\]])\s*([a-z_][a-z0-9_]*)(?:[=\[,;]|$)`)
+)
+
+// modeledFilterNodes is every filtergraph node composeBurn / the rewriter
+// understands. extractGraphFacts bails (ok=false) on a graph carrying anything
+// else, so an unrecognized shape falls through to the existing bail/SW path
+// instead of being mis-recomposed — preserving the strict reFilter* behavior.
+var modeledFilterNodes = map[string]bool{
+	"scale": true, "scale_vaapi": true, "hwupload": true, "hwdownload": true,
+	"hwmap": true, "format": true, "setparams": true, "tonemap": true,
+	"tonemap_opencl": true, "tonemap_vaapi": true, "zscale": true,
+	"inlineass": true, "overlay_vaapi": true,
+}
+
+// graphNodesModeled reports whether every filter node in the graph is in
+// modeledFilterNodes.
+func graphNodesModeled(graph string) bool {
+	for _, m := range reGraphFilterName.FindAllStringSubmatch(graph, -1) {
+		if !modeledFilterNodes[m[1]] {
+			return false
+		}
+	}
+	return true
+}
+
+// extractGraphFacts pulls the orthogonal axes from a Plex filtergraph. It
+// recognizes the same shapes the reFilter* regexes do — text/bitmap × SDR/HDR
+// × scale — keyed on the semantic nodes rather than one rigid layout, and bails
+// (ok=false) on any graph with an unmodeled node. subSrc supplies the
+// authoritative sub kind/spec (from -map_inlineass / probe); the graph supplies
+// w/h, tonemap algo, and the text inlineass params.
+func extractGraphFacts(graph string, subSrc *subtitleSource) graphFacts {
+	var f graphFacts
+	// Bitmap sub2video→overlay_vaapi burn (with/without an intervening
+	// tonemap) — already a fact extractor.
+	if spec, w, h, algo, hdr, ok := detectBitmapOverlayBurn(graph); ok {
+		if !graphNodesModeled(graph) {
+			return f
+		}
+		f.w, f.h, f.algo, f.hdr = w, h, algo, hdr
+		f.subKind, f.subSpec, f.ok = "bitmap", spec, true
+		return f
+	}
+	m := reGraphScaleWH.FindStringSubmatch(graph)
+	if m == nil {
+		return f // no main scale → not a shape we recompose
+	}
+	f.w, f.h = m[1], m[2]
+	switch {
+	case reTonemapOpenCLAlgo.MatchString(graph):
+		f.hdr, f.algo = true, reTonemapOpenCLAlgo.FindStringSubmatch(graph)[1]
+	case reGraphTonemapSW.MatchString(graph):
+		f.hdr, f.algo = true, reGraphTonemapSW.FindStringSubmatch(graph)[1]
+	case strings.Contains(graph, "tonemap_vaapi"):
+		f.hdr = true
+	}
+	switch {
+	case subSrc != nil && subSrc.Kind == "bitmap":
+		// Sidecar/embedded bitmap reaching us via -map_inlineass with Plex's
+		// `inlineass=` node (no overlay_vaapi). subSrc is authoritative — don't
+		// misread the inlineass node as text.
+		f.subKind, f.subSpec = "bitmap", subSrc.StreamSpec
+	case (subSrc != nil && subSrc.Kind == "text") || strings.Contains(graph, "inlineass="):
+		f.subKind = "text"
+		if im := reGraphInlineass.FindStringSubmatch(graph); im != nil {
+			f.subParams = im[1]
+		}
+	}
+	if !graphNodesModeled(graph) {
+		return f
+	}
+	f.ok = true
+	return f
+}
+
 // detectBitmapOverlayBurn recognizes Plex's bitmap (PGS/VobSub/DVDSub)
 // sub2video→overlay_vaapi burn graph — with OR without an intervening
 // tonemap_opencl chain — and extracts the orthogonal facts needed to recompose
@@ -765,129 +832,68 @@ func detectBitmapOverlayBurn(graph string) (streamSpec, w, h, algo string, hdr, 
 	return
 }
 
+// rewriteVideoFilter reshapes Plex's SW-decode filtergraph (the force-HW/reshape
+// path) into scaleplex's canonical HW graph. It is now a thin adapter over the
+// orthogonal core: extractGraphFacts pulls the axes (w/h, hdr+algo, sub
+// kind/params) and composeBurn emits the one canonical shape
+// ([0:0] → hwupload → scale_vaapi(p010|nv12) → [tonemap] → [inlineass]),
+// replacing the per-shape reFilterAss/Plain/HDR/HDRAss branches. [0:0] is a
+// system-memory frame here (Plex SW-decoded), so vaResident=false. Tonemap is
+// driven by facts.hdr (what Plex's graph declared), NOT the source probe — a
+// graph with no tonemap stays SDR even on an HDR source (Plex's policy). Bails
+// (nil) on any unmodeled graph, exactly like the old strict regexes.
 func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sourceIsHDR bool, tm tonemapConfig) *filterRewrite {
 	_ = mediaPath
-	if m := reFilterAss.FindStringSubmatch(filterStr); m != nil {
-		w, h, assParams := m[1], m[2], m[3]
-
-		// Bitmap subs (PGS / VobSub / DVDSub) burn through the SAME inlineass
-		// path as text — one unified sub stage, no overlay_vaapi anywhere. The
-		// fork's -map_inlineass binding routes bitmap codecs to replay_bitmap
-		// and renders at render_height (band), instead of Plex's full-frame
-		// sub2video→overlay_vaapi (the ~5x hog). -map_inlineass is KEPT (the
-		// mode is not "overlay-vaapi"), so the caller leaves the binding + the
-		// sidecar input in place for the fork to consume via StreamSpec.
-		//
-		// No tonemap is composed: a plain reFilterAss match means Plex emitted
-		// none, so scaleplex emits none either (HDR-passthrough policy) — even
-		// when the source is HDR.
-		scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
-
-		if subSrc != nil && subSrc.Kind == "bitmap" && subSrc.StreamSpec != "" {
-			f, newLabel := tm.composeBurn(burnSpec{
-				vaResident: false, w: w, h: h, burnSub: true,
-			})
-			return &filterRewrite{
-				Filter:   f,
-				OldLabel: "[2]",
-				NewLabel: newLabel,
-				Mode:     "bitmap-inlineass-vaapi",
-			}
-		}
-
-		// Text subs (SRT/ASS/MOV_TEXT/...): keep Plex's inlineass=
-		// filter (strip the 4 unknown AVOption keys) and let the
-		// scaleplex-ffmpeg7 fork's vf_inlineass + scaleplex_inlineass
-		// binding render. Sub packets arrive via the -map_inlineass
-		// side-channel; the filter graph runs libass on CPU nv12
-		// frames between hwdownload and hwupload.
-		if subSrc != nil && subSrc.Kind == "text" {
-			mode := "passthrough-inlineass"
-			if sourceIsHDR {
-				mode = "passthrough-inlineass-hdr"
-			}
-			// 0119: fork vf_inlineass parses Plex's overrides/outline/shadow/
-			// language keys, so pass the params verbatim (no strip).
-			strippedAss := assParams
-			return &filterRewrite{
-				Filter: fmt.Sprintf(
-					"[0:0]hwupload[10];"+
-						"[10]%s[11];"+
-						"[11]hwdownload[12];"+
-						"[12]format=pix_fmts=nv12[13];"+
-						"[13]inlineass=%s[14];"+
-						"[14]hwupload[15]",
-					scaleStep, strippedAss),
-				OldLabel: "[2]",
-				NewLabel: "[15]",
-				Mode:     mode,
-			}
-		}
-
-		// No usable subtitle source resolved. Bail loud.
-		_ = w
-		_ = h
-		_ = assParams
+	_ = sourceIsHDR
+	// SW-reshape path only: [0:0] is a system-memory frame (Plex SW-decoded),
+	// so the graph opens with a SW `scale=`. HW-shaped graphs (`scale_vaapi` /
+	// leading `hwupload`, e.g. the hybrid-force-HW case where [0:0] is already
+	// VA) are handled by the HW-decode branch — bail here so they fall through
+	// unchanged rather than getting a wrong leading hwupload from
+	// composeBurn(vaResident=false). Matches the old reFilter* `^\[0:0\]scale=`
+	// anchor.
+	if !strings.HasPrefix(filterStr, "[0:0]scale=w=") {
 		return nil
 	}
-
-	if m := reFilterHDR.FindStringSubmatch(filterStr); m != nil {
-		w, h, finalIdx := m[1], m[2], m[3]
-		return &filterRewrite{
-			Filter: fmt.Sprintf(
-				"[0:0]hwupload[0];[0]%s[1];[1]hwupload[2]",
-				tm.hdrScale(w, h)),
-			OldLabel: "[" + finalIdx + "]",
-			NewLabel: "[2]",
-			Mode:     "hdr-tonemap-vaapi",
-		}
+	facts := extractGraphFacts(filterStr, subSrc)
+	if !facts.ok {
+		return nil
 	}
-
-	if m := reFilterHDRAss.FindStringSubmatch(filterStr); m != nil {
-		// HDR-source + SDR-target + text-sub burn-in. PMS sent a full SW
-		// chain; we force HW reshape with libass on CPU between
-		// hwdownload/hwupload brackets. Mirrors reFilterAss text branch
-		// but with the tonemap step PMS's SW pattern declared inline.
-		w, h, algo, assParams := m[1], m[2], m[3], m[4]
-		if subSrc == nil || subSrc.Kind != "text" {
-			// Bitmap subs reach us via reFilterAss (PGS uses
-			// `format=nv12 + inlineass` without the separate tonemap
-			// step); only the text path lands here. Bail loud if we
-			// see anything else.
-			return nil
-		}
-		// 0119: fork vf_inlineass parses Plex's keys; pass params verbatim.
-		strippedAss := assParams
-		return &filterRewrite{
-			Filter: fmt.Sprintf(
-				"[0:0]hwupload[10];[10]%s[11];"+
-					"[11]hwdownload[12];"+
-					"[12]format=pix_fmts=nv12[13];"+
-					"[13]inlineass=%s[14];"+
-					"[14]hwupload[15]",
-				tm.hdrScaleAlgo(w, h, algo), strippedAss),
-			OldLabel: "[3]",
-			NewLabel: "[15]",
-			Mode:     "hdr-tonemap-vaapi-passthrough-inlineass",
-		}
+	oldLabel := ""
+	if m := reGraphTrailingLabel.FindStringSubmatch(filterStr); m != nil {
+		oldLabel = "[" + m[1] + "]"
 	}
-
-	if m := reFilterPlain.FindStringSubmatch(filterStr); m != nil {
-		w, h := m[1], m[2]
-		// No implicit tonemap: a plain SDR-target chain with no tonemap
-		// filter is exactly what Plex emits when HW tone mapping is off
-		// (Plex then does no tonemapping at all). scaleplex matches that
-		// — it does not second-guess Plex with an injected tonemap.
-		return &filterRewrite{
-			Filter: fmt.Sprintf(
-				"[0:0]hwupload[0];[0]scale_vaapi=w=%s:h=%s:format=nv12[1];[1]hwupload[2]",
-				w, h),
-			OldLabel: "[1]",
-			NewLabel: "[2]",
-			Mode:     "plain",
-		}
+	f, newLabel := tm.composeBurn(burnSpec{
+		vaResident: false,
+		w:          facts.w,
+		h:          facts.h,
+		hdr:        facts.hdr,
+		algo:       facts.algo,
+		burnSub:    facts.subKind != "",
+		subParams:  facts.subParams,
+	})
+	return &filterRewrite{
+		Filter:   f,
+		OldLabel: oldLabel,
+		NewLabel: newLabel,
+		Mode:     composeMode(facts),
 	}
-	return nil
+}
+
+// composeMode names a composeBurn reshape for the change tag + the caller's
+// -map_inlineass handling ("bitmap-inlineass-vaapi" makes the caller ensure the
+// flag is present for the replay_bitmap feed).
+func composeMode(f graphFacts) string {
+	switch f.subKind {
+	case "bitmap":
+		return "bitmap-inlineass-vaapi"
+	case "text":
+		return "text-inlineass-vaapi"
+	}
+	if f.hdr {
+		return "hdr-tonemap-vaapi"
+	}
+	return "plain"
 }
 
 // substituteOpenCLTonemap normalizes Plex's OpenCL HW tonemap filter
