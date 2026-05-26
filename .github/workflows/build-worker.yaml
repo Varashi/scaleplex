@@ -38,6 +38,19 @@ jobs:
       - name: test
         working-directory: worker/agent
         run: go test -cover ./...
+      - name: replay (rewriter-only, fixture corpus)
+        # Build-tagged replay tests against the committed
+        # worker/agent/testdata/replay-corpus/ fixture (240 stratified
+        # synthetic Optimize cells). REPLAY_NO_FFMPEG=1 skips the
+        # in-pod ffmpeg spawn — catches rewriter regressions in PR CI
+        # without needing the cluster or the live corpus. In-pod
+        # replay against plex-test remains a pre-tag step (see
+        # docs/RELEASE_GATE.md T2).
+        working-directory: worker/agent
+        env:
+          REPLAY_CORPUS_DIR: ${{ github.workspace }}/worker/agent/testdata/replay-corpus
+          REPLAY_NO_FFMPEG: "1"
+        run: go test -tags=replay -run TestReplayCorpus ./...
       - name: build
         working-directory: worker/agent
         run: go build ./...
