@@ -1,16 +1,32 @@
 # Unified subtitle burn-in — merged `inlineass` VAAPI branch
 
-> **Status: SHIPPED v1.3.0 (2026-05-24).** Subtitle burn-in moved out of the
-> Go agent orchestration (2nd ffmpeg + qtrle FIFO + `overlay_vaapi` framesync)
-> into the scaleplex-ffmpeg fork. The prototype was a standalone
-> `overlay_sub_vaapi` filter (patches 0112/0113, since dropped); it shipped
-> **merged into `vf_inlineass`** as a format-adaptive HW (VAAPI VPP) branch
-> alongside the existing SW (FFDraw) path — one Plex-native `inlineass` node,
-> HW/SW chosen by the negotiated input frame format (patch **0115**). The
-> rewriter emits `inlineass=…:render_height=N[:animated_tier_down=1]` on the
-> VAAPI surface for HW sub burn (text + PGS), keeping SW `inlineass` as the
-> CPU fallback. The sections below are the design/phasing history that led
-> here; see `CHANGELOG.md` (v1.3.0) and `REWRITER.md` for the shipped shape.
+> **Status: SHIPPED v1.3.0 (2026-05-24), rewriter-side completion v1.6.1 (2026-05-26).**
+> Subtitle burn-in moved out of the Go agent orchestration (2nd ffmpeg + qtrle
+> FIFO + `overlay_vaapi` framesync) into the scaleplex-ffmpeg fork. The
+> prototype was a standalone `overlay_sub_vaapi` filter (patches 0112/0113,
+> since dropped); it shipped **merged into `vf_inlineass`** as a format-adaptive
+> HW (VAAPI VPP) branch alongside the existing SW (FFDraw) path — one
+> Plex-native `inlineass` node, HW/SW chosen by the negotiated input frame
+> format (patch **0115**). The rewriter emits
+> `inlineass=…:render_height=N[:animated_tier_down=1]` on the VAAPI surface
+> for HW sub burn (text + PGS), keeping SW `inlineass` as the CPU fallback.
+>
+> **v1.6.1 closed the last gap** on the **rewriter side**: the full-HW
+> passthrough path used to trust Plex's own bitmap `sub2video → scale-to-output
+> → overlay_vaapi` graph — *with* an intervening `tonemap_opencl` chain on
+> HDR sources — and pass it through unoptimized (the existing reroute only
+> matched the SDR shape). At 4K HDR that ran ~0.37× realtime (full-frame
+> overlay + a decode→sysmem→re-upload round-trip from a leading
+> `[0:0]hwupload`). `detectBitmapOverlayBurn` + `composeBurn` now lift the
+> orthogonal facts (stream spec, target W/H, optional tonemap algo) regardless
+> of the intervening tonemap and re-emit the canonical
+> `[0:0] → scale_vaapi(p010|nv12) → [tonemap] → inlineass(render_height)` —
+> measured **0.37× → 4.6× realtime**. Plus fork patch **0121** makes the bitmap
+> *clear* in `vf_inlineass::refresh_bitmap` sticky (a non-sticky clear let PGS
+> cues resurrect one frame after the empty-PCS clear since `0115`).
+>
+> The sections below are the design/phasing history that led here; see
+> `CHANGELOG.md` (v1.3.0, v1.6.1) and `REWRITER.md` for the shipped shape.
 
 ## Why
 

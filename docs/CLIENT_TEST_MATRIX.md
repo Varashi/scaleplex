@@ -133,10 +133,10 @@ done
 | 3 (HDR pass-through) | `decode:hw-passthrough:hevc`, `encode:hw-passthrough:hevc_vaapi`, `video:hdr-source(smpte2084)`, NO `tonemap-injected` |
 | 4 (HDR→SDR tonemap) | `decode:hw-passthrough:hevc`, `encode:hw-passthrough:h264_vaapi`, `video:hdr-source(smpte2084)`, **`filter:hw-passthrough-tonemap-injected`** |
 | 5 (seek) | tags from prior case + `seek-offset:captured=<T>s`, segment renumber tags |
-| 6 (sub-burn, bitmap SW-decode) | `subtitle:bitmap:<spec>(<codec>)`, `filter:overlay-vaapi-bitmap` (or `filter:overlay-vaapi-bitmap-hdr`) |
-| 6 (sub-burn, bitmap HW-decode pre-render) | `hw-decode:filter:bitmap-sub-prerender`, `bitmap-prerender:band=WxH@yY`; +`seek-offset:captured=<T>s` on resume |
-| 6 (sub-burn, text via inlineass HW-decode) | `hw-decode:filter:inlineass-passthrough` (or `…opencl-tonemap->vaapi:inlineass-passthrough` for HDR→SDR HW-tonemap) |
-| 6 (sub-burn, text via SRT/ASS pre-render HW-decode) | `hw-decode:filter:sub-prerender-overlay` |
+| 6 (sub-burn, bitmap SW-decode reshape) | `subtitle:bitmap:<spec>(<codec>)`, `filter:bitmap-inlineass-vaapi` (HDR variant: `…:hdr-tonemap(<algo>)`) |
+| 6 (sub-burn, bitmap HW-decode passthrough) | `hw-decode:filter:bitmap-inlineass-vaapi` (HDR variant: `…:hdr-tonemap(<algo>)`); `add:-map_inlineass`; +`seek-offset:captured=<T>s` on resume |
+| 6 (sub-burn, text SW-decode reshape) | `filter:text-inlineass-vaapi` |
+| 6 (sub-burn, text HW-decode passthrough) | `hw-decode:filter:inlineass-vaapi` (HDR variant: `…opencl-tonemap->vaapi:inlineass-vaapi`) |
 
 ## Failure capture
 
