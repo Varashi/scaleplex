@@ -877,9 +877,9 @@ func TestRewriter_OptimizeRemux_h264_EAE(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("remux fast-path should fire: %v", out.Changes)
 	}
-	if !containsString(out.Changes, "decode:remux:h264") {
-		t.Errorf("missing decode:remux:h264 tag: %v", out.Changes)
-	}
+	// Post-fold: the decode:remux:* / encode:copy(passthrough) markers
+	// are gone (the transcode block is gated off via isRemux; the
+	// common tail's helper-emitted tags suffice for observability).
 	if !containsString(out.Changes, "audio:eac3_eae->eac3") {
 		t.Errorf("missing eae swap: %v", out.Changes)
 	}

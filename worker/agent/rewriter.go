@@ -1172,10 +1172,10 @@ func stripInlineassDecodeSink(args []string) ([]string, bool) {
 
 // ─── shared rewriter helpers ─────────────────────────────────────────
 //
-// Both the main rewriter and tryOptimizeRemux need to do the same
-// "strip Plex-private cruft + rewrite EAE audio + capture progressurl
-// + adjust env" work. Extracted here so both call paths stay in sync
-// when a flag is added or a base codec needs new handling.
+// The transcode and Optimize-remux paths share the same "strip
+// Plex-private cruft + rewrite EAE audio + capture progressurl +
+// adjust env" tail. Extracted here so the tail in Rewrite() runs once
+// and serves both whether or not the transcode body executed.
 
 // eaeBaseFor maps a `*_eae` codec name to the stock equivalent.
 // **Direction-sensitive** because the answer differs:
@@ -1610,98 +1610,38 @@ func setWorkerHomeEnv(env map[string]string) map[string]string {
 	return env
 }
 
-// tryOptimizeRemux detects + handles Plex Optimize argv shapes where
-// video output is `-codec:0 copy` (no transcode). Returns (result,
-// true) on match. See callsite for rationale.
-func tryOptimizeRemux(args []string, env map[string]string, inputEnv map[string]string) (RewriteResult, bool) {
+// isOptimizeRemux fingerprints the Plex Optimize remux fast-path: bare
+// stock decoder (`-codec:0 <short>` before `-i`, no `-hwaccel:0`)
+// paired with `-codec:0 copy` on the first video output. PMS emits
+// this when the Optimize target preset matches the source resolution/
+// bitrate and video can be passed through. Used by Rewrite() to skip
+// the transcode-side pipeline (HW init, decoder upgrade, filter graph,
+// encoder swap, SEI inject) and run only the transport/audio/env tail.
+// Without this branch the main rewriter would bail with
+// "unknown-decoder:<short>" (decoder allowlist requires a paired
+// hwaccel) and Optimize never works on non-AV1 sources — observed
+// 2026-05-10 with Pat & Mat (h264) and All Creatures (hevc) → ffmpeg
+// exit 8 on "Unknown decoder 'eac3_eae'".
+func isOptimizeRemux(args []string) bool {
 	iIdx := indexOfArg(args, "-i", 0)
 	if iIdx < 0 {
-		return RewriteResult{}, false
+		return false
 	}
-	// Decoder side: bare stock decoder, no hwaccel.
 	dIdx := indexOfArg(args, "-codec:0", 0)
 	if dIdx < 0 || dIdx >= iIdx || dIdx+1 >= len(args) {
-		return RewriteResult{}, false
+		return false
 	}
-	dec := args[dIdx+1]
-	if _, ok := hwDecodeShortCodecs[dec]; !ok {
-		return RewriteResult{}, false
+	if _, ok := hwDecodeShortCodecs[args[dIdx+1]]; !ok {
+		return false
 	}
 	if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
-		return RewriteResult{}, false
+		return false
 	}
-	// Encoder side: first `-codec:0` after -i must be `copy`.
 	encIdx := indexOfArg(args, "-codec:0", iIdx+1)
 	if encIdx < 0 || encIdx+1 >= len(args) || args[encIdx+1] != "copy" {
-		return RewriteResult{}, false
+		return false
 	}
-
-	out := cloneArgs(args)
-	changes := []string{"decode:remux:" + dec, "encode:copy(passthrough)"}
-
-	// Plex-private flags pass through natively: `-loglevel_plex` +
-	// `-strict_ts:N` (patches 0098/0107 stubs); dashenc additions
-	// (`-delete_removed`, `-skip_to_segment`, `-break_non_keyframes`,
-	// `-manifest_name`) and segment.c additions (`-segment_list_*`)
-	// land via patches 0095/0096. `-xioerror` was never observed in
-	// the argv corpus; if it ever surfaces, ffmpeg rejection will
-	// flag it loud and we add a strip then.
-
-	// Rewrite -manifest_name URL to point at the relay; ffmpeg's
-	// dashenc PUTs the manifest body there natively (scaleplex-ffmpeg7
-	// patch 0095). No worker-side publisher.
-	var manifestChanges []string
-	out, manifestChanges = rewriteManifestName(out, inputEnv)
-	changes = append(changes, manifestChanges...)
-
-	// Plex Web Chrome DASH sessions have a SECOND output: subtitle
-	// side-channel running `-f segment -segment_format ass` with its
-	// own `-segment_list http://127.0.0.1:32400/...?stream=subtitles`
-	// loopback URL. Worker pod has no PMS on loopback; rewrite to the
-	// relay (variant="side-channel" matches the stream=subtitles
-	// fingerprint). Without this the sub side-channel ECONNREFUSED's
-	// and ffmpeg exits 145 in the remux fast-path. Observed
-	// 2026-05-14 on Plex Web Chrome FMJ DASH playback.
-	rewriteSegmentList(out, inputEnv, "", &changes, "side-channel")
-
-	// 2-6. Audio EAE swap, eae_prefix drop, progressurl capture,
-	// loglevel + nostats fix-ups, env strips. All shared with the
-	// main rewriter — see helpers above for rationale.
-	var swapped [][2]string
-	out, swapped = swapEAEAudioDecoders(out)
-	for _, p := range swapped {
-		changes = append(changes, "audio:"+p[0]+"->"+p[1])
-	}
-	var droppedPrefixes []string
-	out, droppedPrefixes = dropEAEPrefixFlags(out)
-	for _, d := range droppedPrefixes {
-		changes = append(changes, "drop:"+d)
-	}
-	var progressURL string
-	var progressChanges []string
-	out, progressURL, progressChanges = capturePMSProgressURL(out, inputEnv)
-	changes = append(changes, progressChanges...)
-	if newOut, ok := upgradeLoglevelFromQuiet(out); ok {
-		out = newOut
-		changes = append(changes, "loglevel:->info")
-	}
-	if newOut, ok := dropNostatsFlag(out); ok {
-		out = newOut
-		changes = append(changes, "drop:-nostats")
-	}
-	var envChanges []string
-	env, envChanges = stripEAEEnvVars(env)
-	changes = append(changes, envChanges...)
-	env = setWorkerHomeEnv(env)
-	changes = append(changes, "env:HOME")
-
-	return RewriteResult{
-		Args:        out,
-		Env:         env,
-		Applied:     true,
-		Changes:     changes,
-		ProgressURL: progressURL,
-	}, true
+	return true
 }
 
 func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) RewriteResult {
@@ -1856,26 +1796,23 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 	}
 
-	// Plex Optimize remux fast-path. PMS emits a bare `-codec:0 h264`
-	// (or hevc/av1/vp9) input decoder — no `-hwaccel:0` — paired with
-	// `-codec:0 copy` on the first video output, when the Optimize
-	// target preset already matches the source resolution / bitrate
-	// and video can be passed through. Worker has nothing to do
-	// video-side; the full rewriter pipeline doesn't apply (no
-	// init_hw_device, no encoder swap, no filter chain). But the
-	// argv still carries Plex-private flags (-loglevel_plex,
-	// -progressurl) and EAE audio decoders (-codec:N eac3_eae)
-	// that stock ffmpeg can't handle.
-	//
-	// This branch handles those minimal fixes and returns. Without it
-	// the main rewriter bails with "unknown-decoder:h264" (decoder
-	// allowlist requires a paired hwaccel) and Optimize never works
-	// on non-AV1 sources — observed 2026-05-10 with Pat & Mat
-	// (h264) and All Creatures (hevc) → ffmpeg exit 8 on
-	// "Unknown decoder 'eac3_eae'". Live test confirmed.
-	if remux, ok := tryOptimizeRemux(args, env, inputEnv); ok {
-		return remux
-	}
+	// Plex Optimize remux fast-path detection. PMS emits a bare
+	// `-codec:0 h264` (or hevc/av1/vp9) input decoder — no
+	// `-hwaccel:0` — paired with `-codec:0 copy` on the first video
+	// output, when the Optimize target preset already matches the
+	// source resolution / bitrate and video can be passed through.
+	// Worker has nothing to do video-side; the transcode pipeline
+	// (init_hw_device, decoder upgrade, filter chain, encoder swap,
+	// SEI inject) does not apply. The argv still carries Plex-private
+	// flags (-loglevel_plex, -progressurl) and EAE audio decoders
+	// (-codec:N eac3_eae) that stock ffmpeg can't handle — those run
+	// through the common tail below regardless of isRemux. Without
+	// gating the transcode block off, the decoder allowlist would
+	// bail with "unknown-decoder:<short>" (no paired hwaccel) and
+	// Optimize would never work on non-AV1 sources — observed
+	// 2026-05-10 with Pat & Mat (h264) and All Creatures (hevc) →
+	// ffmpeg exit 8 on "Unknown decoder 'eac3_eae'".
+	isRemux := isOptimizeRemux(args)
 
 	// Detect output format up-front so format-specific rewrites can branch.
 	// Plex's argv ends with one of:
@@ -1897,628 +1834,636 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 	isHLS := outputFormat == "ssegment" || outputFormat == "segment"
 
-	for i := 0; i < len(args); i++ {
-		if args[i] != "-filter_complex" {
-			continue
+	// Transcode-side block. Gated off on Optimize remux (no video work
+	// — bare decoder → -codec:0 copy). The common tail below (EAE
+	// swap, manifest_name / segment_list / progressurl rewrites,
+	// loglevel / env scrubs) runs unconditionally.
+	if !isRemux {
+
+		for i := 0; i < len(args); i++ {
+			if args[i] != "-filter_complex" {
+				continue
+			}
+			f := ""
+			if i+1 < len(args) {
+				f = args[i+1]
+			}
+			if strings.Contains(f, "subtitles=") {
+				return bail("subtitles-burn-in")
+			}
+			// HDR (zscale/tonemap) is rewritten to tonemap_vaapi by
+			// rewriteVideoFilter; only video chains starting with [0:0] are
+			// in-scope. Bail kept off — phase 1 smoke proved tonemap_vaapi
+			// works on real HDR10.
 		}
-		f := ""
-		if i+1 < len(args) {
-			f = args[i+1]
+
+		inputIdx := indexOfArg(args, "-i", 0)
+		if inputIdx < 0 {
+			return bail("no-input")
 		}
-		if strings.Contains(f, "subtitles=") {
-			return bail("subtitles-burn-in")
+
+		// 1. Decoder.
+		//
+		// Two argv shapes:
+		//
+		//   SW-decode (Plex's `HardwareAcceleratedCodecs=0` or no HW probe):
+		//     -codec:0 libdav1d -i ...                 (libhevc / libx264)
+		//   PMS lets the worker handle HW decode by rewriting decoder to
+		//   the native codec name + injecting -hwaccel:0 vaapi flags below.
+		//
+		//   HW-decode (`HardwareAcceleratedCodecs=1` and HW probe succeeded):
+		//     -codec:0 av1 -hwaccel:0 vaapi -hwaccel_output_format:0 vaapi
+		//     -hwaccel_device:0 vaapi -i ...
+		//   PMS already produced the full VAAPI argv: short codec name,
+		//   hwaccel flags, scale_vaapi filter chain, h264_vaapi / hevc_vaapi
+		//   encoder with -qp:0 directly. We pass that through and only do
+		//   the Plex-quirk strips (phases 9-24).
+		decCodecIdx := indexOfArg(args, "-codec:0", 0)
+		if decCodecIdx < 0 || decCodecIdx >= inputIdx {
+			return bail("no-decoder")
 		}
-		// HDR (zscale/tonemap) is rewritten to tonemap_vaapi by
-		// rewriteVideoFilter; only video chains starting with [0:0] are
-		// in-scope. Bail kept off — phase 1 smoke proved tonemap_vaapi
-		// works on real HDR10.
-	}
+		swDecoder := args[decCodecIdx+1]
 
-	inputIdx := indexOfArg(args, "-i", 0)
-	if inputIdx < 0 {
-		return bail("no-input")
-	}
-
-	// 1. Decoder.
-	//
-	// Two argv shapes:
-	//
-	//   SW-decode (Plex's `HardwareAcceleratedCodecs=0` or no HW probe):
-	//     -codec:0 libdav1d -i ...                 (libhevc / libx264)
-	//   PMS lets the worker handle HW decode by rewriting decoder to
-	//   the native codec name + injecting -hwaccel:0 vaapi flags below.
-	//
-	//   HW-decode (`HardwareAcceleratedCodecs=1` and HW probe succeeded):
-	//     -codec:0 av1 -hwaccel:0 vaapi -hwaccel_output_format:0 vaapi
-	//     -hwaccel_device:0 vaapi -i ...
-	//   PMS already produced the full VAAPI argv: short codec name,
-	//   hwaccel flags, scale_vaapi filter chain, h264_vaapi / hevc_vaapi
-	//   encoder with -qp:0 directly. We pass that through and only do
-	//   the Plex-quirk strips (phases 9-24).
-	decCodecIdx := indexOfArg(args, "-codec:0", 0)
-	if decCodecIdx < 0 || decCodecIdx >= inputIdx {
-		return bail("no-decoder")
-	}
-	swDecoder := args[decCodecIdx+1]
-
-	// Honor Plex's HW/SW decision PER AXIS (docs/HW_PROFILE.md). Plex picks
-	// decode and encode independently; we honor both unless SCALEPLEX_FORCE_HW
-	// is set (the homelab's all-GPU fleet sets it → always re-accelerate, so
-	// honor is a no-op there). Backend targeting (which GPU) stays node-local
-	// regardless (patch 0116) — these flags are only the HW-vs-SW axis.
-	//   - honorSW     = no `-hwaccel:0` + SW encoder → full SW on the worker.
-	//   - honorHybrid = `-hwaccel:0` (HW decode) + SW encoder → keep HW decode
-	//     (+ device) and SW-encode on CPU. The smart CPU-offload mode: the
-	//     heavy decode stays on the GPU, only the encode is CPU (realtime even
-	//     for 4K sources, unlike full SW which is decode-bound).
-	forceHW := envBool("SCALEPLEX_FORCE_HW")
-	plexSWEncoder := false
-	if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
-		_, plexSWEncoder = encoderMap[args[peer+1]]
-	}
-	noHwaccel := indexOfArg(args, "-hwaccel:0", 0) < 0
-	honorSW := plexSWEncoder && noHwaccel && !forceHW
-	honorHybrid := plexSWEncoder && !noHwaccel && !forceHW
-
-	// Counterfactual logging: when FORCE_HW=1 masks a session we WOULD
-	// have honored (Plex staged a SW encoder), emit a diagnostic tag so
-	// prod logs quantify real SW exposure before flipping FORCE_HW off
-	// (docs/HW_PROFILE.md). No behaviour change — purely observational.
-	// The session still re-accelerates to HW below.
-	if forceHW && plexSWEncoder {
-		if noHwaccel {
-			changes = append(changes, "force-hw:would-honor-sw")
-		} else {
-			changes = append(changes, "force-hw:would-honor-hwdec-swenc")
+		// Honor Plex's HW/SW decision PER AXIS (docs/HW_PROFILE.md). Plex picks
+		// decode and encode independently; we honor both unless SCALEPLEX_FORCE_HW
+		// is set (the homelab's all-GPU fleet sets it → always re-accelerate, so
+		// honor is a no-op there). Backend targeting (which GPU) stays node-local
+		// regardless (patch 0116) — these flags are only the HW-vs-SW axis.
+		//   - honorSW     = no `-hwaccel:0` + SW encoder → full SW on the worker.
+		//   - honorHybrid = `-hwaccel:0` (HW decode) + SW encoder → keep HW decode
+		//     (+ device) and SW-encode on CPU. The smart CPU-offload mode: the
+		//     heavy decode stays on the GPU, only the encode is CPU (realtime even
+		//     for 4K sources, unlike full SW which is decode-bound).
+		forceHW := envBool("SCALEPLEX_FORCE_HW")
+		plexSWEncoder := false
+		if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
+			_, plexSWEncoder = encoderMap[args[peer+1]]
 		}
-	}
+		noHwaccel := indexOfArg(args, "-hwaccel:0", 0) < 0
+		honorSW := plexSWEncoder && noHwaccel && !forceHW
+		honorHybrid := plexSWEncoder && !noHwaccel && !forceHW
 
-	isHWDecode := false
-	if honorSW {
-		// Honoring Plex's SW pipeline: leave the decoder as PMS emitted it
-		// (no VAAPI swap, no -hwaccel inject). isHWDecode stays false.
-	} else if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
-		if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
-			isHWDecode = true
-			changes = append(changes, "decode:hw-passthrough:"+swDecoder)
-		} else {
-			// Bare short codec name (hevc/h264/av1/vp9) without -hwaccel:0.
-			// Only safe to auto-upgrade when the encoder side is genuinely
-			// SW-shaped (libx264/libx265) — that's the case where PMS
-			// staged a SW pipeline but happened to emit the canonical
-			// codec name in the decoder slot. If the encoder is already
-			// HW-shaped (e.g. h264_vaapi), the argv is malformed in a way
-			// we can't safely reshape; bail rather than guess.
-			if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
-				if _, isSW := encoderMap[args[peer+1]]; !isSW {
+		// Counterfactual logging: when FORCE_HW=1 masks a session we WOULD
+		// have honored (Plex staged a SW encoder), emit a diagnostic tag so
+		// prod logs quantify real SW exposure before flipping FORCE_HW off
+		// (docs/HW_PROFILE.md). No behaviour change — purely observational.
+		// The session still re-accelerates to HW below.
+		if forceHW && plexSWEncoder {
+			if noHwaccel {
+				changes = append(changes, "force-hw:would-honor-sw")
+			} else {
+				changes = append(changes, "force-hw:would-honor-hwdec-swenc")
+			}
+		}
+
+		isHWDecode := false
+		if honorSW {
+			// Honoring Plex's SW pipeline: leave the decoder as PMS emitted it
+			// (no VAAPI swap, no -hwaccel inject). isHWDecode stays false.
+		} else if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
+			if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
+				isHWDecode = true
+				changes = append(changes, "decode:hw-passthrough:"+swDecoder)
+			} else {
+				// Bare short codec name (hevc/h264/av1/vp9) without -hwaccel:0.
+				// Only safe to auto-upgrade when the encoder side is genuinely
+				// SW-shaped (libx264/libx265) — that's the case where PMS
+				// staged a SW pipeline but happened to emit the canonical
+				// codec name in the decoder slot. If the encoder is already
+				// HW-shaped (e.g. h264_vaapi), the argv is malformed in a way
+				// we can't safely reshape; bail rather than guess.
+				if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
+					if _, isSW := encoderMap[args[peer+1]]; !isSW {
+						return bail("unknown-decoder:" + swDecoder)
+					}
+				} else {
 					return bail("unknown-decoder:" + swDecoder)
 				}
-			} else {
-				return bail("unknown-decoder:" + swDecoder)
+				args = spliceArgs(args, decCodecIdx+2,
+					"-hwaccel:0", "vaapi",
+					"-hwaccel_output_format:0", "vaapi",
+					"-hwaccel_device:0", "vaapi",
+				)
+				changes = append(changes, "decode:bare-hw-upgrade:"+swDecoder)
 			}
+		} else if hwDecoder, ok := decoderMap[swDecoder]; ok {
+			args[decCodecIdx+1] = hwDecoder
 			args = spliceArgs(args, decCodecIdx+2,
 				"-hwaccel:0", "vaapi",
 				"-hwaccel_output_format:0", "vaapi",
 				"-hwaccel_device:0", "vaapi",
 			)
-			changes = append(changes, "decode:bare-hw-upgrade:"+swDecoder)
-		}
-	} else if hwDecoder, ok := decoderMap[swDecoder]; ok {
-		args[decCodecIdx+1] = hwDecoder
-		args = spliceArgs(args, decCodecIdx+2,
-			"-hwaccel:0", "vaapi",
-			"-hwaccel_output_format:0", "vaapi",
-			"-hwaccel_device:0", "vaapi",
-		)
-		changes = append(changes, "decode:"+swDecoder+"->"+hwDecoder)
-	} else {
-		return bail("unknown-decoder:" + swDecoder)
-	}
-
-	// FORCE_HW=1 + Plex hybrid (HW decode + SW encode): under the homelab's
-	// force-HW intent we honor neither (honorHybrid is off when forceHW) nor
-	// bail — we reshape the SW filter+encode tail to VAAPI. Plex's hybrid
-	// argv HW-decodes but runs the filter chain AND encoder in software
-	// (`[0:0]scale=...`, `tonemap=...`, `inlineass=...`, libx264 — captured
-	// live 2026-05-24, Avatar 4K HDR with PMS "HW encoding" off). That tail
-	// is shape-identical to a SW-decode session's, so it reshapes through the
-	// same path (rewriteVideoFilter + encoder swap) while keeping the
-	// existing HW decode. Removes the `hw-decode:unexpected-encoder:libx264`
-	// bail landmine and honors force-HW (GPU encode, not CPU). A hybrid whose
-	// graph is already partly-VAAPI (no matching SW regex) falls through to
-	// the bail, which now degrades to "plays" via the EAE safety net.
-	// NOTE: zero argv-corpus coverage (homelab PMS never emits hybrid) —
-	// validate on plex-test with PMS "HW encoding" unchecked before prod.
-	hybridForceHW := isHWDecode && forceHW && plexSWEncoder
-
-	// Detect subtitle source up-front so later phases can act on it.
-	// Pass-through is hardcoded: the fork's scaleplex_inlineass binding
-	// owns the sidecar -i + null-sub output, so we never drop them.
-	var earlySubSrc *subtitleSource
-	if (!isHWDecode || hybridForceHW) && !honorSW {
-		var probe func(string, string) string
-		if opts != nil && opts.ProbeSubtitleCodec != nil {
-			probe = opts.ProbeSubtitleCodec
-		}
-		earlySubSrc = detectSubtitleSource(args, sessionDir, probe)
-	}
-
-	// 2. -init_hw_device. The scaleplex-ffmpeg fork retargets the VAAPI
-	// device at open time from SCALEPLEX_RENDER_DEVICE (patch
-	// 0116-vaapi-device-env-retarget); the driver comes from
-	// LIBVA_DRIVER_NAME, which the rewriter injects into the subprocess
-	// env below. So the device path Plex baked in (its own host's
-	// HardwareDevicePath) is irrelevant on the worker — we leave Plex's
-	// -init_hw_device untouched and only inject the option when Plex
-	// emitted none (a pure SW session being HW-accelerated). The empty
-	// `vaapi=vaapi:` is filled by the fork's env override at device-open.
-	// Skipped entirely when honoring a SW session — no VAAPI device needed.
-	if !honorSW && indexOfArg(args, "-init_hw_device", 0) < 0 {
-		// Inject -init_hw_device + -filter_hw_device BEFORE the first
-		// -i so they're parsed as global options. Placing them after
-		// -i puts them in ffmpeg's per-output option scope, where
-		// -init_hw_device's per-input dispatch silently fails to bind
-		// the hwaccel device to the input stream — ffmpeg parses the
-		// option but the av1 hwaccel decoder doesn't see it,
-		// resulting in "No VA display found for device vaapi" /
-		// "No device available for decoder" at filter graph build.
-		// Live repro 2026-05-09 session 7561 (SW HDR + sub-burn The
-		// Accountant on Plex Android): rewriter applied with both
-		// drop:-i(sidecar-input) and inject:init_hw_device, but
-		// ffmpeg still failed to bind vaapi until injection moved
-		// to global position.
-		newInputIdx := indexOfArg(args, "-i", 0)
-		args = spliceArgs(args, newInputIdx,
-			"-init_hw_device", "vaapi=vaapi:",
-			"-filter_hw_device", "vaapi",
-		)
-		changes = append(changes, "inject:init_hw_device+filter_hw_device")
-	}
-
-	// Locate output -codec:0 (after -i) up-front; both SW and HW paths
-	// reference it for later phases (CRF→QP, preset→cl, sei inject).
-	newInputIdx := indexOfArg(args, "-i", 0)
-	encCodecIdx := indexOfArg(args, "-codec:0", newInputIdx+1)
-	if encCodecIdx < 0 {
-		return bail("no-encoder")
-	}
-
-	mediaPath := ""
-	if i := indexOfArg(args, "-i", 0); i >= 0 && i+1 < len(args) {
-		mediaPath = args[i+1]
-	}
-
-	// SW-decode-only artefacts. In HW-decode mode PMS already shaped
-	// the filter chain, encoder, and map labels for VAAPI; we leave
-	// them untouched. Subtitle burn-in for HW-decode mode is not yet
-	// supported (PMS likely doesn't request it when HW probe matches).
-	var rewritten *filterRewrite
-	var subSrc *subtitleSource
-	sourceIsHDR := false
-
-	if honorSW {
-		// Honor Plex's full software pipeline: decoder, filter chain, and
-		// encoder stay exactly as PMS emitted them — SW decode, SW filters
-		// (scale=/tonemap=/format=), and libx264/libx265 run on the worker
-		// CPU. The fork's merged inlineass SW (FFDraw nv12) branch renders
-		// any `-inlineass` burn-in. Plex's native `-crf`/`-preset`/`-x264opts`
-		// are honoured by libx264 directly. Only the transport/audio/flag
-		// scrubs below apply. See docs/HW_PROFILE.md.
-		//
-		// A fully-SW pipeline uses no VAAPI device, so drop the HW device
-		// init PMS pairs with every spawn — otherwise a GPU-less /
-		// CPU-fallback node would fail trying to open VAAPI.
-		for _, flag := range []string{"-init_hw_device", "-filter_hw_device"} {
-			if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
-				args = removeArgs(args, i, 2)
-			}
-		}
-		changes = append(changes, "honor:plex-sw")
-	} else if !isHWDecode || hybridForceHW {
-		if hybridForceHW {
-			// HW decode already in place (kept); only the SW filter+encode
-			// tail is reshaped to VAAPI below. See hybridForceHW comment.
-			changes = append(changes, "force-hw:reshape-hybrid:"+swDecoder)
-		}
-		// 3. Video -filter_complex rewrite
-		vfIdx := -1
-		for i := 0; i < len(args); i++ {
-			if args[i] == "-filter_complex" && i+1 < len(args) && strings.HasPrefix(args[i+1], "[0:0]") {
-				vfIdx = i + 1
-				break
-			}
-		}
-		if vfIdx < 0 {
-			return bail("no-video-filter")
-		}
-
-		// Subtitle source detection. PMS hands us the subtitle file/stream
-		// via -map_inlineass <spec> + -i shape; the rewriter resolves which
-		// case we're in (text-sidecar / text-embedded / bitmap-embedded /
-		// bitmap-sidecar) and the filter rewrite picks the matching shape.
-		// Text routes through the fork's scaleplex_inlineass binding;
-		// bitmap routes through overlay_vaapi.
-		if earlySubSrc != nil {
-			subSrc = earlySubSrc
+			changes = append(changes, "decode:"+swDecoder+"->"+hwDecoder)
 		} else {
+			return bail("unknown-decoder:" + swDecoder)
+		}
+
+		// FORCE_HW=1 + Plex hybrid (HW decode + SW encode): under the homelab's
+		// force-HW intent we honor neither (honorHybrid is off when forceHW) nor
+		// bail — we reshape the SW filter+encode tail to VAAPI. Plex's hybrid
+		// argv HW-decodes but runs the filter chain AND encoder in software
+		// (`[0:0]scale=...`, `tonemap=...`, `inlineass=...`, libx264 — captured
+		// live 2026-05-24, Avatar 4K HDR with PMS "HW encoding" off). That tail
+		// is shape-identical to a SW-decode session's, so it reshapes through the
+		// same path (rewriteVideoFilter + encoder swap) while keeping the
+		// existing HW decode. Removes the `hw-decode:unexpected-encoder:libx264`
+		// bail landmine and honors force-HW (GPU encode, not CPU). A hybrid whose
+		// graph is already partly-VAAPI (no matching SW regex) falls through to
+		// the bail, which now degrades to "plays" via the EAE safety net.
+		// NOTE: zero argv-corpus coverage (homelab PMS never emits hybrid) —
+		// validate on plex-test with PMS "HW encoding" unchecked before prod.
+		hybridForceHW := isHWDecode && forceHW && plexSWEncoder
+
+		// Detect subtitle source up-front so later phases can act on it.
+		// Pass-through is hardcoded: the fork's scaleplex_inlineass binding
+		// owns the sidecar -i + null-sub output, so we never drop them.
+		var earlySubSrc *subtitleSource
+		if (!isHWDecode || hybridForceHW) && !honorSW {
+			var probe func(string, string) string
+			if opts != nil && opts.ProbeSubtitleCodec != nil {
+				probe = opts.ProbeSubtitleCodec
+			}
+			earlySubSrc = detectSubtitleSource(args, sessionDir, probe)
+		}
+
+		// 2. -init_hw_device. The scaleplex-ffmpeg fork retargets the VAAPI
+		// device at open time from SCALEPLEX_RENDER_DEVICE (patch
+		// 0116-vaapi-device-env-retarget); the driver comes from
+		// LIBVA_DRIVER_NAME, which the rewriter injects into the subprocess
+		// env below. So the device path Plex baked in (its own host's
+		// HardwareDevicePath) is irrelevant on the worker — we leave Plex's
+		// -init_hw_device untouched and only inject the option when Plex
+		// emitted none (a pure SW session being HW-accelerated). The empty
+		// `vaapi=vaapi:` is filled by the fork's env override at device-open.
+		// Skipped entirely when honoring a SW session — no VAAPI device needed.
+		if !honorSW && indexOfArg(args, "-init_hw_device", 0) < 0 {
+			// Inject -init_hw_device + -filter_hw_device BEFORE the first
+			// -i so they're parsed as global options. Placing them after
+			// -i puts them in ffmpeg's per-output option scope, where
+			// -init_hw_device's per-input dispatch silently fails to bind
+			// the hwaccel device to the input stream — ffmpeg parses the
+			// option but the av1 hwaccel decoder doesn't see it,
+			// resulting in "No VA display found for device vaapi" /
+			// "No device available for decoder" at filter graph build.
+			// Live repro 2026-05-09 session 7561 (SW HDR + sub-burn The
+			// Accountant on Plex Android): rewriter applied with both
+			// drop:-i(sidecar-input) and inject:init_hw_device, but
+			// ffmpeg still failed to bind vaapi until injection moved
+			// to global position.
+			newInputIdx := indexOfArg(args, "-i", 0)
+			args = spliceArgs(args, newInputIdx,
+				"-init_hw_device", "vaapi=vaapi:",
+				"-filter_hw_device", "vaapi",
+			)
+			changes = append(changes, "inject:init_hw_device+filter_hw_device")
+		}
+
+		// Locate output -codec:0 (after -i) up-front; both SW and HW paths
+		// reference it for later phases (CRF→QP, preset→cl, sei inject).
+		newInputIdx := indexOfArg(args, "-i", 0)
+		encCodecIdx := indexOfArg(args, "-codec:0", newInputIdx+1)
+		if encCodecIdx < 0 {
+			return bail("no-encoder")
+		}
+
+		mediaPath := ""
+		if i := indexOfArg(args, "-i", 0); i >= 0 && i+1 < len(args) {
+			mediaPath = args[i+1]
+		}
+
+		// SW-decode-only artefacts. In HW-decode mode PMS already shaped
+		// the filter chain, encoder, and map labels for VAAPI; we leave
+		// them untouched. Subtitle burn-in for HW-decode mode is not yet
+		// supported (PMS likely doesn't request it when HW probe matches).
+		var rewritten *filterRewrite
+		var subSrc *subtitleSource
+		sourceIsHDR := false
+
+		if honorSW {
+			// Honor Plex's full software pipeline: decoder, filter chain, and
+			// encoder stay exactly as PMS emitted them — SW decode, SW filters
+			// (scale=/tonemap=/format=), and libx264/libx265 run on the worker
+			// CPU. The fork's merged inlineass SW (FFDraw nv12) branch renders
+			// any `-inlineass` burn-in. Plex's native `-crf`/`-preset`/`-x264opts`
+			// are honoured by libx264 directly. Only the transport/audio/flag
+			// scrubs below apply. See docs/HW_PROFILE.md.
+			//
+			// A fully-SW pipeline uses no VAAPI device, so drop the HW device
+			// init PMS pairs with every spawn — otherwise a GPU-less /
+			// CPU-fallback node would fail trying to open VAAPI.
+			for _, flag := range []string{"-init_hw_device", "-filter_hw_device"} {
+				if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
+					args = removeArgs(args, i, 2)
+				}
+			}
+			changes = append(changes, "honor:plex-sw")
+		} else if !isHWDecode || hybridForceHW {
+			if hybridForceHW {
+				// HW decode already in place (kept); only the SW filter+encode
+				// tail is reshaped to VAAPI below. See hybridForceHW comment.
+				changes = append(changes, "force-hw:reshape-hybrid:"+swDecoder)
+			}
+			// 3. Video -filter_complex rewrite
+			vfIdx := -1
+			for i := 0; i < len(args); i++ {
+				if args[i] == "-filter_complex" && i+1 < len(args) && strings.HasPrefix(args[i+1], "[0:0]") {
+					vfIdx = i + 1
+					break
+				}
+			}
+			if vfIdx < 0 {
+				return bail("no-video-filter")
+			}
+
+			// Subtitle source detection. PMS hands us the subtitle file/stream
+			// via -map_inlineass <spec> + -i shape; the rewriter resolves which
+			// case we're in (text-sidecar / text-embedded / bitmap-embedded /
+			// bitmap-sidecar) and the filter rewrite picks the matching shape.
+			// Text routes through the fork's scaleplex_inlineass binding;
+			// bitmap routes through overlay_vaapi.
+			if earlySubSrc != nil {
+				subSrc = earlySubSrc
+			} else {
+				var probe func(string, string) string
+				if opts != nil && opts.ProbeSubtitleCodec != nil {
+					probe = opts.ProbeSubtitleCodec
+				}
+				subSrc = detectSubtitleSource(args, sessionDir, probe)
+			}
+			if subSrc != nil && subSrc.Kind == "bitmap" {
+				label := "subtitle:bitmap:" + subSrc.StreamSpec
+				if subSrc.Codec != "" {
+					label += "(" + subSrc.Codec + ")"
+				}
+				changes = append(changes, label)
+			}
+
+			// Detect HDR source — Plex's bundled transcoder used to autoinject
+			// tonemap (musl-bound opencl, sw fallback); we can't, so we ask the
+			// agent to ffprobe color metadata and pass through here. Skipped
+			// when no probe is wired (tests treat all sources as SDR by default).
+			if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+				transfer, _, _ := opts.ProbeVideoColor(mediaPath)
+				if isHDRTransfer(transfer) {
+					sourceIsHDR = true
+					changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+				}
+			}
+
+			rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, sourceIsHDR, tm)
+			if rewritten == nil {
+				return bail("filter-pattern:" + args[vfIdx])
+			}
+			args[vfIdx] = rewritten.Filter
+			changes = append(changes, "filter:"+rewritten.Mode)
+
+			// 4. Update -map output label following the video filter.
+			// MUST run BEFORE dropSidecarInput: that drop removes args
+			// from BEFORE vfIdx (the input-1 option block), which shifts
+			// vfIdx downward. Iterating from the old vfIdx+1 then misses
+			// the `-map <oldlabel>` that's now closer to the filter, and
+			// the rewriter silently leaves a stale label → ffmpeg fails
+			// with "Output with label '<old>' does not exist in any
+			// defined filter graph" (live repro 2026-05-09 session 7347:
+			// SW HDR + text-sidecar sub-burn, exit status 234).
+			for i := vfIdx + 1; i < len(args); i++ {
+				if args[i] != "-map" {
+					continue
+				}
+				v := args[i+1]
+				if v == rewritten.OldLabel || v == `"`+rewritten.OldLabel+`"` {
+					if strings.HasPrefix(v, `"`) {
+						args[i+1] = `"` + rewritten.NewLabel + `"`
+					} else {
+						args[i+1] = rewritten.NewLabel
+					}
+					changes = append(changes, "map-label-update")
+					break
+				}
+			}
+
+			// Bitmap subs now burn through the SAME inlineass binding as text
+			// (composeBurn, mode "bitmap-inlineass-vaapi") — no overlay_vaapi. The
+			// fork's `-map_inlineass <stream>` routes the bitmap codec to
+			// replay_bitmap; ensure the flag is present (Plex's overlay argv may
+			// not have carried it). The sidecar input is KEPT (SecondInputArgIdx
+			// stays -1 for bitmap sidecar) so the binding can read the .sup stream.
+			// The decode-sink is stripped later (stripInlineassDecodeSink).
+			if rewritten.Mode == "bitmap-inlineass-vaapi" {
+				if subSrc != nil && subSrc.StreamSpec != "" &&
+					indexOfArg(args, "-map_inlineass", 0) < 0 {
+					args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0),
+						"-map_inlineass", subSrc.StreamSpec)
+					changes = append(changes, "add:-map_inlineass")
+				}
+			}
+
+			// 5. Encoder swap (libx264 → h264_vaapi etc.)
+			// Re-locate encCodecIdx because the splices above may have
+			// shifted indices.
+			newInputIdx = indexOfArg(args, "-i", 0)
+			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+			if encCodecIdx < 0 {
+				return bail("no-encoder")
+			}
+			swEncoder := args[encCodecIdx+1]
+			hwEncoder, ok := encoderMap[swEncoder]
+			if !ok {
+				return bail("unknown-encoder:" + swEncoder)
+			}
+			args[encCodecIdx+1] = hwEncoder
+			changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
+		} else if honorHybrid {
+			// HW decode + SW encode (per-axis honor, docs/HW_PROFILE.md). PMS
+			// emitted `-hwaccel:0 vaapi` decode + a libx264/libx265 encode (its
+			// "HW accel on, HW encoding off" config). Keep the pipeline exactly:
+			// HW decode (device retargeted by the fork, patch 0116), Plex's SW
+			// filter chain incl. its `inlineass` node (fork parses the keys,
+			// patch 0119), and the SW encoder on CPU. No reshape, no VAAPI
+			// encoder validation. The smart CPU-offload mode — the heavy decode
+			// stays on the GPU, only the encode is CPU (realtime even at 4K,
+			// unlike full SW which is decode-bound). Only the transport/audio
+			// scrubs below apply.
+			changes = append(changes, "honor:plex-hwdec-swenc")
+		} else {
+			// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
+			// that, but leave the filter chain, map labels, and encoder
+			// argument intact.
+			swEncoder := args[encCodecIdx+1]
+			switch swEncoder {
+			case "h264_vaapi", "hevc_vaapi":
+				// expected
+			default:
+				return bail("hw-decode:unexpected-encoder:" + swEncoder)
+			}
+			changes = append(changes, "encode:hw-passthrough:"+swEncoder)
+
+			// HDR source detection (diagnostic only). scaleplex does NOT
+			// inject a tonemap: when Plex's HW-decode chain is the plain
+			// `scale_vaapi=...:format=nv12` shape with no tonemap filter,
+			// that means Plex's "Use hardware-accelerated tone mapping" is
+			// off and Plex itself does no tonemapping — scaleplex matches
+			// that behavior rather than second-guessing it.
+			if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+				if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
+					sourceIsHDR = true
+					changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+				}
+			}
+
+			// Sub burn-in: PMS sends `-map_inlineass` even in HW-decode
+			// mode, with a filter graph that runs Plex's private
+			// `inlineass` filter on the CPU side of an
+			// hwdownload/hwupload sandwich. Phase 2c keeps the
+			// `inlineass=` filter (fork's vf_inlineass binding renders
+			// via libass natively); rewriter strips the four Plex-private
+			// AVOption keys vf_inlineass doesn't parse and reshapes the
+			// surrounding chain (e.g. tonemap_vaapi for HDR sources)
+			// while preserving the [0]–[4] label sequence so PMS's
+			// `-map [4]` still resolves.
 			var probe func(string, string) string
 			if opts != nil && opts.ProbeSubtitleCodec != nil {
 				probe = opts.ProbeSubtitleCodec
 			}
 			subSrc = detectSubtitleSource(args, sessionDir, probe)
-		}
-		if subSrc != nil && subSrc.Kind == "bitmap" {
-			label := "subtitle:bitmap:" + subSrc.StreamSpec
-			if subSrc.Codec != "" {
-				label += "(" + subSrc.Codec + ")"
-			}
-			changes = append(changes, label)
-		}
-
-		// Detect HDR source — Plex's bundled transcoder used to autoinject
-		// tonemap (musl-bound opencl, sw fallback); we can't, so we ask the
-		// agent to ffprobe color metadata and pass through here. Skipped
-		// when no probe is wired (tests treat all sources as SDR by default).
-		if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
-			transfer, _, _ := opts.ProbeVideoColor(mediaPath)
-			if isHDRTransfer(transfer) {
-				sourceIsHDR = true
-				changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
-			}
-		}
-
-		rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, sourceIsHDR, tm)
-		if rewritten == nil {
-			return bail("filter-pattern:" + args[vfIdx])
-		}
-		args[vfIdx] = rewritten.Filter
-		changes = append(changes, "filter:"+rewritten.Mode)
-
-		// 4. Update -map output label following the video filter.
-		// MUST run BEFORE dropSidecarInput: that drop removes args
-		// from BEFORE vfIdx (the input-1 option block), which shifts
-		// vfIdx downward. Iterating from the old vfIdx+1 then misses
-		// the `-map <oldlabel>` that's now closer to the filter, and
-		// the rewriter silently leaves a stale label → ffmpeg fails
-		// with "Output with label '<old>' does not exist in any
-		// defined filter graph" (live repro 2026-05-09 session 7347:
-		// SW HDR + text-sidecar sub-burn, exit status 234).
-		for i := vfIdx + 1; i < len(args); i++ {
-			if args[i] != "-map" {
-				continue
-			}
-			v := args[i+1]
-			if v == rewritten.OldLabel || v == `"`+rewritten.OldLabel+`"` {
-				if strings.HasPrefix(v, `"`) {
-					args[i+1] = `"` + rewritten.NewLabel + `"`
-				} else {
-					args[i+1] = rewritten.NewLabel
-				}
-				changes = append(changes, "map-label-update")
-				break
-			}
-		}
-
-		// Bitmap subs now burn through the SAME inlineass binding as text
-		// (composeBurn, mode "bitmap-inlineass-vaapi") — no overlay_vaapi. The
-		// fork's `-map_inlineass <stream>` routes the bitmap codec to
-		// replay_bitmap; ensure the flag is present (Plex's overlay argv may
-		// not have carried it). The sidecar input is KEPT (SecondInputArgIdx
-		// stays -1 for bitmap sidecar) so the binding can read the .sup stream.
-		// The decode-sink is stripped later (stripInlineassDecodeSink).
-		if rewritten.Mode == "bitmap-inlineass-vaapi" {
-			if subSrc != nil && subSrc.StreamSpec != "" &&
-				indexOfArg(args, "-map_inlineass", 0) < 0 {
-				args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0),
-					"-map_inlineass", subSrc.StreamSpec)
-				changes = append(changes, "add:-map_inlineass")
-			}
-		}
-
-		// 5. Encoder swap (libx264 → h264_vaapi etc.)
-		// Re-locate encCodecIdx because the splices above may have
-		// shifted indices.
-		newInputIdx = indexOfArg(args, "-i", 0)
-		encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
-		if encCodecIdx < 0 {
-			return bail("no-encoder")
-		}
-		swEncoder := args[encCodecIdx+1]
-		hwEncoder, ok := encoderMap[swEncoder]
-		if !ok {
-			return bail("unknown-encoder:" + swEncoder)
-		}
-		args[encCodecIdx+1] = hwEncoder
-		changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
-	} else if honorHybrid {
-		// HW decode + SW encode (per-axis honor, docs/HW_PROFILE.md). PMS
-		// emitted `-hwaccel:0 vaapi` decode + a libx264/libx265 encode (its
-		// "HW accel on, HW encoding off" config). Keep the pipeline exactly:
-		// HW decode (device retargeted by the fork, patch 0116), Plex's SW
-		// filter chain incl. its `inlineass` node (fork parses the keys,
-		// patch 0119), and the SW encoder on CPU. No reshape, no VAAPI
-		// encoder validation. The smart CPU-offload mode — the heavy decode
-		// stays on the GPU, only the encode is CPU (realtime even at 4K,
-		// unlike full SW which is decode-bound). Only the transport/audio
-		// scrubs below apply.
-		changes = append(changes, "honor:plex-hwdec-swenc")
-	} else {
-		// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
-		// that, but leave the filter chain, map labels, and encoder
-		// argument intact.
-		swEncoder := args[encCodecIdx+1]
-		switch swEncoder {
-		case "h264_vaapi", "hevc_vaapi":
-			// expected
-		default:
-			return bail("hw-decode:unexpected-encoder:" + swEncoder)
-		}
-		changes = append(changes, "encode:hw-passthrough:"+swEncoder)
-
-		// HDR source detection (diagnostic only). scaleplex does NOT
-		// inject a tonemap: when Plex's HW-decode chain is the plain
-		// `scale_vaapi=...:format=nv12` shape with no tonemap filter,
-		// that means Plex's "Use hardware-accelerated tone mapping" is
-		// off and Plex itself does no tonemapping — scaleplex matches
-		// that behavior rather than second-guessing it.
-		if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
-			if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
-				sourceIsHDR = true
-				changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
-			}
-		}
-
-		// Sub burn-in: PMS sends `-map_inlineass` even in HW-decode
-		// mode, with a filter graph that runs Plex's private
-		// `inlineass` filter on the CPU side of an
-		// hwdownload/hwupload sandwich. Phase 2c keeps the
-		// `inlineass=` filter (fork's vf_inlineass binding renders
-		// via libass natively); rewriter strips the four Plex-private
-		// AVOption keys vf_inlineass doesn't parse and reshapes the
-		// surrounding chain (e.g. tonemap_vaapi for HDR sources)
-		// while preserving the [0]–[4] label sequence so PMS's
-		// `-map [4]` still resolves.
-		var probe func(string, string) string
-		if opts != nil && opts.ProbeSubtitleCodec != nil {
-			probe = opts.ProbeSubtitleCodec
-		}
-		subSrc = detectSubtitleSource(args, sessionDir, probe)
-		if subSrc != nil {
-			switch subSrc.Kind {
-			case "text":
-				vfIdx := -1
-				for i := 0; i < len(args); i++ {
-					if args[i] == "-filter_complex" && i+1 < len(args) &&
-						strings.Contains(args[i+1], "inlineass=") &&
-						strings.HasPrefix(args[i+1], "[0:0]") {
-						vfIdx = i + 1
-						break
-					}
-				}
-				if vfIdx < 0 {
-					return bail("hw-decode-sub:no-inlineass-filter")
-				}
-				m := reFilterHWAss.FindStringSubmatch(args[vfIdx])
-				openclMode := false
-				assGroup := 5
-				if m == nil {
-					// HW VAAPI + OpenCL tonemap variant. PMS emits this
-					// when HW tonemap pref is ON. We can swap the OpenCL
-					// detour for tonemap_vaapi and keep the inlineass
-					// passthrough.
-					m = reFilterHWOpenCLAss.FindStringSubmatch(args[vfIdx])
-					if m == nil {
-						return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
-					}
-					openclMode = true
-					assGroup = 4
-				}
-				w, h := m[1], m[2]
-				// Force nv12 across the libass step (matches the SW
-				// pass-through path). HDR-source detection is diagnostic
-				// only — no tonemap is injected here; if Plex wanted one
-				// it would carry a tonemap_opencl chain (reFilterHWOpenCLAss).
-				if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
-					if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
-						sourceIsHDR = true
-						changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
-					}
-				}
-				scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
-				if openclMode {
-					// Plex's argv carried scale_vaapi(p010) → hwmap(opencl)
-					// → tonemap_opencl(<algo>) → hwdownload. Preserve the
-					// tone map: scale to p010 then run the resolved tonemap
-					// stage (OpenCL passthrough honoring Plex's algorithm,
-					// or tonemap_vaapi under SCALEPLEX_TONEMAP=vaapi).
-					// Without this the HDR source is squashed straight to
-					// nv12 and renders washed.
-					scaleStep = "scale_vaapi=w=" + w + ":h=" + h +
-						":format=p010," + tm.stage(m[3])
-					changes = append(changes,
-						"hw-decode-sub:tonemap-preserved("+m[3]+")")
-				}
-				// Merged inlineass HW branch (vf_inlineass VAAPI path, patch 0115).
-				// scale_vaapi keeps the VAAPI surface and the fork's inlineass renders
-				// the cue ONTO it: render-once-per-cue for static SRT/ASS, per-frame for
-				// animated (libass detect_change). No hwdownload->inlineass(SW)->hwupload
-				// bracket, no FIFO pre-render, no overlay_vaapi second input. Plex's argv
-				// already carries `-map_inlineass <spec>` + the `-map <spec> -f null
-				// -codec ass` decode sink that drives the scaleplex_inlineass feed - both
-				// kept untouched. render_height folds in the old SCALEPLEX_SUB_RENDER_HEIGHT
-				// worker knob (now a filter option); animated_tier_down lets the filter
-				// drop animated cues one resolution tier (a no-op for static cues).
-				assParams := m[assGroup]
-				// 0119: fork vf_inlineass parses Plex's keys; pass verbatim.
-				strippedAss := assParams
-				inlineArgs := fmt.Sprintf("%s:render_height=%d", strippedAss, subRenderHeightCap())
-				if subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile) {
-					inlineArgs += ":animated_tier_down=1"
-				}
-				args[vfIdx] = fmt.Sprintf(
-					"[0:0]hwupload[0];"+
-						"[0]%s[1];"+
-						"[1]inlineass=%s[4]",
-					scaleStep, inlineArgs,
-				)
-				modeTag := "hw-decode:filter:inlineass-vaapi"
-				oldMapLabel := "[4]"
-				if openclMode {
-					// reFilterHWOpenCLAss argv ends at label [6] (extra hwmap->opencl +
-					// tonemap_opencl + hwdownload + inlineass + hwupload). Our graph
-					// outputs [4]; PMS's `-map [6]` must retarget or ffmpeg bails
-					// ("Output with label '6' does not exist").
-					modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi"
-					oldMapLabel = "[6]"
-				}
-				changes = append(changes, modeTag)
-				if oldMapLabel != "[4]" {
-					for i := vfIdx + 1; i < len(args)-1; i++ {
-						if args[i] != "-map" {
-							continue
-						}
-						v := args[i+1]
-						if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
-							if strings.HasPrefix(v, `"`) {
-								args[i+1] = `"[4]"`
-							} else {
-								args[i+1] = "[4]"
-							}
-							changes = append(changes, "hw-decode:map-label-update")
+			if subSrc != nil {
+				switch subSrc.Kind {
+				case "text":
+					vfIdx := -1
+					for i := 0; i < len(args); i++ {
+						if args[i] == "-filter_complex" && i+1 < len(args) &&
+							strings.Contains(args[i+1], "inlineass=") &&
+							strings.HasPrefix(args[i+1], "[0:0]") {
+							vfIdx = i + 1
 							break
 						}
 					}
+					if vfIdx < 0 {
+						return bail("hw-decode-sub:no-inlineass-filter")
+					}
+					m := reFilterHWAss.FindStringSubmatch(args[vfIdx])
+					openclMode := false
+					assGroup := 5
+					if m == nil {
+						// HW VAAPI + OpenCL tonemap variant. PMS emits this
+						// when HW tonemap pref is ON. We can swap the OpenCL
+						// detour for tonemap_vaapi and keep the inlineass
+						// passthrough.
+						m = reFilterHWOpenCLAss.FindStringSubmatch(args[vfIdx])
+						if m == nil {
+							return bail("hw-decode-sub:filter-pattern:" + args[vfIdx])
+						}
+						openclMode = true
+						assGroup = 4
+					}
+					w, h := m[1], m[2]
+					// Force nv12 across the libass step (matches the SW
+					// pass-through path). HDR-source detection is diagnostic
+					// only — no tonemap is injected here; if Plex wanted one
+					// it would carry a tonemap_opencl chain (reFilterHWOpenCLAss).
+					if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+						if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
+							sourceIsHDR = true
+							changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+						}
+					}
+					scaleStep := fmt.Sprintf("scale_vaapi=w=%s:h=%s:format=nv12", w, h)
+					if openclMode {
+						// Plex's argv carried scale_vaapi(p010) → hwmap(opencl)
+						// → tonemap_opencl(<algo>) → hwdownload. Preserve the
+						// tone map: scale to p010 then run the resolved tonemap
+						// stage (OpenCL passthrough honoring Plex's algorithm,
+						// or tonemap_vaapi under SCALEPLEX_TONEMAP=vaapi).
+						// Without this the HDR source is squashed straight to
+						// nv12 and renders washed.
+						scaleStep = "scale_vaapi=w=" + w + ":h=" + h +
+							":format=p010," + tm.stage(m[3])
+						changes = append(changes,
+							"hw-decode-sub:tonemap-preserved("+m[3]+")")
+					}
+					// Merged inlineass HW branch (vf_inlineass VAAPI path, patch 0115).
+					// scale_vaapi keeps the VAAPI surface and the fork's inlineass renders
+					// the cue ONTO it: render-once-per-cue for static SRT/ASS, per-frame for
+					// animated (libass detect_change). No hwdownload->inlineass(SW)->hwupload
+					// bracket, no FIFO pre-render, no overlay_vaapi second input. Plex's argv
+					// already carries `-map_inlineass <spec>` + the `-map <spec> -f null
+					// -codec ass` decode sink that drives the scaleplex_inlineass feed - both
+					// kept untouched. render_height folds in the old SCALEPLEX_SUB_RENDER_HEIGHT
+					// worker knob (now a filter option); animated_tier_down lets the filter
+					// drop animated cues one resolution tier (a no-op for static cues).
+					assParams := m[assGroup]
+					// 0119: fork vf_inlineass parses Plex's keys; pass verbatim.
+					strippedAss := assParams
+					inlineArgs := fmt.Sprintf("%s:render_height=%d", strippedAss, subRenderHeightCap())
+					if subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile) {
+						inlineArgs += ":animated_tier_down=1"
+					}
+					args[vfIdx] = fmt.Sprintf(
+						"[0:0]hwupload[0];"+
+							"[0]%s[1];"+
+							"[1]inlineass=%s[4]",
+						scaleStep, inlineArgs,
+					)
+					modeTag := "hw-decode:filter:inlineass-vaapi"
+					oldMapLabel := "[4]"
+					if openclMode {
+						// reFilterHWOpenCLAss argv ends at label [6] (extra hwmap->opencl +
+						// tonemap_opencl + hwdownload + inlineass + hwupload). Our graph
+						// outputs [4]; PMS's `-map [6]` must retarget or ffmpeg bails
+						// ("Output with label '6' does not exist").
+						modeTag = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi"
+						oldMapLabel = "[6]"
+					}
+					changes = append(changes, modeTag)
+					if oldMapLabel != "[4]" {
+						for i := vfIdx + 1; i < len(args)-1; i++ {
+							if args[i] != "-map" {
+								continue
+							}
+							v := args[i+1]
+							if v == oldMapLabel || v == `"`+oldMapLabel+`"` {
+								if strings.HasPrefix(v, `"`) {
+									args[i+1] = `"[4]"`
+								} else {
+									args[i+1] = "[4]"
+								}
+								changes = append(changes, "hw-decode:map-label-update")
+								break
+							}
+						}
+					}
+					newInputIdx = indexOfArg(args, "-i", 0)
+					encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+				case "bitmap":
+					return bail("hw-decode-sub:bitmap-unsupported")
 				}
+			}
+
+			// PGS / bitmap burn-in in HW-decode mode. PMS emits its own
+			// overlay_vaapi graph that sub2video-bridges the bitmap subtitle and
+			// SW-upscales it to the full output resolution — no `-map_inlineass`,
+			// so the detectSubtitleSource switch above never sees it. That
+			// full-frame overlay (and, on the HDR variant, a decode→sysmem→
+			// re-upload round-trip from Plex's leading `[0:0]hwupload`) runs the
+			// transcode sub-realtime (measured 0.37x at 4K HDR; the buffer Frank
+			// hit 2026-05-25). Unify it onto the inlineass burn like every other
+			// sub path: detectBitmapOverlayBurn extracts the stream spec + target
+			// W/H + (optional) tonemap algo regardless of an intervening tonemap,
+			// and composeBurn re-emits VA-resident scale_vaapi → [tonemap] →
+			// inlineass(render_height) — the fork's replay_bitmap renders the
+			// bitmap at render_height (band), seek is native. See composeBurn /
+			// project_scaleplex_perf_tuning.
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] != "-filter_complex" {
+					continue
+				}
+				streamSpec, w, h, algo, hdr, ok := detectBitmapOverlayBurn(args[i+1])
+				if !ok {
+					break
+				}
+				oldLabel := ""
+				if m := reGraphTrailingLabel.FindStringSubmatch(args[i+1]); m != nil {
+					oldLabel = "[" + m[1] + "]"
+				}
+				// VA-resident only when Plex's argv actually HW-decodes; otherwise
+				// composeBurn prepends the hwupload itself.
+				vaResident := indexOfArg(args, "-hwaccel:0", 0) >= 0
+				newFilter, newLabel := tm.composeBurn(burnSpec{
+					vaResident: vaResident, w: w, h: h, hdr: hdr, algo: algo,
+					burnSub: true,
+				})
+				args[i+1] = newFilter
+				// Make [0:0] a real VA surface (Plex's bitmap argv decodes to
+				// sysmem) so the no-hwupload composer is valid + the round-trip is
+				// gone. Idempotent with gpuResidentOpenCLTonemap's own force.
+				if vaResident {
+					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
+						args[ofIdx+1] = "vaapi"
+					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
+						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+					}
+				}
+				retargetMapLabel(args, oldLabel, newLabel)
+				// Plex's bitmap argv carries no -map_inlineass; add it (before
+				// -filter_complex, matching Plex's text placement) so the fork feeds
+				// the decoded presentation to replay_bitmap. No decode-sink: fork
+				// patch 0120's binding self-decodes the stream, paced by the demux.
+				args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0), "-map_inlineass", streamSpec)
+				if hdr {
+					changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap("+algo+")")
+				} else {
+					changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
+				}
+				// The splices shifted indices; relocate the encoder.
 				newInputIdx = indexOfArg(args, "-i", 0)
 				encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
-			case "bitmap":
-				return bail("hw-decode-sub:bitmap-unsupported")
-			}
-		}
-
-		// PGS / bitmap burn-in in HW-decode mode. PMS emits its own
-		// overlay_vaapi graph that sub2video-bridges the bitmap subtitle and
-		// SW-upscales it to the full output resolution — no `-map_inlineass`,
-		// so the detectSubtitleSource switch above never sees it. That
-		// full-frame overlay (and, on the HDR variant, a decode→sysmem→
-		// re-upload round-trip from Plex's leading `[0:0]hwupload`) runs the
-		// transcode sub-realtime (measured 0.37x at 4K HDR; the buffer Frank
-		// hit 2026-05-25). Unify it onto the inlineass burn like every other
-		// sub path: detectBitmapOverlayBurn extracts the stream spec + target
-		// W/H + (optional) tonemap algo regardless of an intervening tonemap,
-		// and composeBurn re-emits VA-resident scale_vaapi → [tonemap] →
-		// inlineass(render_height) — the fork's replay_bitmap renders the
-		// bitmap at render_height (band), seek is native. See composeBurn /
-		// project_scaleplex_perf_tuning.
-		for i := 0; i+1 < len(args); i++ {
-			if args[i] != "-filter_complex" {
-				continue
-			}
-			streamSpec, w, h, algo, hdr, ok := detectBitmapOverlayBurn(args[i+1])
-			if !ok {
 				break
 			}
-			oldLabel := ""
-			if m := reGraphTrailingLabel.FindStringSubmatch(args[i+1]); m != nil {
-				oldLabel = "[" + m[1] + "]"
-			}
-			// VA-resident only when Plex's argv actually HW-decodes; otherwise
-			// composeBurn prepends the hwupload itself.
-			vaResident := indexOfArg(args, "-hwaccel:0", 0) >= 0
-			newFilter, newLabel := tm.composeBurn(burnSpec{
-				vaResident: vaResident, w: w, h: h, hdr: hdr, algo: algo,
-				burnSub: true,
-			})
-			args[i+1] = newFilter
-			// Make [0:0] a real VA surface (Plex's bitmap argv decodes to
-			// sysmem) so the no-hwupload composer is valid + the round-trip is
-			// gone. Idempotent with gpuResidentOpenCLTonemap's own force.
-			if vaResident {
-				if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
-					args[ofIdx+1] = "vaapi"
-				} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
-					args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
-				}
-			}
-			retargetMapLabel(args, oldLabel, newLabel)
-			// Plex's bitmap argv carries no -map_inlineass; add it (before
-			// -filter_complex, matching Plex's text placement) so the fork feeds
-			// the decoded presentation to replay_bitmap. No decode-sink: fork
-			// patch 0120's binding self-decodes the stream, paced by the demux.
-			args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0), "-map_inlineass", streamSpec)
-			if hdr {
-				changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap("+algo+")")
-			} else {
-				changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
-			}
-			// The splices shifted indices; relocate the encoder.
+		}
+
+		// 5b. GPU-resident OpenCL tonemap fix-up (jellyfin-ffmpeg 7.x). Any
+		// emitted `tonemap_opencl` graph needs an explicit OpenCL device + a VA
+		// surface input + no hwupload/round-trip cruft, else the va→opencl
+		// derive fails ENOSYS on 7.x. Runs after all filter reshaping so it
+		// sees the final graph. See gpuResidentOpenCLTonemap.
+		{
+			var oclChanges []string
+			args, oclChanges = gpuResidentOpenCLTonemap(args)
+			changes = append(changes, oclChanges...)
 			newInputIdx = indexOfArg(args, "-i", 0)
 			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
-			break
 		}
-	}
 
-	// 5b. GPU-resident OpenCL tonemap fix-up (jellyfin-ffmpeg 7.x). Any
-	// emitted `tonemap_opencl` graph needs an explicit OpenCL device + a VA
-	// surface input + no hwupload/round-trip cruft, else the va→opencl
-	// derive fails ENOSYS on 7.x. Runs after all filter reshaping so it
-	// sees the final graph. See gpuResidentOpenCLTonemap.
-	{
-		var oclChanges []string
-		args, oclChanges = gpuResidentOpenCLTonemap(args)
-		changes = append(changes, oclChanges...)
-		newInputIdx = indexOfArg(args, "-i", 0)
-		encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
-	}
+		// 6. -crf:0 is left untouched. The scaleplex-ffmpeg fork's VAAPI
+		// encoder accepts libx264-style `-crf:N` directly and maps it to
+		// QP = crf + crf_qp_offset (default 6) before rate-control
+		// selection (patch 0117-vaapi-encode-accept-crf); patch 0105 then
+		// routes the resulting QP + `-maxrate` to QVBR. So Plex's
+		// `-crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>` argv reaches the
+		// encoder verbatim — no crf->qp translation here. The
+		// HW_QP_CRF_OFFSET env knob is retired; override via the encoder's
+		// `-crf_qp_offset` argv option.
 
-	// 6. -crf:0 is left untouched. The scaleplex-ffmpeg fork's VAAPI
-	// encoder accepts libx264-style `-crf:N` directly and maps it to
-	// QP = crf + crf_qp_offset (default 6) before rate-control
-	// selection (patch 0117-vaapi-encode-accept-crf); patch 0105 then
-	// routes the resulting QP + `-maxrate` to QVBR. So Plex's
-	// `-crf:0 <Q> -maxrate:0 <R> -bufsize:0 <B>` argv reaches the
-	// encoder verbatim — no crf->qp translation here. The
-	// HW_QP_CRF_OFFSET env knob is retired; override via the encoder's
-	// `-crf_qp_offset` argv option.
+		// 7. -preset:0, -x264opts:0 and -x265-params:0 are left untouched.
+		// The fork's VAAPI encoder accepts a libx264-style `-preset NAME`
+		// and maps it to compression_level (iHD TargetUsage) at init, and
+		// swallows the `-x264opts` / `-x265-params` private blobs as no-ops
+		// (patch 0118-vaapi-encode-accept-preset-and-stubs). So Plex's
+		// libx264 encoder argv reaches the VAAPI encoder verbatim — no
+		// preset translation or opt-blob dropping here. When PMS omits a
+		// preset, the encoder leaves compression_level at the driver default
+		// (~TU=4). The SCALEPLEX_PRESET_MAP env knob is retired; override by
+		// passing -compression_level directly.
 
-	// 7. -preset:0, -x264opts:0 and -x265-params:0 are left untouched.
-	// The fork's VAAPI encoder accepts a libx264-style `-preset NAME`
-	// and maps it to compression_level (iHD TargetUsage) at init, and
-	// swallows the `-x264opts` / `-x265-params` private blobs as no-ops
-	// (patch 0118-vaapi-encode-accept-preset-and-stubs). So Plex's
-	// libx264 encoder argv reaches the VAAPI encoder verbatim — no
-	// preset translation or opt-blob dropping here. When PMS omits a
-	// preset, the encoder leaves compression_level at the driver default
-	// (~TU=4). The SCALEPLEX_PRESET_MAP env knob is retired; override by
-	// passing -compression_level directly.
-
-	// 8. Match Plex prod's "no a53_cc SEI in HW-encoded output" convention.
-	//
-	// PMS emits `-sei:0 -a53_cc` on every HEVC/libx265 session (201/287
-	// corpus entries) but omits it on libx264 sessions (10 entries).
-	// In stock AV_OPT_TYPE_FLAGS parser semantics `-X` REMOVES flag X,
-	// not adds it. Plex's bundled libavcodec.so.60 has `a53_cc` as a
-	// SEI flag (verified via `strings`), but their published 1.12.3
-	// source omits it — private patch. Net Plex-prod intent: strip
-	// a53_cc SEI on every HW-encode session so their separate CC
-	// pipeline (PGS-style overlay) drives caption rendering, not SEI
-	// passthrough.
-	//
-	// Without our inject, jellyfin-ffmpeg's h264_vaapi default
-	// (`IDENTIFIER|TIMING|RECOVERY_POINT|A53_CC`, a53_cc default-ON
-	// per vaapi_encode_h264.c L1089) would emit a53_cc SEI on the 10
-	// libx264-swapped-to-h264_vaapi sessions — diverging from Plex
-	// prod. Inject keeps libx264 sessions consistent with the libx265
-	// majority. Tag stays for replay-corpus diagnostics.
-	//
-	// Skipped when honoring a SW session: the encoder stays libx264, where
-	// a53_cc isn't default-injected, so PMS's own omission already matches.
-	if !honorSW && !honorHybrid && indexOfArg(args, "-sei:0", 0) < 0 {
-		if fkfIdx := indexOfArg(args, "-force_key_frames:0", encCodecIdx+1); fkfIdx >= 0 {
-			args = spliceArgs(args, fkfIdx, "-sei:0", "-a53_cc")
-			changes = append(changes, "inject:sei+a53_cc")
+		// 8. Match Plex prod's "no a53_cc SEI in HW-encoded output" convention.
+		//
+		// PMS emits `-sei:0 -a53_cc` on every HEVC/libx265 session (201/287
+		// corpus entries) but omits it on libx264 sessions (10 entries).
+		// In stock AV_OPT_TYPE_FLAGS parser semantics `-X` REMOVES flag X,
+		// not adds it. Plex's bundled libavcodec.so.60 has `a53_cc` as a
+		// SEI flag (verified via `strings`), but their published 1.12.3
+		// source omits it — private patch. Net Plex-prod intent: strip
+		// a53_cc SEI on every HW-encode session so their separate CC
+		// pipeline (PGS-style overlay) drives caption rendering, not SEI
+		// passthrough.
+		//
+		// Without our inject, jellyfin-ffmpeg's h264_vaapi default
+		// (`IDENTIFIER|TIMING|RECOVERY_POINT|A53_CC`, a53_cc default-ON
+		// per vaapi_encode_h264.c L1089) would emit a53_cc SEI on the 10
+		// libx264-swapped-to-h264_vaapi sessions — diverging from Plex
+		// prod. Inject keeps libx264 sessions consistent with the libx265
+		// majority. Tag stays for replay-corpus diagnostics.
+		//
+		// Skipped when honoring a SW session: the encoder stays libx264, where
+		// a53_cc isn't default-injected, so PMS's own omission already matches.
+		if !honorSW && !honorHybrid && indexOfArg(args, "-sei:0", 0) < 0 {
+			if fkfIdx := indexOfArg(args, "-force_key_frames:0", encCodecIdx+1); fkfIdx >= 0 {
+				args = spliceArgs(args, fkfIdx, "-sei:0", "-a53_cc")
+				changes = append(changes, "inject:sei+a53_cc")
+			}
 		}
-	}
+
+	} // end if !isRemux
 
 	// 9. Audio: Plex emits `-codec:N <codec>_eae -eae_prefix:N <token>`
 	// (the `*_eae` family is Plex's EasyAudioEncoder over a localhost
@@ -2770,21 +2715,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	}
 
 	// VAAPI driver discovery env. Only override if explicitly set;
-	// libva otherwise auto-discovers iHD on the worker image.
-	env["LIBVA_DRIVER_NAME"] = vaapiDriver
-	if libvaDriversPath != "" {
-		env["LIBVA_DRIVERS_PATH"] = libvaDriversPath
+	// libva otherwise auto-discovers iHD on the worker image. Skipped
+	// on Optimize remux — pure passthrough, no VAAPI device touched.
+	if !isRemux {
+		env["LIBVA_DRIVER_NAME"] = vaapiDriver
+		if libvaDriversPath != "" {
+			env["LIBVA_DRIVERS_PATH"] = libvaDriversPath
+		}
+		changes = append(changes, "env:LIBVA")
 	}
-	changes = append(changes, "env:LIBVA")
 
 	env = setWorkerHomeEnv(env)
 	changes = append(changes, "env:HOME")
 
 	// scaleplex (0120): drop Plex's subtitle decode-sink now that the
 	// -map_inlineass binding self-decodes. See stripInlineassDecodeSink.
-	if stripped, ok := stripInlineassDecodeSink(args); ok {
-		args = stripped
-		changes = append(changes, "drop:inlineass-decode-sink")
+	// Skipped on Optimize remux — no -map_inlineass / no decode sink in
+	// the argv anyway, but gate it explicitly to keep the remux path's
+	// changes list free of no-op tags.
+	if !isRemux {
+		if stripped, ok := stripInlineassDecodeSink(args); ok {
+			args = stripped
+			changes = append(changes, "drop:inlineass-decode-sink")
+		}
 	}
 
 	isMatroskaSegment := false
