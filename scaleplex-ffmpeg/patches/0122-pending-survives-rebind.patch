@@ -1,0 +1,149 @@
+Description: scaleplex_inlineass: pending queue survives probe->live rebind
+ Patch 0101 added a pre-graph pending-chunk queue so sidecar SRT cues
+ (decoded on a separate fast input demuxer that EOFs before the video
+ filter graph is configured) survive long enough to be replayed at
+ link_graph time. That worked for the simple case where
+ configure_filtergraph runs once. It silently breaks when
+ configure_filtergraph runs TWICE (probe pass + live pass under
+ jellyfin 7.x's split-thread filter scheduler).
+ .
+ Failure trace (sidecar SRT + HW-decode-text-burn, captured 2026-05-26
+ on the orthogonal-detector HW-text refactor branch):
+ .
+   1. Probe configure_filtergraph runs. link_graph binds flt_ctx1,
+      drains pending into flt_ctx1's libass track. handle_subtitle
+      switches to the fast (immediate-dispatch) path -- chunks bypass
+      the pending queue and feed flt_ctx1 directly. By the time the
+      sidecar SRT demuxer EOFs, every cue lives in flt_ctx1's track,
+      and the pending queue is empty.
+   2. Probe->live re-entry. flt_ctx1 is destroyed; the
+      inlineass_filter_uninit_cb clears flt_ctx. link_graph binds the
+      new graph's flt_ctx2. pending_count == 0 -> drain is a no-op.
+      flt_ctx2's libass track is empty.
+   3. Video frames render against flt_ctx2. Empty track -> no cues
+      visible. Sidecar SRT subtitles silently lost.
+ .
+ Embedded subtitles dodge the race because their decoder is paced by
+ the same demuxer that feeds video: handle_subtitle keeps firing past
+ the rebind, so flt_ctx2's track gets fresh cues from continued
+ decoding (patch 0101's "the live graph will see fresh subs as decoding
+ resumes" -- true for embedded, false for an instant-EOF sidecar).
+ .
+ Fix: treat the per-binding queue as the persistent source of truth.
+ .
+   - handle_subtitle now ALWAYS pending_push()s the chunk, then ALSO
+     dispatches it immediately if flt_ctx is bound. Replays of the
+     full queue into a freshly-bound flt_ctx see every cue ever
+     observed, including those dispatched into a previous (now-freed)
+     graph's track.
+ .
+   - link_graph calls a new pending_replay() (instead of
+     pending_drain()) that walks the queue without consuming it. Cap
+     and queue lifetime semantics are unchanged; only the
+     consume-on-drain step is dropped.
+ .
+   - pending_drain() is retained but no longer called (kept for
+     symmetry / possible future use).
+ .
+ Memory: ~200 bytes per cue (ass_line is the long field -- typical
+ SRT events wrapped in ASS dialog tags are < 80 chars). 2-hour movie
+ with 2000 cues = ~400 KiB per binding. Bounded by the existing
+ INLINEASS_PENDING_MAX (4096) cap. Freed at uninit (unchanged).
+ .
+ Bitmap subs (PGS/DVD/DVB/XSUB) are unaffected -- they use the
+ replay_bitmap side-channel that drops pre-graph presentations and
+ relies on PGS retransmission. Only the text path needs persistent
+ replay.
+ .
+ No rewriter change needed. Restores parity with v1.6.1-and-earlier
+ sidecar-SRT prod behavior on the new (orthogonal-detector) shape
+ that routes through vf_inlineass HW (VAAPI) branch.
+Origin: scaleplex; design ref patch 0101 + post-PR#41 plex-test repro
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-26
+--- a/fftools/scaleplex_inlineass.c	2026-05-26 15:13:56.874149231 +0200
++++ b/fftools/scaleplex_inlineass.c	2026-05-26 15:15:06.826374497 +0200
+@@ -129,6 +129,32 @@
+     b->pending_dropped = 0;
+ }
+ 
++/* scaleplex (0122): replay the persistent queue into the bound filter
++ * WITHOUT consuming it. Used by link_graph on every (re)bind so the new
++ * filter's libass track sees every text cue ever observed for this
++ * binding -- not just chunks queued before the first link_graph call.
++ * Required for sidecar-SRT inputs whose demuxer EOFs before the
++ * probe->live filter graph rebind: cues dispatched into the probe-pass
++ * flt_ctx are gone once that filter is freed, and no further
++ * handle_subtitle calls will arrive to repopulate the live-pass
++ * flt_ctx. Caller holds bindings_lock AND b->flt_ctx is set. */
++static void pending_replay(InlineAssBinding *b)
++{
++    PendingSubChunk *p;
++    int n = 0;
++
++    for (p = b->pending_head; p; p = p->next) {
++        avfilter_inlineass_replay_chunk(b->flt_ctx, b->dec_ctx,
++                                        p->start_ms, p->duration_ms,
++                                        p->ass_line);
++        n++;
++    }
++    if (n)
++        av_log(NULL, AV_LOG_VERBOSE,
++               "scaleplex_inlineass: replayed %d cached chunks into bind#%td flt_ctx=%p\n",
++               n, b - bindings, b->flt_ctx);
++}
++
+ /* Caller holds bindings_lock. Used when link_graph rebinds (probe→live)
+  * or at uninit. */
+ static void pending_free(InlineAssBinding *b)
+@@ -330,11 +356,16 @@
+                "scaleplex_inlineass: bound filter to input #%d:%s (dec_ctx=%p)\n",
+                b->file_idx, b->stream_spec, (void*)b->dec_ctx);
+ 
+-        /* Flush any pending chunks that arrived before this graph was
+-         * ready — happens on the sidecar -i sub.srt path where sub
+-         * decode races ahead of video filter configuration. */
++        /* scaleplex (0122): replay the persistent queue into the freshly
++         * bound filter on every link_graph call (probe pass, post probe
++         * ->live rebind, or any reconfigure). The queue is the source
++         * of truth -- handle_subtitle appends every cue, and the new
++         * flt_ctx's libass track is empty until we feed it. Without
++         * replay-on-rebind, sidecar SRT (instant-EOF demuxer) loses all
++         * cues that were dispatched into the now-freed previous flt_ctx,
++         * and the live-pass renders blank subs. */
+         if (b->pending_count)
+-            pending_drain(b);
++            pending_replay(b);
+     }
+     pthread_mutex_unlock(&bindings_lock);
+ }
+@@ -424,6 +455,17 @@
+                                    av_make_q(1, 1000));
+         start_ms   += sub->start_display_time;
+ 
++        /* scaleplex (0122): always append to the persistent queue. The
++         * queue is the source of truth used by link_graph on every
++         * (re)bind to repopulate the new flt_ctx's libass track. The
++         * immediate dispatch below is a live-path optimization for the
++         * already-bound case; it's additive, not exclusive. Without
++         * always-queue, sidecar SRT cues dispatched into the probe-pass
++         * flt_ctx vanish when that filter is freed at probe->live
++         * rebind, and no further handle_subtitle calls arrive to refill
++         * the live-pass filter. */
++        pending_push(b, start_ms, duration_ms, rect->ass);
++
+         if (b->flt_ctx) {
+             av_log(NULL, AV_LOG_VERBOSE,
+                    "scaleplex_inlineass: handle_subtitle bind#%td dec_ctx=%p flt_ctx=%p rects=%d\n",
+@@ -432,9 +474,8 @@
+                                             start_ms, duration_ms, rect->ass);
+         } else {
+             av_log(NULL, AV_LOG_VERBOSE,
+-                   "scaleplex_inlineass: buffer chunk bind#%td start=%" PRId64 " dur=%" PRId64 " queued=%d\n",
++                   "scaleplex_inlineass: buffer chunk bind#%td start=%" PRId64 " dur=%" PRId64 " queued=%d (no flt_ctx yet)\n",
+                    b - bindings, start_ms, duration_ms, b->pending_count);
+-            pending_push(b, start_ms, duration_ms, rect->ass);
+         }
+     }
+ 
