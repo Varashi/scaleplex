@@ -23,9 +23,11 @@ func TestRewriterTagInventory(t *testing.T) {
 	}
 
 	emitted, bailed := extractEmittedLiterals(t, "rewriter.go")
-	if len(emitted) == 0 {
-		t.Fatal("rewriter.go AST scan found no change-tag emit sites; parser broken?")
-	}
+	// Post-PR-B the canonical state is zero string-literal emit sites — every
+	// tag is a Tag* / TagPrefix* / TagBailReason* reference. Empty sets here
+	// are correct, not "parser broken." If a future PR re-introduces a
+	// literal that doesn't trace to the inventory, the un-coverage loop
+	// below catches it.
 
 	// Change-tag emissions: must match a Tag* full value, or a TagPrefix*
 	// prefix value, or — for emit-sites with concatenated suffix — the
