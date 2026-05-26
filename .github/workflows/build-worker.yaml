@@ -70,7 +70,7 @@ jobs:
             --status=success \
             --limit=1 \
             --json databaseId \
-            --jq '.[0].databaseId' || true)
+            --jq '.[0].databaseId // empty' || true)
           if [[ -n "${run_id:-}" ]]; then
             echo "downloading scaleplex-ffmpeg7-deb from run $run_id"
             gh run download "$run_id" \
