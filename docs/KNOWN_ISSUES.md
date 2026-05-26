@@ -3,6 +3,10 @@
 Tracked limitations as of v1.6.1. None block playback; each has a
 documented cause and, where relevant, a path to a fix.
 
+See also: [`TEST_MATRIX.md`](TEST_MATRIX.md) for cells flagged
+`[KNOWN: <slug>]` — those cross-reference back here so a known-broken
+shape isn't re-validated each release.
+
 ## Burned PGS cue stayed on screen until next cue — RESOLVED in v1.6.1
 
 Was: `vf_inlineass::refresh_bitmap` recomputed `have_bmp` every frame from the
@@ -32,7 +36,38 @@ facts regardless of an intervening tonemap, and `composeBurn` re-emits the
 canonical VA-resident `scale_vaapi(p010) → [tonemap] → inlineass(render_height)`
 graph. Measured **0.37× → 4.6× realtime** end-to-end live.
 
+## Plex for Windows · live HLS-matroska transcode — mpv aborts demux
+
+`[KNOWN: PWin720p]`
+
+**Severity:** affects Plex for Windows desktop transcode at 720p/1080p only.
+Direct play works (confirmed sha-03b2cd0 era). Plex for Windows is
+~3.9% of prod transcoded traffic (top-5 client per Tautulli).
+
+When Plex for Windows negotiates HLS-matroska transcode at 720p or 1080p,
+mpv (the desktop client's player) aborts demuxing the matroska stream
+shortly after the first segment. Source-codec independent — happens on
+HEVC, AV1, and h264 sources. Direct streaming the same content to Plex
+for Windows plays cleanly; the issue is the scaleplex-produced mkv
+byte stream.
+
+**Status:** unresolved as of v1.7.0 (2026-05-26). Root cause undiagnosed.
+Hypothesis: matroska EBML byte stream emitted by scaleplex-ffmpeg7's
+`matroskaenc` (fork patch 0107 Duration backport) differs from stock
+Plex Transcoder's mkv output in a way mpv's demuxer rejects. Confirmation
+requires hex diff of prod vs scaleplex first-segment EBML headers on
+identical content.
+
+**Tracked in:**
+- `docs/TEST_MATRIX.md` ("NOT yet validated" cells)
+- memory `project_scaleplex_plex_windows_720p_gap.md`
+
+**Workaround:** Plex for Windows user can set quality cap above source
+resolution (forces direct play), or use Plex Web (DASH) instead.
+
 ## HW-decode + SW-encode hybrid — 4K HDR corruption
+
+`[KNOWN: HWDecSWEnc4KHDR]`
 
 **Severity:** affects only `SCALEPLEX_FORCE_HW=0` (honor mode); prod runs
 `FORCE_HW=1` so the honor paths are dormant.
