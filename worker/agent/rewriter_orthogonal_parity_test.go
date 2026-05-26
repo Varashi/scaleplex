@@ -87,6 +87,13 @@ func TestReplayCorpus_OrthogonalEmitParity(t *testing.T) {
 	}
 	t.Logf("orthogonal emit parity: considered=%d parity=%d algo-only-diff=%d other-diff=%d",
 		considered, parity, diffAlgo, diffOther)
+	// Hard coverage gate: if every corpus entry was filtered out the harness
+	// reports green by accident (no comparisons). Require at least one
+	// considered entry so a future change that breaks Rewrite() / the dispatch
+	// (everything bails) can't pass silently.
+	if considered == 0 {
+		t.Fatalf("zero corpus entries considered — harness coverage broken (corpus empty or every Rewrite bailed)")
+	}
 	if diffOther > 0 {
 		t.Errorf("%d corpus emits diverge beyond the allow-listed tonemap-algo difference — investigate before swapping the dispatch", diffOther)
 	}

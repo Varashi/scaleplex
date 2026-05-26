@@ -726,10 +726,13 @@ var (
 	reGraphTonemapSW = regexp.MustCompile(`(?:^|[,;\]])tonemap=([A-Za-z0-9]+)`)
 	reGraphInlineass = regexp.MustCompile(`inlineass=([^\[]*)`)
 	// reGraphFilterName: a filtergraph node name — an identifier preceded by a
-	// chain boundary (start, ';', ',', ']') and followed by '=', '[', ',', ';'
-	// or end. Arg values (after '=' or ':') are not preceded by a boundary, so
-	// they aren't matched.
-	reGraphFilterName = regexp.MustCompile(`(?:^|[;,\]])([a-z_][a-z0-9_]*)(?:[=\[,;]|$)`)
+	// chain boundary (start, ';', ',', ']') possibly followed by whitespace,
+	// and followed by '=', '[', ',', ';' or end. Arg values (after '=' or ':')
+	// are not preceded by a boundary, so they aren't matched. The `\s*` after
+	// the boundary lets the matcher catch nodes after whitespace (Plex emits
+	// e.g. `; [1]crop=...` in places) — without it, an unmodeled node could
+	// bypass graphNodesModeled and silently skip the safety bail.
+	reGraphFilterName = regexp.MustCompile(`(?:^|[;,\]])\s*([a-z_][a-z0-9_]*)(?:[=\[,;]|$)`)
 )
 
 // modeledFilterNodes is every filtergraph node composeBurn / the rewriter
