@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **refactor(rewriter): orthogonal HW-decode-text branch** (#40). The
+- **refactor(rewriter): orthogonal HW-decode-text branch** (#41). The
   HW-decode-text path now runs through `extractGraphFacts +
   composeBurn(burnSpec{vaResident:true, …})` — the same orthogonal core the
   SW-reshape (#39) and HW-decode-bitmap (#37) branches already use. The
@@ -21,7 +21,52 @@
   `-map [4]` / `-map [6]` is retargeted via the shared `retargetMapLabel`.
   Orthogonal parity harness 1369/1369 over the 1583-entry argv corpus, no
   drift; 4 of the original `reFilter*` regex zoo gone in v1.6.1, last 2 gone
-  now. No fork change.
+  now.
+
+- **fix(ffmpeg): sched start_prepare per-output sinkless gate** (#41, patch
+  `0122`). Patch `0120` skipped `dst_finished` allocation in `start_prepare()`
+  for any decoder marked `sink_less` — correct when the decoder has only a
+  sink-less side-channel output, broken when the decoder has BOTH a
+  sink-less side-channel AND a real OST consumer (the dual-consumer case
+  exercised when an argv keeps Plex's `-map <spec> -f null -codec ass
+  nullfile` decode-sink alongside `-map_inlineass <spec>`). In that case,
+  the OST output's `dst_finished` stayed NULL while `nb_dst=1`, and the
+  first `sch_dec_send` for the OST dereferenced `&dst_finished[0]` →
+  SIGSEGV in `dec1:0:srt`. Fix: move the sink-less gate INSIDE the
+  per-output loop so `dst_finished` is allocated for real outputs and only
+  the genuinely-unconnected outputs are skipped. Live-validated on
+  plex-test with a minimal lavfi+SRT gdb repro (pre-patch SIGSEGV →
+  post-patch clean decode, 2 packets read, 2 frames decoded).
+
+- **fix(rewriter): keep inlineass decode-sink for sidecar bindings** (#41).
+  Patch `0120`'s sink-less self-decode (via `ist_inlineass_add`) works for
+  embedded subtitle streams — they share the demuxer with main video,
+  which is pumped by the scheduler fast enough to feed the sink-less
+  decoder. For sidecar inputs (`-i temp-0.srt -map_inlineass 1:s:0`) the
+  separate sidecar demuxer thread has no other downstream consumer; the
+  scheduler chokes after the first packet (1 packet / 7 bytes from a
+  134 KiB SRT file, 0 frames decoded, libass track empty, subs render
+  blank). Fix: `stripInlineassDecodeSink` now gates on the `-map_inlineass`
+  binding's `file_idx == 0`. Sidecar bindings (`file_idx >= 1`) keep
+  Plex's emitted `-map <spec> -f null -codec ass nullfile` so the sidecar
+  demuxer has a real downstream consumer. Combined with patch `0122`
+  (above) the dual-consumer state is safe; sidecar SRT renders. Embedded
+  bindings still get the original `0120` strip (no extra null-mux
+  competing for the NFS read during pre-throttle buffer fill).
+
+- **refactor(rewriter): fold tryOptimizeRemux into Rewrite()** (#43). The
+  Optimize remux fast-path was a parallel function that re-ordered the
+  same helpers the main rewriter's tail already calls. Collapsed into one
+  path: detect `isRemux := isOptimizeRemux(args)` up-front, gate the
+  transcode block (decoder upgrade, init_hw_device, sub detection, filter
+  rewrite, encoder swap, SEI inject) and the VAAPI-only env writes (LIBVA
+  driver, inlineass-decode-sink strip) on `!isRemux`. Common tail (EAE
+  swap, manifest_name / segment_list / progressurl rewrites, loglevel /
+  nostats / env scrubs) runs unconditionally — already shared via
+  helpers, order-independent. Drops `decode:remux:<short>` and
+  `encode:copy(passthrough)` change tags (helper-emitted tags suffice).
+  Parity-validated on 720 corpus entries (real-prod + Optimize-sweep
+  matrix): 0 argv / env / progressurl divergence. Net −47 LOC.
 
 ## v1.6.1 — 2026-05-26
 
