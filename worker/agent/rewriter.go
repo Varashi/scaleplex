@@ -1035,11 +1035,11 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 	g := args[vfIdx]
 	if reLeadHwuploadOCL.MatchString(g) {
 		g = reLeadHwuploadOCL.ReplaceAllString(g, "[0:0]")
-		changes = append(changes, "tonemap:ocl:drop-lead-hwupload")
+		changes = append(changes, TagTonemapOCLDropLeadHWUpload)
 	}
 	if reRevmapBeforeDownloadOCL.MatchString(g) {
 		g = reRevmapBeforeDownloadOCL.ReplaceAllString(g, "hwdownload")
-		changes = append(changes, "tonemap:ocl:collapse-revmap-download")
+		changes = append(changes, TagTonemapOCLCollapseRevmapDownload)
 	}
 	args[vfIdx] = g
 
@@ -1061,7 +1061,7 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 		}
 		if vaIdx >= 0 {
 			args = spliceArgs(args, vaIdx+2, "-init_hw_device", "opencl=ocl@"+vaName)
-			changes = append(changes, "tonemap:ocl:inject-opencl-device")
+			changes = append(changes, TagTonemapOCLInjectOpenCLDevice)
 		}
 	}
 
@@ -1069,7 +1069,7 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 	if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 &&
 		indexOfArg(args, "-hwaccel_output_format:0", 0) < 0 {
 		args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
-		changes = append(changes, "tonemap:ocl:force-output-format-vaapi")
+		changes = append(changes, TagTonemapOCLForceOutputFormatVA)
 	}
 	return args, changes
 }
