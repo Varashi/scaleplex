@@ -80,6 +80,13 @@ const (
 
 type Capture struct {
 	SessionID        string            `json:"session_id"`
+	// PlexSessionToken / PlexSessionUUID — parsed by the worker from
+	// the cwd shape /transcode/Transcode/Sessions/plex-transcode-<TOKEN>-<UUID>.
+	// SessionID stays as the shim's derived id (input-basename + pid + nonce)
+	// for filename idempotency; these fields let a downstream tool
+	// cross-reference back to PMS's `?session=<TOKEN>` request-URL parameter.
+	PlexSessionToken string            `json:"plex_session_token,omitempty"`
+	PlexSessionUUID  string            `json:"plex_session_uuid,omitempty"`
 	CaptureSource    string            `json:"capture_source,omitempty"`
 	CapturedAt       string            `json:"captured_at,omitempty"`
 	WorkerPod        string            `json:"worker_pod,omitempty"`
