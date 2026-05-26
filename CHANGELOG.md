@@ -1,27 +1,137 @@
 # Changelog
 
-## Unreleased
+## v1.7.0 — 2026-05-26
 
-- **refactor(rewriter): orthogonal HW-decode-text branch** (#40). The
-  HW-decode-text path now runs through `extractGraphFacts +
-  composeBurn(burnSpec{vaResident:true, …})` — the same orthogonal core the
-  SW-reshape (#39) and HW-decode-bitmap (#37) branches already use. The
-  per-shape `reFilterHWAss` / `reFilterHWOpenCLAss` regex literals (the last
-  two of the original six `reFilter*` shape-keyed regexes) are deleted; every
-  reshape now sits behind the one fact-extractor + one composer. The HDR
-  variant (Plex's `tonemap_opencl` detour) is honored via `tm.stage(facts.algo)`
-  exactly as the SW-HDR path is — algorithm preserved, washed-HDR risk
-  eliminated by construction rather than by a dedicated regex branch.
-  `composeBurn` gains an `animatedTierDown` axis, so the SW-reshape path also
-  picks up the animated-cue tier-down knob (latent feature gain — embedded ASS
-  on SW reshape now tier-downs animated cues the same way the HW path always
-  did). Output graph is byte-equivalent up to label renumbering — Plex's
-  redundant leading `[0:0]hwupload[0]` drops out (the source is already
-  VA-tagged) and labels start at `[0]`/`[1]` instead of `[1]`/`[4]`. PMS's
-  `-map [4]` / `-map [6]` is retargeted via the shared `retargetMapLabel`.
-  Orthogonal parity harness 1369/1369 over the 1583-entry argv corpus, no
-  drift; 4 of the original `reFilter*` regex zoo gone in v1.6.1, last 2 gone
-  now. No fork change.
+Rewriter-orthogonality completion + sidecar-sink-keep + `tryOptimizeRemux`
+fold + comprehensive pre-tag testing infrastructure. Plus the live-
+validation sweep that closed the long-open `KNOWN: PWin720p` known-issue.
+
+> **The HW-decode-text branch was the last `reFilter*` shape-keyed regex
+> survivor**; folded onto `extractGraphFacts + composeBurn`. The
+> `tryOptimizeRemux` fast-path was a parallel rewriter that re-ordered
+> the same helpers the main path's tail already calls; collapsed into one
+> path with an `isRemux` gate. Pre-tag testing infrastructure
+> (release-gate doc, rewriter-tag-canon assertion + replacement, CI
+> replay against fixture corpus) wired up alongside the rewriter changes.
+
+### Rewriter / fork
+
+- **refactor(rewriter): orthogonal HW-decode-text branch** (#41,
+  fork patch `0122-sched-sinkless-per-output`). The HW-decode-text
+  path now runs through `extractGraphFacts +
+  composeBurn(burnSpec{vaResident:true, …})` — the same orthogonal core
+  the SW-reshape (#39) and HW-decode-bitmap (#37) branches already use.
+  The per-shape `reFilterHWAss` / `reFilterHWOpenCLAss` regex literals
+  (the last two of the original six `reFilter*` shape-keyed regexes)
+  are deleted; every reshape now sits behind the one fact-extractor +
+  one composer. The HDR variant (Plex's `tonemap_opencl` detour) is
+  honored via `tm.stage(facts.algo)` exactly as the SW-HDR path is —
+  algorithm preserved, washed-HDR risk eliminated by construction
+  rather than by a dedicated regex branch. `composeBurn` gains an
+  `animatedTierDown` axis, so the SW-reshape path also picks up the
+  animated-cue tier-down knob (latent feature gain — embedded ASS on
+  SW reshape now tier-downs animated cues the same way the HW path
+  always did). Output graph is byte-equivalent up to label renumbering
+  — Plex's redundant leading `[0:0]hwupload[0]` drops out (the source
+  is already VA-tagged) and labels start at `[0]`/`[1]` instead of
+  `[1]`/`[4]`. PMS's `-map [4]` / `-map [6]` is retargeted via the
+  shared `retargetMapLabel`. Orthogonal parity harness 1369/1369 over
+  the 1583-entry argv corpus, no drift.
+- **fix(rewriter): keep inlineass decode-sink for sidecar bindings**
+  (#41). Sidecar SRT bindings (`file_idx >= 1`, e.g. PMS's staged
+  `-i temp-0.srt`) still need the `-f null -codec dvdsub nullfile`
+  decode-sink to feed the sub decoder. Embedded bindings
+  (`file_idx == 0`, the v1.5.0 paced-self-decode path) drop the sink.
+  Tag delta: embedded → `drop:inlineass-decode-sink` present; sidecar
+  → absent. Live-validated 2026-05-26 (Plex for Android TV + Dusk Till
+  Dawn sidecar SRT).
+- **refactor(rewriter): fold `tryOptimizeRemux` into `Rewrite`** (#43).
+  Optimize remux fast-path was a parallel function that re-ordered the
+  same helpers the main rewriter's tail already calls. Collapsed into
+  one path: detect `isRemux := isOptimizeRemux(args)` up-front, gate
+  the transcode block (decoder upgrade, init_hw_device, sub detection,
+  filter rewrite, encoder swap, SEI inject) and the VAAPI-only env
+  writes on `!isRemux`. Common tail (EAE swap, manifest_name /
+  segment_list / progressurl rewrites, loglevel / nostats / env
+  scrubs) runs unconditionally — already shared via helpers,
+  order-independent. Drops `decode:remux:<short>` and
+  `encode:copy(passthrough)` change tags; helper-emitted tags suffice.
+  Parity-validated on 720 remux corpus entries — 0 argv / env /
+  progressurl divergence. Net -47 LOC.
+
+### Testing infrastructure
+
+- **test(worker): pin rewriter change-tag canon + AST assertion**
+  (#46). New `worker/agent/rewriter_tags.go` declaring every
+  change-tag string the rewriter emits (30 full literals + 22 prefixes
+  + 7 bail-reason strings). `TestRewriterTagInventory` AST-parses
+  `rewriter.go`, extracts the leading literal of every value fed to
+  `append(*Changes, ...)` and every `bail(...)` reason, asserts each
+  traces to a `Tag*` / `TagPrefix*` / `TagBailReason*` constant.
+  `TestTagValues_Stable` pins every constant to its expected string
+  value (immutable contract; rename = explicit edit).
+  `TestRewriterTagInventory_ConstsAreUnique` guards against typo
+  duplicates.
+- **refactor(worker): replace rewriter change-tag literals with
+  consts** (#47). Every literal in `rewriter.go` (~50 sites) now
+  references a `Tag*` / `TagPrefix*` / `TagBailReason*` constant.
+  Renames update one place instead of N.
+- **ci: enable `go test -cover` in worker / shim / orchestrator**
+  (#45). Worker CI ran `go vet` + `go build` only; `go test` was
+  missing despite worker/agent carrying 130 of the 157-test Go suite.
+  Adds the missing step + `-cover` reporting in all three jobs. Plus
+  triggers workflow files on self-edits.
+- **ci(worker): wire replay tests against fixture corpus** (#49).
+  240-cell stratified Optimize fixture committed under
+  `worker/agent/testdata/replay-corpus/`. CI runs all 3 replay tests
+  with `REPLAY_NO_FFMPEG=1` per-PR. Rewriter-only validation against
+  the synthetic-Optimize matrix on every PR — no cluster access
+  needed.
+
+### Tooling + docs
+
+- **feat(cmd): optimize-corpus-gen — Plex Optimize argv corpus
+  generator** (#42). New `cmd/optimize-corpus-gen/` tool drives
+  plex-test PMS to spawn Plex Optimize jobs across a synthetic-content
+  matrix (codec × profile × resolution × depth × color × audio × subs
+  × target-tier × server-prefs). Generated 1824 cells / 53 shapes / 0
+  errors on first sweep; the corpus that drove the `tryOptimizeRemux`
+  fold decision (#43).
+- **docs: release-gate** (#48). New `docs/RELEASE_GATE.md` codifying
+  the T1 unit → T2 replay → T3 qa_matrix → T4 live → T5 debug-build
+  pre-tag procedure with per-tier pass criteria. `docs/TEST_MATRIX.md`
+  gains a "Release gate" section with per-tag append-only history.
+  `docs/KNOWN_ISSUES.md` gains `[KNOWN: <slug>]` cross-link markers;
+  `Plex for Windows · 720p transcode` documented for the first time
+  in-tree.
+
+### Known issues — closed
+
+- **`KNOWN: PWin720p`** — open since 2026-05-13 (sha-03b2cd0 era) —
+  **RESOLVED**. Plex for Windows desktop transcode at 720p/1080p
+  (HLS-matroska) no longer aborts mpv demux. Cumulative fix across
+  the v1.5.0→v1.7.0 fork-patch stack (0115-0122); top candidates 0120
+  paced self-decode and 0122 sched-sinkless-per-output.
+  Live-validated with 720p forced transcode + sustained 10-minute run
+  at ~4.9× realtime. Affected ~3.9% of prod transcoded traffic.
+
+### Known issues — added
+
+- **`KNOWN: FramedropBSF`** — `framedrop` audio bitstream filter
+  (Plex-Transcoder-only) not stripped by rewriter → ffmpeg exit
+  status 8 on certain DASH AAC+seek sessions. Recoverable (Plex
+  retries with different argv). Fix path: rewriter strips
+  `-bsf:N framedrop=*` output args.
+- **Duplicate `video:hdr-source(...)` tag** on text-burn HW-decode
+  path — cosmetic only.
+
+### Live validation
+
+11/11 cells PASS on the v1.7.0 release-gate sweep (2026-05-26)
+across Plex Web Chrome, Web Firefox, Plex Windows, Android TV,
+LG webOS, PS4, Android mobile, plus Plex Optimize via T2 corpus.
+4K HEVC HDR transcodes sustained 3-5× realtime across all client
+paths.
 
 ## v1.6.1 — 2026-05-26
 

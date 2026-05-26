@@ -1,6 +1,6 @@
 # Known issues
 
-Tracked limitations as of v1.6.1. None block playback; each has a
+Tracked limitations as of v1.7.0. None block playback; each has a
 documented cause and, where relevant, a path to a fix.
 
 See also: [`TEST_MATRIX.md`](TEST_MATRIX.md) for cells flagged
@@ -36,34 +36,67 @@ facts regardless of an intervening tonemap, and `composeBurn` re-emits the
 canonical VA-resident `scale_vaapi(p010) → [tonemap] → inlineass(render_height)`
 graph. Measured **0.37× → 4.6× realtime** end-to-end live.
 
-## Plex for Windows · live HLS-matroska transcode — mpv aborts demux
+## Plex for Windows · live HLS-matroska transcode — mpv aborts demux — RESOLVED in v1.7.0
 
-`[KNOWN: PWin720p]`
+Was: when Plex for Windows desktop negotiated HLS-matroska transcode at
+720p or 1080p, mpv (the client's built-in player) aborted demuxing the
+matroska stream shortly after the first segment. Source-codec independent
+— happened on HEVC, AV1, and h264 sources. Direct streaming the same
+content to Plex for Windows played cleanly; the issue was the
+scaleplex-produced mkv byte stream. Open since sha-03b2cd0 (2026-05-13).
+Affected ~3.9% of prod transcoded traffic (top-5 client per Tautulli).
 
-**Severity:** affects Plex for Windows desktop transcode at 720p/1080p only.
-Direct play works (confirmed sha-03b2cd0 era). Plex for Windows is
-~3.9% of prod transcoded traffic (top-5 client per Tautulli).
+**Fixed in v1.7.0 (live-validated 2026-05-26):** From Dusk Till Dawn 4K
+HEVC HDR → 720p forced transcode plays correctly in Plex Windows, with a
+sustained 10-minute run at ~4.9× realtime confirming stability beyond
+first-segment. Specific patch attribution requires bisection across the
+v1.5.0→v1.7.0 fork-patch stack (0115-0122); top candidates: 0120 paced
+self-decode (changes how matroska demux feeds the decoder), 0107
+matroskaenc Duration backport, 0122 sched-sinkless-per-output. The
+cumulative effect closed the bug; no targeted fix was authored against
+the symptom.
 
-When Plex for Windows negotiates HLS-matroska transcode at 720p or 1080p,
-mpv (the desktop client's player) aborts demuxing the matroska stream
-shortly after the first segment. Source-codec independent — happens on
-HEVC, AV1, and h264 sources. Direct streaming the same content to Plex
-for Windows plays cleanly; the issue is the scaleplex-produced mkv
-byte stream.
+## Plex `framedrop` audio bitstream filter not stripped — `exit status 8`
 
-**Status:** unresolved as of v1.7.0 (2026-05-26). Root cause undiagnosed.
-Hypothesis: matroska EBML byte stream emitted by scaleplex-ffmpeg7's
-`matroskaenc` (fork patch 0107 Duration backport) differs from stock
-Plex Transcoder's mkv output in a way mpv's demuxer rejects. Confirmation
-requires hex diff of prod vs scaleplex first-segment EBML headers on
-identical content.
+`[KNOWN: FramedropBSF]`
 
-**Tracked in:**
-- `docs/TEST_MATRIX.md` ("NOT yet validated" cells)
-- memory `project_scaleplex_plex_windows_720p_gap.md`
+**Severity:** recoverable transient. Affects a subset of Plex Web DASH
+sessions with AAC audio + seek (PMS emits `-bsf:1 framedrop=count=N` to
+drop initial AAC frames for A/V alignment post-seek). The fork's
+ffmpeg has no `framedrop` bitstream filter (Plex-Transcoder-only),
+ffmpeg fails to open it, exits 8. Plex re-spawns the session with
+different argv and playback resumes — user-visible effect is a brief
+stutter or silent retry at session start, not a stuck failure.
 
-**Workaround:** Plex for Windows user can set quality cap above source
-resolution (forces direct play), or use Plex Web (DASH) instead.
+Spotted live during the v1.7.0 release-gate sweep (2026-05-26, Plex Web
+Chrome + Firefox seek bursts).
+
+**Fix path (post-tag):** rewriter should strip `-bsf:N framedrop=*`
+output args (parallel to the existing `*_eae` codec strip and
+`-eae_prefix:N` drop in `swapEAEAudioDecoders` / `dropEAEPrefixFlags`).
+Tracked in memory `project_scaleplex_framedrop_bsf_strip.md`.
+
+**Workaround:** none needed — Plex's session retry path handles
+recovery transparently.
+
+## Duplicate `video:hdr-source(...)` tag on text-burn HW-decode path
+
+**Severity:** cosmetic — log noise only, no behavioral impact.
+
+The HDR-source detection in `rewriter.go` emits the same
+`video:hdr-source(<transfer>)` tag from both the encoder-side detection
+block (line ~2201) and the HW-decode-sub detection block (line ~2258).
+On sessions that hit both branches (HW decode + text sub burn + HDR
+source), the tag appears twice in `res.Changes`. Bitmap-burn path
+emits once (only one branch fires). argv output and rewriter behavior
+are unaffected; only the change-list logging is noisy.
+
+Spotted during the v1.7.0 release-gate sweep, Android TV + Dusk Till
+Dawn with embedded SRT burn.
+
+**Fix path:** consolidate the HDR-source emit into a single site, or
+dedupe via `slices.Contains` before append in
+`worker/agent/rewriter.go`.
 
 ## HW-decode + SW-encode hybrid — 4K HDR corruption
 
