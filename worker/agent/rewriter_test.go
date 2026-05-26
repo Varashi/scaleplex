@@ -2368,11 +2368,14 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 	if iCount != 2 {
 		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
 	}
-	// 4. Null-sub decode sink stripped: patch 0120 self-decodes the
-	//    -map_inlineass binding (the SW inlineass is fed via the side-channel),
-	//    so the `-map ... -f null -codec ass nullfile` output is removed.
-	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
-		t.Errorf("null-sub decode sink must be stripped (0120 self-decodes): %v", out.Args)
+	// 4. Null-sub decode sink: KEPT for sidecar bindings (file_idx >= 1) —
+	//    patch 0120's sink-less self-decode doesn't pump the sidecar
+	//    demuxer (scheduler choke after first packet; live-validated
+	//    2026-05-26). The decode sink is the only thing that pulls the
+	//    SRT through. For embedded subs (file_idx == 0) the sink IS
+	//    stripped because the main demuxer is already pumped by video.
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Errorf("sidecar null-sub decode sink must be KEPT: %v", out.Args)
 	}
 	// 5. Mode tag — unified text sub-burn via composeBurn.
 	if !containsString(out.Changes, "filter:text-inlineass-vaapi") {
@@ -2438,11 +2441,14 @@ func TestRewriter_HWText_SRT_Sidecar(t *testing.T) {
 	if iCount != 2 {
 		t.Errorf("expected 2 -i (source + sidecar, no FIFO), got %d", iCount)
 	}
-	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
-		t.Errorf("decode sink (nullfile) must be stripped (0120 self-decodes): %v", out.Args)
+	// Sidecar binding (1:s:0): decode sink MUST be kept. 0120's
+	// sink-less self-decode doesn't pump the sidecar demuxer past
+	// the first packet (live-validated 2026-05-26).
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Errorf("sidecar decode sink (nullfile) must be KEPT: %v", out.Args)
 	}
-	if !containsString(out.Changes, "drop:inlineass-decode-sink") {
-		t.Errorf("missing drop:inlineass-decode-sink tag: %v", out.Changes)
+	if containsString(out.Changes, "drop:inlineass-decode-sink") {
+		t.Errorf("sidecar must NOT trigger drop:inlineass-decode-sink: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
 		t.Errorf("missing inlineass-vaapi tag: %v", out.Changes)
