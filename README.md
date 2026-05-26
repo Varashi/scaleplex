@@ -34,6 +34,24 @@ bookkeeping is unchanged.
 
 ## Status
 
+**v1.6.1 — bitmap sub-burn unified onto `inlineass` + PGS cue-clear fix +
+orthogonal SW-reshape detector.** v1.3.0 put all sub burn-in into one fork-side
+`inlineass` filter; v1.6.1 completes the unification on the **rewriter side**:
+`detectBitmapOverlayBurn` extracts the orthogonal facts (stream spec, target
+W/H, optional tonemap algo) from Plex's `sub2video → scale-to-output →
+overlay_vaapi` shape — *with or without an intervening tonemap* — and
+`composeBurn` re-emits the canonical
+`[0:0] → [hwupload]? → scale_vaapi(p010|nv12) → [tonemap]? → inlineass(render_height)`
+graph. The HDR + burned-PGS + tonemap case (which previously escaped the
+optimizer and ran ~0.37× realtime through Plex's full-frame overlay + a
+decode→sysmem→re-upload round-trip) now runs **~4.6× realtime** end-to-end.
+Fork patch `0121` makes `vf_inlineass::refresh_bitmap`'s clear *sticky*
+(`bmp_end_ms = time_ms` on clear) — PGS cues stop resurrecting one frame after
+the empty-PCS clear (a bug latent in `0115` since v1.3.0). Rewriter dispatch
+swapped onto `extractGraphFacts → composeBurn` — **4 of 6 `reFilter*` regexes
+removed**, parity vs corpus 1369/1369. *(v1.6.0: GPU-resident OpenCL HDR
+tonemap fix — see CHANGELOG.)*
+
 **v1.5.0 — paced self-decode for `-map_inlineass`.** The subtitle stream that
 feeds `inlineass` decodes via a **sink-less decoder** (no output stream/encoder/
 muxer), paced by the demux's video-read backpressure; the rewriter drops Plex's
@@ -89,10 +107,10 @@ jellyfin-ffmpeg v7.1.3-6:
 | PMS Detection / ML pre-pass | ✓ | n/a | n/a | bail-path scrub — ffmpeg runs the original argv cleaned of Plex-private flags |
 
 **Source matrix:** AV1 + HEVC + H264; SDR + HDR10; embedded and sidecar
-SRT / ASS text subs (SRT / static ASS burn-in via the `overlay_vaapi`
-pre-render path, animated ASS via the fork-native `inlineass=` filter);
-embedded PGS bitmap subs (`overlay_vaapi`). HDR→SDR tone-mapping
-honored from Plex's argv.
+SRT / ASS text subs and embedded PGS / DVD bitmap subs — **all** burned on
+the GPU via the single fork-native `inlineass=` filter (text through libass,
+bitmap through in-filter `replay_bitmap`, animated ASS at one tier lower via
+`animated_tier_down`). HDR→SDR tone-mapping honored from Plex's argv.
 
 **Resilience:** PMS `canThrottle` pass-through, multi-engine GPU load
 reporting, transparent mid-stream worker recovery across DaemonSet rolls

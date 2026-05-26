@@ -125,8 +125,10 @@ a node with no HW for a session honors SW → runs CPU.
   the SW transcode still runs correctly on the worker. **Deploy gotcha:
   ship the default-flip and the homelab worker DS `SCALEPLEX_FORCE_HW=1` in
   the same change — otherwise all 19 HDR/AV1/sub-burn jobs (+46 SW-decode
-  partials) regress to CPU.** Also sidesteps the `reFilterHDRAss`
-  hardcoded-`hable` exit-8 bug (the SW-HDR reshape path stops being forced).
+  partials) regress to CPU.** (Historical: also sidestepped the SW-HDR
+  reshape's hardcoded-`hable` exit-8 bug — fixed in v1.5.0 by capturing any
+  algo via the rewriter, then made moot in v1.6.1 when the SW-HDR reshape was
+  collapsed onto `extractGraphFacts → composeBurn`.)
 
 - **Phase 2 — node HW profile abstraction + multi-backend reshape.**
   Parameterise encoder_map / filter_map / device by backend; auto-detect at

@@ -4,6 +4,19 @@
 a stock-ffmpeg VAAPI invocation that produces the same output bytes
 under the same names in the same directory.
 
+> **v1.6.1 — orthogonal SW-reshape detector.** The SW-decode reshape path is now
+> one fact-extractor + one composer:
+> `extractGraphFacts(graph) → {w/h, hdr+algo, subKind/params/spec}` → `composeBurn` emits the canonical
+> `[0:0] → [hwupload]? → scale_vaapi(p010|nv12) → [tonemap]? → [inlineass]?`
+> graph. The per-shape `reFilterAss / reFilterPlain / reFilterHDR / reFilterHDRAss`
+> branches collapsed (**4 of 6 regexes removed**). A node-allow-list guard
+> bails on any unmodeled node (`crop`, `eq`, `fps`, …) — preserving the strict
+> reFilter\* fall-through. `reFilterHWAss` / `reFilterHWOpenCLAss` remain for
+> the not-yet-swapped HW-decode-text path (its emit is already
+> inlineass-on-VA, equivalent shape). Bitmap sub-burn (PGS / DVD / DVB) also
+> routes through the unified `inlineass` filter via `detectBitmapOverlayBurn`
+> — no `overlay_vaapi` anywhere. See CHANGELOG v1.6.1 / #37 / #39.
+
 The translator is **conservative** — it bails (returns `applied=false`,
 caller spawns ffmpeg with the original argv unchanged) on anything it
 doesn't recognise. This means scaleplex degrades to running Plex's own
@@ -255,23 +268,24 @@ side-channel:
 
 **Label:** `hw-decode:filter:bitmap-inlineass-vaapi`.
 
-#### SW-decode (CPU fallback) — unchanged
+#### SW-decode (force-HW reshape)
 
-When Plex sends a software-decode shape (`reFilterAss` / `reFilterHDRAss`,
-e.g. HW acceleration disabled), the rewriter reshapes scale + encode to VAAPI
-but keeps `inlineass` on an nv12 (CPU) frame between `hwdownload`/`hwupload`,
-exercising the filter's **SW FFDraw branch**:
+When Plex sends a software-decode shape (HW acceleration disabled, force-HW
+on the worker), `rewriteVideoFilter` runs `extractGraphFacts(graph, subSrc)`
+to lift the orthogonal facts and `composeBurn(burnSpec{vaResident:false, …})`
+emits the canonical shape — `inlineass` on the VA surface itself (the same
+VAAPI branch the HW-decode-text path has exercised in prod since v1.3.0), no
+`hwdownload`/`hwupload` bracket, with the fork's `render_height` band:
 
 ```
-[0:0]hwupload[10];[10]scale_vaapi=W:H:format=nv12[11];[11]hwdownload[12];
-[12]format=pix_fmts=nv12[13];[13]inlineass=<stripped>[14];[14]hwupload[15]
+[0:0]hwupload[0];[0]scale_vaapi=W:H:format=nv12[1];[1]inlineass=<params>:render_height=N[2]
 ```
 
-**Labels:** `filter:passthrough-inlineass` (SDR) /
-`filter:passthrough-inlineass-hdr` (HDR). The merged filter renders these
-nv12 frames via the same libass code on CPU. *(Known gap: `reFilterHDRAss`
-matches only `tonemap=hable`; a SW-decode HDR session with another tonemap
-algorithm skips the reshape — tracked separately.)*
+For an HDR source, scale_vaapi emits p010 and the tonemap stage sits between
+scale and inlineass — Plex's honored algo extracted from the input's
+`tonemap_opencl=tonemap=X` or bare `tonemap=X`. **Labels:**
+`filter:text-inlineass-vaapi` (text), `filter:bitmap-inlineass-vaapi(:hdr-tonemap(<algo>))`
+(bitmap), `filter:hdr-tonemap-vaapi` (no-sub HDR), `filter:plain` (no-sub SDR).
 
 ### HDR tonemap (HDR source → SDR output)
 
@@ -292,12 +306,17 @@ re-emits it in canonical comma form, keeping Plex's chosen algorithm:
    hwmap=derive_device=vaapi:reverse=1[C]
 ```
 
-`hwmap` self-derives the OpenCL device from the VAAPI frame context —
-no `-init_hw_device opencl` needed. `SCALEPLEX_TONEMAP=vaapi` instead
-collapses the chain to iHD's fixed-curve `tonemap_vaapi` (BT.2390 EETF,
-no per-algorithm tuning) — an OpenCL-trouble fallback. `reFilterHDR` /
-`reFilterHDRAss` similarly reshape Plex's explicit SW-shaped tonemap
-chains to the HW pipeline.
+On the jellyfin-ffmpeg 7.x base `hwmap` no longer self-derives the OpenCL
+device inside a `-filter_complex` (it did on ffmpeg-6), so
+`gpuResidentOpenCLTonemap` post-fixes the emitted graph: injects
+`-init_hw_device opencl=ocl@<vaapi-device>`, forces VA-resident decode, drops
+a leading `[0:0]hwupload`, and collapses any reverse-map→download round-trip.
+`SCALEPLEX_TONEMAP=vaapi` instead collapses the chain to iHD's fixed-curve
+`tonemap_vaapi` (BT.2390 EETF, no per-algorithm tuning) — an OpenCL-trouble
+fallback. SW-shaped HDR tonemap chains (Plex's bare `tonemap=X` or
+`zscale…tonemap`) are reshaped the same way: `extractGraphFacts` captures the
+algo from whichever tonemap node Plex emitted, and `composeBurn` re-emits
+through `tm.stage(algo)`.
 
 > The worker **must** strip `OCL_ICD_VENDORS` from the spawn env (it
 > does — see `stripEAEEnvVars`). PMS sets `OCL_ICD_VENDORS=0` to disable
@@ -316,16 +335,16 @@ when:
 
 - Filter graph contains a `subtitles=...` already (Plex's own SW path)
 - Decoder is unrecognised
-- Filter shape doesn't match any known mode. The shapes the rewriter
-  understands are (filter-rewrite return modes plus the side-channel
-  HW-decode + bitmap-overlay regex path):
+- Filter graph carries an unmodeled node — `extractGraphFacts`'s allow-list
+  guard bails on anything outside `scale/scale_vaapi/hwupload/hwdownload/hwmap/
+  format/setparams/tonemap/tonemap_opencl/tonemap_vaapi/zscale/inlineass/
+  overlay_vaapi`. The composed modes (the `filter:<mode>` change tag):
   - `plain` — straight transcode, no subs, no tonemap
-  - `overlay-vaapi-bitmap` / `overlay-vaapi-bitmap-hdr` (SW-decode + bitmap sub)
-  - `passthrough-inlineass` / `passthrough-inlineass-hdr` (text sub via fork's `inlineass`)
-  - `hdr-tonemap-vaapi` / `hdr-tonemap-vaapi-passthrough-inlineass`
-  - `hw-decode:filter:sub-prerender-overlay` (SRT / static-ASS via GPU pre-render)
-  - `hw-decode:filter:bitmap-sub-prerender` (PGS via the canvas+overlay pre-render — see above)
-  - `hw-decode:filter:inlineass-passthrough` (animated ASS on HW-decode path)
+  - `hdr-tonemap-vaapi` — no-sub HDR
+  - `text-inlineass-vaapi` — text sub burn-in (SDR or HDR), inlineass on the VA surface
+  - `bitmap-inlineass-vaapi` (`:hdr-tonemap(<algo>)` suffix when HDR) — bitmap sub burn-in via the fork's `replay_bitmap` binding
+  - HW-decode-text uses its own legacy tags (`hw-decode:filter:inlineass-vaapi` ±
+    `opencl-tonemap->vaapi:` prefix) — same shape, not yet collapsed onto composeBurn.
 
 These are diagnostic dead-ends rather than failures: stock ffmpeg with
 the original Plex argv will fail, but the failure surface is ffmpeg's

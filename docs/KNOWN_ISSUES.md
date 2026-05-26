@@ -1,7 +1,36 @@
 # Known issues
 
-Tracked limitations as of v1.4.0. None block playback; each has a
+Tracked limitations as of v1.6.1. None block playback; each has a
 documented cause and, where relevant, a path to a fix.
+
+## Burned PGS cue stayed on screen until next cue — RESOLVED in v1.6.1
+
+Was: `vf_inlineass::refresh_bitmap` recomputed `have_bmp` every frame from the
+last bitmap's `[bmp_start_ms, bmp_end_ms)` window. PGS cues carry
+`end_display_time=0` → `bmp_end_ms=-1`, so the empty-PCS clear (which dropped
+`have_bmp` and returned early) was undone the very next frame by the recompute
+— the cue resurrected one frame after the clear and hung until the next cue.
+Latent in patch `0115` since v1.3.0; only spotted when watched closely.
+
+**Fixed (v1.6.1, patch `0121`):** on clear, set `bmp_end_ms = time_ms` to close
+the window so the recompute yields `have_bmp=false` until a new bitmap's
+`do_upload` resets it. Live-validated on plex-test (PGS-SDH burn filmstrip
+shows the cue clearing at its end).
+
+## 4K HDR + burned PGS sub-realtime (full-frame overlay) — RESOLVED in v1.6.1
+
+Was: in the full-HW passthrough path, scaleplex trusted Plex's own
+`sub2video → scale-to-4K → overlay_vaapi` graph (with a leading `[0:0]hwupload`
+that re-uploaded the already-VA decoded surface — a decode→sysmem→re-upload
+round-trip). At 4K HDR the full-frame overlay + the round-trip ran ~0.37×
+realtime → buffering. The existing reroute only matched the SDR shape; the HDR
+variant (a `tonemap_opencl` chain spliced between the scaled video and the
+overlay) escaped it.
+
+**Fixed (v1.6.1, #37):** `detectBitmapOverlayBurn` extracts the orthogonal
+facts regardless of an intervening tonemap, and `composeBurn` re-emits the
+canonical VA-resident `scale_vaapi(p010) → [tonemap] → inlineass(render_height)`
+graph. Measured **0.37× → 4.6× realtime** end-to-end live.
 
 ## HW-decode + SW-encode hybrid — 4K HDR corruption
 
