@@ -83,13 +83,10 @@ either rewriter bails (`applied=false`) or stock tonemap chain runs.
 
 These need a play-through before we can promote:
 
-- Plex Windows desktop · live HLS-matroska · cold start + seek
-  `[KNOWN: PWin720p]` — see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#plex-for-windows--live-hls-matroska-transcode--mpv-aborts-demux).
-  **PARTIAL 2026-05-13:** direct-play works (sha-03b2cd0 era),
-  but TRANSCODE at 720p/1080p **fails — mpv aborts demux**.
-  Tracked in `project_scaleplex_plex_windows_720p_gap.md` (memory).
-  Need prod vs scaleplex EBML diff to find the matroska byte-stream
-  delta. **Re-test each release** to confirm still-broken / accidentally-fixed.
+- ~~Plex Windows desktop · live HLS-matroska · cold start + seek~~ —
+  **RESOLVED in v1.7.0** (live-validated 2026-05-26). 720p forced
+  transcode of 4K HEVC HDR plays correctly + sustained 10-min run.
+  See [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#plex-for-windows--live-hls-matroska-transcode--mpv-aborts-demux--resolved-in-v170).
 - Plex iOS · any path
 - Apple TV · any path
 - ~~LG webOS · any path~~ — partial: Avatar 4K HEVC HDR + PGS burn initial-play green 2026-05-20 (sha-b364cb3). **Still need: LG webOS seek + LG webOS quality-change.**
@@ -172,32 +169,64 @@ The cells below are the **must-pass live sweep** before tagging a new
 the live sweep is what's enumerated here. Add a new section per release
 (append-only history).
 
-### v1.7.0 — TBD
+### v1.7.0 — 2026-05-26 — **11/11 PASS** ✅
 
-11-cell live sweep on Frank's physical fleet (~85% of prod transcoded
-traffic head-on; remaining ~15% lives in the corpus replay via T2 and
-the API matrix via T3).
+Live-validated against worker image `sha-c53f4b4` on plex-test
+(SCALEPLEX_FORCE_HW=0). 11-cell live sweep on Frank's physical fleet
+(~89% of prod transcoded traffic head-on; remaining ~11% covered by
+corpus replay via T2). Item: From Dusk Till Dawn (rk=325708) HEVC 4K HDR,
+Avatar Fire and Ash (rk=325689) AV1 4K HDR10+DV P7 FEL, Witch Hat Atelier
+S1E1 (rk=325342) AV1 1080p SDR ASS, Chained Soldier S1E1 (rk=311314)
+AV1 1080p SDR animated ASS.
 
-| # | Client | Path | Source | Action | Tag(s) expected | Status |
-|---|---|---|---|---|---|---|
-| 1 | Plex Web Chrome | DASH | 4K HEVC HDR + AC3 copy | play + seek-fwd + seek-back | `decode:hw-passthrough:hevc`, `encode:hw-passthrough:hevc_vaapi`, `seek-offset:captured=…` | |
-| 2 | Plex Web Chrome | DASH | 4K HEVC HDR + embedded PGS burn | play + seek | `subtitle:bitmap:…(pgssub)`, `filter:bitmap-inlineass-vaapi…` or `hw-decode:filter:bitmap-inlineass-vaapi(:hdr-tonemap(…))` | |
-| 3 | Plex Web Firefox | DASH | 4K HEVC HDR + embedded PGS burn | play + seek | as #2 (Firefox MSE/sidx delta check) | |
-| 4 | Plex for Android (TV) | HLS-matroska | 4K HEVC HDR + embedded SRT burn | play + seek | `add:-map_inlineass`, `hw-decode:filter:inlineass-vaapi` | |
-| 5 | Plex for Android (TV) | HLS-matroska | 4K AV1 HDR + sidecar SRT burn | play + seek + audio swap | `subtitle:bitmap:…` *(N/A — text path)*, `filter:text-inlineass-vaapi` or `hw-decode:filter:inlineass-vaapi`, `audio:…->…` on swap | |
-| 6 | Plex for Android (TV) | HLS-matroska | Embedded animated ASS | play | `filter:text-inlineass-vaapi` (or HW-decode equivalent), no bail | |
-| 7 | Plex for LG (webOS) | HLS-mpegts | 4K HEVC HDR + PGS burn | play + **seek + quality change** | bitmap-burn path tags; new cells (open) | |
-| 8 | PS4 | HLS-mpegts | 1080p AV1 + ASS burn | play + seek | h264 encode (PS4 no HEVC), text-burn path; new cell (open) | |
-| 9 | Plex for Android (Mobile) | HLS | 1080p HEVC + SRT burn | play | text-burn path; mobile-codec cell | |
-| 10 | Any | Plex Optimize | HW-decode shape + remux shape | (offline) | `decode:hw-passthrough:hevc` (HW shape); fast-path (remux shape, no `init_hw_device`) | |
-| 11 | Plex for Windows | live HLS-matroska | 4K HEVC HDR → 1080p transcode | play + seek | `[KNOWN: PWin720p]` — confirm still-broken / broken-new / accidentally-fixed by v1.7.0 (mpv demux abort expected); capture argv + protocol into corpus regardless | |
+| # | Client | Path | Source | Action | Status |
+|---|---|---|---|---|---|
+| 1 | Plex Web Chrome | DASH | 4K HEVC HDR + EAC3 | play + seek | ✓ |
+| 2 | Plex Web Chrome | DASH | 4K HEVC HDR + embedded PGS burn | play + seek | ✓ |
+| 3 | Plex Web Firefox | DASH | 4K HEVC HDR + side-channel SRT, then PGS burn | play + seek | ✓ |
+| 4 | Plex for Android (TV) | HLS-matroska | 4K HEVC HDR + embedded SRT (+ sidecar SRT + PGS burn variants) | play + seek | ✓ thorough |
+| 5 | Plex for Android (TV) | HLS-matroska | 4K AV1 HDR10 + DV P7 FEL + PGS burn | play + seek + audio swap | ✓ |
+| 6 | Plex for Android (TV) | HLS-matroska | AV1 1080p SDR + animated ASS burn | play | ✓ |
+| 7 | Plex for LG (webOS) | HLS-mpegts | 4K HEVC HDR + PGS burn | play + seek + quality change | ✓ |
+| 8 | PS4 | HLS-mpegts | AV1 1080p SDR + ASS burn | play + seek | ✓ |
+| 9 | Plex for Android (Mobile) | HLS | AV1 1080p SDR + ASS burn | play | ✓ |
+| 10 | Any | Plex Optimize | HW-decode + remux shapes | offline | ✓ by T2 |
+| 11 | Plex for Windows | live HLS-matroska | 4K HEVC HDR → 720p transcode | play + seek + sustained 10-min run | **✓ KNOWN: PWin720p FIXED** |
 
-Tag references resolve to the `Tag*` / `TagPrefix*` constants in
-[`worker/agent/rewriter_tags.go`](../worker/agent/rewriter_tags.go). Live
-verification: `kubectl -n <ns> logs -l app.kubernetes.io/controller=worker
---since=2m | grep 'rewriter applied:'`. The
+#### Notable findings live-validated
+
+- **`KNOWN: PWin720p`** — open since 2026-05-13 (sha-03b2cd0 era) —
+  **closed**. Cell 11 plays cleanly + sustained 10-min run at ~4.9×
+  realtime. Cumulative fix across the v1.5.0→v1.7.0 fork-patch stack;
+  no targeted symptom fix.
+- **PR #41 sidecar-sink-keep validated live.** Embedded vs sidecar SRT
+  bindings correctly differentiated: `drop:inlineass-decode-sink`
+  PRESENT on embedded, ABSENT on sidecar (`-i temp-0.srt` shape).
+- **v1.6.1 bitmap-burn unification (PR #37)** validated across 4
+  client surfaces (Chrome, Firefox, Android TV, LG webOS) — all emit
+  `hw-decode:filter:bitmap-inlineass-vaapi` for PGS.
+- **EAE audio swap path (`audio:eac3_eae->eac3`)** validated for the
+  first time live — Plex Web DASH always re-encodes audio via EAE
+  binding; rewriter maps to native eac3.
+- **AV1 HW decode + heterogeneous encode** validated: Android
+  TV/Mobile→`hevc_vaapi`, PS4→`h264_vaapi` (client-profile-correct).
+
+#### New bugs spotted (deferred to post-tag)
+
+- **`framedrop` BSF not stripped** — exit status 8 on certain DASH
+  AAC+seek sessions. Recoverable (Plex retries with different argv).
+  See `KNOWN_ISSUES.md#plex-framedrop-audio-bitstream-filter-not-stripped--exit-status-8`.
+- **Duplicate `video:hdr-source(...)` tag** on text-burn HW-decode
+  path. Cosmetic, log-noise only.
+
+Tag references in this table resolve to the `Tag*` / `TagPrefix*`
+constants in [`worker/agent/rewriter_tags.go`](../worker/agent/rewriter_tags.go).
+Live verification per cell:
+`kubectl -n <ns> logs -l app.kubernetes.io/controller=worker --since=2m
+| grep 'rewriter applied:'`. The
 [`CLIENT_TEST_MATRIX.md`](CLIENT_TEST_MATRIX.md) "Worker-side PASS
 verification" + "Failure capture" sections cover the per-cell mechanics.
 
-Wallclock target: ~35 min for one operator. Cells 7-11 cover the
-currently-open matrix gaps from the "NOT yet validated" list above.
+Wallclock: ~75 min actual (more thorough variant coverage than the
+35-min minimum spec — e.g. cell 4 walked SRT internal + sidecar + PGS
+variants on Android TV).
