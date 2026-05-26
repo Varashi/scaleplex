@@ -1,0 +1,79 @@
+Description: fftools_sched: gate sink-less skip per-output, not per-decoder
+ Patch 0120's start_prepare modification skipped the whole-decoder
+ dst_finished allocation when `dec->sink_less` was set:
+ .
+   if (dec->sink_less)
+       continue;
+ .
+ That's correct when the decoder has ONLY a sink-less side-channel
+ output (the `-map_inlineass` self-decode case where the binding is
+ the only consumer). It's WRONG when the decoder has BOTH a sink-less
+ side-channel AND a real OST consumer (the dual-consumer case
+ triggered when an argv keeps Plex's `-map <spec> -f null -codec ass
+ nullfile` decode-sink alongside `-map_inlineass <spec>`).
+ .
+ In the dual-consumer case, ist_use() for the OST registers output 0
+ with nb_dst=1 (the real OST). Then ist_inlineass_add() runs ist_use()
+ idempotently (no new output added) and calls sch_dec_set_sinkless()
+ on the SHARED decoder. start_prepare then hits the early `continue`
+ and skips allocation of dst_finished for output 0 — even though it
+ has a real consumer that needs it. dst_finished stays NULL.
+ .
+ First sch_dec_send for the OST output dereferences
+ `&o->dst_finished[0]` and SEGVs:
+ .
+   Thread "dec1:0:srt" SIGSEGV at fftools/ffmpeg_sched.c:2318
+     #0  sch_dec_send (sch, dec_idx=<opt>, out_idx=<opt>, frame)
+         o = {dst=0x..., dst_finished=0x0, nb_dst=1}  <-- bug
+     #1  process_subtitle  (fftools/ffmpeg_dec.c:618)
+     #2  transcode_subtitles  (fftools/ffmpeg_dec.c:707)
+     #3  packet_decode  (fftools/ffmpeg_dec.c:717)
+     #4  decoder_thread  (fftools/ffmpeg_dec.c:966)
+ .
+ Live-validated 2026-05-26 on plex-test with the minimal repro:
+ .
+   ffmpeg -f lavfi -i 'color=...' -i sidecar.srt \
+          -map_inlineass 1:s:0 -filter_complex '[0:v]inlineass=...[v]' \
+          -map [v] -c:v libx264 -f null - \
+          -map 1:s:0 -f null -codec ass nullfile
+ .
+ Fix: move the sink-less check INTO the per-output loop. For outputs
+ that are genuinely sink-less (nb_dst == 0), treat the "not connected
+ to any sink" as a valid state and skip allocation. For outputs that
+ DO have downstream consumers, allocate dst_finished as normal.
+ .
+ The sink_less DECODER flag remains as-is (used by sch_dec_send's
+ nb_dst==0 fallthrough guard and unchoke_downstream's NULL-deref
+ guard); only the start_prepare validation+alloc loop changes.
+Origin: scaleplex; refines 0120
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-26
+--- a/fftools/ffmpeg_sched.c
++++ b/fftools/ffmpeg_sched.c
+@@ -1514,15 +1514,20 @@ static int start_prepare(Scheduler *sch)
+             return AVERROR(EINVAL);
+         }
+
+-        /* scaleplex: a sink-less decoder feeds a side-channel, not a
+-         * scheduler output; its auto-created output 0 stays unconnected. */
+-        if (dec->sink_less)
+-            continue;
+-
+         for (unsigned j = 0; j < dec->nb_outputs; j++) {
+             SchDecOutput *o = &dec->outputs[j];
+
+             if (!o->nb_dst) {
++                /* scaleplex (0122): unconnected output is OK on a sink-less
++                 * decoder — it's the auto-created side-channel output
++                 * that the vf_inlineass binding (or any other side-channel
++                 * consumer) decodes through without a scheduler-tracked
++                 * sink. Leave dst_finished NULL: sch_dec_send's nb_dst==0
++                 * guard (patch 0120) discards frames before reaching the
++                 * loop that would dereference it. Only an unconnected
++                 * output on a NON-sinkless decoder is a real error. */
++                if (dec->sink_less)
++                    continue;
+                 av_log(dec, AV_LOG_ERROR,
+                        "Decoder output %u not connected to any sink\n", j);
+                 return AVERROR(EINVAL);

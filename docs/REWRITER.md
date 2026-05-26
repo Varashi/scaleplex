@@ -4,18 +4,20 @@
 a stock-ffmpeg VAAPI invocation that produces the same output bytes
 under the same names in the same directory.
 
-> **v1.6.1 — orthogonal SW-reshape detector.** The SW-decode reshape path is now
-> one fact-extractor + one composer:
+> **Orthogonal detector — all paths.** Every reshape now runs through one
+> fact-extractor + one composer:
 > `extractGraphFacts(graph) → {w/h, hdr+algo, subKind/params/spec}` → `composeBurn` emits the canonical
 > `[0:0] → [hwupload]? → scale_vaapi(p010|nv12) → [tonemap]? → [inlineass]?`
 > graph. The per-shape `reFilterAss / reFilterPlain / reFilterHDR / reFilterHDRAss`
-> branches collapsed (**4 of 6 regexes removed**). A node-allow-list guard
-> bails on any unmodeled node (`crop`, `eq`, `fps`, …) — preserving the strict
-> reFilter\* fall-through. `reFilterHWAss` / `reFilterHWOpenCLAss` remain for
-> the not-yet-swapped HW-decode-text path (its emit is already
-> inlineass-on-VA, equivalent shape). Bitmap sub-burn (PGS / DVD / DVB) also
-> routes through the unified `inlineass` filter via `detectBitmapOverlayBurn`
-> — no `overlay_vaapi` anywhere. See CHANGELOG v1.6.1 / #37 / #39.
+> SW branches collapsed in v1.6.1 (#37/#39); the HW-decode-text branch
+> (`reFilterHWAss` / `reFilterHWOpenCLAss`) collapsed next — **6 of 6 reFilter\*
+> regexes removed**. A node-allow-list guard bails on any unmodeled node
+> (`crop`, `eq`, `fps`, …) — preserving the strict reFilter\* fall-through.
+> Bitmap sub-burn (PGS / DVD / DVB) also routes through the unified
+> `inlineass` filter via `detectBitmapOverlayBurn` — no `overlay_vaapi`
+> anywhere. `animated_tier_down` is a composeBurn axis now, so the
+> SW-reshape path picks up the animated-cue tier-down knob the HW-decode-text
+> path always had. See CHANGELOG v1.6.1 / #37 / #39 / #40.
 
 The translator is **conservative** — it bails (returns `applied=false`,
 caller spawns ffmpeg with the original argv unchanged) on anything it
@@ -211,21 +213,26 @@ two format-adaptive branches sharing one libass track (fed via the
 #### HW-decode text (SRT / ASS)
 
 Plex sends `[0:0]hwupload[0];[0]scale_vaapi=W:H[1];[1]hwdownload,format=nv12[2];[2]inlineass=…[3];[3]hwupload[4]`
-(`reFilterHWAss`, or `reFilterHWOpenCLAss` with an OpenCL tonemap). The
-rewriter **strips the `hwdownload → inlineass → hwupload` bracket** so the
-filter composites directly on the VAAPI surface:
+(SDR; the HDR variant splices a `hwmap=opencl → tonemap_opencl → hwdownload`
+chain in place of `scale_vaapi`'s straight `format=nv12`). Both shapes go
+through `extractGraphFacts + composeBurn(burnSpec{vaResident:true, …})` —
+the same orthogonal core the SW-reshape and HW-decode-bitmap branches use.
+Plex's redundant leading `[0:0]hwupload[0]` is dropped (the source is already
+a VA surface), the `hwdownload → inlineass → hwupload` bracket is absent by
+construction, and the OpenCL detour collapses into the canonical
+`scale_vaapi(p010) → tonemap_stage → inlineass` shape:
 
 ```
-[0:0]hwupload[0];
-[0]scale_vaapi=w=W:h=H:format=nv12[1];     # (+ tonemap stage if Plex sent one)
-[1]inlineass=<stripped-params>:render_height=N[:animated_tier_down=1][4]
+[0:0]scale_vaapi=w=W:h=H:format=nv12[0];   # (+ tonemap stage if Plex sent one — p010 then)
+[0]inlineass=<plex-params>:render_height=N[:animated_tier_down=1][1]
 ```
 
 - `render_height=N` is `SCALEPLEX_SUB_RENDER_HEIGHT` (default 1080) as a filter
   option — libass rasterises at the cap and the VPP blend upscales.
 - `animated_tier_down=1` is added when `subtitleIsAnimated()` is true (ASS with
   `\move`/`\t`/`\k`/`\fad`); the filter then renders animated cues one
-  resolution tier below `render_height`. Static cues are unaffected.
+  resolution tier below `render_height`. Static cues are unaffected. Same knob
+  applies on the SW-reshape path (`composeBurn`'s `animatedTierDown` axis).
 - Plex's `-map_inlineass <spec>` is **kept** — it drives the libass feed.
 - Plex's `-map <spec> -f null -codec ass` decode-sink is **stripped**
   (`stripInlineassDecodeSink`, gated on `-map_inlineass` still being present).
@@ -239,10 +246,17 @@ filter composites directly on the VAAPI surface:
   user's subtitle appearance (font/colour/border/shadow) is preserved.
   Earlier builds stripped them (`stripPlexInlineassFilterArgs`, removed in
   0119), which lost the styling and crashed any verbatim path.
-- OpenCL-tonemap variant: the tonemap is preserved and PMS's `-map [6]` is
-  retargeted to `[4]`.
+- OpenCL-tonemap variant: the tonemap algorithm is preserved (via
+  `tm.stage(facts.algo)`) and PMS's `-map [6]` is retargeted via
+  `retargetMapLabel` (composeBurn's output label is `[1]` for HDR text
+  here — `[0]` is the scale stage).
+- `-hwaccel_output_format:0` is forced to `vaapi` defensively (parity with
+  the HW-decode-bitmap branch) so the composer's no-leading-hwupload
+  assumption holds even on argv shapes that omitted it.
 
-**Label:** `hw-decode:filter:inlineass-vaapi`.
+**Labels:** `hw-decode:filter:inlineass-vaapi` (SDR),
+`hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi` +
+`hw-decode-sub:tonemap-preserved(<algo>)` (HDR/OpenCL).
 
 #### HW-decode bitmap (PGS / DVD / DVB)
 
@@ -343,8 +357,11 @@ when:
   - `hdr-tonemap-vaapi` — no-sub HDR
   - `text-inlineass-vaapi` — text sub burn-in (SDR or HDR), inlineass on the VA surface
   - `bitmap-inlineass-vaapi` (`:hdr-tonemap(<algo>)` suffix when HDR) — bitmap sub burn-in via the fork's `replay_bitmap` binding
-  - HW-decode-text uses its own legacy tags (`hw-decode:filter:inlineass-vaapi` ±
-    `opencl-tonemap->vaapi:` prefix) — same shape, not yet collapsed onto composeBurn.
+  - HW-decode-text uses the `hw-decode:filter:inlineass-vaapi` tag
+    (`opencl-tonemap->vaapi:` prefix on the HDR/OpenCL variant) — same
+    composeBurn(vaResident=true) shape as the SW path, just labelled with
+    the `hw-decode:` prefix so log readers can tell from one grep whether
+    Plex's argv arrived HW-shaped or SW-shaped.
 
 These are diagnostic dead-ends rather than failures: stock ffmpeg with
 the original Plex argv will fail, but the failure surface is ffmpeg's

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -2367,11 +2368,14 @@ func TestRewriter_InlineassPassthrough_SW_KeepsSidecarAndStrip(t *testing.T) {
 	if iCount != 2 {
 		t.Errorf("expected 2 -i (sidecar kept), got %d", iCount)
 	}
-	// 4. Null-sub decode sink stripped: patch 0120 self-decodes the
-	//    -map_inlineass binding (the SW inlineass is fed via the side-channel),
-	//    so the `-map ... -f null -codec ass nullfile` output is removed.
-	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
-		t.Errorf("null-sub decode sink must be stripped (0120 self-decodes): %v", out.Args)
+	// 4. Null-sub decode sink: KEPT for sidecar bindings (file_idx >= 1) —
+	//    patch 0120's sink-less self-decode doesn't pump the sidecar
+	//    demuxer (scheduler choke after first packet; live-validated
+	//    2026-05-26). The decode sink is the only thing that pulls the
+	//    SRT through. For embedded subs (file_idx == 0) the sink IS
+	//    stripped because the main demuxer is already pumped by video.
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Errorf("sidecar null-sub decode sink must be KEPT: %v", out.Args)
 	}
 	// 5. Mode tag — unified text sub-burn via composeBurn.
 	if !containsString(out.Changes, "filter:text-inlineass-vaapi") {
@@ -2437,11 +2441,14 @@ func TestRewriter_HWText_SRT_Sidecar(t *testing.T) {
 	if iCount != 2 {
 		t.Errorf("expected 2 -i (source + sidecar, no FIFO), got %d", iCount)
 	}
-	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
-		t.Errorf("decode sink (nullfile) must be stripped (0120 self-decodes): %v", out.Args)
+	// Sidecar binding (1:s:0): decode sink MUST be kept. 0120's
+	// sink-less self-decode doesn't pump the sidecar demuxer past
+	// the first packet (live-validated 2026-05-26).
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Errorf("sidecar decode sink (nullfile) must be KEPT: %v", out.Args)
 	}
-	if !containsString(out.Changes, "drop:inlineass-decode-sink") {
-		t.Errorf("missing drop:inlineass-decode-sink tag: %v", out.Changes)
+	if containsString(out.Changes, "drop:inlineass-decode-sink") {
+		t.Errorf("sidecar must NOT trigger drop:inlineass-decode-sink: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
 		t.Errorf("missing inlineass-vaapi tag: %v", out.Changes)
@@ -2595,5 +2602,82 @@ func TestRewriter_InlineassPassthrough_HW_EmbeddedASS(t *testing.T) {
 	}
 	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
 		t.Errorf("missing inlineass-vaapi tag: %v", out.Changes)
+	}
+}
+
+// SW-decode reshape + embedded ASS: composeBurn must emit animated_tier_down=1
+// (embedded ASS has no readable file → subtitleIsAnimated conservatively true).
+// Parity with the HW-decode-text path (TestRewriter_InlineassPassthrough_HW_EmbeddedASS).
+func TestRewriter_SWReshape_EmbeddedASS_AnimatedTierDown(t *testing.T) {
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-i", "/media/anime.mkv",
+		"-start_at_zero", "-copyts", "-fps_mode", "cfr",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-map_inlineass", "0:3",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1];[1]inlineass=font_scale=1.0:font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264", "-crf:0", "21", "-preset:0", "veryfast",
+		"-segment_format", "mpegts", "-f", "ssegment", "-segment_time", "1",
+		"-segment_start_number", "0", "media-%05d.ts",
+		"-map", "0:3", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, map[string]string{}, &RewriteOpts{
+		ProbeSubtitleCodec: func(string, string) string { return "ass" },
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	vfIdx := findFilterComplex(out.Args, "[0:0]")
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex")
+	}
+	graph := out.Args[vfIdx]
+	if !strings.Contains(graph, "animated_tier_down=1") {
+		t.Errorf("embedded ASS on SW reshape must enable animated_tier_down: %s", graph)
+	}
+	if !containsString(out.Changes, "filter:text-inlineass-vaapi") {
+		t.Errorf("missing filter:text-inlineass-vaapi tag: %v", out.Changes)
+	}
+}
+
+// SW-decode reshape + sidecar SRT: composeBurn must NOT emit animated_tier_down
+// (SRT carries no override tags → subtitleIsAnimated returns false). Guards
+// against a regression that would tier-down every text sub.
+func TestRewriter_SWReshape_SidecarSRT_NoTierDown(t *testing.T) {
+	dir := t.TempDir()
+	srt := filepath.Join(dir, "temp-0.srt")
+	if err := os.WriteFile(srt, []byte("1\n00:00:01,000 --> 00:00:04,000\nHello\n\n"), 0o644); err != nil {
+		t.Fatalf("write srt: %v", err)
+	}
+	args := []string{
+		"-codec:0", "hevc",
+		"-i", "/media/m.mkv",
+		"-i", srt,
+		"-start_at_zero", "-copyts", "-fps_mode", "cfr",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_hw_device", "vaapi",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1];[1]inlineass=font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264", "-crf:0", "21", "-preset:0", "veryfast",
+		"-segment_format", "mpegts", "-f", "ssegment", "-segment_time", "1",
+		"-segment_start_number", "0", "media-%05d.ts",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, map[string]string{}, &RewriteOpts{
+		FSExists:           func(string) bool { return true },
+		ProbeSubtitleCodec: func(string, string) string { return "subrip" },
+	})
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	vfIdx := findFilterComplex(out.Args, "[0:0]")
+	if vfIdx < 0 {
+		t.Fatal("missing -filter_complex")
+	}
+	if strings.Contains(out.Args[vfIdx], "animated_tier_down") {
+		t.Errorf("sidecar SRT must NOT enable animated_tier_down: %s", out.Args[vfIdx])
 	}
 }
