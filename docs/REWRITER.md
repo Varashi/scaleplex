@@ -303,13 +303,24 @@ scale and inlineass — Plex's honored algo extracted from the input's
 
 ### HDR tonemap (HDR source → SDR output)
 
-**scaleplex never decides whether to tone-map — Plex does.** Plex
-tone-maps HDR→SDR only in hardware: with "Use hardware-accelerated tone
-mapping" on, its argv carries a `tonemap_opencl` chain; with it off,
-Plex emits a plain SDR-target chain and does no tone-mapping at all
-(washed/dim output — Plex's own behavior). There is no software
-tone-map path. So the argv is authoritative: scaleplex honors a tonemap
-filter when Plex sent one, and injects nothing when Plex didn't.
+**scaleplex never decides whether to tone-map — Plex does.** Plex's
+tonemap policy depends on **both** the "Use hardware-accelerated tone
+mapping" pref (`TranscoderToneMapping`) AND whether HW codecs are
+available for the session:
+
+- **HW tonemap on + HW codecs on** → argv carries a `tonemap_opencl`
+  chain (`hwmap=opencl → tonemap_opencl=tonemap=<algo> → hwmap=vaapi:reverse=1`).
+- **HW tonemap on + HW codecs off** (SW fallback) → argv carries a
+  **SW tonemap** node as part of the SW pipeline (`[0]format=p010,
+  tonemap=<algo>[N];[N]format=pix_fmts=yuv420p|nv12[N]`). Algo tracks
+  `TranscoderTonemapAlgorithm` (defaults to `mobius`). Confirmed by
+  the 2026-05-26 Optimize-corpus sweep (~3% of cells).
+- **HW tonemap off** (any HW state) → plain SDR-target chain, no
+  tonemap node. Output is washed/dim — Plex's own behavior. scaleplex
+  matches it and injects nothing.
+
+So the argv is authoritative: scaleplex honors a tonemap filter when
+Plex sent one, and injects nothing when Plex didn't.
 
 When Plex's argv carries the OpenCL chain, `substituteOpenCLTonemap`
 re-emits it in canonical comma form, keeping Plex's chosen algorithm:
