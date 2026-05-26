@@ -28,6 +28,11 @@ gh run list --branch main --workflow=build-shim --limit=1 --json conclusion --jq
 - `TestRewriterTagInventory` + `TestRewriterTagInventory_ConstsAreUnique`
   + `TestTagValues_Stable` green (drift-catch on the rewriter change-tag
   canon — see [`worker/agent/rewriter_tags.go`](../worker/agent/rewriter_tags.go))
+- Worker `replay (rewriter-only, fixture corpus)` step green — runs
+  the build-tagged replay tests against the committed 240-cell
+  stratified Optimize fixture at `worker/agent/testdata/replay-corpus/`
+  with `REPLAY_NO_FFMPEG=1`. Catches rewriter regressions per-PR
+  without cluster access.
 - Coverage % unchanged or improved vs prior release (manual eyeball,
   no automated trend yet)
 
@@ -44,9 +49,15 @@ Corpus at `~/scaleplex-corpus/` (root + `optimize-sweep/` +
 **Step 1 — pre-tag corpus refresh:**
 
 ```bash
+# Production captures (worker NFS + stderr logs from prod + plex-test):
 ~/git/scaleplex/cmd/argv-extract/sweep.sh
-# Pulls latest worker NFS captures + worker stderr logs from prod + plex-test
-# Idempotent — only adds new sessions
+
+# Optional: synthetic Optimize matrix (1824 cells / 53 shapes) via
+# the optimize-corpus-gen tool. Skip if the latest sweep is recent
+# (see `~/scaleplex-corpus/optimize-sweep/` mtime).
+cd ~/git/scaleplex/cmd/optimize-corpus-gen
+# (See cmd/optimize-corpus-gen/README.md for the run command — needs
+# plex-test PMS token + the synthetic test-clips media share.)
 ```
 
 **Step 2 — local rewriter-only validation:**
