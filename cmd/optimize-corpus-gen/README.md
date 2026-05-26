@@ -20,60 +20,78 @@ This generator builds a deliberate Optimize corpus by automating the
 API surface PMS exposes — same mechanism `python-plexapi`'s
 `media.optimize()` and Tautulli's `plex_optimize.py` use.
 
-## Status
+## Subcommands
 
-**Phase 1 — end-to-end one-cell smoke test (this commit).** Validates:
-- Plex REST plumbing (identity, sections, items, prefs, optimize)
-- ffprobe via local OR remote (kubectl exec into media-toolkit pod)
-- Pref snapshot + restore on exit (incl. SIGINT/SIGTERM)
-- Optimize trigger via background-processing playlist (id 1066 on our
-  PMS, discovered at runtime)
-- Worker capture watcher (local dir OR remote via kubectl exec)
-- Capture tagging (sidecar `.optimize-cell.json` with source probe +
-  target + prefs)
-- Sweep-cancel pending corpus jobs + stuck static sessions
+| Subcommand | Purpose |
+|---|---|
+| `smoke`   | One-cell end-to-end test against an existing library item. Validates Plex REST + ffprobe + watcher + cancel plumbing. |
+| `synth`   | Build the synthetic source-clip matrix into a directory (idempotent — skips clips already present). |
+| `library` | Create+scan the Plex library section that holds the synth clips. Idempotent — refreshes existing sections. |
+| `sweep`   | Run the full {sources × targets × prefs} matrix sweep. Resumable via `manifest.json`. |
+| `clean`   | Cancel all `scaleplex-corpus-gen-*` Optimize jobs + stop stuck static transcode sessions. |
+| `analyze` | Cluster the captured corpus by argv-shape fingerprint. Reports distinct shapes + their representative cells. |
 
-**Phase 2 — matrix sweep (next).** TODO:
-- Synthetic source clip generator (codec × profile × bit-depth ×
-  transfer × audio × sub matrix, ~30-50 short ffmpeg-built clips into a
-  dedicated test library section)
-- Pref combination enumerator (32 cells: `HardwareAcceleratedCodecs ×
-  HardwareAcceleratedEncoders × TranscoderToneMapping ×
-  TranscoderHEVCEncodingMode × TranscoderHEVCOptimize`)
-- Cell-loop with pacing (PMS Optimize is one-at-a-time:
-  `OptimizerTranscodeCountLimit=1`)
-- Resume-from-manifest on interrupt
-- Optimize-version disk cleanup (PMS keeps the optimized file even
-  after job delete; need to `DELETE /library/metadata/<id>` on the
-  optimized children to truly free the source for re-Optimize)
-
-## Run (Phase 1)
+## Full workflow (homelab)
 
 ```bash
 source ~/.config/plex.env   # PLEX_TOKEN, PLEX_TEST_URL, PLEX_URL
 
-# Remote ffprobe + remote corpus (homelab setup — no NFS on workstation):
-go run . \
-    -plex "$PLEX_TEST_URL" \
-    -token "$PLEX_TOKEN" \
-    -source-section "Movies Kids NL" \
-    -source-rating-key 313359 \
-    -ffprobe-exec "kubectl exec -n media-toolkit media-toolkit-<pod> -- ffprobe" \
-    -path-translate "/media=/mnt/media/media" \
-    -corpus-exec "kubectl exec -n plex-test plex-test-worker-<pod> --" \
-    -corpus-remote-dir /transcode/_argv-corpus \
-    -corpus-dir ~/scaleplex-corpus/optimize-gen \
-    -target-tag 2 \
-    -capture-timeout 60s
+POD_FFMPEG="kubectl exec -n media-toolkit $(k get pod -n media-toolkit -o name | head -1 | cut -d/ -f2) -- ffmpeg"
+POD_FFPROBE="kubectl exec -n media-toolkit $(k get pod -n media-toolkit -o name | head -1 | cut -d/ -f2) -- ffprobe"
+POD_WORKER="kubectl exec -n plex-test $(k get pod -n plex-test -l app.kubernetes.io/name=scaleplex-worker -o name | head -1 | cut -d/ -f2) --"
 
-# Local-only (NFS mounted on workstation):
-go run . \
-    -plex "$PLEX_TEST_URL" \
-    -token "$PLEX_TOKEN" \
-    -source-section Movies \
-    -corpus-dir ~/scaleplex-corpus \
-    -dry-run    # validate plumbing without touching PMS state
+# 1. Synthesize the 19-clip source matrix into the NFS-shared dir.
+#    ~3 min first run; sub-second on re-runs (all skipped).
+optimize-corpus-gen synth \
+    -out-dir /mnt/media/media/scaleplex-test-clips \
+    -ffmpeg-exec "$POD_FFMPEG"
+
+# 2. Create + scan the Plex library section (idempotent).
+optimize-corpus-gen library \
+    -plex "$PLEX_TEST_URL" -token "$PLEX_TOKEN" \
+    -name "scaleplex-test-corpus" \
+    -location /media/scaleplex-test-clips \
+    -expected-items 19 -wait-timeout 90s
+
+# 3. Sweep the matrix (resumable; ~1.5s/cell, ~45 min for the full 1824).
+optimize-corpus-gen sweep \
+    -plex "$PLEX_TEST_URL" -token "$PLEX_TOKEN" \
+    -source-section "scaleplex-test-corpus" \
+    -ffprobe-exec "$POD_FFPROBE" -path-translate "/media=/mnt/media/media" \
+    -corpus-exec "$POD_WORKER" \
+    -corpus-dir ~/scaleplex-corpus/optimize-sweep
+
+# 4. Analyze: cluster captures by argv-shape fingerprint.
+optimize-corpus-gen analyze -corpus-dir ~/scaleplex-corpus/optimize-sweep
+
+# Recovery: kill stuck PMS state if a previous run was interrupted.
+optimize-corpus-gen clean -plex "$PLEX_TEST_URL" -token "$PLEX_TOKEN"
 ```
+
+## Matrix dimensions
+
+**Sources** (19 synthetic clips, codec × profile × bit-depth × transfer × audio × sub):
+- 3 h264 cells (1080p stereo, 1080p 5.1, 720p stereo)
+- 8 hevc cells (Main 8-bit, Main10 10-bit × {1080p, 4K} × {SDR, HDR10, HLG})
+- 4 av1 cells (Main + Main10, +HDR variants, +SRT variant)
+- 2 7.1-channel cells (h264, hevc HDR)
+- 4 sub-burn variants (SRT + ASS on h264/hevc)
+
+**Targets** (3 built-in):
+- tagID=1 "Optimized for Mobile" (720p, 4 Mbps)
+- tagID=2 "Optimized for TV" (1080p, 8 Mbps)
+- tagID=3 "Original Quality" (no transcode — pure remux)
+
+**Prefs** (32 cells = 2⁵):
+- `HardwareAcceleratedCodecs`     {true, false}    HW decode
+- `HardwareAcceleratedEncoders`   {true, false}    HW encode
+- `TranscoderToneMapping`         {true, false}    HW HDR tonemap
+- `TranscoderHEVCEncodingMode`    {always, never}  HEVC for standard transcodes
+- `TranscoderHEVCOptimize`        {true, false}    HEVC for Optimize jobs (independent!)
+
+Cartesian: **19 × 3 × 32 = 1824 cells**. Many collapse to identical argv
+shapes in PMS (HW-encode-on with HW-decode-off is a no-op variant, etc.);
+the `analyze` subcommand counts the actual distinct shapes.
 
 ## Output
 

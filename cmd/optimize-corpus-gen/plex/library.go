@@ -27,13 +27,20 @@ type Item struct {
 // Media is one Plex Media block (1:N items have multiple — Optimized
 // versions show up as siblings of the original). Part holds the
 // on-disk file path the worker actually opens.
+//
+// proxyType=42 marks an Optimize-output Media (matching python-plexapi's
+// convention). The generator deletes those between cells so PMS's
+// "media version already exists" (code 1006) doesn't block the next
+// pref combo from re-triggering the same {source, target}.
 type Media struct {
 	ID                int64  `json:"id"`
+	ProxyType         int    `json:"proxyType"`
 	Container         string `json:"container"`
 	VideoCodec        string `json:"videoCodec"`
 	VideoProfile      string `json:"videoProfile"`
 	VideoResolution   string `json:"videoResolution"`
 	OptimizedForStreaming int `json:"optimizedForStreaming"`
+	Target            string `json:"target"`
 	Part              []Part `json:"Part"`
 }
 
@@ -111,6 +118,36 @@ func (c *Client) Metadata(ratingKey string) (*Item, error) {
 		return nil, fmt.Errorf("metadata %s: no item returned", ratingKey)
 	}
 	return &resp.MediaContainer.Metadata[0], nil
+}
+
+// DeleteOptimizeChildren removes every Optimize-output Media child of
+// `sourceRatingKey` (proxyType=42). Returns the count deleted. Used
+// between matrix cells to free the {source, target} for the next pref
+// combo's trigger — PMS's "already exists" (code 1006) check on
+// Optimize re-trigger is keyed off these children.
+//
+// Endpoint per python-plexapi Media.delete():
+//   DELETE /library/metadata/<sourceRatingKey>/media/<media.id>
+//
+// Requires PMS pref `allowMediaDeletion` true (default on a fresh
+// install).
+func (c *Client) DeleteOptimizeChildren(sourceRatingKey string) (int, error) {
+	full, err := c.Metadata(sourceRatingKey)
+	if err != nil {
+		return 0, fmt.Errorf("metadata %s: %w", sourceRatingKey, err)
+	}
+	count := 0
+	for _, m := range full.Media {
+		if m.ProxyType != 42 {
+			continue
+		}
+		path := fmt.Sprintf("/library/metadata/%s/media/%d", sourceRatingKey, m.ID)
+		if err := c.do("DELETE", path, nil, nil); err != nil {
+			return count, fmt.Errorf("delete media %d on %s: %w", m.ID, sourceRatingKey, err)
+		}
+		count++
+	}
+	return count, nil
 }
 
 // FindSectionByTitle returns the section whose title matches exactly,

@@ -132,17 +132,20 @@ func (c *Client) TriggerOptimize(backgroundKey, ratingKey, sectionUUID, jobTitle
 // jobTitle) so it can cancel after the worker captures the argv.
 //
 // Endpoint: GET <backgroundKey>. Items come as <Item id=... title=...>
-// children of the response MediaContainer.
+// children of the response MediaContainer — the JSON wraps them under
+// "Item" (singular), NOT "Metadata" like most other PMS endpoints.
+// Easy gotcha to miss; missing the field name returns nil and the
+// cleanup silently no-ops.
 func (c *Client) OptimizedItems(backgroundKey string) ([]OptimizedItem, error) {
 	var resp struct {
 		MediaContainer struct {
-			Metadata []OptimizedItem `json:"Metadata"`
+			Item []OptimizedItem `json:"Item"`
 		} `json:"MediaContainer"`
 	}
 	if err := c.do("GET", backgroundKey, nil, &resp); err != nil {
 		return nil, err
 	}
-	return resp.MediaContainer.Metadata, nil
+	return resp.MediaContainer.Item, nil
 }
 
 // CancelOptimize removes an Optimize job by its Item id. The endpoint
