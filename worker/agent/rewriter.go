@@ -1781,9 +1781,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	if newArgs, did := substituteOpenCLTonemap(args, tm); did {
 		args = newArgs
 		if tm.useOpenCL {
-			changes = append(changes, "filter:tonemap_opencl-normalized")
+			changes = append(changes, TagFilterTonemapOpenCLNormalized)
 		} else {
-			changes = append(changes, "filter:tonemap_opencl->tonemap_vaapi")
+			changes = append(changes, TagFilterTonemapOpenCLToVAAPI)
 		}
 	}
 
@@ -1901,9 +1901,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// The session still re-accelerates to HW below.
 		if forceHW && plexSWEncoder {
 			if noHwaccel {
-				changes = append(changes, "force-hw:would-honor-sw")
+				changes = append(changes, TagForceHWWouldHonorSW)
 			} else {
-				changes = append(changes, "force-hw:would-honor-hwdec-swenc")
+				changes = append(changes, TagForceHWWouldHonorHWDecSWEnc)
 			}
 		}
 
@@ -2047,12 +2047,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					args = removeArgs(args, i, 2)
 				}
 			}
-			changes = append(changes, "honor:plex-sw")
+			changes = append(changes, TagHonorPlexSW)
 		} else if !isHWDecode || hybridForceHW {
 			if hybridForceHW {
 				// HW decode already in place (kept); only the SW filter+encode
 				// tail is reshaped to VAAPI below. See hybridForceHW comment.
-				changes = append(changes, "force-hw:reshape-hybrid:"+swDecoder)
+				changes = append(changes, TagPrefixForceHWReshapeHybrid+swDecoder)
 			}
 			// 3. Video -filter_complex rewrite
 			vfIdx := -1
@@ -2175,7 +2175,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// stays on the GPU, only the encode is CPU (realtime even at 4K,
 			// unlike full SW which is decode-bound). Only the transport/audio
 			// scrubs below apply.
-			changes = append(changes, "honor:plex-hwdec-swenc")
+			changes = append(changes, TagHonorPlexHWDecSWEnc)
 		} else {
 			// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
 			// that, but leave the filter chain, map labels, and encoder
