@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "shim/**"
+      - ".github/workflows/build-shim.yaml"
   workflow_dispatch:
 
 permissions:
