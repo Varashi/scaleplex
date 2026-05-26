@@ -1,0 +1,9 @@
+go 1.26.1
+
+use (
+	./cmd/argv-extract
+	./cmd/optimize-corpus-gen
+	./orchestrator
+	./shim
+	./worker/agent
+)
