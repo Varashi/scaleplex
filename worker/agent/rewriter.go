@@ -2185,7 +2185,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			case "h264_vaapi", "hevc_vaapi":
 				// expected
 			default:
-				return bail("hw-decode:unexpected-encoder:" + swEncoder)
+				return bail(TagPrefixBailUnexpectedEncoder + swEncoder)
 			}
 			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
 
@@ -2230,7 +2230,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					if vfIdx < 0 {
-						return bail("hw-decode-sub:no-inlineass-filter")
+						return bail(TagBailReasonHWDecodeSubNoInlineass)
 					}
 					// Orthogonal core: extractGraphFacts + composeBurn — same
 					// path the SW-reshape and HW-decode-bitmap branches already
@@ -2244,7 +2244,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// detour are absent by construction.
 					facts := extractGraphFacts(args[vfIdx], subSrc)
 					if !facts.ok || facts.subKind != "text" {
-						return bail("hw-decode-sub:unmodeled-graph:" + args[vfIdx])
+						return bail(TagPrefixBailHWDecodeSubUnmodeled + args[vfIdx])
 					}
 					if facts.hdr {
 						sourceIsHDR = true
@@ -2293,18 +2293,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						// through tm.stage, which keeps the OpenCL chain by default
 						// or collapses to tonemap_vaapi under SCALEPLEX_TONEMAP=vaapi).
 						// Without this preservation HDR renders washed.
-						changes = append(changes, "hw-decode-sub:tonemap-preserved("+facts.algo+")")
-						changes = append(changes, "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi")
+						changes = append(changes, TagPrefixHWDecodeSubTonemapPreserved+facts.algo+")")
+						changes = append(changes, TagHWDecodeFilterOCLToVAAPIIA)
 					} else {
-						changes = append(changes, "hw-decode:filter:inlineass-vaapi")
+						changes = append(changes, TagHWDecodeFilterInlineassVA)
 					}
 					if oldLabel != "" && oldLabel != newLabel {
-						changes = append(changes, "hw-decode:map-label-update")
+						changes = append(changes, TagHWDecodeMapLabelUpdate)
 					}
 					newInputIdx = indexOfArg(args, "-i", 0)
 					encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
 				case "bitmap":
-					return bail("hw-decode-sub:bitmap-unsupported")
+					return bail(TagBailReasonHWDecodeSubBitmapUnsupported)
 				}
 			}
 
@@ -2359,9 +2359,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// patch 0120's binding self-decodes the stream, paced by the demux.
 				args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0), "-map_inlineass", streamSpec)
 				if hdr {
-					changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap("+algo+")")
+					changes = append(changes, TagPrefixHWDecodeFilterBitmapHDRTM+algo+")")
 				} else {
-					changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
+					changes = append(changes, TagHWDecodeFilterBitmapInlineassVA)
 				}
 				// The splices shifted indices; relocate the encoder.
 				newInputIdx = indexOfArg(args, "-i", 0)
