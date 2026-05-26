@@ -1126,9 +1126,29 @@ func removeArgs(s []string, at, n int) []string {
 // (NFS) input read during the pre-throttle buffer fill, the embedded-sub
 // startup skips. Gated on `-map_inlineass` still being present: if a path
 // dropped the binding (e.g. overlay_vaapi), the sink is the only thing
-// decoding the sub and must stay. Returns (args, stripped?).
+// decoding the sub and must stay.
+//
+// **Sidecar exception (validated 2026-05-26)**: patch 0120's sink-less
+// decoder relies on the SHARED demuxer being pumped by the video pipeline
+// — when the `-map_inlineass` stream lives in a separate input file
+// (sidecar SRT: `-i sub.srt -map_inlineass 1:s:0`), the sidecar's own
+// demuxer has no other consumer and the scheduler only emits the first
+// packet (~7 bytes) before stalling. The decoder thread fires zero
+// times → libass track stays empty → blank subs. Keep the decode-sink
+// for sidecar bindings (file_idx >= 1) so the sidecar demuxer has a
+// real downstream consumer; the sink-less decoder co-exists (ist_use
+// is idempotent), but the real-sink one is what actually pumps the
+// stream. Returns (args, stripped?).
 func stripInlineassDecodeSink(args []string) ([]string, bool) {
-	if indexOfArg(args, "-map_inlineass", 0) < 0 {
+	mi := indexOfArg(args, "-map_inlineass", 0)
+	if mi < 0 || mi+1 >= len(args) {
+		return args, false
+	}
+	// `-map_inlineass <file_idx>:<stream_spec>` — keep the sink when the
+	// binding points at a non-main (sidecar) input. See header comment.
+	spec := args[mi+1]
+	colon := strings.IndexByte(spec, ':')
+	if colon > 0 && spec[:colon] != "0" {
 		return args, false
 	}
 	for i := 0; i+6 < len(args); i++ {

@@ -55,15 +55,18 @@ func TestRewriter_HWDecode_SRT_Sidecar_Inlineass(t *testing.T) {
 		t.Errorf("merged HW branch must drop overlay_vaapi + the hwdownload/hwupload bracket: %q", fc)
 	}
 	// The fork's feed must survive: -map_inlineass stays. The decode sink is
-	// stripped — patch 0120 makes the binding self-decode (paced by the demux).
+	// KEPT for sidecar bindings (file_idx >= 1) — patch 0120's sink-less
+	// self-decode doesn't pump the sidecar demuxer (scheduler choke after
+	// first packet; live-validated 2026-05-26 with She's Out of My League).
+	// The decode sink is the only thing that pulls the SRT through.
 	if indexOfArg(out.Args, "-map_inlineass", 0) < 0 {
 		t.Error("-map_inlineass must be kept (drives the scaleplex_inlineass feed)")
 	}
-	if indexOfArg(out.Args, "nullfile", 0) >= 0 {
-		t.Errorf("decode sink (-map 1:s:0 -f null -codec ass nullfile) must be stripped: %v", out.Args)
+	if indexOfArg(out.Args, "nullfile", 0) < 0 {
+		t.Errorf("sidecar decode sink must be KEPT (0120 sink-less doesn't pump sidecar demuxer): %v", out.Args)
 	}
-	if !containsString(out.Changes, "drop:inlineass-decode-sink") {
-		t.Errorf("missing drop:inlineass-decode-sink change tag: %v", out.Changes)
+	if containsString(out.Changes, "drop:inlineass-decode-sink") {
+		t.Errorf("sidecar binding (1:s:0) must NOT trigger drop:inlineass-decode-sink: %v", out.Changes)
 	}
 	if !containsString(out.Changes, "hw-decode:filter:inlineass-vaapi") {
 		t.Errorf("missing hw-decode:filter:inlineass-vaapi tag: %v", out.Changes)
