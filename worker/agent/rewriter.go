@@ -1035,11 +1035,11 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 	g := args[vfIdx]
 	if reLeadHwuploadOCL.MatchString(g) {
 		g = reLeadHwuploadOCL.ReplaceAllString(g, "[0:0]")
-		changes = append(changes, "tonemap:ocl:drop-lead-hwupload")
+		changes = append(changes, TagTonemapOCLDropLeadHWUpload)
 	}
 	if reRevmapBeforeDownloadOCL.MatchString(g) {
 		g = reRevmapBeforeDownloadOCL.ReplaceAllString(g, "hwdownload")
-		changes = append(changes, "tonemap:ocl:collapse-revmap-download")
+		changes = append(changes, TagTonemapOCLCollapseRevmapDownload)
 	}
 	args[vfIdx] = g
 
@@ -1061,7 +1061,7 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 		}
 		if vaIdx >= 0 {
 			args = spliceArgs(args, vaIdx+2, "-init_hw_device", "opencl=ocl@"+vaName)
-			changes = append(changes, "tonemap:ocl:inject-opencl-device")
+			changes = append(changes, TagTonemapOCLInjectOpenCLDevice)
 		}
 	}
 
@@ -1069,7 +1069,7 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 	if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 &&
 		indexOfArg(args, "-hwaccel_output_format:0", 0) < 0 {
 		args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
-		changes = append(changes, "tonemap:ocl:force-output-format-vaapi")
+		changes = append(changes, TagTonemapOCLForceOutputFormatVA)
 	}
 	return args, changes
 }
@@ -1444,9 +1444,9 @@ func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string,
 		} else {
 			rewritten += "?X-Plex-Token=" + tok
 		}
-		changes = append(changes, "progress:append-X-Plex-Token")
+		changes = append(changes, TagProgressAppendXPlexToken)
 	}
-	changes = append(changes, "progressurl:captured-for-reporter")
+	changes = append(changes, TagProgressURLCapturedForReporter)
 	// Inject -canthrottleurl pointing at the same relay endpoint.
 	// Splice at index 0 so it lands in global-scope (before -i),
 	// matching ffmpeg's option-context rules. Skip if the option is
@@ -1459,10 +1459,10 @@ func capturePMSProgressURL(args []string, inputEnv map[string]string) ([]string,
 	// unthrottled; progress is still read via `-progress pipe:N`.
 	if indexOfArg(args, "-canthrottleurl", 0) < 0 {
 		if os.Getenv("SCALEPLEX_DISABLE_CANTHROTTLE") != "" {
-			changes = append(changes, "canthrottle:disabled-by-env")
+			changes = append(changes, TagCanThrottleDisabledByEnv)
 		} else {
 			args = spliceArgs(args, 0, "-canthrottleurl", rewritten)
-			changes = append(changes, "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)")
+			changes = append(changes, TagInjectCanThrottleURL)
 		}
 	}
 	return args, rewritten, changes
@@ -1513,7 +1513,7 @@ func stripEAEEnvVars(env map[string]string) (map[string]string, []string) {
 	for _, k := range []string{"EAE_ROOT", "FFMPEG_EXTERNAL_LIBS", "OCL_ICD_VENDORS"} {
 		if _, ok := env[k]; ok {
 			delete(env, k)
-			changes = append(changes, "env:strip:"+k)
+			changes = append(changes, TagPrefixEnvStrip+k)
 		}
 	}
 	return env, changes
@@ -1581,7 +1581,7 @@ func dropInputAudioDecoderHints(args []string) ([]string, []string) {
 		for i := 0; i < len(args); i++ {
 			if strings.HasPrefix(args[i], "-eae_prefix") && i+1 < len(args) {
 				args = removeArgs(args, i, 2)
-				changes = append(changes, "drop:-eae_prefix(bail)")
+				changes = append(changes, TagDropEAEPrefixBail)
 				removed = true
 				break
 			}
@@ -1668,7 +1668,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				break
 			}
 			args = removeArgs(args, i, 2)
-			bailChanges = append(bailChanges, "drop:-progressurl(bail)")
+			bailChanges = append(bailChanges, TagDropProgressurlBail)
 		}
 		// `-segment_list http://127.0.0.1:32400/...` — PMS loopback URL that
 		// the segment muxer PUTs the CSV manifest to. Worker pod's loopback
@@ -1702,7 +1702,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					}
 				}
 				args[i+1] = rewritten
-				bailChanges = append(bailChanges, "bail:segment_list:rewrite-to-relay")
+				bailChanges = append(bailChanges, TagBailSegmentListRewriteToRelay)
 			}
 		}
 		return args, bailChanges
@@ -1747,14 +1747,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		var eaeSwapped [][2]string
 		args, eaeSwapped = swapEAEAudioDecoders(args)
 		for _, p := range eaeSwapped {
-			merged = append(merged, "audio:"+p[0]+"->"+p[1]+"(bail)")
+			merged = append(merged, TagPrefixAudio+p[0]+"->"+p[1]+"(bail)")
 		}
 		var eaeDropped []string
 		args, eaeDropped = dropEAEPrefixFlags(args)
 		for _, d := range eaeDropped {
-			merged = append(merged, "drop:"+d+"(bail)")
+			merged = append(merged, TagPrefixDrop+d+"(bail)")
 		}
-		merged = append(merged, "skip:"+reason)
+		merged = append(merged, TagPrefixSkip+reason)
 		// Applied=true whenever we mutated argv (scrub, hint drops, or
 		// EAE swap/prefix-drop), so the worker uses our rewritten copy
 		// instead of the input.
@@ -1781,9 +1781,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	if newArgs, did := substituteOpenCLTonemap(args, tm); did {
 		args = newArgs
 		if tm.useOpenCL {
-			changes = append(changes, "filter:tonemap_opencl-normalized")
+			changes = append(changes, TagFilterTonemapOpenCLNormalized)
 		} else {
-			changes = append(changes, "filter:tonemap_opencl->tonemap_vaapi")
+			changes = append(changes, TagFilterTonemapOpenCLToVAAPI)
 		}
 	}
 
@@ -1840,7 +1840,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				f = args[i+1]
 			}
 			if strings.Contains(f, "subtitles=") {
-				return bail("subtitles-burn-in")
+				return bail(TagBailReasonSubtitlesBurnIn)
 			}
 			// HDR (zscale/tonemap) is rewritten to tonemap_vaapi by
 			// rewriteVideoFilter; only video chains starting with [0:0] are
@@ -1850,7 +1850,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 		inputIdx := indexOfArg(args, "-i", 0)
 		if inputIdx < 0 {
-			return bail("no-input")
+			return bail(TagBailReasonNoInput)
 		}
 
 		// 1. Decoder.
@@ -1871,7 +1871,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		//   the Plex-quirk strips (phases 9-24).
 		decCodecIdx := indexOfArg(args, "-codec:0", 0)
 		if decCodecIdx < 0 || decCodecIdx >= inputIdx {
-			return bail("no-decoder")
+			return bail(TagBailReasonNoDecoder)
 		}
 		swDecoder := args[decCodecIdx+1]
 
@@ -1901,9 +1901,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// The session still re-accelerates to HW below.
 		if forceHW && plexSWEncoder {
 			if noHwaccel {
-				changes = append(changes, "force-hw:would-honor-sw")
+				changes = append(changes, TagForceHWWouldHonorSW)
 			} else {
-				changes = append(changes, "force-hw:would-honor-hwdec-swenc")
+				changes = append(changes, TagForceHWWouldHonorHWDecSWEnc)
 			}
 		}
 
@@ -1914,7 +1914,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		} else if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
 			if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
 				isHWDecode = true
-				changes = append(changes, "decode:hw-passthrough:"+swDecoder)
+				changes = append(changes, TagPrefixDecodeHWPassthrough+swDecoder)
 			} else {
 				// Bare short codec name (hevc/h264/av1/vp9) without -hwaccel:0.
 				// Only safe to auto-upgrade when the encoder side is genuinely
@@ -1925,17 +1925,17 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// we can't safely reshape; bail rather than guess.
 				if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
 					if _, isSW := encoderMap[args[peer+1]]; !isSW {
-						return bail("unknown-decoder:" + swDecoder)
+						return bail(TagPrefixBailUnknownDecoder + swDecoder)
 					}
 				} else {
-					return bail("unknown-decoder:" + swDecoder)
+					return bail(TagPrefixBailUnknownDecoder + swDecoder)
 				}
 				args = spliceArgs(args, decCodecIdx+2,
 					"-hwaccel:0", "vaapi",
 					"-hwaccel_output_format:0", "vaapi",
 					"-hwaccel_device:0", "vaapi",
 				)
-				changes = append(changes, "decode:bare-hw-upgrade:"+swDecoder)
+				changes = append(changes, TagPrefixDecodeBareHWUpgrade+swDecoder)
 			}
 		} else if hwDecoder, ok := decoderMap[swDecoder]; ok {
 			args[decCodecIdx+1] = hwDecoder
@@ -1944,9 +1944,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				"-hwaccel_output_format:0", "vaapi",
 				"-hwaccel_device:0", "vaapi",
 			)
-			changes = append(changes, "decode:"+swDecoder+"->"+hwDecoder)
+			changes = append(changes, TagPrefixDecode+swDecoder+"->"+hwDecoder)
 		} else {
-			return bail("unknown-decoder:" + swDecoder)
+			return bail(TagPrefixBailUnknownDecoder + swDecoder)
 		}
 
 		// FORCE_HW=1 + Plex hybrid (HW decode + SW encode): under the homelab's
@@ -2006,7 +2006,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				"-init_hw_device", "vaapi=vaapi:",
 				"-filter_hw_device", "vaapi",
 			)
-			changes = append(changes, "inject:init_hw_device+filter_hw_device")
+			changes = append(changes, TagInjectInitHWDevice)
 		}
 
 		// Locate output -codec:0 (after -i) up-front; both SW and HW paths
@@ -2014,7 +2014,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		newInputIdx := indexOfArg(args, "-i", 0)
 		encCodecIdx := indexOfArg(args, "-codec:0", newInputIdx+1)
 		if encCodecIdx < 0 {
-			return bail("no-encoder")
+			return bail(TagBailReasonNoEncoder)
 		}
 
 		mediaPath := ""
@@ -2047,12 +2047,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					args = removeArgs(args, i, 2)
 				}
 			}
-			changes = append(changes, "honor:plex-sw")
+			changes = append(changes, TagHonorPlexSW)
 		} else if !isHWDecode || hybridForceHW {
 			if hybridForceHW {
 				// HW decode already in place (kept); only the SW filter+encode
 				// tail is reshaped to VAAPI below. See hybridForceHW comment.
-				changes = append(changes, "force-hw:reshape-hybrid:"+swDecoder)
+				changes = append(changes, TagPrefixForceHWReshapeHybrid+swDecoder)
 			}
 			// 3. Video -filter_complex rewrite
 			vfIdx := -1
@@ -2063,7 +2063,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 			}
 			if vfIdx < 0 {
-				return bail("no-video-filter")
+				return bail(TagBailReasonNoVideoFilter)
 			}
 
 			// Subtitle source detection. PMS hands us the subtitle file/stream
@@ -2082,7 +2082,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				subSrc = detectSubtitleSource(args, sessionDir, probe)
 			}
 			if subSrc != nil && subSrc.Kind == "bitmap" {
-				label := "subtitle:bitmap:" + subSrc.StreamSpec
+				label := TagPrefixSubtitleBitmap + subSrc.StreamSpec
 				if subSrc.Codec != "" {
 					label += "(" + subSrc.Codec + ")"
 				}
@@ -2097,16 +2097,16 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				transfer, _, _ := opts.ProbeVideoColor(mediaPath)
 				if isHDRTransfer(transfer) {
 					sourceIsHDR = true
-					changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+					changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
 				}
 			}
 
 			rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, sourceIsHDR, tm)
 			if rewritten == nil {
-				return bail("filter-pattern:" + args[vfIdx])
+				return bail(TagPrefixBailFilterPattern + args[vfIdx])
 			}
 			args[vfIdx] = rewritten.Filter
-			changes = append(changes, "filter:"+rewritten.Mode)
+			changes = append(changes, TagPrefixFilter+rewritten.Mode)
 
 			// 4. Update -map output label following the video filter.
 			// MUST run BEFORE dropSidecarInput: that drop removes args
@@ -2128,7 +2128,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					} else {
 						args[i+1] = rewritten.NewLabel
 					}
-					changes = append(changes, "map-label-update")
+					changes = append(changes, TagMapLabelUpdate)
 					break
 				}
 			}
@@ -2145,7 +2145,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					indexOfArg(args, "-map_inlineass", 0) < 0 {
 					args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0),
 						"-map_inlineass", subSrc.StreamSpec)
-					changes = append(changes, "add:-map_inlineass")
+					changes = append(changes, TagAddMapInlineass)
 				}
 			}
 
@@ -2155,15 +2155,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			newInputIdx = indexOfArg(args, "-i", 0)
 			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
 			if encCodecIdx < 0 {
-				return bail("no-encoder")
+				return bail(TagBailReasonNoEncoder)
 			}
 			swEncoder := args[encCodecIdx+1]
 			hwEncoder, ok := encoderMap[swEncoder]
 			if !ok {
-				return bail("unknown-encoder:" + swEncoder)
+				return bail(TagPrefixBailUnknownEncoder + swEncoder)
 			}
 			args[encCodecIdx+1] = hwEncoder
-			changes = append(changes, "encode:"+swEncoder+"->"+hwEncoder)
+			changes = append(changes, TagPrefixEncode+swEncoder+"->"+hwEncoder)
 		} else if honorHybrid {
 			// HW decode + SW encode (per-axis honor, docs/HW_PROFILE.md). PMS
 			// emitted `-hwaccel:0 vaapi` decode + a libx264/libx265 encode (its
@@ -2175,7 +2175,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// stays on the GPU, only the encode is CPU (realtime even at 4K,
 			// unlike full SW which is decode-bound). Only the transport/audio
 			// scrubs below apply.
-			changes = append(changes, "honor:plex-hwdec-swenc")
+			changes = append(changes, TagHonorPlexHWDecSWEnc)
 		} else {
 			// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
 			// that, but leave the filter chain, map labels, and encoder
@@ -2185,9 +2185,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			case "h264_vaapi", "hevc_vaapi":
 				// expected
 			default:
-				return bail("hw-decode:unexpected-encoder:" + swEncoder)
+				return bail(TagPrefixBailUnexpectedEncoder + swEncoder)
 			}
-			changes = append(changes, "encode:hw-passthrough:"+swEncoder)
+			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
 
 			// HDR source detection (diagnostic only). scaleplex does NOT
 			// inject a tonemap: when Plex's HW-decode chain is the plain
@@ -2198,7 +2198,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 				if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
 					sourceIsHDR = true
-					changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+					changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
 				}
 			}
 
@@ -2230,7 +2230,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					if vfIdx < 0 {
-						return bail("hw-decode-sub:no-inlineass-filter")
+						return bail(TagBailReasonHWDecodeSubNoInlineass)
 					}
 					// Orthogonal core: extractGraphFacts + composeBurn — same
 					// path the SW-reshape and HW-decode-bitmap branches already
@@ -2244,7 +2244,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// detour are absent by construction.
 					facts := extractGraphFacts(args[vfIdx], subSrc)
 					if !facts.ok || facts.subKind != "text" {
-						return bail("hw-decode-sub:unmodeled-graph:" + args[vfIdx])
+						return bail(TagPrefixBailHWDecodeSubUnmodeled + args[vfIdx])
 					}
 					if facts.hdr {
 						sourceIsHDR = true
@@ -2255,7 +2255,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
 						if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
 							sourceIsHDR = true
-							changes = append(changes, "video:hdr-source("+strings.ToLower(transfer)+")")
+							changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
 						}
 					}
 					oldLabel := ""
@@ -2293,18 +2293,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						// through tm.stage, which keeps the OpenCL chain by default
 						// or collapses to tonemap_vaapi under SCALEPLEX_TONEMAP=vaapi).
 						// Without this preservation HDR renders washed.
-						changes = append(changes, "hw-decode-sub:tonemap-preserved("+facts.algo+")")
-						changes = append(changes, "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi")
+						changes = append(changes, TagPrefixHWDecodeSubTonemapPreserved+facts.algo+")")
+						changes = append(changes, TagHWDecodeFilterOCLToVAAPIIA)
 					} else {
-						changes = append(changes, "hw-decode:filter:inlineass-vaapi")
+						changes = append(changes, TagHWDecodeFilterInlineassVA)
 					}
 					if oldLabel != "" && oldLabel != newLabel {
-						changes = append(changes, "hw-decode:map-label-update")
+						changes = append(changes, TagHWDecodeMapLabelUpdate)
 					}
 					newInputIdx = indexOfArg(args, "-i", 0)
 					encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
 				case "bitmap":
-					return bail("hw-decode-sub:bitmap-unsupported")
+					return bail(TagBailReasonHWDecodeSubBitmapUnsupported)
 				}
 			}
 
@@ -2359,9 +2359,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// patch 0120's binding self-decodes the stream, paced by the demux.
 				args = spliceArgs(args, indexOfArg(args, "-filter_complex", 0), "-map_inlineass", streamSpec)
 				if hdr {
-					changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap("+algo+")")
+					changes = append(changes, TagPrefixHWDecodeFilterBitmapHDRTM+algo+")")
 				} else {
-					changes = append(changes, "hw-decode:filter:bitmap-inlineass-vaapi")
+					changes = append(changes, TagHWDecodeFilterBitmapInlineassVA)
 				}
 				// The splices shifted indices; relocate the encoder.
 				newInputIdx = indexOfArg(args, "-i", 0)
@@ -2428,7 +2428,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if !honorSW && !honorHybrid && indexOfArg(args, "-sei:0", 0) < 0 {
 			if fkfIdx := indexOfArg(args, "-force_key_frames:0", encCodecIdx+1); fkfIdx >= 0 {
 				args = spliceArgs(args, fkfIdx, "-sei:0", "-a53_cc")
-				changes = append(changes, "inject:sei+a53_cc")
+				changes = append(changes, TagInjectSEIA53CC)
 			}
 		}
 
@@ -2450,14 +2450,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		var swapped [][2]string
 		args, swapped = swapEAEAudioDecoders(args)
 		for _, p := range swapped {
-			changes = append(changes, "audio:"+p[0]+"->"+p[1])
+			changes = append(changes, TagPrefixAudio+p[0]+"->"+p[1])
 		}
 	}
 	{
 		var dropped []string
 		args, dropped = dropEAEPrefixFlags(args)
 		for _, d := range dropped {
-			changes = append(changes, "drop:"+d)
+			changes = append(changes, TagPrefixDrop+d)
 		}
 	}
 
@@ -2476,7 +2476,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// strip the flag.
 	if i := indexOfArg(args, "-skip_to_segment", 0); i >= 0 && i+1 < len(args) {
 		if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
-			changes = append(changes, "skip_to_segment:passthrough="+args[i+1])
+			changes = append(changes, TagPrefixSkipToSegmentPassthrough+args[i+1])
 		}
 	}
 
@@ -2619,7 +2619,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	if ssIdx := indexOfArg(args, "-ss", 0); ssIdx >= 0 && ssIdx+1 < len(args) {
 		if v, err := strconv.ParseFloat(args[ssIdx+1], 64); err == nil && v > 0 {
 			seekOffsetSeconds = v
-			changes = append(changes, fmt.Sprintf("seek-offset:captured=%.3fs", v))
+			changes = append(changes, fmt.Sprintf(TagPrefixSeekOffsetCaptured, v))
 		}
 	}
 	// The subtitle pre-render timeline must start at the same offset as
@@ -2670,11 +2670,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	if newArgs, ok := upgradeLoglevelFromQuiet(args); ok {
 		args = newArgs
-		changes = append(changes, "loglevel:->info")
+		changes = append(changes, TagLoglevelInfo)
 	}
 	if newArgs, ok := dropNostatsFlag(args); ok {
 		args = newArgs
-		changes = append(changes, "drop:-nostats")
+		changes = append(changes, TagDropNostats)
 	}
 
 	{
@@ -2691,11 +2691,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if libvaDriversPath != "" {
 			env["LIBVA_DRIVERS_PATH"] = libvaDriversPath
 		}
-		changes = append(changes, "env:LIBVA")
+		changes = append(changes, TagEnvLIBVA)
 	}
 
 	env = setWorkerHomeEnv(env)
-	changes = append(changes, "env:HOME")
+	changes = append(changes, TagEnvHOME)
 
 	// scaleplex (0120): drop Plex's subtitle decode-sink now that the
 	// -map_inlineass binding self-decodes. See stripInlineassDecodeSink.
@@ -2705,7 +2705,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	if !isRemux {
 		if stripped, ok := stripInlineassDecodeSink(args); ok {
 			args = stripped
-			changes = append(changes, "drop:inlineass-decode-sink")
+			changes = append(changes, TagDropInlineassDecodeSink)
 		}
 	}
 

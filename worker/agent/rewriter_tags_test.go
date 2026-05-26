@@ -23,9 +23,11 @@ func TestRewriterTagInventory(t *testing.T) {
 	}
 
 	emitted, bailed := extractEmittedLiterals(t, "rewriter.go")
-	if len(emitted) == 0 {
-		t.Fatal("rewriter.go AST scan found no change-tag emit sites; parser broken?")
-	}
+	// Post-PR-B the canonical state is zero string-literal emit sites — every
+	// tag is a Tag* / TagPrefix* / TagBailReason* reference. Empty sets here
+	// are correct, not "parser broken." If a future PR re-introduces a
+	// literal that doesn't trace to the inventory, the un-coverage loop
+	// below catches it.
 
 	// Change-tag emissions: must match a Tag* full value, or a TagPrefix*
 	// prefix value, or — for emit-sites with concatenated suffix — the
@@ -252,5 +254,136 @@ func TestRewriterTagInventory_ConstsAreUnique(t *testing.T) {
 	add("Tag*", full)
 	add("TagPrefix*", prefixes)
 	add("TagBailReason*", bail)
+}
+
+// TestTagValues_Stable pins every Tag* / TagPrefix* / TagBailReason* constant
+// to its expected string value. Locks the canon against silent renames done
+// in rewriter_tags.go itself — the inventory test catches a literal in
+// rewriter.go that drifts from the canon, but it can't catch a rename done
+// in lockstep on both sides. This map is the immovable contract; updating a
+// value here is the explicit "yes, this rename is intentional" gate.
+//
+// Loaded via the same AST helper as the inventory test so a const renamed
+// from Tag* to something else (or accidentally moved into a non-const decl)
+// surfaces as a "missing const" failure, not a silent skip.
+func TestTagValues_Stable(t *testing.T) {
+	want := map[string]string{
+		// Tag* full literals
+		"TagAddMapInlineass":                  "add:-map_inlineass",
+		"TagBailSegmentListRewriteToRelay":    "bail:segment_list:rewrite-to-relay",
+		"TagCanThrottleDisabledByEnv":         "canthrottle:disabled-by-env",
+		"TagDropEAEPrefixBail":                "drop:-eae_prefix(bail)",
+		"TagDropInlineassDecodeSink":          "drop:inlineass-decode-sink",
+		"TagDropNostats":                      "drop:-nostats",
+		"TagDropProgressurlBail":              "drop:-progressurl(bail)",
+		"TagEnvHOME":                          "env:HOME",
+		"TagEnvLIBVA":                         "env:LIBVA",
+		"TagFilterTonemapOpenCLNormalized":    "filter:tonemap_opencl-normalized",
+		"TagFilterTonemapOpenCLToVAAPI":       "filter:tonemap_opencl->tonemap_vaapi",
+		"TagForceHWWouldHonorHWDecSWEnc":      "force-hw:would-honor-hwdec-swenc",
+		"TagForceHWWouldHonorSW":              "force-hw:would-honor-sw",
+		"TagHWDecodeFilterBitmapInlineassVA":  "hw-decode:filter:bitmap-inlineass-vaapi",
+		"TagHWDecodeFilterInlineassVA":        "hw-decode:filter:inlineass-vaapi",
+		"TagHWDecodeFilterOCLToVAAPIIA":       "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi",
+		"TagHWDecodeMapLabelUpdate":           "hw-decode:map-label-update",
+		"TagHonorPlexHWDecSWEnc":              "honor:plex-hwdec-swenc",
+		"TagHonorPlexSW":                      "honor:plex-sw",
+		"TagInjectCanThrottleURL":             "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)",
+		"TagInjectInitHWDevice":               "inject:init_hw_device+filter_hw_device",
+		"TagInjectSEIA53CC":                   "inject:sei+a53_cc",
+		"TagLoglevelInfo":                     "loglevel:->info",
+		"TagMapLabelUpdate":                   "map-label-update",
+		"TagProgressAppendXPlexToken":         "progress:append-X-Plex-Token",
+		"TagProgressURLCapturedForReporter":   "progressurl:captured-for-reporter",
+		"TagTonemapOCLCollapseRevmapDownload": "tonemap:ocl:collapse-revmap-download",
+		"TagTonemapOCLDropLeadHWUpload":       "tonemap:ocl:drop-lead-hwupload",
+		"TagTonemapOCLForceOutputFormatVA":    "tonemap:ocl:force-output-format-vaapi",
+		"TagTonemapOCLInjectOpenCLDevice":     "tonemap:ocl:inject-opencl-device",
+
+		// TagPrefix* dynamic-suffix prefixes
+		"TagPrefixAudio":                       "audio:",
+		"TagPrefixBailFilterPattern":           "filter-pattern:",
+		"TagPrefixBailHWDecodeSubUnmodeled":    "hw-decode-sub:unmodeled-graph:",
+		"TagPrefixBailUnexpectedEncoder":       "hw-decode:unexpected-encoder:",
+		"TagPrefixBailUnknownDecoder":          "unknown-decoder:",
+		"TagPrefixBailUnknownEncoder":          "unknown-encoder:",
+		"TagPrefixDecode":                      "decode:",
+		"TagPrefixDecodeBareHWUpgrade":         "decode:bare-hw-upgrade:",
+		"TagPrefixDecodeHWPassthrough":         "decode:hw-passthrough:",
+		"TagPrefixDrop":                        "drop:",
+		"TagPrefixEncode":                      "encode:",
+		"TagPrefixEncodeHWPassthrough":         "encode:hw-passthrough:",
+		"TagPrefixEnvStrip":                    "env:strip:",
+		"TagPrefixFilter":                      "filter:",
+		"TagPrefixForceHWReshapeHybrid":        "force-hw:reshape-hybrid:",
+		"TagPrefixHWDecodeFilterBitmapHDRTM":   "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap(",
+		"TagPrefixHWDecodeSubTonemapPreserved": "hw-decode-sub:tonemap-preserved(",
+		"TagPrefixSeekOffsetCaptured":          "seek-offset:captured=%.3fs",
+		"TagPrefixSkip":                        "skip:",
+		"TagPrefixSkipToSegmentPassthrough":    "skip_to_segment:passthrough=",
+		"TagPrefixSubtitleBitmap":              "subtitle:bitmap:",
+		"TagPrefixVideoHDRSource":              "video:hdr-source(",
+
+		// TagBailReason* static bail() arguments
+		"TagBailReasonHWDecodeSubBitmapUnsupported": "hw-decode-sub:bitmap-unsupported",
+		"TagBailReasonHWDecodeSubNoInlineass":       "hw-decode-sub:no-inlineass-filter",
+		"TagBailReasonNoDecoder":                    "no-decoder",
+		"TagBailReasonNoEncoder":                    "no-encoder",
+		"TagBailReasonNoInput":                      "no-input",
+		"TagBailReasonNoVideoFilter":                "no-video-filter",
+		"TagBailReasonSubtitlesBurnIn":              "subtitles-burn-in",
+	}
+
+	got := loadTagInventoryByName()
+	for name, expected := range want {
+		actual, ok := got[name]
+		if !ok {
+			t.Errorf("missing constant %s — was it renamed or removed?", name)
+			continue
+		}
+		if actual != expected {
+			t.Errorf("%s = %q, want %q — value drifted; update TestTagValues_Stable IF intentional",
+				name, actual, expected)
+		}
+	}
+	for name := range got {
+		if _, ok := want[name]; !ok {
+			t.Errorf("new constant %s = %q in rewriter_tags.go not pinned here — add to TestTagValues_Stable",
+				name, got[name])
+		}
+	}
+}
+
+// loadTagInventoryByName parses rewriter_tags.go and returns every
+// Tag* / TagPrefix* / TagBailReason* constant keyed by its name.
+func loadTagInventoryByName() map[string]string {
+	out := map[string]string{}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "rewriter_tags.go", nil, 0)
+	if err != nil {
+		return out
+	}
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Names) == 0 || len(vs.Values) == 0 {
+				continue
+			}
+			name := vs.Names[0].Name
+			lit, ok := vs.Values[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			if !strings.HasPrefix(name, "Tag") {
+				continue
+			}
+			out[name] = strings.Trim(lit.Value, "`\"")
+		}
+	}
+	return out
 }
 
