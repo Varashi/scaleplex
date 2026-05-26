@@ -56,28 +56,30 @@ matroskaenc Duration backport, 0122 sched-sinkless-per-output. The
 cumulative effect closed the bug; no targeted fix was authored against
 the symptom.
 
-## Plex `framedrop` audio bitstream filter not stripped — `exit status 8`
+## Plex `framedrop` audio bitstream filter — `exit status 8` (FIXED post-v1.7.0)
 
-`[KNOWN: FramedropBSF]`
+`[FIXED: FramedropBSF]`
 
-**Severity:** recoverable transient. Affects a subset of Plex Web DASH
-sessions with AAC audio + seek (PMS emits `-bsf:1 framedrop=count=N` to
-drop initial AAC frames for A/V alignment post-seek). The fork's
-ffmpeg has no `framedrop` bitstream filter (Plex-Transcoder-only),
-ffmpeg fails to open it, exits 8. Plex re-spawns the session with
-different argv and playback resumes — user-visible effect is a brief
-stutter or silent retry at session start, not a stuck failure.
+**Severity (pre-fix):** recoverable transient. Affected a subset of
+Plex Web DASH sessions with AAC audio + seek (PMS emits `-bsf:1
+framedrop=count=N` to drop initial AAC frames for A/V alignment
+post-seek). The fork's ffmpeg has no `framedrop` bitstream filter
+(Plex-Transcoder-only), ffmpeg failed to open it, exited 8. Plex
+re-spawned the session with different argv and playback resumed —
+user-visible effect was a brief stutter or silent retry at session
+start, not a stuck failure.
 
-Spotted live during the v1.7.0 release-gate sweep (2026-05-26, Plex Web
-Chrome + Firefox seek bursts).
+Spotted live during the v1.7.0 release-gate sweep (2026-05-26, Plex
+Web Chrome + Firefox seek bursts).
 
-**Fix path (post-tag):** rewriter should strip `-bsf:N framedrop=*`
-output args (parallel to the existing `*_eae` codec strip and
-`-eae_prefix:N` drop in `swapEAEAudioDecoders` / `dropEAEPrefixFlags`).
-Tracked in memory `project_scaleplex_framedrop_bsf_strip.md`.
-
-**Workaround:** none needed — Plex's session retry path handles
-recovery transparently.
+**Fix:** rewriter now strips `-bsf:N framedrop=*` from output args
+in both the bail path (safety net) and the main path via the new
+`dropFramedropBSF` helper — parallel to the existing `*_eae` codec
+strip and `-eae_prefix:N` drop in `swapEAEAudioDecoders` /
+`dropEAEPrefixFlags`. Emits change tag `drop:-bsf:N(framedrop)` (or
+`drop:-bsf:N(framedrop)(bail)` from the bail-path scrub). Preserves
+other `-bsf:N` flags (e.g. `dovi_rpu=strip=1`). Tracked in memory
+`project_scaleplex_framedrop_bsf_strip.md`.
 
 ## Duplicate `video:hdr-source(...)` tag on text-burn HW-decode path
 

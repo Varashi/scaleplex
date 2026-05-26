@@ -211,6 +211,135 @@ func TestRewriter_EAE_TrueHDBothDirections(t *testing.T) {
 	}
 }
 
+// PMS-emitted argv for a DASH AAC session with post-seek framedrop
+// BSF. Plex injects `-bsf:1 framedrop=count=2` on the audio output to
+// drop the first 2 AAC frames for A/V alignment. `framedrop` is a
+// Plex-Transcoder-only bitstream filter; scaleplex-ffmpeg7's
+// jellyfin-ffmpeg7 base has no such BSF, so without rewriter scrub
+// ffmpeg exits 8 with "Bitstream filter not found 'framedrop'" before
+// any chunks land. Live repro: Plex Web Chrome seek burst, 2026-05-26.
+func TestRewriter_FramedropBSF_Strip(t *testing.T) {
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/Movies/Whatever.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]scale=w=1280:h=720[0];[0]format=pix_fmts=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "18",
+		"-preset:0", "veryfast",
+		"-metadata:s:1", "language=eng",
+		"-codec:1", "aac",
+		"-b:1", "96k",
+		"-bsf:1", "framedrop=count=2",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	// Change tag must surface.
+	if !containsString(out.Changes, "drop:-bsf:1(framedrop)") {
+		t.Fatalf("missing drop:-bsf:1(framedrop) change: %v", out.Changes)
+	}
+	// Both halves of the pair must be gone from argv.
+	if containsString(out.Args, "-bsf:1") {
+		t.Fatal("-bsf:1 must be stripped")
+	}
+	for _, a := range out.Args {
+		if strings.HasPrefix(a, "framedrop=") {
+			t.Fatalf("framedrop=* value must be stripped: %q", a)
+		}
+	}
+}
+
+// Multiple framedrop pairs (rare but possible — independent video +
+// audio outputs both seeking) must all be removed. Verifies the
+// loop-until-stable pattern doesn't drop just the first occurrence.
+// Uses a filter chain that passes the main-path graph check so we
+// hit dropFramedropBSF directly, not the bail-path safety net.
+func TestRewriter_FramedropBSF_StripMultiple(t *testing.T) {
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/x.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]scale=w=1280:h=720[0];[0]format=pix_fmts=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "18",
+		"-preset:0", "veryfast",
+		"-bsf:0", "framedrop=count=1",
+		"-metadata:s:1", "language=eng",
+		"-codec:1", "aac",
+		"-b:1", "96k",
+		"-bsf:1", "framedrop=count=2",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	// Sanity: this should NOT be a bail — we want main-path coverage.
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "skip:") {
+			t.Fatalf("unexpected bail: %v", out.Changes)
+		}
+	}
+	for _, want := range []string{"drop:-bsf:0(framedrop)", "drop:-bsf:1(framedrop)"} {
+		if !containsString(out.Changes, want) {
+			t.Errorf("missing change %q: %v", want, out.Changes)
+		}
+	}
+	for _, a := range out.Args {
+		if strings.HasPrefix(a, "framedrop=") {
+			t.Fatalf("framedrop= residue in argv: %v", out.Args)
+		}
+	}
+}
+
+// Other `-bsf:N <chain>` flags MUST survive untouched. `dovi_rpu` is
+// Dolby Vision RPU passthrough (round-trip-validated 2026-05-24 —
+// stripping it breaks HDR remux); `h264_metadata` is a stock BSF used
+// by some Plex argv shapes for SAR/colour fixups.
+func TestRewriter_FramedropBSF_PreservesOtherBSF(t *testing.T) {
+	args := []string{
+		"-codec:0", "hevc",
+		"-i", "/media/dolby.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]format=pix_fmts=p010[1]",
+		"-map", "[1]",
+		"-codec:0", "copy",
+		"-bsf:0", "dovi_rpu=strip=1",
+		"-codec:1", "aac",
+		"-bsf:1", "framedrop=count=2",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	// dovi_rpu must survive.
+	foundDovi := false
+	for i, a := range out.Args {
+		if a == "-bsf:0" && i+1 < len(out.Args) && strings.HasPrefix(out.Args[i+1], "dovi_rpu=") {
+			foundDovi = true
+		}
+	}
+	if !foundDovi {
+		t.Fatalf("dovi_rpu BSF must be preserved: %v", out.Args)
+	}
+	// framedrop must be gone.
+	for _, a := range out.Args {
+		if strings.HasPrefix(a, "framedrop=") {
+			t.Fatalf("framedrop= must be stripped: %v", out.Args)
+		}
+	}
+	if !containsString(out.Changes, "drop:-bsf:1(framedrop)") {
+		t.Fatalf("missing drop:-bsf:1(framedrop) change: %v", out.Changes)
+	}
+}
+
 func TestRewriter_StripsPlexEnv(t *testing.T) {
 	in := map[string]string{
 		"EAE_ROOT":             "/run/plex-temp/.../EasyAudioEncoder",
