@@ -1,0 +1,80 @@
+name: docker-compose-smoke
+
+# Validates deploy/docker/compose.yaml (config + bring up orchestrator,
+# confirm /healthz is 200) — the no-k8s deployment path. Worker
+# requires GPU passthrough (/dev/dri/renderD128), which GH-hosted
+# runners don't have, so this smoke only covers the orchestrator side.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/docker/**"
+      - "orchestrator/**"
+      - ".github/workflows/docker-compose-smoke.yaml"
+  pull_request:
+    paths:
+      - "deploy/docker/**"
+      - "orchestrator/**"
+      - ".github/workflows/docker-compose-smoke.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  config-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config (validate YAML + interpolation)
+        working-directory: deploy/docker
+        run: |
+          cp .env.example .env
+          docker compose config > /dev/null
+
+  smoke:
+    runs-on: ubuntu-24.04
+    needs: config-lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: build orchestrator image from this PR
+        # Smoke must run against this PR's code, not whatever `latest`
+        # on GHCR happens to be — otherwise new endpoints / behaviour
+        # added in the PR (e.g. /register) won't be exercised. Local
+        # `docker build` is ~30s; no push.
+        run: |
+          docker build -t ghcr.io/varashi/scaleplex_orchestrator:smoke \
+            -f orchestrator/Dockerfile .
+      - name: prepare env
+        working-directory: deploy/docker
+        run: |
+          cp .env.example .env
+          # Point compose at the locally-built image.
+          sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=smoke/' .env
+          mkdir -p ./media ./transcode
+      - name: bring orchestrator up (worker omitted — no GPU on runner)
+        working-directory: deploy/docker
+        run: |
+          docker compose up -d orchestrator
+          # /healthz is the liveness probe — doesn't require a healthy
+          # worker, just that the HTTP server is up.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3500/healthz; then exit 0; fi
+            sleep 1
+          done
+          echo "orchestrator failed to come up"
+          docker compose logs orchestrator
+          exit 1
+      - name: register a fake worker via PUSH + verify it appears
+        run: |
+          curl -fsS -X POST http://localhost:3500/register \
+            -H 'Content-Type: application/json' \
+            -d '{"host":"fake-worker","port":3501,"version":"smoke"}'
+          sleep 1
+          curl -fsS http://localhost:3500/workers | tee /tmp/workers.json
+          grep -q '"sources":"push"' /tmp/workers.json
+      - name: tear down
+        if: always()
+        working-directory: deploy/docker
+        run: docker compose down -v
