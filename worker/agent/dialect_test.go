@@ -10,11 +10,15 @@ func TestSelectDialect(t *testing.T) {
 		envBackend  string
 		wantBackend string
 	}{
-		{"unset defaults to vaapi", "", "vaapi"},
-		{"vaapi", "vaapi", "vaapi"},
+		// Unset → auto-probe — on the CI runner /dev/nvidia0 is absent
+		// → falls back to vaapi. Same observable outcome as a literal
+		// "vaapi" pin in CI; the auto-default semantics are exercised
+		// via the dedicated subtest below.
+		{"unset auto-probes (no /dev/nvidia0 → vaapi)", "", "vaapi"},
+		{"vaapi pin", "vaapi", "vaapi"},
 		{"VAAPI uppercase", "VAAPI", "vaapi"},
 		{"vaapi padded", "  vaapi  ", "vaapi"},
-		{"nvidia", "nvidia", "nvidia"},
+		{"nvidia pin", "nvidia", "nvidia"},
 		{"NVIDIA uppercase", "NVIDIA", "nvidia"},
 		{"unknown falls back to vaapi", "intel-qsv", "vaapi"},
 	}

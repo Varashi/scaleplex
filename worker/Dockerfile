@@ -1,11 +1,21 @@
-# scaleplex worker image
+# scaleplex worker image — dual-backend (Intel VAAPI + NVIDIA NVENC).
 #
-# Ubuntu 24.04 + scaleplex-ffmpeg7 + Intel iHD VAAPI driver + fonts.
-# scaleplex-ffmpeg7 = jellyfin-ffmpeg + a small Plex-backport patch
-# layer (see ../scaleplex-ffmpeg/). Same upstream lineage as
-# jellyfin-ffmpeg, same featureset (VAAPI HW tonemap, overlay_vaapi,
-# sub2video etc.), plus four DASH muxer extensions that let the worker
-# rewriter drop a lot of seek-resume scaffolding.
+# scaleplex-ffmpeg7 = jellyfin-ffmpeg + Plex-backport patch layer (see
+# ../scaleplex-ffmpeg/). The deb compiles with BOTH backends enabled
+# (VAAPI + iHD + opencl AND CUDA + NVENC + NVDEC + libnpp), so a
+# single image carries both runtimes. At startup the worker agent's
+# selectDialect() probes /dev/nvidia0 and /dev/dri/renderD* and picks
+# automatically; WORKER_BACKEND env overrides. The runtime layer the
+# host doesn't have sits unused (~200MB of CUDA libs on an Intel-only
+# host; ~80MB of VAAPI userspace on an NVIDIA-only host) — accepted
+# cost for one-image operational simplicity.
+#
+# Base: nvidia/cuda:12.6.3-runtime-ubuntu24.04 — ships CUDA runtime
+# libs (libcuda, libcudart) needed by NVENC/NVDEC. NVENC/NVDEC encoder
+# shared libs themselves (libnvidia-encode, libnvcuvid,
+# libnvidia-opticalflow) come from the host at runtime via
+# nvidia-container-toolkit's CDI spec. The Intel VAAPI stack is added
+# on top via apt (intel-media-va-driver-non-free + libva + opencl).
 #
 # The deb is built by ../scaleplex-ffmpeg/build.sh (or the
 # build-ffmpeg GHA workflow) and placed in ../scaleplex-ffmpeg/dist/
@@ -20,14 +30,16 @@ COPY worker/agent/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
       -o /out/scaleplex-agent ./...
 
-FROM ubuntu:24.04
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
-LABEL org.opencontainers.image.description="scaleplex worker — scaleplex-ffmpeg + Intel iHD VAAPI + Go agent"
+LABEL org.opencontainers.image.description="scaleplex worker — scaleplex-ffmpeg + Intel VAAPI + NVIDIA NVENC + Go agent"
 LABEL org.opencontainers.image.licenses=MIT
 
 # multiverse for intel-media-va-driver-non-free; scaleplex-ffmpeg
 # expects libva to come from the system (it doesn't bundle the VAAPI
-# userspace, same as jellyfin-ffmpeg).
+# userspace, same as jellyfin-ffmpeg). CUDA runtime libs come from the
+# base image; NVENC/NVDEC encoder libs (libnvidia-encode, libnvcuvid)
+# are bound in at runtime via nvidia-container-toolkit's CDI spec.
 COPY scaleplex-ffmpeg/dist/scaleplex-ffmpeg7_*.deb /tmp/
 RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|' \
       /etc/apt/sources.list.d/ubuntu.sources && \
@@ -84,6 +96,16 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 ENV LIBVA_DRIVER_NAME=iHD
+# Backend selection — default `auto` probes /dev/nvidia0 first, falls
+# back to VAAPI. Explicit "vaapi" / "nvidia" overrides the probe; the
+# worker logs the resolved backend at startup. See worker/agent/dialect.go.
+ENV WORKER_BACKEND=auto
+# NVIDIA visibility — overridable by --gpus / nvidia-container-toolkit
+# CDI request at runtime. Baked-in defaults so the binary's NVML probe
+# works under a plain docker run --gpus=all without an explicit CDI
+# device spec.
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=video,compute,utility
 # libass + fontconfig: point at the slim config so fontselect scans 14
 # DejaVu files instead of the system corpus. The rewriter sets HOME=
 # /home/ubuntu in the spawn env so libass finds the per-user cache the

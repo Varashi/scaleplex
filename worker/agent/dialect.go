@@ -167,18 +167,21 @@ func (vaapiDialect) hwDownloadFilter() string { return "hwdownload" }
 var activeDialect dialect = vaapiDialect{}
 
 // selectDialect picks the backend at worker startup based on
-// WORKER_BACKEND env. Values: "vaapi" (default), "nvidia", "auto"
-// (probe /dev/nvidia0 first, fall back to vaapi).
+// WORKER_BACKEND env. Values: "auto" (default — probes /dev/nvidia0
+// first, falls back to VAAPI), "vaapi", "nvidia".
 //
-// On unknown values: log a WARN and fall back to vaapi (safe default —
-// matches every existing prod deployment).
+// The unified worker image carries both runtimes (VAAPI userspace +
+// CUDA runtime); the device-probe picks the one matching the host.
+// Operators can pin via the env knob; unknown values log a WARN and
+// fall back to VAAPI (safe default — matches every pre-PR-#61
+// deployment).
 func selectDialect() dialect {
 	switch want := strings.ToLower(strings.TrimSpace(os.Getenv("WORKER_BACKEND"))); want {
-	case "", "vaapi":
+	case "vaapi":
 		return vaapiDialect{}
 	case "nvidia":
 		return nvidiaDialect{}
-	case "auto":
+	case "", "auto":
 		if _, err := os.Stat("/dev/nvidia0"); err == nil {
 			return nvidiaDialect{}
 		}
