@@ -489,8 +489,21 @@ type filterRewrite struct {
 //     algorithm isn't carried through; substituteOpenCLTonemap keeps
 //     the algorithm straight off Plex's own chain.
 type tonemapConfig struct {
-	useOpenCL bool   // false = iHD fixed-curve tonemap_vaapi
+	useOpenCL bool   // VAAPI only: false = iHD fixed-curve tonemap_vaapi
 	algo      string // fallback algorithm for the SW-chain reshapes
+	// d is the worker's HW backend. nil = vaapiDialect{} fallback (kept
+	// for test ergonomics — tests construct tonemapConfig{...} literals
+	// without specifying d and expect VAAPI shapes).
+	d dialect
+}
+
+// backend returns tm.d with a VAAPI fallback for tests that construct
+// tonemapConfig literals without setting d.
+func (tm tonemapConfig) backend() dialect {
+	if tm.d == nil {
+		return vaapiDialect{}
+	}
+	return tm.d
 }
 
 func validTonemapAlgo(a string) bool {
@@ -502,11 +515,16 @@ func validTonemapAlgo(a string) bool {
 }
 
 // resolveTonemapConfig builds the tone-mapping backend policy from the
-// worker-pod env.
+// worker-pod env + the active HW dialect. useOpenCL is gated to VAAPI
+// — NVIDIA has no OpenCL-derive tonemap path (Plex emits `tonemap_cuda`
+// directly and the worker passes it through, see tm.stage).
 func resolveTonemapConfig() tonemapConfig {
 	cfg := tonemapConfig{
-		useOpenCL: !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi"),
-		algo:      "hable",
+		d:    activeDialect,
+		algo: "hable",
+	}
+	if cfg.d.backendName() == "vaapi" {
+		cfg.useOpenCL = !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi")
 	}
 	if a := strings.ToLower(os.Getenv("SCALEPLEX_TONEMAP_ALGO")); validTonemapAlgo(a) {
 		cfg.algo = a
@@ -514,15 +532,17 @@ func resolveTonemapConfig() tonemapConfig {
 	return cfg
 }
 
-// stage returns the filter fragment that converts an HDR p010 VAAPI
-// surface into an SDR (BT.709) nv12 VAAPI surface. It is inserted
-// directly after a `scale_vaapi=...:format=p010` step and its output is
-// a VAAPI surface either way, so it is drop-in wherever `tonemap_vaapi`
+// stage returns the filter fragment that converts an HDR p010 HW
+// surface into an SDR (BT.709) nv12 HW surface. It is inserted directly
+// after a `scale_*=...:format=p010` step and its output is a same-backend
+// surface either way, so it is drop-in wherever a single-stage tonemap
 // stood. `algo` overrides the config's algorithm (used when Plex's argv
-// carried its own); empty uses cfg.algo. Ignored in vaapi mode.
+// carried its own); empty uses cfg.algo. Ignored on VAAPI when useOpenCL
+// is false (iHD fixed-curve has no algo slot).
 //
-//	opencl: hwmap→opencl, tonemap_opencl=<algo>, hwmap→vaapi:reverse=1
-//	vaapi:  tonemap_vaapi (iHD fixed BT.2390 EETF)
+//	VAAPI, useOpenCL: hwmap→opencl, tonemap_opencl=<algo>, hwmap→vaapi:reverse=1
+//	VAAPI, fixed:     tonemap_vaapi (iHD fixed BT.2390 EETF)
+//	NVIDIA:           tonemap_cuda=<algo>:nv12 (algo-driven, no OpenCL derive)
 //
 // On ffmpeg-7 `hwmap=derive_device=opencl` does NOT self-create the OpenCL
 // device inside a -filter_complex (ffmpeg-6 did) — gpuResidentOpenCLTonemap
@@ -530,7 +550,7 @@ func resolveTonemapConfig() tonemapConfig {
 // VA-resident so this fragment's va→opencl derive succeeds.
 func (tm tonemapConfig) stage(algo string) string {
 	if !tm.useOpenCL {
-		return "tonemap_vaapi=transfer=bt709:format=nv12"
+		return tm.backend().tonemapFilter(algo, "nv12")
 	}
 	if !validTonemapAlgo(algo) {
 		algo = tm.algo
@@ -541,8 +561,8 @@ func (tm tonemapConfig) stage(algo string) string {
 		"hwmap=derive_device=vaapi:reverse=1"
 }
 
-// hdrScale returns the combined `scale_vaapi(p010) + tonemap` chain that
-// downscales and tone-maps an HDR source to an SDR nv12 VAAPI surface.
+// hdrScale returns the combined `scale(p010) + tonemap` chain that
+// downscales and tone-maps an HDR source to an SDR nv12 HW surface.
 // Used by the reFilterHDR/HDRAss reshapes — i.e. only where Plex's argv
 // already declared a tonemap.
 func (tm tonemapConfig) hdrScale(w, h string) string {
@@ -552,7 +572,7 @@ func (tm tonemapConfig) hdrScale(w, h string) string {
 // hdrScaleAlgo is hdrScale with an explicit tonemap algo (Plex's captured
 // algo on the SW-HDR reshape path). Empty algo falls back to tm.algo.
 func (tm tonemapConfig) hdrScaleAlgo(w, h, algo string) string {
-	return "scale_vaapi=w=" + w + ":h=" + h + ":format=p010," + tm.stage(algo)
+	return tm.backend().scaleFilter(w, h, "p010") + "," + tm.stage(algo)
 }
 
 // burnSpec captures the orthogonal axes of a HW scale / sub-burn graph. One
@@ -595,22 +615,23 @@ type burnSpec struct {
 // HDR-agnostic and the tonemap stage is sub-agnostic. gpuResidentOpenCLTonemap
 // later injects the OpenCL device + asserts VA-residency for the tonemap stage.
 func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
+	d := tm.backend()
 	n := 0
 	next := func() string { l := strconv.Itoa(n); n++; return l }
 	var b strings.Builder
 	src := "[0:0]"
 	if !s.vaResident {
 		u := next()
-		fmt.Fprintf(&b, "%shwupload[%s];", src, u)
+		fmt.Fprintf(&b, "%s%s[%s];", src, d.hwUploadFilter(), u)
 		src = "[" + u + "]"
 	}
 	scaled := next()
 	if s.hdr {
-		fmt.Fprintf(&b, "%sscale_vaapi=w=%s:h=%s:format=p010,%s[%s]",
-			src, s.w, s.h, tm.stage(s.algo), scaled)
+		fmt.Fprintf(&b, "%s%s,%s[%s]",
+			src, d.scaleFilter(s.w, s.h, "p010"), tm.stage(s.algo), scaled)
 	} else {
-		fmt.Fprintf(&b, "%sscale_vaapi=w=%s:h=%s:format=nv12[%s]",
-			src, s.w, s.h, scaled)
+		fmt.Fprintf(&b, "%s%s[%s]",
+			src, d.scaleFilter(s.w, s.h, "nv12"), scaled)
 	}
 	out := scaled
 	if s.burnSub {
