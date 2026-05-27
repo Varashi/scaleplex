@@ -2,6 +2,14 @@
 
 ## [1.8.0](https://github.com/Varashi/scaleplex/compare/v1.7.2...v1.8.0) (2026-05-27)
 
+**Images shipped:**
+
+| Image | Tag | Notes |
+|---|---|---|
+| `ghcr.io/varashi/scaleplex_worker` | `v1.8.0` | new — adds `startRegisterLoop()` for PUSH discovery |
+| `ghcr.io/varashi/scaleplex_orchestrator` | `v1.3.0` | new — `WORKERS_LIST` + `POST /register` + `sources` field |
+| `ghcr.io/varashi/scaleplex_pms_dockermod` | `v1.2.1` | unchanged (shim untouched) |
+
 Non-k8s deployment path so homelab users without a Kubernetes cluster
 can run scaleplex. The same three components (worker, orchestrator,
 PMS docker-mod) run as plain Docker containers; the PMS docker-mod is
