@@ -1289,6 +1289,44 @@ func dropEAEPrefixFlags(args []string) ([]string, []string) {
 	return args, dropped
 }
 
+// dropFramedropBSF walks args and removes every `-bsf:N framedrop=*`
+// pair. PMS emits this BSF on the audio output post-seek to drop the
+// first N AAC frames for A/V alignment; `framedrop` is a
+// Plex-Transcoder-only bitstream filter (scaleplex-ffmpeg7's
+// jellyfin-ffmpeg7 base has no such BSF). Without this drop, ffmpeg
+// fails at open-output time with "Bitstream filter not found
+// 'framedrop'" → exit status 8 before any chunks are written. Plex's
+// session-handler retries on exit-8 with different argv so the user
+// sees a brief stutter rather than a stuck session, but the
+// recoverable failure is still ugly in logs.
+//
+// Match is anchored on BOTH halves of the pair: the flag starts with
+// `-bsf:` (covers `-bsf:0`, `-bsf:1`, `-bsf:a:0`, etc.) and the value
+// starts with `framedrop=`. Other `-bsf:N <chain>` pairs (e.g.
+// `-bsf:0 dovi_rpu=strip=1` — used by Dolby Vision passthrough — or
+// `-bsf:v h264_metadata=...`) MUST survive untouched, so the value
+// prefix check is mandatory. Returns updated args and the flag names
+// dropped (for change tags).
+func dropFramedropBSF(args []string) ([]string, []string) {
+	var dropped []string
+	for {
+		removed := false
+		for i := 0; i < len(args)-1; i++ {
+			if strings.HasPrefix(args[i], "-bsf:") &&
+				strings.HasPrefix(args[i+1], "framedrop=") {
+				dropped = append(dropped, args[i])
+				args = removeArgs(args, i, 2)
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			break
+		}
+	}
+	return args, dropped
+}
+
 // rewriteManifestName rewrites `-manifest_name <url>` in-place: the
 // loopback URL (which workers can't reach) becomes the relay's base
 // URL, with X_PLEX_TOKEN appended. ffmpeg then PUTs the manifest body
@@ -1754,12 +1792,25 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		for _, d := range eaeDropped {
 			merged = append(merged, TagPrefixDrop+d+"(bail)")
 		}
+		// Same safety-net rationale as the EAE swap above: a bail
+		// returns before the main path's dropFramedropBSF (step 9
+		// neighbour), so any `-bsf:N framedrop=*` PMS emitted survives
+		// into the bailed argv. scaleplex-ffmpeg7 has no `framedrop`
+		// BSF → ffmpeg exits 8 "Bitstream filter not found" before any
+		// chunks are written. Strip on every bail so the bailed
+		// session at least reaches open-output cleanly.
+		var fdDropped []string
+		args, fdDropped = dropFramedropBSF(args)
+		for _, d := range fdDropped {
+			merged = append(merged, TagPrefixDrop+d+"(framedrop)(bail)")
+		}
 		merged = append(merged, TagPrefixSkip+reason)
-		// Applied=true whenever we mutated argv (scrub, hint drops, or
-		// EAE swap/prefix-drop), so the worker uses our rewritten copy
-		// instead of the input.
+		// Applied=true whenever we mutated argv (scrub, hint drops,
+		// EAE swap/prefix-drop, or framedrop-BSF drop), so the worker
+		// uses our rewritten copy instead of the input.
 		applied := len(scrub) > 0 || len(hintChanges) > 0 ||
-			len(eaeSwapped) > 0 || len(eaeDropped) > 0
+			len(eaeSwapped) > 0 || len(eaeDropped) > 0 ||
+			len(fdDropped) > 0
 		return RewriteResult{
 			Args:    args,
 			Env:     cloneEnv(inputEnv),
@@ -2458,6 +2509,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		args, dropped = dropEAEPrefixFlags(args)
 		for _, d := range dropped {
 			changes = append(changes, TagPrefixDrop+d)
+		}
+	}
+
+	// `-bsf:N framedrop=count=*` — Plex emits this audio-output BSF
+	// post-seek to drop the first N AAC frames for A/V alignment.
+	// `framedrop` is Plex-Transcoder-only; scaleplex-ffmpeg7 lacks the
+	// BSF → exit 8 "Bitstream filter not found" at open-output.
+	// Recoverable (PMS retries with different argv) but ugly in logs.
+	// Mirror the EAE-prefix drop pattern.
+	{
+		var dropped []string
+		args, dropped = dropFramedropBSF(args)
+		for _, d := range dropped {
+			changes = append(changes, TagPrefixDrop+d+"(framedrop)")
 		}
 	}
 
