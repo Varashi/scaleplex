@@ -17,6 +17,8 @@
 
 package main
 
+import "strconv"
+
 // nvencEncoderMap routes PMS's chosen software encoder to its NVENC
 // equivalent. PMS picks libx264 vs libx265 per session based on its
 // own prefs + client capability; same logic as VAAPI, different
@@ -49,4 +51,29 @@ func (nvidiaDialect) hwDecodeShortCodecs() map[string]struct{} {
 	// probe. Same set as VAAPI — Plex's HW-decode hint codec list is
 	// the union of formats its NVDEC/VAAPI probe accepts.
 	return hwDecodeShortCodecs
+}
+
+// hwaccelName: Plex emits "-hwaccel:0 nvdec" for NVIDIA HW decode (vs
+// "cuda"). Mirror what PMS sends so passthrough is byte-identical.
+func (nvidiaDialect) hwaccelName() string { return "nvdec" }
+
+// hwaccelOutputFormat: surface format the HW decoder writes to.
+// PMS emits "-hwaccel_output_format:0 cuda" — frames sit on the
+// CUDA device for scale_cuda/tonemap_cuda to consume directly.
+func (nvidiaDialect) hwaccelOutputFormat() string { return "cuda" }
+
+// filterHWDeviceName: -filter_hw_device cuda — binds graph filters
+// (scale_cuda, tonemap_cuda, overlay_cuda) to the CUDA device.
+func (nvidiaDialect) filterHWDeviceName() string { return "cuda" }
+
+// initHWDeviceArg normalizes to the worker-local CUDA device index.
+// PMS emits `-init_hw_device cuda=cuda:pci:BBBB:BB:DD.F` for HW-probed
+// sessions; the PCI ID is host-local on the PMS box and meaningless on
+// a remote worker. Worker-local device index `devIdx` is always used.
+func (nvidiaDialect) initHWDeviceArg(devIdx int) string {
+	return "cuda=cuda:" + strconv.Itoa(devIdx)
+}
+
+func (nvidiaDialect) scaleFilter(w, h, pix string) string {
+	return "scale_cuda=w=" + w + ":h=" + h + ":format=" + pix
 }

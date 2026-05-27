@@ -57,6 +57,41 @@ type dialect interface {
 	// these alongside the matching -hwaccel flag, the rest of the
 	// argv is already in this backend's shape and we pass through.
 	hwDecodeShortCodecs() map[string]struct{}
+
+	// hwaccelName is the value passed to `-hwaccel:N` for HW decode.
+	// VAAPI: "vaapi". NVIDIA: "nvdec" (matches Plex's emitted value;
+	// CUVID-side decoders also accept "cuda" but Plex picks nvdec).
+	hwaccelName() string
+
+	// hwaccelOutputFormat is the value passed to `-hwaccel_output_format:N`
+	// — the surface format ffmpeg uses for HW-decoded frames before they
+	// enter the filter graph. VAAPI: "vaapi". NVIDIA: "cuda".
+	hwaccelOutputFormat() string
+
+	// filterHWDeviceName is the value passed to `-filter_hw_device`,
+	// binding HW filters in the graph to this backend's device.
+	// VAAPI: "vaapi". NVIDIA: "cuda".
+	filterHWDeviceName() string
+
+	// initHWDeviceArg returns the `-init_hw_device` value targeting the
+	// worker's local device index `devIdx`.
+	//
+	// VAAPI: returns "vaapi=vaapi:" — empty path; the scaleplex-ffmpeg
+	// fork patch 0116-vaapi-device-env-retarget retargets the VAAPI device
+	// at open time from SCALEPLEX_RENDER_DEVICE, so the path content here
+	// is intentionally blank. devIdx is ignored on this backend.
+	//
+	// NVIDIA: returns "cuda=cuda:N". PMS's `-init_hw_device cuda=cuda:pci:BBBB:BB:DD.F`
+	// PCI form is host-local and meaningless on a remote worker, so the
+	// rewriter normalizes to the worker-local device index always.
+	initHWDeviceArg(devIdx int) string
+
+	// scaleFilter emits a HW scale filter targeting pixel format `pix`
+	// (typical values: "nv12", "p010"). The format is appended via
+	// `:format=PIX`. Filter name is backend-specific:
+	//   VAAPI: scale_vaapi=w=W:h=H:format=PIX
+	//   NVIDIA: scale_cuda=w=W:h=H:format=PIX
+	scaleFilter(w, h, pix string) string
 }
 
 // vaapiDialect — Intel iHD / VAAPI. The historical default; tested
@@ -78,6 +113,20 @@ func (vaapiDialect) decoderMap() map[string]string {
 
 func (vaapiDialect) hwDecodeShortCodecs() map[string]struct{} {
 	return hwDecodeShortCodecs
+}
+
+func (vaapiDialect) hwaccelName() string         { return "vaapi" }
+func (vaapiDialect) hwaccelOutputFormat() string { return "vaapi" }
+func (vaapiDialect) filterHWDeviceName() string  { return "vaapi" }
+
+func (vaapiDialect) initHWDeviceArg(_ int) string {
+	// devIdx ignored — the scaleplex-ffmpeg fork patch 0116 retargets
+	// the VAAPI device at open time from SCALEPLEX_RENDER_DEVICE.
+	return "vaapi=vaapi:"
+}
+
+func (vaapiDialect) scaleFilter(w, h, pix string) string {
+	return "scale_vaapi=w=" + w + ":h=" + h + ":format=" + pix
 }
 
 // activeDialect is the worker's selected backend. Populated in main()
