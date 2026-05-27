@@ -1,0 +1,91 @@
+# scaleplex worker image — NVIDIA NVENC/NVDEC variant.
+#
+# Sister of worker/Dockerfile (Intel iHD VAAPI). Uses the SAME
+# scaleplex-ffmpeg7 deb (jellyfin-ffmpeg compiles in CUDA + NVENC +
+# NVDEC + libnpp alongside VAAPI by default); only the runtime base
+# image and HW packages differ.
+#
+# Base: nvidia/cuda:12.6-runtime-ubuntu24.04 — drops CUDA runtime libs
+# (libcuda.so, libcudart, etc.) needed by NVDEC/NVENC. NVENC/NVDEC
+# encoder/decoder shared libs themselves (libnvidia-encode,
+# libnvcuvid, libnvidia-opticalflow) are NOT shipped in this image —
+# they come from the host via nvidia-container-toolkit's CDI spec at
+# runtime. On WSL nvidia-container-toolkit 1.19 the CDI spec is
+# incomplete; see feedback_wsl_nvidia_cdi_video_lib_bind in
+# operator-side memory for the manual bind workaround.
+#
+# Same agent, same fonts setup, same setcap dance — only the HW
+# runtime layer + the default WORKER_BACKEND env differ.
+
+FROM golang:1.26-bookworm AS agent-build
+WORKDIR /src
+COPY worker/agent/go.mod worker/agent/go.sum ./
+RUN go mod download
+COPY worker/agent/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+      -o /out/scaleplex-agent ./...
+
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
+LABEL org.opencontainers.image.description="scaleplex worker — scaleplex-ffmpeg + NVIDIA NVENC/NVDEC + Go agent"
+LABEL org.opencontainers.image.licenses=MIT
+
+# NVIDIA worker doesn't need intel-media-va-driver, libva, vainfo, or
+# intel-opencl-icd. tini stays (PID 1 reaper), libcap2-bin transient
+# for setcap, fontconfig+fonts for libass, strace for diagnostics.
+COPY scaleplex-ffmpeg/dist/scaleplex-ffmpeg7_*.deb /tmp/
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      /tmp/scaleplex-ffmpeg7_*.deb \
+      fontconfig fonts-dejavu-core \
+      strace \
+      tini && \
+    rm /tmp/scaleplex-ffmpeg7_*.deb && \
+    rm -rf /var/lib/apt/lists/*
+
+# Slim fontconfig — same rationale as the VAAPI Dockerfile (libass
+# fontselect cost dominates startup latency on the system corpus).
+RUN install -d -m 0755 /opt/scaleplex
+COPY worker/fonts.conf /opt/scaleplex/fonts.conf
+
+# /usr/lib/scaleplex-ffmpeg/{ffmpeg,ffprobe} install path; symlinks
+# into /usr/bin so the agent's hardcoded paths keep working.
+RUN ln -sf /usr/lib/scaleplex-ffmpeg/ffmpeg  /usr/bin/ffmpeg && \
+    ln -sf /usr/lib/scaleplex-ffmpeg/ffprobe /usr/bin/ffprobe
+
+# render group (568) for parity with the VAAPI image — harmless on
+# NVIDIA where the device node is /dev/nvidia* (different gid). NVIDIA
+# devices come via nvidia-container-toolkit's CDI mounts; uid 1000 has
+# implicit access on the CDI-injected nodes.
+RUN groupadd -g 568 render2 || true && \
+    useradd -u 1000 -g users -G video,render2 -m -s /bin/bash scaleplex || true
+
+COPY --from=agent-build /out/scaleplex-agent /usr/local/bin/scaleplex-agent
+
+# cap_perfmon for i915 PMU is iHD-only — leave on the binary anyway
+# (harmless on NVIDIA; the agent's load reader falls back to NVML on
+# this backend per Phase 1 PR #3).
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libcap2-bin && \
+    setcap cap_perfmon=ep /usr/local/bin/scaleplex-agent && \
+    apt-get purge -y --auto-remove libcap2-bin && \
+    rm -rf /var/lib/apt/lists/*
+
+# Default backend: this image only makes sense on a NVIDIA-equipped
+# host. Operators can still set WORKER_BACKEND=vaapi to disable the
+# NVIDIA-specific paths (but they shouldn't — use the VAAPI image).
+ENV WORKER_BACKEND=nvidia
+# Container runtime exposes nvidia tools via CDI; PATH stays default.
+ENV FONTCONFIG_FILE=/opt/scaleplex/fonts.conf
+
+# nvidia-container-toolkit sets these at runtime via the CDI spec, but
+# baking the defaults here means a docker run --gpus=all without a CDI
+# request still passes the agent's startup probe.
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=video,compute,utility
+
+EXPOSE 3501
+
+# Pre-populate the fontconfig cache (same as VAAPI image).
+RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v 2>&1 | tail -3
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/scaleplex-agent"]
