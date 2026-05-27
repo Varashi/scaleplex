@@ -1,0 +1,148 @@
+# scaleplex single-host all-in-one Docker Compose.
+#
+# Brings up orchestrator + 1 worker on one host, optionally with a
+# linuxserver/plex PMS container wired to scaleplex via DOCKER_MODS.
+#
+# For multi-host deployments — orchestrator on one host, workers on
+# many — see ./multi-host.md.
+#
+# Defaults assume an Intel iGPU / Arc card at /dev/dri/renderD128 (the
+# scaleplex worker's hardware path). Adjust IMAGE_TAG, paths, and
+# PMS_CLAIM in .env before `docker compose up -d`.
+#
+# Security posture: LAN-only, HTTP plaintext. scaleplex does NOT ship
+# auth or TLS — wrap the deployment in a reverse proxy (Caddy/Traefik)
+# or restrict the LAN if you need either. Cross-site / WAN workers
+# are a future feature; see the WAN-worker memo.
+
+services:
+  orchestrator:
+    image: ghcr.io/varashi/scaleplex_orchestrator:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    ports:
+      # PMS (via the docker-mod shim) calls this from its container.
+      - "${ORCHESTRATOR_PORT:-3500}:3500"
+    environment:
+      LISTEN_ADDR: ":3500"
+      # Docker's embedded DNS resolves the compose service name "worker"
+      # to its container IP on the user-defined bridge. One A record
+      # per running replica — drop-in replacement for a k8s headless
+      # Service. If you scale workers on a separate host, leave this as
+      # "worker" (it picks up the local container) and add the remote
+      # workers via WORKERS_LIST or PUSH (see multi-host.md).
+      WORKERS_DNS: worker
+      WORKER_PORT: "3501"
+      # Optional: comma-separated host[:port] static list — merged with
+      # DNS-discovered workers. Useful for adding remote-host workers
+      # without setting up DNS for them.
+      WORKERS_LIST: "${WORKERS_LIST:-}"
+      WORKERS_REFRESH_SECONDS: "5"
+      WORKERS_PROBE_SECONDS: "5"
+      # PUSH discovery — workers calling /register self-add. Reaper
+      # drops them after WORKERS_PUSH_TIMEOUT_SECONDS of silence.
+      WORKERS_PUSH_REAP_SECONDS: "5"
+      WORKERS_PUSH_TIMEOUT_SECONDS: "15"
+    healthcheck:
+      # /readyz returns 200 when at least one healthy worker is
+      # registered. Use /healthz if you'd rather not wait for workers.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3500/readyz"]
+      interval: 5s
+      timeout: 2s
+      retries: 30
+    networks:
+      - scaleplex_net
+
+  worker:
+    image: ghcr.io/varashi/scaleplex_worker:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    # Worker port is reachable inside the compose network for
+    # /capability + /task. Expose to the host only if you need to add
+    # this worker to a remote orchestrator (PUSH mode); otherwise
+    # leave commented to keep the surface minimal.
+    # ports:
+    #   - "3501:3501"
+    devices:
+      - "${WORKER_RENDER_DEV:-/dev/dri/renderD128}:/dev/dri/renderD128"
+    # The worker binary expects uid 1000 / gid 100. Supplementary
+    # groups 44 (video) + 568 (lsio/render) come from the k8s
+    # DaemonSet posture; they cover the typical Intel iGPU/Arc render
+    # node ownership across distros. Adjust if your renderD* node is
+    # owned by a different gid (`stat /dev/dri/renderD128`).
+    user: "1000:100"
+    group_add:
+      - "44"
+      - "568"
+    # Optional: GPU-busy% load telemetry needs CAP_PERFMON to read the
+    # i915 PMU. Without it, orchestrator load-balances on session
+    # count alone, which is fine for most single-GPU setups.
+    # cap_add:
+    #   - PERFMON
+    volumes:
+      # /media — PMS's media library, read-only. Must be the SAME path
+      # PMS uses inside its container (the worker reads bytes the
+      # ffmpeg argv references verbatim).
+      - "${MEDIA_DIR:-./media}:/media:ro"
+      # /transcode — PMS's transcode scratch. Worker writes segments
+      # here; PMS serves them from the same path. Must be writable by
+      # uid 1000 and the PMS container's own uid (typically also 1000
+      # under LSIO). On multi-host, mount the same NFS export here.
+      - "${TRANSCODE_DIR:-./transcode}:/transcode"
+    environment:
+      # Force HW re-acceleration even when Plex emits a SW argv. Set
+      # to 0 (or unset) for honor-Plex behavior — useful for hetero or
+      # CPU-only fleets. Homelab default = 1.
+      SCALEPLEX_FORCE_HW: "${SCALEPLEX_FORCE_HW:-1}"
+      # Tonemap path: opencl (algo-honored, Plex's chosen algorithm)
+      # or vaapi (fixed-curve BT.2390 EETF, lower CPU).
+      SCALEPLEX_TONEMAP: "${SCALEPLEX_TONEMAP:-opencl}"
+      WORKER_MAX_SESSIONS: "${WORKER_MAX_SESSIONS:-0}"
+      # PUSH-mode self-registration (optional). Leave SCALEPLEX_ORCHESTRATOR_URL
+      # unset on the local worker — the orchestrator's WORKERS_DNS already
+      # picks it up over the compose network. Set it ONLY when this
+      # worker should join a REMOTE orchestrator.
+      # SCALEPLEX_ORCHESTRATOR_URL: "http://orchestrator-host.lan:3500"
+      # SCALEPLEX_WORKER_HOST: "worker-a.lan"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3501/readyz"]
+      interval: 5s
+      timeout: 2s
+      # Pre-warm + iHD VAAPI init can take 30-60s on cold start.
+      retries: 60
+    networks:
+      - scaleplex_net
+
+  # -- Reference Plex Media Server stanza (commented). --
+  # Uncomment + configure to run PMS in the same compose as scaleplex.
+  # You can also keep your existing PMS deployment and only add the
+  # DOCKER_MODS env to it — same effect. The mod swaps `Plex Transcoder`
+  # for the scaleplex shim on container start.
+  #
+  # plex:
+  #   image: lscr.io/linuxserver/plex:latest
+  #   restart: unless-stopped
+  #   network_mode: host        # PMS prefers host net for client discovery
+  #   environment:
+  #     PUID: "1000"
+  #     PGID: "1000"
+  #     TZ: "${TZ:-Etc/UTC}"
+  #     VERSION: docker
+  #     PLEX_CLAIM: "${PLEX_CLAIM:-}"        # https://www.plex.tv/claim/
+  #     # The scaleplex docker-mod. Drops the shim into
+  #     # /usr/lib/plexmediaserver/ on every container start.
+  #     DOCKER_MODS: "ghcr.io/varashi/scaleplex_pms_dockermod:${IMAGE_TAG:-latest}"
+  #     LOCAL_RELAY_ENABLED: "1"
+  #     LOCAL_RELAY_PORT: "32499"
+  #     SCALEPLEX_ORCHESTRATOR_URL: "http://127.0.0.1:${ORCHESTRATOR_PORT:-3500}"
+  #   devices:
+  #     - "${WORKER_RENDER_DEV:-/dev/dri/renderD128}:/dev/dri/renderD128"
+  #   volumes:
+  #     - "${PLEX_CONFIG_DIR:-./plex-config}:/config"
+  #     - "${MEDIA_DIR:-./media}:/media:ro"
+  #     - "${TRANSCODE_DIR:-./transcode}:/transcode"
+  #   depends_on:
+  #     orchestrator:
+  #       condition: service_healthy
+
+networks:
+  scaleplex_net:
+    driver: bridge

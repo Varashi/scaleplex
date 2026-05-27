@@ -168,15 +168,34 @@ loopback-equivalent endpoint to call back on (workers can't reach PMS's
 | `worker/Dockerfile` | Ubuntu 24.04 + scaleplex-ffmpeg7 + iHD VAAPI + agent. |
 | `worker/deploy/` | DaemonSet + namespace YAML. |
 | `orchestrator/deploy/` | Deployment YAML. |
+| `deploy/docker/` | docker-compose + multi-host `docker run` recipes for non-k8s users. |
 | `scaleplex-ffmpeg/` | Patch layer + Debian build pipeline for `scaleplex-ffmpeg7` (jellyfin-ffmpeg + Plex backports). |
 | `charts/scaleplex/` | Helm chart (placeholder; deploy via raw YAML for now). |
 | `docs/` | Architecture, rewriter, seek, latency, lessons. |
 
 ## Deploy
 
-scaleplex is Kubernetes-native. It adds three things to a cluster and
-**does not own the PMS pod** — PMS stays whatever you already run, which
-keeps rollback a one-line revert.
+scaleplex supports **two deployment shapes**, with the same three
+components either way (worker, orchestrator, PMS docker-mod), and
+neither one owns the PMS pod — rollback is a one-line revert in both.
+
+- **Kubernetes (recommended)** — DaemonSet worker + Deployment
+  orchestrator + `DOCKER_MODS` on the existing PMS pod. See the next
+  section.
+- **Docker / docker-compose** — single-host compose for all-in-one,
+  or per-host `docker run` for multi-host fleets. Three worker
+  discovery modes (DNS / `WORKERS_LIST` / worker push-register).
+  See [`deploy/docker/`](deploy/docker/).
+
+**Security posture.** scaleplex is HTTP plaintext on a trusted LAN by
+design — no built-in auth or TLS. Wrap with a reverse proxy
+(Caddy/Traefik) if your subnet has untrusted devices. Cross-site / WAN
+workers are tracked as a future feature (the data plane assumes a
+shared filesystem today).
+
+### Deploy — Kubernetes
+
+Three things added to the cluster:
 
 1. **Worker** — a DaemonSet, one pod per GPU node (Intel iGPU / Arc,
    `/dev/dri/render*`). Pre-warms VAAPI; `/readyz` gates on warm-up.
@@ -198,7 +217,7 @@ The worker + PMS pods must share the NFS volumes PMS transcodes into
 (`/transcode`) and reads media from (`/media`) — the worker writes
 segments exactly where the PMS serves them.
 
-### Namespace topology — pick one
+#### Namespace topology — pick one
 
 The worker wants `CAP_PERFMON` to read the i915 hardware PMU for
 GPU-busy load telemetry (needed on GPUs with no sysfs busy file, e.g.
@@ -235,6 +254,32 @@ shape, headless discovery Service, PERFMON cap) is the planned
 distribution artifact; a dedicated first-party chart is a possible
 follow-up if the reference proves clumsy. The `charts/scaleplex/`
 directory is a placeholder.
+
+### Deploy — Docker / docker-compose
+
+For homelabs without a Kubernetes cluster. The same three components
+(worker, orchestrator, PMS docker-mod) run as plain Docker containers.
+
+- **Single-host all-in-one** — [`deploy/docker/compose.yaml`](deploy/docker/compose.yaml)
+  brings up orchestrator + 1 worker on one host; uncomment the
+  `plex` stanza to add a linuxserver/plex container wired to the
+  scaleplex shim via `DOCKER_MODS`. Edit
+  [`deploy/docker/.env.example`](deploy/docker/.env.example) to point
+  at your `/media` + `/transcode` paths and `docker compose up -d`.
+- **Multi-host fleet** — see
+  [`deploy/docker/multi-host.md`](deploy/docker/multi-host.md) for
+  `docker run` recipes per host. Three discovery modes coexist:
+  - **DNS** (`WORKERS_DNS` on orchestrator) — k8s pattern, also works
+    on docker compose where the service name resolves on the bridge.
+  - **LIST** (`WORKERS_LIST=host1:3501,host2:3501` on orchestrator) —
+    static comma-separated, no DNS needed.
+  - **PUSH** (`SCALEPLEX_ORCHESTRATOR_URL` on each worker) —
+    friction-free: a new `docker run` joins the fleet automatically;
+    workers heartbeat every 5s, reaped after 15s of silence.
+
+Multi-host requires the same `/transcode` (rw) and `/media` (ro)
+visible on every worker host AND PMS — typically an NFS export. No
+auth, no TLS; LAN-only by design.
 
 ## Docs
 

@@ -4,9 +4,25 @@
 // worker, forwards the request, and streams the worker's response back.
 // No arg rewriting (worker handles that). No socket.io. No LOCAL_RELAY.
 //
-// Worker discovery: DNS lookup of WORKERS_DNS (a headless k8s Service),
-// re-resolved every WORKERS_REFRESH_SECONDS. Each resolved pod IP gets
-// its load polled via GET /capability every WORKERS_PROBE_SECONDS.
+// Worker discovery — three coexisting sources, deduped by URL:
+//   1. DNS  — lookup of WORKERS_DNS (k8s headless Service or any A-record
+//      set), re-resolved every WORKERS_REFRESH_SECONDS. Default for k8s
+//      and docker compose (Docker's embedded DNS resolves a service name
+//      to all replica IPs as multiple A records).
+//   2. LIST — static comma-separated host[:port] list in WORKERS_LIST,
+//      loaded once at startup. For fixed multi-host deployments without
+//      a DNS layer.
+//   3. PUSH — worker self-registers via POST /register on startup +
+//      heartbeat. Activated when the worker has SCALEPLEX_ORCHESTRATOR_URL
+//      set. Substrate for friction-free Docker multi-host and (future)
+//      autoscaling. Reaped after 15s with no heartbeat.
+//
+// Each worker tracks which source(s) vouch for it (sources bitset). A
+// worker is removed only when its source set becomes empty — e.g. a
+// LIST + DNS worker survives a DNS dropout because LIST still vouches.
+//
+// Each worker's load is polled via GET /capability every
+// WORKERS_PROBE_SECONDS regardless of source.
 //
 // Selection: pick the worker with the lowest (active_sessions /
 // max_sessions) ratio. max_sessions=0 (unlimited) treats the worker as
@@ -39,6 +55,11 @@ const (
 	defaultRefreshSeconds  = 5
 	defaultProbeSeconds    = 5
 	defaultProbeTimeoutSec = 2
+	// PUSH heartbeat reaping. Worker sends a /register every
+	// defaultPushHeartbeatSeconds; orchestrator reaps workers whose
+	// last heartbeat is older than defaultPushTimeoutSeconds.
+	defaultPushReapSeconds    = 5
+	defaultPushTimeoutSeconds = 15
 )
 
 type capabilityResponse struct {
@@ -49,9 +70,37 @@ type capabilityResponse struct {
 	GPUEngines     int     `json:"gpu_engines"` // vcs/vecs engine count
 }
 
+// sourceBits is a bit-set of the discovery sources currently vouching
+// for a worker. A worker stays in the pool while any source bit is set.
+type sourceBits uint8
+
+const (
+	srcDNS  sourceBits = 1 << 0
+	srcList sourceBits = 1 << 1
+	srcPush sourceBits = 1 << 2
+)
+
+func (s sourceBits) String() string {
+	parts := make([]string, 0, 3)
+	if s&srcDNS != 0 {
+		parts = append(parts, "dns")
+	}
+	if s&srcList != 0 {
+		parts = append(parts, "list")
+	}
+	if s&srcPush != 0 {
+		parts = append(parts, "push")
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, "+")
+}
+
 type worker struct {
-	host string // pod IP
-	url  string // http://<ip>:3501
+	host    string     // hostname or IP (whatever the source provided)
+	url     string     // http://<host>:<port>
+	sources sourceBits // which discovery sources vouch for this worker
 
 	mu             sync.Mutex
 	healthy        bool
@@ -62,6 +111,7 @@ type worker struct {
 	gpuEngines     int
 	lastErr        string
 	lastUpdated    time.Time
+	lastHeartbeat  time.Time // only meaningful when sources&srcPush != 0
 }
 
 func (w *worker) snapshot() (active, max int, gpuLoad float64, healthy bool) {
@@ -104,7 +154,56 @@ func (w *worker) dispatchEnd()   { atomic.AddInt32(&w.inFlight, -1) }
 
 type pool struct {
 	mu      sync.RWMutex
-	workers map[string]*worker // keyed by host (pod IP)
+	workers map[string]*worker // keyed by url ("http://host:port")
+}
+
+// hostPort is the parsed form of a single WORKERS_LIST entry.
+type hostPort struct {
+	host string
+	port int
+}
+
+func (hp hostPort) url() string {
+	return fmt.Sprintf("http://%s:%d", hp.host, hp.port)
+}
+
+// parseWorkerList parses the WORKERS_LIST env: comma-separated host[:port]
+// entries. Whitespace tolerant. Empty input → nil. Malformed entries are
+// skipped with a log warning; the rest of the list is honored. Entries
+// without an explicit :port get defaultPort.
+func parseWorkerList(s string, defaultPort int) []hostPort {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []hostPort
+	for _, raw := range strings.Split(s, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		host := entry
+		port := defaultPort
+		if i := strings.LastIndex(entry, ":"); i >= 0 {
+			host = strings.TrimSpace(entry[:i])
+			portStr := strings.TrimSpace(entry[i+1:])
+			p, err := strconv.Atoi(portStr)
+			if err != nil {
+				log.Printf("list: skipping %q (bad port %q: %v)", entry, portStr, err)
+				continue
+			}
+			if p < 1 || p > 65535 {
+				log.Printf("list: skipping %q (port %d out of range)", entry, p)
+				continue
+			}
+			port = p
+		}
+		if host == "" {
+			log.Printf("list: skipping %q (empty host)", entry)
+			continue
+		}
+		out = append(out, hostPort{host: host, port: port})
+	}
+	return out
 }
 
 func (p *pool) list() []*worker {
@@ -136,22 +235,115 @@ func (p *pool) refresh(dns string, port int) {
 	}
 	seen := make(map[string]struct{}, len(ips))
 	for _, ip := range ips {
-		seen[ip] = struct{}{}
+		url := fmt.Sprintf("http://%s:%d", ip, port)
+		seen[url] = struct{}{}
 	}
 	p.mu.Lock()
-	for ip := range seen {
-		if _, ok := p.workers[ip]; !ok {
-			p.workers[ip] = &worker{host: ip, url: fmt.Sprintf("http://%s:%d", ip, port)}
-			log.Printf("dns: added worker %s", p.workers[ip].url)
+	defer p.mu.Unlock()
+	for url := range seen {
+		if w, ok := p.workers[url]; ok {
+			if w.sources&srcDNS == 0 {
+				w.sources |= srcDNS
+				log.Printf("dns: %s now also vouched by DNS (sources=%s)", url, w.sources)
+			}
+			continue
+		}
+		// Extract host from "http://<host>:<port>" for the worker's
+		// host field (used for logging + future capability reporting).
+		host := strings.TrimPrefix(url, "http://")
+		if i := strings.LastIndex(host, ":"); i >= 0 {
+			host = host[:i]
+		}
+		p.workers[url] = &worker{host: host, url: url, sources: srcDNS}
+		log.Printf("dns: added worker %s", url)
+	}
+	for url, w := range p.workers {
+		if w.sources&srcDNS == 0 {
+			continue
+		}
+		if _, ok := seen[url]; ok {
+			continue
+		}
+		w.sources &^= srcDNS
+		if w.sources == 0 {
+			log.Printf("dns: removed worker %s", url)
+			delete(p.workers, url)
+		} else {
+			log.Printf("dns: %s dropped from DNS but kept by %s", url, w.sources)
 		}
 	}
-	for ip, w := range p.workers {
-		if _, ok := seen[ip]; !ok {
-			log.Printf("dns: removed worker %s", w.url)
-			delete(p.workers, ip)
+}
+
+// loadList vouches for each entry under the LIST source. Idempotent —
+// re-applying the same list (e.g. on SIGHUP, future) just re-sets the
+// bit. Pre-existing DNS/PUSH bits on a matching URL are preserved.
+func (p *pool) loadList(entries []hostPort) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range entries {
+		url := e.url()
+		if w, ok := p.workers[url]; ok {
+			if w.sources&srcList == 0 {
+				w.sources |= srcList
+				log.Printf("list: %s now also vouched by LIST (sources=%s)", url, w.sources)
+			}
+			continue
+		}
+		p.workers[url] = &worker{host: e.host, url: url, sources: srcList}
+		log.Printf("list: added worker %s", url)
+	}
+}
+
+// register vouches for a worker under the PUSH source and refreshes its
+// last-heartbeat timestamp. Idempotent — a worker re-registering or
+// heartbeating goes through this same path. Returns true if this call
+// created the worker (newly seen), false if it just refreshed an
+// existing one.
+func (p *pool) register(host string, port int, now time.Time) bool {
+	url := fmt.Sprintf("http://%s:%d", host, port)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if w, ok := p.workers[url]; ok {
+		newBit := w.sources&srcPush == 0
+		w.sources |= srcPush
+		w.lastHeartbeat = now
+		if newBit {
+			log.Printf("push: %s now also vouched by PUSH (sources=%s)", url, w.sources)
+		}
+		return false
+	}
+	p.workers[url] = &worker{
+		host:          host,
+		url:           url,
+		sources:       srcPush,
+		lastHeartbeat: now,
+	}
+	log.Printf("push: added worker %s", url)
+	return true
+}
+
+// reapPush clears the PUSH bit on workers whose lastHeartbeat is older
+// than timeout. Workers reduced to zero sources are removed from the
+// pool. Workers without the PUSH bit are ignored.
+func (p *pool) reapPush(now time.Time, timeout time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for url, w := range p.workers {
+		if w.sources&srcPush == 0 {
+			continue
+		}
+		if now.Sub(w.lastHeartbeat) <= timeout {
+			continue
+		}
+		w.sources &^= srcPush
+		if w.sources == 0 {
+			log.Printf("push: reaped worker %s (no heartbeat for %s)", url, now.Sub(w.lastHeartbeat).Round(time.Second))
+			delete(p.workers, url)
+		} else {
+			log.Printf("push: %s dropped from PUSH (no heartbeat for %s) but kept by %s",
+				url, now.Sub(w.lastHeartbeat).Round(time.Second), w.sources)
 		}
 	}
-	p.mu.Unlock()
 }
 
 // probeAll fans out a /capability poll per worker. Cheap (one HTTP GET
@@ -271,17 +463,29 @@ func main() {
 	refresh := envSecondsOr("WORKERS_REFRESH_SECONDS", defaultRefreshSeconds)
 	probe := envSecondsOr("WORKERS_PROBE_SECONDS", defaultProbeSeconds)
 
+	listEntries := parseWorkerList(os.Getenv("WORKERS_LIST"), workerPort)
+	if len(listEntries) > 0 {
+		pl.loadList(listEntries)
+		log.Printf("workers: loaded %d static entries from WORKERS_LIST", len(listEntries))
+	}
+
+	pushReap := envSecondsOr("WORKERS_PUSH_REAP_SECONDS", defaultPushReapSeconds)
+	pushTimeout := envSecondsOr("WORKERS_PUSH_TIMEOUT_SECONDS", defaultPushTimeoutSeconds)
+
 	go discoveryLoop(workersDNS, workerPort, refresh, probe)
+	go pushReaperLoop(time.Duration(pushReap)*time.Second, time.Duration(pushTimeout)*time.Second)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/readyz", handleReady)
 	mux.HandleFunc("/workers", handleWorkers)
+	mux.HandleFunc("/register", handleRegister)
 	mux.HandleFunc("/task", handleTask)
 	mux.HandleFunc("/task/", handleTaskByID)
 	mux.Handle("/metrics", promhttp.Handler())
 
-	log.Printf("scaleplex-orchestrator listening on %s, workers=%s:%d", listen, workersDNS, workerPort)
+	log.Printf("scaleplex-orchestrator listening on %s, dns=%s:%d list=%d entries, push-reap=%ds push-timeout=%ds",
+		listen, workersDNS, workerPort, len(listEntries), pushReap, pushTimeout)
 	srv := &http.Server{Addr: listen, Handler: mux}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
@@ -328,11 +532,62 @@ func handleReady(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "no healthy workers\n")
 }
 
+// registerRequest is the body shape for POST /register. Fields beyond
+// host/port are reserved for future use (autoscaling / per-node
+// HWProfile capability tagging); unknown keys are ignored by Go's
+// JSON decoder so workers can add metadata forward-compatibly.
+type registerRequest struct {
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	Version string `json:"version,omitempty"`
+}
+
+// handleRegister accepts POST /register from a worker. Idempotent —
+// covers both initial registration and periodic heartbeat (worker just
+// re-POSTs the same body every WORKERS_PUSH_HEARTBEAT_SECONDS).
+//
+// Body: { "host": "...", "port": 3501, "version": "..." }
+// host can be a hostname or IP; orchestrator must be able to reach
+// http://host:port for /capability polling and task dispatch.
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req registerRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Host == "" {
+		http.Error(w, "host required", http.StatusBadRequest)
+		return
+	}
+	if req.Port < 1 || req.Port > 65535 {
+		http.Error(w, "port out of range", http.StatusBadRequest)
+		return
+	}
+	pl.register(req.Host, req.Port, time.Now())
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// pushReaperLoop clears the PUSH bit on workers whose heartbeat has
+// gone stale. Runs every reapInterval; uses pushTimeout as the
+// no-heartbeat cutoff.
+func pushReaperLoop(reapInterval, pushTimeout time.Duration) {
+	t := time.NewTicker(reapInterval)
+	defer t.Stop()
+	for range t.C {
+		pl.reapPush(time.Now(), pushTimeout)
+	}
+}
+
 // handleWorkers returns the current pool snapshot — useful for debugging
 // and for the eventual /status dashboard.
 func handleWorkers(w http.ResponseWriter, r *http.Request) {
 	type entry struct {
 		URL            string  `json:"url"`
+		Sources        string  `json:"sources"`
 		Healthy        bool    `json:"healthy"`
 		ActiveSessions int     `json:"active_sessions"`
 		InFlight       int32   `json:"in_flight"`
@@ -349,6 +604,7 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 		wk.mu.Lock()
 		e := entry{
 			URL:            wk.url,
+			Sources:        wk.sources.String(),
 			Healthy:        wk.healthy,
 			ActiveSessions: wk.activeSessions,
 			InFlight:       atomic.LoadInt32(&wk.inFlight),

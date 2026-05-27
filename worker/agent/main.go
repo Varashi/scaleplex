@@ -165,6 +165,7 @@ func main() {
 	log.Printf("gpu engines discovered: %d (mode=%s)", engineSamplerInst.numEngines(), engineSamplerInst.modeTag())
 
 	go prewarm()
+	startRegisterLoop()
 
 	log.Printf("scaleplex-agent listening on %s", listenAddr)
 	srv := &http.Server{
