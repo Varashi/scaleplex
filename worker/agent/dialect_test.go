@@ -128,6 +128,41 @@ func TestDialect_ScaleFilter(t *testing.T) {
 	}
 }
 
+func TestDialect_TonemapFilter(t *testing.T) {
+	cases := []struct {
+		name string
+		d    dialect
+		algo string
+		pix  string
+		want string
+	}{
+		{"vaapi ignores algo", vaapiDialect{}, "hable", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
+		{"vaapi empty algo same", vaapiDialect{}, "", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
+		{"nvidia hable nv12 — corpus shape", nvidiaDialect{}, "hable", "nv12", "tonemap_cuda=hable:nv12"},
+		{"nvidia bt2390 nv12", nvidiaDialect{}, "bt2390", "nv12", "tonemap_cuda=bt2390:nv12"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.d.tonemapFilter(tc.algo, tc.pix); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDialect_HWUploadDownload(t *testing.T) {
+	for _, d := range []dialect{vaapiDialect{}, nvidiaDialect{}} {
+		t.Run(d.backendName(), func(t *testing.T) {
+			if got := d.hwUploadFilter(); got != "hwupload" {
+				t.Errorf("hwUploadFilter: got %q, want hwupload", got)
+			}
+			if got := d.hwDownloadFilter(); got != "hwdownload" {
+				t.Errorf("hwDownloadFilter: got %q, want hwdownload", got)
+			}
+		})
+	}
+}
+
 func TestNvidiaDialect_SharedMaps(t *testing.T) {
 	// decoderMap + hwDecodeShortCodecs are intentionally shared with
 	// VAAPI — Plex's SW decoder names + HW-decode short codecs don't

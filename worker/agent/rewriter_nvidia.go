@@ -77,3 +77,15 @@ func (nvidiaDialect) initHWDeviceArg(devIdx int) string {
 func (nvidiaDialect) scaleFilter(w, h, pix string) string {
 	return "scale_cuda=w=" + w + ":h=" + h + ":format=" + pix
 }
+
+// tonemapFilter emits `tonemap_cuda=ALGO:PIX`. Plex's argv captures
+// 2026-05-27 (test/corpus/nvenc/persistent/) confirm this shape — algo
+// is honored and the format follows after a single colon. No transfer/
+// matrix/primaries kwargs are needed because tonemap_cuda assumes
+// BT.709 output for SDR targets (matches Plex's choice).
+func (nvidiaDialect) tonemapFilter(algo, pix string) string {
+	return "tonemap_cuda=" + algo + ":" + pix
+}
+
+func (nvidiaDialect) hwUploadFilter() string   { return "hwupload" }
+func (nvidiaDialect) hwDownloadFilter() string { return "hwdownload" }

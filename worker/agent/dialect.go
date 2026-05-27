@@ -92,6 +92,29 @@ type dialect interface {
 	//   VAAPI: scale_vaapi=w=W:h=H:format=PIX
 	//   NVIDIA: scale_cuda=w=W:h=H:format=PIX
 	scaleFilter(w, h, pix string) string
+
+	// tonemapFilter emits a single-stage HW tonemap targeting pixel
+	// format `pix` (typical "nv12"). Algo precedence is backend-specific:
+	//
+	//   VAAPI: tonemap_vaapi=transfer=bt709:format=PIX
+	//          (iHD fixed BT.2390 EETF — algo is IGNORED. The OpenCL-derive
+	//          alternative used by the existing VAAPI tonemapConfig is
+	//          NOT a single-stage filter and is composed elsewhere.)
+	//   NVIDIA: tonemap_cuda=ALGO:PIX
+	//          (algo is honored; matches Plex's argv shape captured
+	//          2026-05-27 from the dev box.)
+	tonemapFilter(algo, pix string) string
+
+	// hwUploadFilter is the filter name that uploads CPU frames to this
+	// backend's HW surface. Both backends accept the bare "hwupload" name
+	// when -filter_hw_device steers the right device; method kept for
+	// symmetry + future divergence (e.g. hwupload_cuda explicit form).
+	hwUploadFilter() string
+
+	// hwDownloadFilter is the filter name that pulls HW frames back to
+	// system memory. Same string ("hwdownload") on both backends today;
+	// kept for symmetry.
+	hwDownloadFilter() string
 }
 
 // vaapiDialect — Intel iHD / VAAPI. The historical default; tested
@@ -128,6 +151,14 @@ func (vaapiDialect) initHWDeviceArg(_ int) string {
 func (vaapiDialect) scaleFilter(w, h, pix string) string {
 	return "scale_vaapi=w=" + w + ":h=" + h + ":format=" + pix
 }
+
+func (vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+	// iHD fixed-curve BT.2390 EETF — no algo slot. Algo arg ignored.
+	return "tonemap_vaapi=transfer=bt709:format=" + pix
+}
+
+func (vaapiDialect) hwUploadFilter() string   { return "hwupload" }
+func (vaapiDialect) hwDownloadFilter() string { return "hwdownload" }
 
 // activeDialect is the worker's selected backend. Populated in main()
 // via selectDialect() before any rewrite occurs. Default vaapi for
