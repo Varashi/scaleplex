@@ -161,6 +161,9 @@ func main() {
 		metricFFmpegOK.Set(1)
 	}
 
+	activeDialect = selectDialect()
+	log.Printf("worker backend: %s", activeDialect.backendName())
+
 	engineSamplerInst = startEngineSampler()
 	log.Printf("gpu engines discovered: %d (mode=%s)", engineSamplerInst.numEngines(), engineSamplerInst.modeTag())
 
