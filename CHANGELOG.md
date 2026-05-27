@@ -1,5 +1,105 @@
 # Changelog
 
+## [1.8.0](https://github.com/Varashi/scaleplex/compare/v1.7.2...v1.8.0) (2026-05-27)
+
+Non-k8s deployment path so homelab users without a Kubernetes cluster
+can run scaleplex. The same three components (worker, orchestrator,
+PMS docker-mod) run as plain Docker containers; the PMS docker-mod is
+unchanged (already shipped at `ghcr.io/varashi/scaleplex_pms_dockermod`).
+
+Three worker discovery modes now coexist on the orchestrator, deduped
+by URL into a single internal pool, removed only when no source
+vouches. Existing k8s deployments are byte-for-byte unchanged — only
+the DNS code path runs unless the new envs are set.
+
+LAN-only HTTP plaintext by design. Auth (`SCALEPLEX_AUTH_TOKEN`), TLS
+(`SCALEPLEX_TLS_CERT/_KEY`), and the media/transcode HTTP planes
+needed for WAN / public-cloud workers are deferred to a future
+WAN-worker design memo.
+
+First release of the `scaleplex_orchestrator` image with the new
+`/register` endpoint + `sources` field on `/workers` — recommended
+image-tag bump: `scaleplex_orchestrator:v1.2.1 → v1.3.0` (crane-tag
+manually). `scaleplex_pms_dockermod` unchanged.
+
+### Features
+
+- **feat(deploy): Docker / docker-compose deployment shape** ([#56](https://github.com/Varashi/scaleplex/pull/56), [e13a760](https://github.com/Varashi/scaleplex/commit/e13a760081e4bf4ed895536f5245ed4481cb6712)).
+  - `deploy/docker/compose.yaml` — single-host all-in-one (orchestrator
+    + worker + commented LSIO `plex` stanza with `DOCKER_MODS` wiring).
+  - `deploy/docker/multi-host.md` — topology diagram, three discovery
+    modes walkthrough, per-host `docker run` recipes, host
+    `kernel.perf_event_paranoid=0` sysctl note (required for
+    `CAP_PERFMON` to open the i915 PMU under restrictive distros).
+  - `deploy/docker/.env.example` — every knob documented.
+  - README — Deploy section restructured into parallel Kubernetes +
+    Docker / docker-compose sub-sections.
+
+- **feat(orchestrator): WORKERS_LIST static discovery + PUSH register/heartbeat endpoints.**
+  - **DNS** (existing) — `net.LookupHost(WORKERS_DNS)`, periodic
+    refresh. Works on k8s headless Services AND docker compose
+    user-defined bridges (Docker's embedded DNS returns one A record
+    per replica).
+  - **LIST** (new) — `WORKERS_LIST=host[:port],...` parsed at startup
+    via `parseWorkerList`. Fixed multi-host without DNS infra.
+  - **PUSH** (new) — worker `POST /register` on startup + every
+    `SCALEPLEX_HEARTBEAT_SECONDS` (default 5); orchestrator reaps PUSH
+    entries via `pushReaperLoop` after `WORKERS_PUSH_TIMEOUT_SECONDS`
+    (default 15). Friction-free Docker multi-host — a fresh `docker
+    run` with one env var joins the fleet.
+  - `sourceBits` bitset (DNS|LIST|PUSH) per worker; pool re-keyed by
+    URL so all three sources dedup naturally. Workers removed only
+    when the source set becomes empty.
+  - `/workers` JSON gains a `sources` field for observability.
+
+- **feat(worker): self-registration goroutine.** `startRegisterLoop()`
+  is a no-op unless `SCALEPLEX_ORCHESTRATOR_URL` is set, preserving
+  existing k8s/DNS deployments byte-for-byte. `SCALEPLEX_WORKER_HOST`
+  preferred, `os.Hostname()` fallback (works on compose where the
+  container name resolves on the user-defined bridge). Exponential
+  backoff capped at 30s on POST failures; context-cancellable.
+
+### CI
+
+- `.github/workflows/docker-compose-smoke.yaml` — builds the
+  orchestrator image inline from the PR's Dockerfile, brings the
+  stack up, POSTs a fake `/register`, asserts the worker appears in
+  `/workers` with `sources:push`. Worker container skipped (no GPU on
+  GH runners).
+
+### Tests
+
+- 35 new cases across `discovery_list_test.go`, `discovery_push_test.go`,
+  `register_test.go`. Orchestrator + worker test suites green.
+  `parseWorkerList` table-driven (12 sub-cases incl. whitespace,
+  malformed ports, IPv4, empty entries). PUSH handler verified for
+  happy path / idempotency / 405 / 6 rejection cases / 4096-byte body
+  limit / DNS+PUSH dedup / 15s reap timeout / LIST keeps survivor.
+
+### Live validation
+
+End-to-end transcode validated against the existing plex-test PMS
+(k8s, env-flipped to point at a Docker-deployed orchestrator) on a
+fresh Ubuntu 24.04 VM with Intel Arc A310 PCI passthrough:
+
+- All three discovery modes confirmed simultaneously in `/workers`
+  (DNS healthy real worker + LIST static stub + PUSH self-registered
+  worker); PUSH reaper removes stale entries after 15s no-heartbeat.
+- Full 4K HDR AV1 → HEVC HW transcode (HW-decode + scale_vaapi +
+  hevc_vaapi + EAE-swap + opencl tonemap) played end-to-end through a
+  Plex client; 12+ segments produced; segment-list relay to PMS
+  LoadBalancer working.
+
+### NOT in scope (deferred)
+
+- Authentication (`SCALEPLEX_AUTH_TOKEN` env).
+- TLS (`SCALEPLEX_TLS_CERT/_KEY` env).
+- Media + transcode HTTP planes (LAN-only assumes shared filesystem).
+- mTLS.
+
+These all gate on a future WAN-worker design that solves the media +
+transcode planes' shared-FS assumption.
+
 ## v1.7.2 — 2026-05-27
 
 Single-purpose maintenance release: introduce `SubCueClock` primitive in
