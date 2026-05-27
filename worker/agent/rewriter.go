@@ -2267,14 +2267,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// scrubs below apply.
 			changes = append(changes, TagHonorPlexHWDecSWEnc)
 		} else {
-			// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
-			// that, but leave the filter chain, map labels, and encoder
-			// argument intact.
+			// HW-decode mode: PMS already emitted a HW encoder for the
+			// active backend. Validate that, but leave the filter chain,
+			// map labels, and encoder argument intact. The accepted set
+			// is whatever encoderMap maps to — VAAPI:
+			// {h264_vaapi, hevc_vaapi}; NVIDIA: {h264_nvenc, hevc_nvenc}.
 			swEncoder := args[encCodecIdx+1]
-			switch swEncoder {
-			case "h264_vaapi", "hevc_vaapi":
-				// expected
-			default:
+			expected := false
+			for _, hw := range activeDialect.encoderMap() {
+				if hw == swEncoder {
+					expected = true
+					break
+				}
+			}
+			if !expected {
 				return bail(TagPrefixBailUnexpectedEncoder + swEncoder)
 			}
 			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
