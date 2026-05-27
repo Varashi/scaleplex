@@ -1,0 +1,47 @@
+version: "2"
+
+# Multi-module repo (worker/agent, shim, orchestrator, cmd/argv-extract,
+# cmd/optimize-corpus-gen) — the root has no go.mod. Before this config
+# + go.work at the same level, CodeRabbit's golangci-lint invocation
+# from the repo root errored:
+#
+#   directory prefix . does not contain main module or its
+#   selected dependencies
+#
+# go.work makes the workspace discoverable so `golangci-lint run` walks
+# every module; this file pins behavior + the linter set.
+#
+# Scope: keep the default-enabled set (errcheck/govet/ineffassign/
+# staticcheck/unused) plus a few low-noise additions. Wide refactor
+# linters (gocritic, revive, gosec) intentionally omitted — turn them
+# on case-by-case when the codebase is ready to absorb the findings.
+
+run:
+  timeout: 5m
+  # All modules are on Go 1.23+. Pin the toolchain version the
+  # linters target so analysis stays in sync across the workspace.
+  go: "1.23"
+  modules-download-mode: readonly
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+  exclusions:
+    rules:
+      # Generated / fixture trees — already exempt via .coderabbit.yaml
+      # path filters; mirror here so a manual local run is equally quiet.
+      - path: testdata/
+        linters:
+          - all
+      - path: scaleplex-ffmpeg/
+        linters:
+          - all
