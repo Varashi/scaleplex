@@ -142,8 +142,8 @@ func TestDialect_TonemapFilter(t *testing.T) {
 	}{
 		{"vaapi ignores algo", vaapiDialect{}, "hable", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
 		{"vaapi empty algo same", vaapiDialect{}, "", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
-		{"nvidia hable nv12 — corpus shape", nvidiaDialect{}, "hable", "nv12", "tonemap_cuda=hable:nv12"},
-		{"nvidia bt2390 nv12", nvidiaDialect{}, "bt2390", "nv12", "tonemap_cuda=bt2390:nv12"},
+		{"nvidia hable nv12 — corpus shape", nvidiaDialect{}, "hable", "nv12", "tonemap_cuda=tonemap=hable:format=nv12"},
+		{"nvidia bt2390 nv12", nvidiaDialect{}, "bt2390", "nv12", "tonemap_cuda=tonemap=bt2390:format=nv12"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

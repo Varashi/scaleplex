@@ -35,13 +35,13 @@ func TestComposeBurn_NVIDIA(t *testing.T) {
 		{
 			name:      "hdr/no-sub/cuda-resident/algo-honored",
 			spec:      burnSpec{vaResident: true, w: "3840", h: "2160", hdr: true, algo: "hable"},
-			wantFltr:  "[0:0]scale_cuda=w=3840:h=2160:format=p010,tonemap_cuda=hable:nv12[0]",
+			wantFltr:  "[0:0]scale_cuda=w=3840:h=2160:format=p010,tonemap_cuda=tonemap=hable:format=nv12[0]",
 			wantLabel: "[0]",
 		},
 		{
 			name:      "hdr/no-sub/sw-upload — matches corpus shape exactly",
 			spec:      burnSpec{vaResident: false, w: "1280", h: "720", hdr: true, algo: "hable"},
-			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=1280:h=720:format=p010,tonemap_cuda=hable:nv12[1]",
+			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=1280:h=720:format=p010,tonemap_cuda=tonemap=hable:format=nv12[1]",
 			wantLabel: "[1]",
 		},
 		{
@@ -53,7 +53,7 @@ func TestComposeBurn_NVIDIA(t *testing.T) {
 		{
 			name:      "hdr/text-sub/sw-upload",
 			spec:      burnSpec{vaResident: false, w: "3840", h: "2160", hdr: true, algo: "hable", burnSub: true},
-			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=3840:h=2160:format=p010,tonemap_cuda=hable:nv12[1];[1]inlineass=render_height=1080[2]",
+			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=3840:h=2160:format=p010,tonemap_cuda=tonemap=hable:format=nv12[1];[1]inlineass=render_height=1080[2]",
 			wantLabel: "[2]",
 		},
 		{

@@ -78,13 +78,19 @@ func (nvidiaDialect) scaleFilter(w, h, pix string) string {
 	return "scale_cuda=w=" + w + ":h=" + h + ":format=" + pix
 }
 
-// tonemapFilter emits `tonemap_cuda=ALGO:PIX`. Plex's argv captures
-// 2026-05-27 (test/corpus/nvenc/persistent/) confirm this shape — algo
-// is honored and the format follows after a single colon. No transfer/
-// matrix/primaries kwargs are needed because tonemap_cuda assumes
-// BT.709 output for SDR targets (matches Plex's choice).
+// tonemapFilter emits `tonemap_cuda=tonemap=ALGO:format=PIX` (named-arg
+// syntax). Plex's bundled ffmpeg accepts the positional form
+// `tonemap_cuda=ALGO:PIX` (its fork puts `format` as positional 2),
+// but jellyfin-ffmpeg (= scaleplex-ffmpeg7's lineage) puts
+// `tonemap_mode` at positional 2, so the positional form parses
+// `PIX` as a tonemap_mode enum value and bails with "Undefined
+// constant". Discovered 2026-05-28 via live deploy on skw-d-linuxtest:
+// the 4K HDR HEVC NVDEC chain failed at filter-init until the
+// rewriter switched to named-arg emission. Named form is portable
+// across both forks. transfer/matrix/primaries kwargs default to
+// bt709 which matches Plex's intent for SDR targets.
 func (nvidiaDialect) tonemapFilter(algo, pix string) string {
-	return "tonemap_cuda=" + algo + ":" + pix
+	return "tonemap_cuda=tonemap=" + algo + ":format=" + pix
 }
 
 func (nvidiaDialect) hwUploadFilter() string   { return "hwupload" }

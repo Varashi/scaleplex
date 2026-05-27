@@ -712,10 +712,17 @@ var (
 	// excluding tonemap_opencl=/tonemap_vaapi=/tonemap_cuda= (those are
 	// matched separately).
 	reGraphTonemapSW = regexp.MustCompile(`(?:^|[,;\]])tonemap=([A-Za-z0-9]+)`)
-	// reGraphTonemapCUDA: NVIDIA HW tonemap — Plex emits
-	// `tonemap_cuda=ALGO:PIX`. Capture the algo so extractGraphFacts can
-	// surface it for the recomposer (NVIDIA composeBurn honors algo).
-	reGraphTonemapCUDA = regexp.MustCompile(`tonemap_cuda=([A-Za-z0-9]+)`)
+	// reGraphTonemapCUDA: NVIDIA HW tonemap. Matches BOTH:
+	//  - Plex's positional form `tonemap_cuda=ALGO:PIX` (Plex-fork
+	//    ffmpeg accepts positional 2 = `format`).
+	//  - jellyfin-ffmpeg's named form `tonemap_cuda=tonemap=ALGO:format=PIX`
+	//    (jellyfin parses positional 2 as `tonemap_mode`, so the named
+	//    form is the portable shape — see nvidiaDialect.tonemapFilter
+	//    for why the rewriter emits named-arg form even though Plex's
+	//    incoming argv uses positional).
+	// Optional `tonemap=` prefix skipped so the captured group is the
+	// algo string in either shape.
+	reGraphTonemapCUDA = regexp.MustCompile(`tonemap_cuda=(?:tonemap=)?([A-Za-z0-9]+)`)
 	reGraphInlineass   = regexp.MustCompile(`inlineass=([^\[]*)`)
 	// reGraphFilterName: a filtergraph node name — an identifier preceded by a
 	// chain boundary (start, ';', ',', ']') possibly followed by whitespace,
