@@ -81,24 +81,36 @@ strip and `-eae_prefix:N` drop in `swapEAEAudioDecoders` /
 other `-bsf:N` flags (e.g. `dovi_rpu=strip=1`). Tracked in memory
 `project_scaleplex_framedrop_bsf_strip.md`.
 
-## Duplicate `video:hdr-source(...)` tag on text-burn HW-decode path
+## Duplicate `video:hdr-source(...)` tag (FIXED post-v1.7.0)
 
-**Severity:** cosmetic — log noise only, no behavioral impact.
+`[FIXED: DupHDRTag]`
 
-The HDR-source detection in `rewriter.go` emits the same
-`video:hdr-source(<transfer>)` tag from both the encoder-side detection
-block (line ~2201) and the HW-decode-sub detection block (line ~2258).
-On sessions that hit both branches (HW decode + text sub burn + HDR
-source), the tag appears twice in `res.Changes`. Bitmap-burn path
-emits once (only one branch fires). argv output and rewriter behavior
-are unaffected; only the change-list logging is noisy.
+**Severity (pre-fix):** cosmetic — log noise only, no behavioral
+impact.
 
-Spotted during the v1.7.0 release-gate sweep, Android TV + Dusk Till
-Dawn with embedded SRT burn.
+The HDR-source detection in `rewriter.go` emitted the same
+`video:hdr-source(<transfer>)` tag from up to three branch-local
+sites: SW-reshape (line ~2151), HW-decode passthrough (line ~2252),
+and the HW-decode-sub-burn text branch (line ~2309). On sessions
+that hit both the HW-decode passthrough block AND the
+HW-decode-text-sub-burn sub-branch (HEVC/AV1 HDR + text SRT/ASS
+burn, ~10% of HDR transcodes), the tag appeared twice in
+`res.Changes`. Bitmap-burn path emitted once. argv output and
+rewriter behavior were unaffected; only the change-list logging
+was noisy.
 
-**Fix path:** consolidate the HDR-source emit into a single site, or
-dedupe via `slices.Contains` before append in
-`worker/agent/rewriter.go`.
+Spotted during the v1.7.0 release-gate sweep, Android TV + Dusk
+Till Dawn with embedded SRT burn.
+
+**Fix:** HDR-source detection hoisted to a single session-level
+site immediately after `mediaPath` resolution, before the branch
+split. All three downstream branches now read `sourceIsHDR` from
+the same fact and do not re-emit the tag. The
+HW-decode-sub-text-burn branch also keeps the `facts.hdr`
+graph-derived signal as an OR (so a probe that returns "" still
+triggers the right tonemap downstream). Regression-guard tests:
+`TestRewriter_HDRSource_EmittedExactlyOnce_HWDecodeTextBurnHDR`
+and `_SWReshape` in `rewriter_test.go`.
 
 ## HW-decode + SW-encode hybrid — 4K HDR corruption
 

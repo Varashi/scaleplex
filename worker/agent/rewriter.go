@@ -2073,13 +2073,25 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			mediaPath = args[i+1]
 		}
 
-		// SW-decode-only artefacts. In HW-decode mode PMS already shaped
-		// the filter chain, encoder, and map labels for VAAPI; we leave
-		// them untouched. Subtitle burn-in for HW-decode mode is not yet
-		// supported (PMS likely doesn't request it when HW probe matches).
+		// HDR-source detection — session-level, run once. Previously each
+		// downstream branch re-probed (SW-reshape, HW-decode-passthrough,
+		// HW-decode-text-sub-burn) and each emitted its own
+		// `video:hdr-source(<transfer>)` change tag, surfacing the tag
+		// 2× on sessions that hit both the HW-decode-passthrough block
+		// AND the HW-decode-text-sub-burn sub-branch (HEVC/AV1 HDR +
+		// text SRT/ASS burn, ~10% of HDR transcodes). Cosmetic but
+		// confusing in logs and grep tooling. Hoist the probe + emit
+		// here so every downstream consumer reads `sourceIsHDR` from
+		// the same fact.
 		var rewritten *filterRewrite
 		var subSrc *subtitleSource
 		sourceIsHDR := false
+		if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
+			if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
+				sourceIsHDR = true
+				changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
+			}
+		}
 
 		if honorSW {
 			// Honor Plex's full software pipeline: decoder, filter chain, and
@@ -2140,17 +2152,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				changes = append(changes, label)
 			}
 
-			// Detect HDR source — Plex's bundled transcoder used to autoinject
-			// tonemap (musl-bound opencl, sw fallback); we can't, so we ask the
-			// agent to ffprobe color metadata and pass through here. Skipped
-			// when no probe is wired (tests treat all sources as SDR by default).
-			if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
-				transfer, _, _ := opts.ProbeVideoColor(mediaPath)
-				if isHDRTransfer(transfer) {
-					sourceIsHDR = true
-					changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
-				}
-			}
+			// HDR-source already detected + emitted once at the session level
+			// (hoisted above the branch split); `sourceIsHDR` carries the
+			// decision into rewriteVideoFilter so it picks the tonemap shape.
 
 			rewritten = rewriteVideoFilter(args[vfIdx], mediaPath, subSrc, sourceIsHDR, tm)
 			if rewritten == nil {
@@ -2240,18 +2244,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
 
-			// HDR source detection (diagnostic only). scaleplex does NOT
-			// inject a tonemap: when Plex's HW-decode chain is the plain
+			// HDR-source already detected + emitted at the session level
+			// (hoisted above the branch split); `sourceIsHDR` flows through
+			// for diagnostic-only consumers. scaleplex does NOT inject a
+			// tonemap here — when Plex's HW-decode chain is the plain
 			// `scale_vaapi=...:format=nv12` shape with no tonemap filter,
 			// that means Plex's "Use hardware-accelerated tone mapping" is
 			// off and Plex itself does no tonemapping — scaleplex matches
 			// that behavior rather than second-guessing it.
-			if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
-				if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
-					sourceIsHDR = true
-					changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
-				}
-			}
 
 			// Sub burn-in: PMS sends `-map_inlineass` even in HW-decode
 			// mode, with a filter graph that runs Plex's private
@@ -2297,17 +2297,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if !facts.ok || facts.subKind != "text" {
 						return bail(TagPrefixBailHWDecodeSubUnmodeled + args[vfIdx])
 					}
+					// Two HDR signals merge into the session-level `sourceIsHDR`:
+					// `facts.hdr` (graph-derived — Plex's argv carried a tonemap
+					// stage, indicating it saw HDR) and the hoisted ProbeVideoColor
+					// emit above. Keep the graph-derived OR here so a probe that
+					// returns "" (file unreadable / non-PathMedia source) still
+					// triggers the right tonemap shape downstream. The
+					// `video:hdr-source(<transfer>)` tag is NOT re-emitted —
+					// hoisted to a single session-level site to fix the
+					// double-emit on HW-decode + text-sub-burn + HDR (the issue
+					// `[KNOWN: DupHDRTag]` documented).
 					if facts.hdr {
 						sourceIsHDR = true
-					}
-					// HDR-source label is diagnostic; HW-tonemap-OFF plain shapes
-					// stay tonemap-free here (facts.hdr=false → no tonemap stage),
-					// matching Plex's own behavior.
-					if opts != nil && opts.ProbeVideoColor != nil && mediaPath != "" {
-						if transfer, _, _ := opts.ProbeVideoColor(mediaPath); isHDRTransfer(transfer) {
-							sourceIsHDR = true
-							changes = append(changes, TagPrefixVideoHDRSource+strings.ToLower(transfer)+")")
-						}
 					}
 					oldLabel := ""
 					if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
