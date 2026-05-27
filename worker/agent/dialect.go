@@ -87,25 +87,20 @@ func (vaapiDialect) hwDecodeShortCodecs() map[string]struct{} {
 var activeDialect dialect = vaapiDialect{}
 
 // selectDialect picks the backend at worker startup based on
-// WORKER_BACKEND env. Values: "vaapi" (default), "nvidia" (Phase 1+),
-// "auto" (probe /dev/nvidia0 first, then /dev/dri/renderD*).
+// WORKER_BACKEND env. Values: "vaapi" (default), "nvidia", "auto"
+// (probe /dev/nvidia0 first, fall back to vaapi).
 //
 // On unknown values: log a WARN and fall back to vaapi (safe default —
-// matches every existing prod deployment). Phase 1 NVIDIA dialect is
-// not yet implemented; "nvidia" / "auto" currently log + fall back to
-// vaapi so the env knob is wired but inert until [PR #2 of this
-// sequence] lands the nvidiaDialect impl.
+// matches every existing prod deployment).
 func selectDialect() dialect {
 	switch want := strings.ToLower(strings.TrimSpace(os.Getenv("WORKER_BACKEND"))); want {
 	case "", "vaapi":
 		return vaapiDialect{}
 	case "nvidia":
-		log.Printf("WORKER_BACKEND=nvidia requested but nvidia dialect not yet implemented; falling back to vaapi")
-		return vaapiDialect{}
+		return nvidiaDialect{}
 	case "auto":
 		if _, err := os.Stat("/dev/nvidia0"); err == nil {
-			log.Printf("WORKER_BACKEND=auto: /dev/nvidia0 present, but nvidia dialect not yet implemented; falling back to vaapi")
-			return vaapiDialect{}
+			return nvidiaDialect{}
 		}
 		return vaapiDialect{}
 	default:
