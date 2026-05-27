@@ -1,0 +1,76 @@
+Description: vf_tonemap_cuda: accept Plex's positional argv shape `ALGO:PIX`
+ Plex's ffmpeg fork orders `tonemap_cuda`'s AVOption array so the second
+ positional argument is `format` (output pixel format, AV_OPT_TYPE_STRING).
+ jellyfin-ffmpeg's order puts `tonemap_mode` (an enum: max/rgb/lum/itp/auto)
+ at positional 2 instead. Result: PMS argv `tonemap_cuda=hable:nv12` —
+ emitted verbatim by PMS on every HW-decode-passthrough HDR-tonemap
+ session — fails on jellyfin with
+ .
+   [AVOptionsContext @ ...] Undefined constant or missing '(' in 'nv12'
+   [Parsed_tonemap_cuda_0 @ ...] Error setting option tonemap_mode to value nv12.
+ .
+ because the parser tries to resolve `nv12` against `tonemap_mode`'s CONST
+ list (`max|rgb|lum|itp|auto`).
+ .
+ Drop-in Plex-Transcoder replacement requires the positional shape to
+ work without any rewriter intervention (HW-decode-passthrough doesn't
+ touch -filter_complex). The portable named-arg form
+ `tonemap_cuda=tonemap=ALGO:format=PIX` already works on both forks and
+ is what the worker rewriter emits on reshape paths (scaleplex PR #61
+ commit 14c7f45), but HW-decode-passthrough sessions flow PMS argv
+ verbatim — they need the fork to accept the positional shape natively.
+ .
+ Fix: move the `format` AVOption entry up to immediately after `tonemap`
+ (and its CONST entries), so positional 2 binds to `format`. Other
+ AVOptions shift down by one positional slot:
+ .
+   was: tonemap, tonemap_mode, transfer/t, matrix/m, primaries/p, range/r,
+        format, apply_dovi, tradeoff, peak, param, desat, threshold
+   now: tonemap, format, tonemap_mode, transfer/t, matrix/m, primaries/p,
+        range/r,         apply_dovi, tradeoff, peak, param, desat, threshold
+ .
+ Risk analysis. Any caller passing a non-`format` option positionally at
+ slot 2 (or at any slot >2 with respect to its old index) breaks. In our
+ corpus (209-entry PMS argv capture) `tonemap_mode` is never set
+ explicitly — Plex's argv always passes it by name when used at all
+ (typical: `tonemap_cuda=tonemap=mobius:tonemap_mode=lum:...`), and the
+ default `auto` is correct for every observed session. Named-arg form
+ `tonemap_mode=rgb` continues to work post-reorder (AVOption lookup-
+ by-name is position-agnostic). Same logic for all the shifted entries.
+ .
+ Positional 1 (`tonemap`) is unchanged; only positional 2+ shift. PMS's
+ own argv uses positional 1 + named 3..N, never positional 2, so PMS's
+ own shape works on both forks.
+Origin: scaleplex, empirically confirmed from PMS argv capture
+        2026-05-27 on skw-d-linuxtest:
+        `tonemap_cuda=hable:nv12` (corpus shape `tonemap_cuda=ALGO:PIX`),
+        which Plex's fork accepts and jellyfin-ffmpeg rejects with the
+        "Undefined constant" error above. The reorder mirrors Plex's
+        positional contract without requiring the full upstream-fork
+        AVOption array (we keep jellyfin's TONEMAP_BT2390 default + the
+        extra tonemap_mode/tradeoff/threshold/etc options jellyfin adds
+        on top of Plex's set).
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-28
+---
+--- a/libavfilter/vf_tonemap_cuda.c
++++ b/libavfilter/vf_tonemap_cuda.c
+@@ -1190,6 +1190,9 @@ static const AVOption options[] = {
+     {     "hable",     0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_HABLE},             0, 0, FLAGS, .unit = "tonemap" },
+     {     "mobius",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MOBIUS},            0, 0, FLAGS, .unit = "tonemap" },
+     {     "bt2390",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_BT2390},            0, 0, FLAGS, .unit = "tonemap" },
++    // scaleplex: format moved to positional 2 to match Plex's fork
++    // (PMS emits `tonemap_cuda=ALGO:PIX`, e.g. `hable:nv12`).
++    { "format",        "Output format",       OFFSET(format_str), AV_OPT_TYPE_STRING, { .str = "same" }, .flags = FLAGS },
+     { "tonemap_mode",  "Tonemap mode selection", OFFSET(tonemap_mode), AV_OPT_TYPE_INT, {.i64 = TONEMAP_MODE_AUTO}, TONEMAP_MODE_MAX, TONEMAP_MODE_COUNT - 1, FLAGS, .unit = "tonemap_mode" },
+     {     "max",  "Brightest channel based tonemap",  0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MODE_MAX},  0, 0, FLAGS, .unit = "tonemap_mode" },
+     {     "rgb",  "Per-channel based tonemap",        0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MODE_RGB},  0, 0, FLAGS, .unit = "tonemap_mode" },
+@@ -1215,7 +1218,6 @@ static const AVOption options[] = {
+     {     "pc",        0, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},          0, 0, FLAGS, .unit = "range" },
+     {     "limited",   0, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_MPEG},          0, 0, FLAGS, .unit = "range" },
+     {     "full",      0, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},          0, 0, FLAGS, .unit = "range" },
+-    { "format",        "Output format",       OFFSET(format_str), AV_OPT_TYPE_STRING, { .str = "same" }, .flags = FLAGS },
+     { "apply_dovi",    "Apply Dolby Vision metadata if possible", OFFSET(apply_dovi), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+     { "tradeoff",      "Apply tradeoffs to offload computing", OFFSET(tradeoff), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 1, FLAGS, .unit = "tradeoff" },
+     {     "auto",      0, 0, AV_OPT_TYPE_CONST, {.i64 = -1},                        0, 0, FLAGS, .unit = "tradeoff" },
