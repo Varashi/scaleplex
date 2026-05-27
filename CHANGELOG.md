@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/Varashi/scaleplex/compare/v1.7.2...v1.8.0) (2026-05-27)
+
+
+### Features
+
+* **deploy:** Docker / docker-compose deployment shape ([#56](https://github.com/Varashi/scaleplex/issues/56)) ([e13a760](https://github.com/Varashi/scaleplex/commit/e13a760081e4bf4ed895536f5245ed4481cb6712))
+
 ## v1.7.2 — 2026-05-27
 
 Single-purpose maintenance release: introduce `SubCueClock` primitive in
