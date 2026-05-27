@@ -703,12 +703,20 @@ type graphFacts struct {
 }
 
 var (
-	// reGraphScaleWH: the main-video scale (scale= or scale_vaapi=) target.
-	reGraphScaleWH = regexp.MustCompile(`scale(?:_vaapi)?=w=(\d+):h=(\d+)`)
+	// reGraphScaleWH: the main-video scale target. Matches the bare SW
+	// `scale=w=…:h=…` and both HW backends — `scale_vaapi=` (Intel) and
+	// `scale_cuda=` (NVIDIA). Backend identification is via the leading
+	// hwupload/hwaccel context, not this regex.
+	reGraphScaleWH = regexp.MustCompile(`scale(?:_(?:vaapi|cuda))?=w=(\d+):h=(\d+)`)
 	// reGraphTonemapSW: a bare `tonemap=<algo>` filter (Plex's SW HDR chain),
-	// excluding tonemap_opencl=/tonemap_vaapi= (those are matched separately).
+	// excluding tonemap_opencl=/tonemap_vaapi=/tonemap_cuda= (those are
+	// matched separately).
 	reGraphTonemapSW = regexp.MustCompile(`(?:^|[,;\]])tonemap=([A-Za-z0-9]+)`)
-	reGraphInlineass = regexp.MustCompile(`inlineass=([^\[]*)`)
+	// reGraphTonemapCUDA: NVIDIA HW tonemap — Plex emits
+	// `tonemap_cuda=ALGO:PIX`. Capture the algo so extractGraphFacts can
+	// surface it for the recomposer (NVIDIA composeBurn honors algo).
+	reGraphTonemapCUDA = regexp.MustCompile(`tonemap_cuda=([A-Za-z0-9]+)`)
+	reGraphInlineass   = regexp.MustCompile(`inlineass=([^\[]*)`)
 	// reGraphFilterName: a filtergraph node name — an identifier preceded by a
 	// chain boundary (start, ';', ',', ']') possibly followed by whitespace,
 	// and followed by '=', '[', ',', ';' or end. Arg values (after '=' or ':')
@@ -724,10 +732,12 @@ var (
 // else, so an unrecognized shape falls through to the existing bail/SW path
 // instead of being mis-recomposed — preserving the strict reFilter* behavior.
 var modeledFilterNodes = map[string]bool{
-	"scale": true, "scale_vaapi": true, "hwupload": true, "hwdownload": true,
+	"scale": true, "scale_vaapi": true, "scale_cuda": true,
+	"hwupload": true, "hwdownload": true,
 	"hwmap": true, "format": true, "setparams": true, "tonemap": true,
-	"tonemap_opencl": true, "tonemap_vaapi": true, "zscale": true,
-	"inlineass": true, "overlay_vaapi": true,
+	"tonemap_opencl": true, "tonemap_vaapi": true, "tonemap_cuda": true,
+	"zscale":    true,
+	"inlineass": true, "overlay_vaapi": true, "overlay_cuda": true,
 }
 
 // graphNodesModeled reports whether every filter node in the graph is in
@@ -767,6 +777,8 @@ func extractGraphFacts(graph string, subSrc *subtitleSource) graphFacts {
 	switch {
 	case reTonemapOpenCLAlgo.MatchString(graph):
 		f.hdr, f.algo = true, reTonemapOpenCLAlgo.FindStringSubmatch(graph)[1]
+	case reGraphTonemapCUDA.MatchString(graph):
+		f.hdr, f.algo = true, reGraphTonemapCUDA.FindStringSubmatch(graph)[1]
 	case reGraphTonemapSW.MatchString(graph):
 		f.hdr, f.algo = true, reGraphTonemapSW.FindStringSubmatch(graph)[1]
 	case strings.Contains(graph, "tonemap_vaapi"):
