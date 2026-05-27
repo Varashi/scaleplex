@@ -2068,9 +2068,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// env below. So the device path Plex baked in (its own host's
 		// HardwareDevicePath) is irrelevant on the worker — we leave Plex's
 		// -init_hw_device untouched and only inject the option when Plex
-		// emitted none (a pure SW session being HW-accelerated). The empty
-		// `vaapi=vaapi:` is filled by the fork's env override at device-open.
-		// Skipped entirely when honoring a SW session — no VAAPI device needed.
+		// emitted none (a pure SW session being HW-accelerated). On VAAPI
+		// the injected `vaapi=vaapi:` is filled by the fork's env override
+		// at device-open; on NVIDIA the dialect emits `cuda=cuda:N` against
+		// the worker-local device index. Skipped entirely when honoring a
+		// SW session — no HW device needed.
 		if !honorSW && indexOfArg(args, "-init_hw_device", 0) < 0 {
 			// Inject -init_hw_device + -filter_hw_device BEFORE the first
 			// -i so they're parsed as global options. Placing them after
@@ -2087,8 +2089,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// to global position.
 			newInputIdx := indexOfArg(args, "-i", 0)
 			args = spliceArgs(args, newInputIdx,
-				"-init_hw_device", "vaapi=vaapi:",
-				"-filter_hw_device", "vaapi",
+				"-init_hw_device", activeDialect.initHWDeviceArg(0),
+				"-filter_hw_device", activeDialect.filterHWDeviceName(),
 			)
 			changes = append(changes, TagInjectInitHWDevice)
 		}

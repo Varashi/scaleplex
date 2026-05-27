@@ -489,6 +489,44 @@ func TestRewriter_InitHwDevice_Inject(t *testing.T) {
 	}
 }
 
+// NVIDIA sister test of TestRewriter_InitHwDevice_Inject — same input
+// args, activeDialect swapped to nvidiaDialect, expects cuda=cuda:0
+// and -filter_hw_device cuda. Locks the call-site migration in Rewrite().
+func TestRewriter_InitHwDevice_Inject_NVIDIA(t *testing.T) {
+	prev := activeDialect
+	activeDialect = nvidiaDialect{}
+	defer func() { activeDialect = prev }()
+
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-i", "/media/m.mkv",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "16",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "inject:init_hw_device+filter_hw_device") {
+		t.Fatalf("missing injection: %v", out.Changes)
+	}
+	i := indexOfArg(out.Args, "-i", 0)
+	if i < 4 {
+		t.Fatalf("-i too early; injection should precede it. args=%v", out.Args)
+	}
+	want := []string{
+		"-init_hw_device", "cuda=cuda:0",
+		"-filter_hw_device", "cuda",
+	}
+	for k, w := range want {
+		if out.Args[i-4+k] != w {
+			t.Fatalf("arg[%d]=%q want %q", i-4+k, out.Args[i-4+k], w)
+		}
+	}
+}
+
 // inlineass-style argv with no sidecar on disk: bail. The previous
 // behaviour emitted a filter graph using Plex's private `inlineass`
 // filter, which stock ffmpeg doesn't have, and ffmpeg failed at runtime
