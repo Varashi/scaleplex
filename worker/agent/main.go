@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -789,12 +790,50 @@ type captureOutcome struct {
 	EndedAt    string `json:"ended_at"`
 }
 
+// rePlexSessionToken extracts Plex's real session token from a
+// transcode-session cwd. PMS layout is
+//
+//	/transcode/Transcode/Sessions/plex-transcode-<TOKEN>-<UUID>
+//
+// where <TOKEN> is 24 lowercase alnum chars (e.g. `01xtsbm57otmikj51elqu64g`)
+// and <UUID> is RFC 4122 lowercase. The PMS log "Request:" lines for
+// `/video/:/transcode/universal/start` carry `?session=<TOKEN>`, so
+// capturing both halves lets a downstream tool (vcflogs ↔ argv corpus)
+// cross-reference real sessions to their rewriter input/output by
+// PMS-known token, not the shim's synthesised session_id.
+//
+// 24-char token shape is conservative — Plex also produces uppercase
+// hex tokens (e.g. `B27FB75F45FB3869-com-plexapp-android-android`) for
+// some clients. Accept either; UUID half stays for the rare case the
+// downstream wants worker-instance disambiguation.
+var rePlexSessionToken = regexp.MustCompile(
+	`/plex-transcode-([A-Za-z0-9_.-]+)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:/|$)`,
+)
+
+// extractPlexSessionToken returns (token, uuid, true) when cwd matches
+// the PMS transcode-session layout, else ("", "", false). Best-effort;
+// captures with no recognisable cwd just emit empty fields, downstream
+// already handles those.
+func extractPlexSessionToken(cwd string) (token, uuid string, ok bool) {
+	m := rePlexSessionToken.FindStringSubmatch(cwd)
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
 // persistArgvCapture writes a JSON capture of the PMS argv to the
 // shared corpus dir (default /transcode/_argv-corpus on NFS). Survives
 // pod restarts, accessible from anywhere the NFS is mounted. The
 // captures feed cmd/argv-extract for pattern recognition and seed
 // rewriter test fixtures. Best-effort — failures are logged but never
 // fail the session.
+//
+// session_id stays as the shim's deriveSessionID output (input-basename
+// + pid + nonce) for filename idempotency. plex_session_token /
+// plex_session_uuid are parsed from cwd so a downstream tool (vcflogs
+// ↔ corpus cross-ref) can resolve PMS-known sessions to their captured
+// argv without needing the shim's synthesised id.
 func persistArgvCapture(sessionID, cwd string, args []string, env map[string]string) {
 	dir := os.Getenv("WORKER_ARGV_CORPUS_DIR")
 	if dir == "" {
@@ -809,26 +848,31 @@ func persistArgvCapture(sessionID, cwd string, args []string, env map[string]str
 		return // idempotent
 	}
 	type capture struct {
-		SessionID  string            `json:"session_id"`
-		CapturedAt string            `json:"captured_at"`
-		WorkerPod  string            `json:"worker_pod,omitempty"`
-		WorkerHost string            `json:"worker_host,omitempty"`
-		Cwd        string            `json:"session_cwd,omitempty"`
-		Argv       []string          `json:"argv"`
-		Env        map[string]string `json:"env,omitempty"`
-		Client     *captureClient    `json:"client,omitempty"`
-		Outcome    *captureOutcome   `json:"outcome,omitempty"`
+		SessionID        string            `json:"session_id"`
+		PlexSessionToken string            `json:"plex_session_token,omitempty"`
+		PlexSessionUUID  string            `json:"plex_session_uuid,omitempty"`
+		CapturedAt       string            `json:"captured_at"`
+		WorkerPod        string            `json:"worker_pod,omitempty"`
+		WorkerHost       string            `json:"worker_host,omitempty"`
+		Cwd              string            `json:"session_cwd,omitempty"`
+		Argv             []string          `json:"argv"`
+		Env              map[string]string `json:"env,omitempty"`
+		Client           *captureClient    `json:"client,omitempty"`
+		Outcome          *captureOutcome   `json:"outcome,omitempty"`
 	}
 	host, _ := os.Hostname()
+	plexToken, plexUUID, _ := extractPlexSessionToken(cwd)
 	c := capture{
-		SessionID:  sessionID,
-		CapturedAt: time.Now().UTC().Format(time.RFC3339),
-		WorkerPod:  os.Getenv("HOSTNAME"),
-		WorkerHost: host,
-		Cwd:        cwd,
-		Argv:       args,
-		Env:        env,
-		Client:     captureClientInfo(env),
+		SessionID:        sessionID,
+		PlexSessionToken: plexToken,
+		PlexSessionUUID:  plexUUID,
+		CapturedAt:       time.Now().UTC().Format(time.RFC3339),
+		WorkerPod:        os.Getenv("HOSTNAME"),
+		WorkerHost:       host,
+		Cwd:              cwd,
+		Argv:             args,
+		Env:              env,
+		Client:           captureClientInfo(env),
 	}
 	if err := writeCaptureJSON(path, dir, sessionID, &c); err != nil {
 		log.Printf("argv-capture %s: %v", sessionID, err)
