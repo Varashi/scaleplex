@@ -199,19 +199,93 @@ fork patch list.
 
 ## Tagging
 
-After T1–T5 green:
+After T1–T5 green. **release-please** (`.github/workflows/release-please.yaml`)
+watches `main` for Conventional Commits and maintains a draft Release PR
+titled `chore(main): release X.Y.Z`. The bot computes the version bump
+from commit types (`feat:` → minor, `fix:` → patch, `feat!:`/`BREAKING
+CHANGE:` → major). The git tag + GitHub Release are created
+automatically when the Release PR merges. Image retagging stays manual
+via `crane` (the gh CLI's token has `read:packages` only — push needs
+`SECRET_GHCR_PUSH_TOKEN` from BWS).
+
+### Release-PR pre-merge edits
+
+The auto-generated CHANGELOG entry is one bullet per merged PR. Before
+merging the Release PR, edit `CHANGELOG.md` in that PR's branch to:
+
+1. **Prepend an Images-shipped table** immediately after the version
+   header. The git tag tracks the worker stream only; the table tells
+   readers which of the three images actually bumped.
+
+   ```markdown
+   ## [X.Y.Z](https://github.com/Varashi/scaleplex/compare/vPREV...vX.Y.Z) (DATE)
+
+   **Images shipped:**
+
+   | Image | Tag | Notes |
+   |---|---|---|
+   | `ghcr.io/varashi/scaleplex_worker` | `vX.Y.Z` | new — <one-line> |
+   | `ghcr.io/varashi/scaleplex_orchestrator` | `vA.B.C` | new — <one-line>, or `unchanged` |
+   | `ghcr.io/varashi/scaleplex_pms_dockermod` | `vD.E.F` | new — <one-line>, or `unchanged` |
+   ```
+
+2. **Add narrative paragraphs** describing what shipped at a level
+   matching prior releases (see v1.7.0/v1.7.2 for examples — terse
+   one-bullet auto-CHANGELOG is too thin for users diffing release
+   pages).
+
+### Merge + post-merge sync
+
+Merge the Release PR. release-please creates the git tag + GH Release
+in ~30s. **The GH Release body is the auto-generated bullets, NOT the
+CHANGELOG.md section** (release-please's quirk — it doesn't re-read
+the file after PR commit). Sync it:
 
 ```bash
-cd ~/git/scaleplex
-git tag -a v<X.Y.Z> -m "scaleplex v<X.Y.Z>"
-git push origin v<X.Y.Z>
-# wait for build-worker.yaml to produce sha-<short>
-crane tag ghcr.io/varashi/scaleplex_worker:sha-<short> v<X.Y.Z>
-# crane tag (NOT podman) — see feedback_podman_retag_breaks_lsio_dockermods
+# Extract the new version's section from CHANGELOG.md and overwrite the
+# GH Release body with it.
+awk '/^## \[X.Y.Z\]/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md > /tmp/release-body.md
+gh release edit vX.Y.Z -R Varashi/scaleplex --notes-file /tmp/release-body.md
 ```
 
-Then GitOps bump in `~/git/k8s/cluster-talos/kubernetes/apps/plex/.../`
-(image tag pin), commit, push, Flux reconcile.
+### Image retagging (crane)
+
+For each image whose code changed since the previous release, retag the
+`sha-<short>` (of the merge commit) to the new image version. **Use
+`crane tag` — NEVER `docker pull+tag+push` or `podman pull+tag+push`**
+(those corrupt LSIO docker-mod images, see
+`feedback_podman_retag_breaks_lsio_dockermods`).
+
+```bash
+# Auth (uses SECRET_GHCR_PUSH_TOKEN from BWS — the gh CLI token has
+# read:packages + delete:packages only; no write:packages):
+PUSH_TOKEN=$(bws secret get 8e6f3b91-17c1-4c76-bba2-b42c01780722 \
+  | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['value'])")
+echo "$PUSH_TOKEN" | crane auth login ghcr.io -u Varashi --password-stdin
+
+# Retag whichever images bumped (skip lines for unchanged images):
+crane tag ghcr.io/varashi/scaleplex_worker:sha-<short>       vX.Y.Z
+crane tag ghcr.io/varashi/scaleplex_orchestrator:sha-<short> vA.B.C
+crane tag ghcr.io/varashi/scaleplex_pms_dockermod:sha-<short> vD.E.F
+
+# Verify digests match:
+crane digest ghcr.io/varashi/scaleplex_worker:vX.Y.Z
+crane digest ghcr.io/varashi/scaleplex_worker:sha-<short>
+```
+
+Per-image cadence:
+- `scaleplex_worker` — fast (matches git tag stream)
+- `scaleplex_orchestrator` — slow (last bumped v1.2.1 → v1.3.0 in v1.8.0)
+- `scaleplex_pms_dockermod` — slow (only when `shim/` changes)
+
+### GitOps bump (prod)
+
+```bash
+$EDITOR ~/git/k8s/cluster-talos/kubernetes/apps/media/plex/app/helmrelease.yaml
+# Update scaleplex_worker tag + sha pin.
+git -C ~/git/k8s add . && git -C ~/git/k8s commit -m "..." && git -C ~/git/k8s push
+# Flux webhook fires; reconcile in ~30s.
+```
 
 ## Per-release checklist template
 
@@ -243,8 +317,11 @@ Copy into the release PR description:
 - [ ] DEB_BUILD_OPTIONS=nostrip live validation on plex-test
 - [ ] Stripped deb produced for release
 
-### Tag
-- [ ] git tag v<X.Y.Z>
-- [ ] crane tag worker image
-- [ ] GitOps bump in k8s repo
+### Release
+- [ ] release-please Release PR opened (`chore(main): release X.Y.Z`)
+- [ ] CHANGELOG.md edited in Release PR with **Images-shipped table** + narrative paragraphs
+- [ ] Release PR merged → `vX.Y.Z` git tag + GitHub Release auto-created
+- [ ] GH Release body synced from CHANGELOG.md via `gh release edit --notes-file`
+- [ ] `crane tag` applied to each image whose code changed (worker / orchestrator / pms_dockermod) — auth via `SECRET_GHCR_PUSH_TOKEN` from BWS
+- [ ] GitOps bump in `~/git/k8s/cluster-talos/kubernetes/apps/media/plex/...` (image tag + sha pin), commit + push
 ```
