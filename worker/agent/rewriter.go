@@ -2015,18 +2015,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					return bail(TagPrefixBailUnknownDecoder + swDecoder)
 				}
 				args = spliceArgs(args, decCodecIdx+2,
-					"-hwaccel:0", "vaapi",
-					"-hwaccel_output_format:0", "vaapi",
-					"-hwaccel_device:0", "vaapi",
+					"-hwaccel:0", activeDialect.hwaccelName(),
+					"-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat(),
+					"-hwaccel_device:0", activeDialect.filterHWDeviceName(),
 				)
 				changes = append(changes, TagPrefixDecodeBareHWUpgrade+swDecoder)
 			}
 		} else if hwDecoder, ok := activeDialect.decoderMap()[swDecoder]; ok {
 			args[decCodecIdx+1] = hwDecoder
 			args = spliceArgs(args, decCodecIdx+2,
-				"-hwaccel:0", "vaapi",
-				"-hwaccel_output_format:0", "vaapi",
-				"-hwaccel_device:0", "vaapi",
+				"-hwaccel:0", activeDialect.hwaccelName(),
+				"-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat(),
+				"-hwaccel_device:0", activeDialect.filterHWDeviceName(),
 			)
 			changes = append(changes, TagPrefixDecode+swDecoder+"->"+hwDecoder)
 		} else {
@@ -2349,16 +2349,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
 						oldLabel = "[" + m[1] + "]"
 					}
-					// vaResident=true: Plex's argv carries `-hwaccel:0 vaapi
-					// -hwaccel_output_format:0 vaapi`, so [0:0] is already a VA
-					// surface — composeBurn skips the leading hwupload (Plex's
-					// own leading `[0:0]hwupload[0]` was a redundant passthrough
-					// on a VA-tagged frame). Force -hwaccel_output_format:0 vaapi
-					// defensively (parity with the HW-decode-bitmap branch).
+					// vaResident=true: Plex's argv carries the HW decode flags
+					// (`-hwaccel:0 <vaapi|nvdec> -hwaccel_output_format:0
+					// <vaapi|cuda>`), so [0:0] is already a backend surface —
+					// composeBurn skips the leading hwupload (Plex's own leading
+					// `[0:0]hwupload[0]` was a redundant passthrough on a
+					// HW-tagged frame). Force -hwaccel_output_format:0 to the
+					// backend's surface format defensively (parity with the
+					// HW-decode-bitmap branch).
 					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
-						args[ofIdx+1] = "vaapi"
+						args[ofIdx+1] = activeDialect.hwaccelOutputFormat()
 					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
-						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat())
 						vfIdx = indexOfArg(args, "-filter_complex", 0) + 1
 					}
 					animated := subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile)
@@ -2429,14 +2431,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					burnSub: true,
 				})
 				args[i+1] = newFilter
-				// Make [0:0] a real VA surface (Plex's bitmap argv decodes to
+				// Make [0:0] a real HW surface (Plex's bitmap argv decodes to
 				// sysmem) so the no-hwupload composer is valid + the round-trip is
 				// gone. Idempotent with gpuResidentOpenCLTonemap's own force.
 				if vaResident {
 					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
-						args[ofIdx+1] = "vaapi"
+						args[ofIdx+1] = activeDialect.hwaccelOutputFormat()
 					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
-						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat())
 					}
 				}
 				retargetMapLabel(args, oldLabel, newLabel)

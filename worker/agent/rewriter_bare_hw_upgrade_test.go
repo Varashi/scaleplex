@@ -5,6 +5,62 @@ import (
 	"testing"
 )
 
+// NVIDIA bare-HW-upgrade sister test of TestRewriter_BareHEVC_NoHWAccel_UpgradesToVAAPI.
+// Swaps activeDialect to nvidiaDialect{}; asserts the spliced hwaccel flags
+// match the NVIDIA shape:
+//
+//	-hwaccel:0 nvdec
+//	-hwaccel_output_format:0 cuda
+//	-hwaccel_device:0 cuda
+//
+// Filter chain reshape + encoder swap still produce VAAPI-tagged literals
+// today (those are migrated in follow-up commits) — this test only locks
+// the hwaccel inject site.
+func TestRewriter_BareHEVC_NoHWAccel_UpgradesToNVIDIA_HWAccelFlags(t *testing.T) {
+	prev := activeDialect
+	activeDialect = nvidiaDialect{}
+	defer func() { activeDialect = prev }()
+
+	args := []string{
+		"-codec:0", "hevc",
+		"-analyzeduration", "20000000",
+		"-probesize", "20000000",
+		"-i", "/media/Movies/HEVCSource.mkv",
+		"-init_hw_device", "cuda=cuda:0",
+		"-filter_complex", "[0:0]scale=w=1920:h=1080[0];[0]format=pix_fmts=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264",
+		"-crf:0", "16",
+		"-preset:0", "veryfast",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "decode:bare-hw-upgrade:hevc") {
+		t.Fatalf("expected decode:bare-hw-upgrade:hevc: %v", out.Changes)
+	}
+	for _, want := range []string{
+		"-hwaccel:0", "nvdec",
+		"-hwaccel_output_format:0", "cuda",
+		"-hwaccel_device:0", "cuda",
+	} {
+		if !containsString(out.Args, want) {
+			t.Errorf("missing hwaccel flag %q in args: %v", want, out.Args)
+		}
+	}
+	// Defensive: ensure the VAAPI literals are NOT present in the spliced
+	// hwaccel flag positions.
+	for _, banned := range []string{"vaapi"} {
+		// Look only at the -hwaccel:0 value (right after the flag).
+		if hwIdx := indexOfArg(out.Args, "-hwaccel:0", 0); hwIdx >= 0 && hwIdx+1 < len(out.Args) {
+			if out.Args[hwIdx+1] == banned {
+				t.Errorf("-hwaccel:0 = %q under NVIDIA dialect; want nvdec", banned)
+			}
+		}
+	}
+}
+
 // Bare short codec name in -codec:0 (hevc / h264 / av1 / vp9) without
 // a -hwaccel:0 flag, paired with a SW-shaped encoder + filter chain.
 // PMS sometimes emits this when its HW probe failed mid-session or
