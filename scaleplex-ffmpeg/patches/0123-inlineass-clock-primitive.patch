@@ -1,0 +1,148 @@
+Description: vf_inlineass: introduce SubCueClock primitive for bitmap path
+ The bitmap path (PGS/DVD/DVB) carried its own ad-hoc display-window state
+ (have_bmp, bmp_start_ms, bmp_end_ms, bmp_pend_start_ms, bmp_pend_end_ms)
+ with the lifecycle scattered across replay_bitmap (decoder thread) and
+ refresh_bitmap (filter thread). The window was open-ended for PGS cues
+ (end_display_time=0 -> sentinel -1) and a previous patch (0121, now
+ dropped) had to add an explicit close-on-clear fix because the per-frame
+ recompute would otherwise resurrect a just-cleared cue.
+ .
+ Consolidate the lifecycle into a small SubCueClock primitive with three
+ inline ops: sub_cue_set, sub_cue_close, sub_cue_active_at. INT64_MIN is
+ the open-ended sentinel. close() always bounds the window, so the
+ sticky-clear behaviour is enforced by the API rather than by remembering
+ to write bmp_end_ms = time_ms at every clear site.
+ .
+ Net effect:
+   - Folds 5 scattered fields into 2 (bmp_clock + bmp_pend_clock).
+   - Single source of truth for "is the bitmap cue active at T".
+   - Patch 0121's sticky-clear fix is absorbed (file removed alongside).
+   - No behaviour change for the text path (libass owns its own clock).
+   - No perf delta: same compare-and-cache, just behind an inline.
+   - Text path could adopt the primitive later (e.g. to gate
+     animated_tier_down windows); not retrofitted here to keep the
+     diff scoped.
+Forwarded: not-yet
+Last-Update: 2026-05-27
+
+Index: ffmpeg/libavfilter/vf_inlineass.c
+===================================================================
+--- ffmpeg.orig/libavfilter/vf_inlineass.c
++++ ffmpeg/libavfilter/vf_inlineass.c
+@@ -62,6 +62,38 @@
+ #include "video.h"
+ #include "libavutil/frame.h"
+ 
++/* Display-window lifecycle for a single subtitle cue. Decoupled from
++ * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
++ * can share a small, testable primitive with the text path. INT64_MIN
++ * is the open-ended sentinel: PGS PCS sets end_display_time=0, so the
++ * cue's true end is only known when an empty presentation arrives. */
++typedef struct SubCueClock {
++    int64_t start_ms;
++    int64_t end_ms;     /* INT64_MIN == open-ended (close-via-clear pending) */
++    int     active;     /* cached: result of last sub_cue_active_at() */
++} SubCueClock;
++
++static inline void sub_cue_set(SubCueClock *c,
++                               int64_t start_ms, int64_t end_ms_or_open)
++{
++    c->start_ms = start_ms;
++    c->end_ms   = (end_ms_or_open > start_ms) ? end_ms_or_open : INT64_MIN;
++    c->active   = 0;
++}
++
++static inline void sub_cue_close(SubCueClock *c, int64_t time_ms)
++{
++    c->end_ms = time_ms;   /* bound the window so active_at() cannot resurrect */
++    c->active = 0;
++}
++
++static inline int sub_cue_active_at(SubCueClock *c, int64_t time_ms)
++{
++    c->active = (time_ms >= c->start_ms) &&
++                (c->end_ms == INT64_MIN || time_ms < c->end_ms);
++    return c->active;
++}
++
+ typedef struct {
+     /* scaleplex: VAAPIVPPContext MUST be the first field. Its own first
+      * field is `const AVClass *class`, so the av_opt class stays at priv
+@@ -127,9 +159,8 @@ typedef struct {
+     int          bmp_surf_w, bmp_surf_h; /**< current bmp_overlay surface dims */
+     int          bmp_pending;        /**< 1 = new presentation staged */
+     int          bmp_pending_clear;  /**< 1 = pending is a clear (no rects) */
+-    int          have_bmp;           /**< a bitmap is currently visible */
+-    int64_t      bmp_start_ms, bmp_end_ms;       /**< active display window */
+-    int64_t      bmp_pend_start_ms, bmp_pend_end_ms;
++    SubCueClock  bmp_clock;          /**< active display window (.active = was: have_bmp) */
++    SubCueClock  bmp_pend_clock;     /**< pending presentation's display window */
+ } AssContext;
+ 
+ /* scaleplex: process-wide libass lock. libass is not reentrant across
+@@ -519,9 +550,11 @@ void avfilter_inlineass_replay_bitmap(AV
+         ass->bmp_pending       = 1;
+         ass->bmp_pending_clear = 0;
+     }
+-    ass->bmp_pend_start_ms = base_ms + sub->start_display_time;
+-    ass->bmp_pend_end_ms   = (sub->end_display_time > sub->start_display_time)
+-                           ? base_ms + sub->end_display_time : -1;
++    sub_cue_set(&ass->bmp_pend_clock,
++                base_ms + sub->start_display_time,
++                (sub->end_display_time > sub->start_display_time)
++                    ? base_ms + sub->end_display_time
++                    : INT64_MIN);
+     pthread_mutex_unlock(&inlineass_lock);
+ }
+ 
+@@ -531,7 +564,7 @@ static int refresh_bitmap(AVFilterContex
+ {
+     AssContext *ass = avctx->priv;
+     int err = 0, do_upload = 0, clear = 0, cw = 0, ch = 0, stride = 0, y;
+-    int64_t start_ms = 0, end_ms = -1;
++    SubCueClock pend = {0};
+ 
+     pthread_mutex_lock(&inlineass_lock);
+     if (ass->bmp_pending) {
+@@ -548,15 +581,14 @@ static int refresh_bitmap(AVFilterContex
+                            ass->bmp_pending_buf + (ptrdiff_t)y * stride,
+                            (size_t)cw * 4);
+                 do_upload = 1;
+-                start_ms = ass->bmp_pend_start_ms;
+-                end_ms   = ass->bmp_pend_end_ms;
++                pend     = ass->bmp_pend_clock;
+             }
+         }
+     }
+     pthread_mutex_unlock(&inlineass_lock);
+ 
+     if (clear) {
+-        ass->have_bmp = 0;
++        sub_cue_close(&ass->bmp_clock, time_ms);
+         return 0;
+     }
+     if (do_upload) {
+@@ -565,12 +597,10 @@ static int refresh_bitmap(AVFilterContex
+             av_log(avctx, AV_LOG_ERROR, "Failed to upload bitmap overlay: %d.\n", err);
+             return err;
+         }
+-        ass->bmp_start_ms = start_ms;
+-        ass->bmp_end_ms   = end_ms;
++        ass->bmp_clock = pend;
+     }
+     if (ass->bmp_overlay)
+-        ass->have_bmp = (time_ms >= ass->bmp_start_ms) &&
+-                        (ass->bmp_end_ms < 0 || time_ms < ass->bmp_end_ms);
++        sub_cue_active_at(&ass->bmp_clock, time_ms);
+     return 0;
+ }
+ 
+@@ -1277,7 +1307,7 @@ static int filter_frame_hw(AVFilterLink
+      * downstream HW encoder. */
+     nb_params = 1;
+     {
+-        AVFrame *ov = ass->have_bmp     ? ass->bmp_overlay
++        AVFrame *ov = ass->bmp_clock.active ? ass->bmp_overlay
+                     : ass->have_overlay ? ass->overlay
+                     : NULL;
+         if (ov) {

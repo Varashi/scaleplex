@@ -1,5 +1,56 @@
 # Changelog
 
+## v1.7.2 — 2026-05-27
+
+Single-purpose maintenance release: introduce `SubCueClock` primitive in
+`vf_inlineass` for the bitmap-subtitle path. Folds the open-ended display
+window + close-via-clear lifecycle behind a small, testable API. Absorbs
+the v1.6.1-era sticky-clear fix (patch 0121) which is now enforced by the
+primitive itself.
+
+### Rewriter / fork
+
+- **refactor(vf_inlineass): SubCueClock primitive for bitmap path**
+  (fork patch `0123-inlineass-clock-primitive`). The PGS/DVD/DVB bitmap
+  path's display-window state (`have_bmp`, `bmp_start_ms`, `bmp_end_ms`,
+  `bmp_pend_start_ms`, `bmp_pend_end_ms`) — previously scattered across
+  `replay_bitmap` (decoder thread) and `refresh_bitmap` (filter thread)
+  — collapses into a `SubCueClock` struct with three inline ops:
+  `sub_cue_set`, `sub_cue_close`, `sub_cue_active_at`. `INT64_MIN` is
+  the open-ended sentinel (matching PGS's `end_display_time=0`);
+  `close()` always bounds the window, so the 0121-class sticky-clear
+  bug is enforced by the API rather than by remembering to write
+  `bmp_end_ms = time_ms` at every clear site. 5 scattered fields → 2
+  `SubCueClock` structs, single source of truth for "is the bitmap cue
+  active at T". Text path unchanged (libass owns its own clock). No
+  perf delta — same compare-and-cache, behind an inline.
+
+- **drop(fork): patches/0121-inlineass-bitmap-clear-sticky.patch**
+  Absorbed into 0123; the sticky-clear fix is now structural rather
+  than an inline patch.
+
+### Build infra
+
+- **chore(scaleplex-ffmpeg/build): plumb `DEB_BUILD_OPTIONS` env into
+  docker run.** Enables `DEB_BUILD_OPTIONS=nostrip ./build.sh` for
+  debug-symbol iteration on plex-test. Default release builds remain
+  stripped.
+
+### Validation
+
+Live-validated on `plex-test` worker fleet (debug deb @ 197M,
+FORCE_HW=1) across the full sub-codec axis:
+
+- PGS (4K AV1 HDR + bitmap burn) on `2 Fast 2 Furious`: rewriter
+  `hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi` engaged,
+  first segment ready, no errors.
+- ASS (1080p HEVC SDR) and SRT (4K HEVC HDR) on the test-corpus
+  shapes: text path unchanged (`honor:plex-sw`), no regressions.
+- 0121 regression spot-check: 30-frame HLS pull at offset 1800s of
+  the PGS transcode, sub-band crop confirms cues clear correctly
+  between dialogue lines (no sub persistence across PCS-clear
+  silences).
+
 ## v1.7.0 — 2026-05-26
 
 Rewriter-orthogonality completion + sidecar-sink-keep + `tryOptimizeRemux`

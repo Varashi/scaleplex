@@ -137,7 +137,7 @@ EOF
   fi
   mkdir -p ./dist
   # `:z` relabels the host bind for podman SELinux; no-op on Docker.
-  docker run --rm -v "$PWD/dist:/dist:z" "$IMG"
+  docker run --rm -e DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS:-}" -v "$PWD/dist:/dist:z" "$IMG"
 )
 
 echo "==> Copying artifacts to $DIST/"
