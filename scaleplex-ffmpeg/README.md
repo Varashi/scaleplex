@@ -4,6 +4,28 @@ A thin patch layer on top of [jellyfin-ffmpeg](https://github.com/jellyfin/jelly
 that backports the small subset of Plex Inc.'s ffmpeg fork that lets us
 delete a meaningful chunk of worker rewriter / agent scaffolding.
 
+## Design intent
+
+scaleplex-ffmpeg7 = **drop-in `Plex Transcoder` replacement**, plus
+scaleplex's performance enhancements and functionality fixes layered
+on top. Anything Plex's bundled ffmpeg-fork accepts, this fork should
+accept. Anything Plex's argv produces (CLI flags, filter positional
+orders, AVOption keys), this fork should parse without rewriter-side
+translation.
+
+This is the explicit policy: when a Plex-fork divergence from
+jellyfin-ffmpeg upstream surfaces (via PMS argv corpus or live deploy
+breakage), the **default response is to patch the fork** — not
+extend the worker rewriter. Rewriter complexity grows with each
+filter dialect divergence; parser-side compat absorbs it once and
+benefits every code path (passthrough + reshape + future filter-graph
+shapes). The rewriter's job is graph reshape, not translation between
+ffmpeg dialects.
+
+Rewriter-side translation is reserved for cases where a fork patch is
+genuinely infeasible — for example, when Plex semantics differ in
+ways that can't be reconciled with a single AVOption.
+
 ## Why fork
 
 scaleplex's worker rewriter spends a lot of effort coercing stock ffmpeg
@@ -14,9 +36,18 @@ publisher, chunk renumber + tfdt patcher, external SIGSTOP/SIGCONT
 throttle) exist purely to approximate Plex-fork features that don't
 ship in upstream FFmpeg.
 
-This subdir builds a re-namespaced deb (`scaleplex-ffmpeg7`) with each
-of those Plex-fork features ported as a clean Debian-format patch on
-top of jellyfin-ffmpeg's existing 93-patch stack.
+This subdir builds a re-namespaced deb (`scaleplex-ffmpeg7`) with two
+layers of patches on top of jellyfin-ffmpeg's existing 93-patch stack:
+
+- **Plex-fork compat** — accept Plex argv shapes jellyfin-ffmpeg
+  upstream doesn't (`0099` matroska Duration, `0102`
+  segment_format_options, `0103` dashenc URL manifest, `0104` fftools
+  throttle hook, future *_cuda / *_vaapi positional-arg patches).
+  These make the fork behave as a drop-in for what PMS sends.
+- **scaleplex enhancements** — perf + correctness fixes scaleplex
+  invented, no Plex precedent (`0115` inlineass merge, `0120` paced
+  self-decode, `0121` sticky bitmap clear, `0123` SubCueClock, etc.).
+  These are layered on top of the drop-in baseline.
 
 ## Patch series
 
