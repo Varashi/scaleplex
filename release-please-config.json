@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "simple",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": true,
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "draft": false,
+  "prerelease": false,
+  "packages": {
+    ".": {
+      "package-name": "scaleplex",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": []
+    }
+  },
+  "changelog-sections": [
+    {"type": "feat",     "section": "Features"},
+    {"type": "fix",      "section": "Fixes"},
+    {"type": "perf",     "section": "Performance"},
+    {"type": "refactor", "section": "Refactor"},
+    {"type": "revert",   "section": "Reverts"},
+    {"type": "build",    "section": "Build"},
+    {"type": "ci",       "section": "CI",       "hidden": true},
+    {"type": "docs",     "section": "Docs",     "hidden": true},
+    {"type": "test",     "section": "Tests",    "hidden": true},
+    {"type": "chore",    "section": "Chore",    "hidden": true},
+    {"type": "style",    "section": "Style",    "hidden": true}
+  ]
+}

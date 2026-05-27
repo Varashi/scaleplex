@@ -1,0 +1,26 @@
+name: release-please
+
+# Watches main for Conventional Commits and maintains a "Release PR" that
+# bumps the version + drafts CHANGELOG diff. Merging the Release PR auto-
+# tags `vX.Y.Z` on the merge commit and creates a GitHub Release with the
+# CHANGELOG body. Per-image GHCR tags (scaleplex_worker:vX.Y.Z etc.) are
+# still applied manually via `crane tag` — keep the
+# feedback_podman_retag_breaks_lsio_dockermods rule in mind.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
