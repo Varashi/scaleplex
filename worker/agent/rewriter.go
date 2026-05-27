@@ -1660,7 +1660,7 @@ func isOptimizeRemux(args []string) bool {
 	if dIdx < 0 || dIdx >= iIdx || dIdx+1 >= len(args) {
 		return false
 	}
-	if _, ok := hwDecodeShortCodecs[args[dIdx+1]]; !ok {
+	if _, ok := activeDialect.hwDecodeShortCodecs()[args[dIdx+1]]; !ok {
 		return false
 	}
 	if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
@@ -1939,7 +1939,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		forceHW := envBool("SCALEPLEX_FORCE_HW")
 		plexSWEncoder := false
 		if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
-			_, plexSWEncoder = encoderMap[args[peer+1]]
+			_, plexSWEncoder = activeDialect.encoderMap()[args[peer+1]]
 		}
 		noHwaccel := indexOfArg(args, "-hwaccel:0", 0) < 0
 		honorSW := plexSWEncoder && noHwaccel && !forceHW
@@ -1962,7 +1962,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if honorSW {
 			// Honoring Plex's SW pipeline: leave the decoder as PMS emitted it
 			// (no VAAPI swap, no -hwaccel inject). isHWDecode stays false.
-		} else if _, isShort := hwDecodeShortCodecs[swDecoder]; isShort {
+		} else if _, isShort := activeDialect.hwDecodeShortCodecs()[swDecoder]; isShort {
 			if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
 				isHWDecode = true
 				changes = append(changes, TagPrefixDecodeHWPassthrough+swDecoder)
@@ -1975,7 +1975,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// HW-shaped (e.g. h264_vaapi), the argv is malformed in a way
 				// we can't safely reshape; bail rather than guess.
 				if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
-					if _, isSW := encoderMap[args[peer+1]]; !isSW {
+					if _, isSW := activeDialect.encoderMap()[args[peer+1]]; !isSW {
 						return bail(TagPrefixBailUnknownDecoder + swDecoder)
 					}
 				} else {
@@ -1988,7 +1988,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				)
 				changes = append(changes, TagPrefixDecodeBareHWUpgrade+swDecoder)
 			}
-		} else if hwDecoder, ok := decoderMap[swDecoder]; ok {
+		} else if hwDecoder, ok := activeDialect.decoderMap()[swDecoder]; ok {
 			args[decCodecIdx+1] = hwDecoder
 			args = spliceArgs(args, decCodecIdx+2,
 				"-hwaccel:0", "vaapi",
@@ -2213,7 +2213,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				return bail(TagBailReasonNoEncoder)
 			}
 			swEncoder := args[encCodecIdx+1]
-			hwEncoder, ok := encoderMap[swEncoder]
+			hwEncoder, ok := activeDialect.encoderMap()[swEncoder]
 			if !ok {
 				return bail(TagPrefixBailUnknownEncoder + swEncoder)
 			}
