@@ -74,6 +74,17 @@ func TestReplayCorpus(t *testing.T) {
 	activeDialect = selectDialect()
 	t.Logf("replay backend: %s", activeDialect.backendName())
 
+	// The replay validates the REWRITER (+ ffmpeg), not the Plex-Pass gate
+	// (#78, which has its own tests). The corpus carries a captured
+	// SCALEPLEX_PMS_BASE_URL pointing at the origin PMS (often an in-cluster
+	// address unreachable from the replay host) — the real gate query would
+	// fail-closed and skip every HW re-accel/cross-backend reshape, masking
+	// the rewriter under spurious FAIL-argv. Stub the gate active so the
+	// rewriter paths are exercised. (Set REPLAY_REAL_PASS_CHECK to opt out.)
+	if os.Getenv("REPLAY_REAL_PASS_CHECK") == "" {
+		passCheck = func(_, _ string) (bool, error) { return true, nil }
+	}
+
 	corpusDir := os.Getenv("REPLAY_CORPUS_DIR")
 	if corpusDir == "" {
 		home, _ := os.UserHomeDir()
