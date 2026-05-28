@@ -19,6 +19,7 @@ package main
 // pre-Phase-3, no regression on CPU-only or unsupported workers.
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"log"
@@ -267,8 +268,11 @@ func newNvidiaReader() (*nvidiaReader, error) {
 }
 
 // query returns instantaneous encoder + decoder utilization as fractions 0..1.
+// Bounded by a 5s context timeout so a hung nvidia-smi can't stall the sampler.
 func (r *nvidiaReader) query() (enc, dec float64, err error) {
-	out, err := exec.Command("nvidia-smi",
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "nvidia-smi",
 		"--query-gpu=utilization.encoder,utilization.decoder",
 		"--format=csv,noheader,nounits", "-i", "0").Output()
 	if err != nil {
@@ -289,9 +293,11 @@ func (r *nvidiaReader) query() (enc, dec float64, err error) {
 func (r *nvidiaReader) sample() ([]uint64, error) {
 	enc, dec, err := r.query()
 	if err != nil {
-		// Return last accumulated values unchanged — the sampler reads a
-		// zero-delta and keeps its cached fraction (fail-soft).
-		return []uint64{uint64(r.accEnc), uint64(r.accDec)}, nil
+		// Propagate the error so engineSampler keeps its cached fraction.
+		// Returning a nil error with unchanged counters would make the sampler
+		// recompute a zero delta and drive cached load to 0 on a transient
+		// nvidia-smi hiccup (fail-soft = hold last good, not go idle).
+		return nil, err
 	}
 	now := time.Now()
 	if !r.lastTime.IsZero() {

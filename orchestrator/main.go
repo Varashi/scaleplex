@@ -721,7 +721,7 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 		MaxSessions    int     `json:"max_sessions"`
 		GPULoad        float64 `json:"gpu_load"`
 		GPUEngines     int     `json:"gpu_engines"`
-		Backend        string  `json:"backend,omitempty"`
+		Backend        string  `json:"backend"`
 		Load           float64 `json:"load"`
 		LastErr        string  `json:"last_err,omitempty"`
 		LastUpdatedAgo string  `json:"last_updated_ago,omitempty"`
@@ -742,6 +742,9 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 			Backend:        wk.backend,
 			Load:           load,
 			LastErr:        wk.lastErr,
+		}
+		if e.Backend == "" {
+			e.Backend = "unknown" // pre-PR4 worker; scheduler classifies it as HW
 		}
 		if !wk.lastUpdated.IsZero() {
 			e.LastUpdatedAgo = time.Since(wk.lastUpdated).Round(time.Millisecond).String()

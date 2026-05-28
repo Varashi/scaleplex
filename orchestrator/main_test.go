@@ -355,7 +355,9 @@ func TestSchedule_FlatPool(t *testing.T) {
 	}
 }
 
-// round-robin rotates the starting worker across successive dispatches.
+// round-robin left-rotates the order on each successive dispatch. Validated
+// relative to the first schedule's order (not a hardcoded base) so the test
+// isn't brittle to tie-break/base-order changes.
 func TestSchedule_RoundRobin(t *testing.T) {
 	resetGlobals()
 	pl.strategy = lbRoundRobin
@@ -363,14 +365,25 @@ func TestSchedule_RoundRobin(t *testing.T) {
 		w := addWorker(t, u, 0, 0, true)
 		w.backend = "vaapi"
 	}
-	var firsts []string
-	for i := 0; i < 3; i++ {
-		firsts = append(firsts, pl.schedule()[0].url)
+	urls := func(ws []*worker) []string {
+		out := make([]string, len(ws))
+		for i, w := range ws {
+			out[i] = w.url
+		}
+		return out
 	}
-	want := []string{"http://a", "http://b", "http://c"}
-	for i := range want {
-		if firsts[i] != want[i] {
-			t.Errorf("round-robin dispatch %d: first=%s want=%s (all=%v)", i, firsts[i], want[i], firsts)
+	base := urls(pl.schedule())
+	if len(base) != 3 {
+		t.Fatalf("want 3 workers, got %d", len(base))
+	}
+	for k := 1; k <= len(base); k++ {
+		got := urls(pl.schedule())
+		want := append(append([]string{}, base[k%len(base):]...), base[:k%len(base)]...)
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("dispatch %d: got %v, want %v (left-rotation %d of base %v)", k, got, want, k, base)
+				break
+			}
 		}
 	}
 }
