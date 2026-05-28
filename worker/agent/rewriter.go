@@ -655,8 +655,11 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 var reBitmapSubBranch = regexp.MustCompile(`\[(0:[0-9]+)\]scale=[0-9]+:[0-9]+,hwupload\[`)
 
 // reBitmapMainScale extracts the main-video target W/H from the overlay graph:
-// `[0:0]hwupload[..];[..]scale_vaapi=w=W:h=H`.
-var reBitmapMainScale = regexp.MustCompile(`\[0:0\]hwupload\[\d+\];\[\d+\]scale_vaapi=w=([0-9]+):h=([0-9]+)`)
+// `[0:0]hwupload[..];[..]scale_{vaapi,cuda}=w=W:h=H`. Matches both HW
+// backends for parity with reGraphScaleWH — NVIDIA PGS-burn graphs use
+// scale_cuda. NOTE: the NVIDIA bitmap-overlay path is not yet
+// live-validated (no PGS NVENC capture in the corpus); see scaleplex#66.
+var reBitmapMainScale = regexp.MustCompile(`\[0:0\]hwupload\[\d+\];\[\d+\]scale_(?:vaapi|cuda)=w=([0-9]+):h=([0-9]+)`)
 
 // reTonemapOpenCLAlgo extracts Plex's tonemap algorithm from an (already
 // substituteOpenCLTonemap-normalized) tonemap_opencl node.
@@ -819,7 +822,7 @@ func extractGraphFacts(graph string, subSrc *subtitleSource) graphFacts {
 // video and overlay_vaapi (the HDR variant) no longer escapes the optimizer.
 // Returns ok=false when the graph isn't a bitmap overlay burn.
 func detectBitmapOverlayBurn(graph string) (streamSpec, w, h, algo string, hdr, ok bool) {
-	if !strings.Contains(graph, "overlay_vaapi") {
+	if !strings.Contains(graph, "overlay_vaapi") && !strings.Contains(graph, "overlay_cuda") {
 		return
 	}
 	sb := reBitmapSubBranch.FindStringSubmatch(graph)

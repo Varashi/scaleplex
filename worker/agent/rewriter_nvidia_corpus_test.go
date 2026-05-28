@@ -148,7 +148,11 @@ func findCorpusFiles(dir string) ([]string, error) {
 		}
 		return nil
 	})
-	return files, err
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // loadCorpusArgv parses a captured PMS argv dump. Format:

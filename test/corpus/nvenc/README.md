@@ -18,6 +18,29 @@ No tokens, no credentials — only argv + PID + TS_NS + session UUIDs.
   hevc_nvenc playback shape — distinct subset (mobile profile bitrates
   + audio-only re-encodes).
 
+## This is a FAITHFUL capture, not a curated HW-only set
+
+These files are everything PMS spawned during the NVENC capture
+session on skw-d-linuxtest — captured verbatim via `WORKER_DUMP_ARGV=1`.
+That population intentionally includes argv shapes that are NOT
+NVENC/NVDEC transcodes:
+
+- **SW thumbnail extraction** (`libdav1d`/`libx264` decode + CPU
+  `scale`, output to `thumb-%05d.jpeg`) — Plex generates these
+  alongside playback sessions.
+- **Audio-only / detection passes** — no video `-codec:0`.
+- **Hybrid sessions** — PMS sets `-init_hw_device cuda` /
+  `-filter_hw_device cuda` but then emits a CPU `scale` + `libx264`
+  tail (HW-accel on, HW-encode off in PMS prefs).
+
+Do NOT "clean up" these by moving the SW/hybrid files out. The replay
+test (`worker/agent/rewriter_nvidia_corpus_test.go`) feeds the WHOLE
+population through `Rewrite()` under `WORKER_BACKEND=nvidia` and asserts
+(a) no panic and (b) no VAAPI literal leaks into any output. The SW and
+hybrid captures are load-bearing: they prove the NVIDIA dialect handles
+SW-passthrough and hybrid argv without mis-shaping them. Removing them
+shrinks coverage of exactly the edge cases most likely to regress.
+
 ## Format
 
 One `.argv` file per PMS invocation. Header:
