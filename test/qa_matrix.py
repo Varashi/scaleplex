@@ -350,8 +350,8 @@ def trigger_spawn(params, hdrs):
     retry when the worker hasn't spawned yet."""
     code, body = plex("/video/:/transcode/universal/start.m3u8", params, headers=hdrs, timeout=30)
     if code == 200:
-        for rel in [ln.strip() for ln in body.splitlines()
-                    if ln.strip() and not ln.startswith("#")][:2]:
+        for rel in [s for s in (ln.strip() for ln in body.splitlines())
+                    if s and not s.startswith("#")][:2]:
             plex(f"/video/:/transcode/universal/{rel}",
                  {"X-Plex-Session-Identifier": params["X-Plex-Session-Identifier"]},
                  headers=hdrs, timeout=20)
@@ -384,8 +384,9 @@ def _scan_logs(slug, since):
         if mt:
             tags = mt.group(1)
         head = line.split("stderr_tail=", 1)[0]  # skip the source stream dump
-        if ERR_RE.search(head):
-            errors.append(ERR_RE.search(head).group(0))
+        m = ERR_RE.search(head)
+        if m:
+            errors.append(m.group(0))
     return spawned, first_seg, tags, errors
 
 
@@ -557,7 +558,7 @@ def main():
         print("NODISPATCH (decided-transcode but never reached the worker — investigate dispatch):")
         for fhw, label, status, info in results:
             if status == "NODISPATCH":
-                print(f"  NODISPATCH FORCE_HW={fhw} {label}")
+                print(f"  NODISPATCH FORCE_HW={fhw} {label} :: {info}")
     # Ironclad gate: any real worker FAIL is a hard fail.
     sys.exit(1 if tally["FAIL"] else 0)
 
