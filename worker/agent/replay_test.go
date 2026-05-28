@@ -61,6 +61,19 @@ type replayCapture struct {
 }
 
 func TestReplayCorpus(t *testing.T) {
+	// Initialize the HW dialect from WORKER_BACKEND, exactly as main()
+	// does at worker startup. Without this the replay binary (which
+	// never runs main) would leave activeDialect at its vaapiDialect{}
+	// default and validate the WRONG backend — e.g. emit scale_vaapi /
+	// h264_vaapi / init_hw_device vaapi against a NVENC corpus on a
+	// NVIDIA worker, producing spurious FAIL-argv. Set REPLAY_BACKEND
+	// (or WORKER_BACKEND) to pick; defaults to auto-probe like prod.
+	if b := os.Getenv("REPLAY_BACKEND"); b != "" {
+		t.Setenv("WORKER_BACKEND", b)
+	}
+	activeDialect = selectDialect()
+	t.Logf("replay backend: %s", activeDialect.backendName())
+
 	corpusDir := os.Getenv("REPLAY_CORPUS_DIR")
 	if corpusDir == "" {
 		home, _ := os.UserHomeDir()
