@@ -15,3 +15,6 @@ worker/agent/scaleplex-agent
 orchestrator/orchestrator
 orchestrator/scaleplex-orchestrator
 scaleplex-ffmpeg/.wip-patches/
+/agent
+__pycache__/
+*.pyc
