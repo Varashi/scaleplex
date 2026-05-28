@@ -36,6 +36,20 @@ WORKER_DS = os.environ.get("WORKER_DS", "plex-test-worker")
 WORKER_CONTAINER = os.environ.get("WORKER_CONTAINER", "app")
 MOVIE_SECTION = os.environ.get("SECTION", "1")
 
+# Worker control mode. "k8s" (default) drives the in-cluster Arc worker
+# DaemonSet (set env + rollout, kubectl logs). "docker" drives an external
+# compose worker over SSH (e.g. the NVIDIA worker on skw-d-frank) — recreate
+# the container to change FORCE_HW, read `docker logs`. For "docker" runs you
+# typically scale the Arc DS to 0 first so the orchestrator routes every
+# session to the external worker.
+WORKER_MODE = os.environ.get("WORKER_MODE", "k8s")
+WORKER_SSH = os.environ.get("WORKER_SSH", "")               # e.g. root@skw-d-frank.boeye.net
+WORKER_COMPOSE_DIR = os.environ.get("WORKER_COMPOSE_DIR", "/root/scaleplex-deploy")
+WORKER_DOCKER_NAME = os.environ.get("WORKER_DOCKER_NAME", "scaleplex-deploy-worker-1")
+# Seconds to wait after a docker-worker recreate for the agent to boot +
+# PUSH-re-register with the orchestrator before driving sessions.
+WORKER_DOCKER_SETTLE = float(os.environ.get("WORKER_DOCKER_SETTLE", "18"))
+
 # Recognized Plex-Web client identity → Plex loads a base profile (an
 # unrecognized platform 400s with "unable to find a matching profile").
 CLIENT_HEADERS = {
@@ -83,7 +97,21 @@ def kubectl(*args, timeout=200):
                           text=True, timeout=timeout)
 
 
+def _ssh(cmd, timeout=200):
+    return subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", WORKER_SSH, cmd],
+                          capture_output=True, text=True, timeout=timeout)
+
+
 def set_force_hw(val):
+    if WORKER_MODE == "docker":
+        # Rewrite the compose FORCE_HW env + recreate the container; the agent
+        # re-registers (PUSH) within a few seconds. Quoted value matches the
+        # `SCALEPLEX_FORCE_HW: "N"` compose form.
+        _ssh(f"cd {WORKER_COMPOSE_DIR} && "
+             f"sed -i 's/SCALEPLEX_FORCE_HW: .*/SCALEPLEX_FORCE_HW: \"{val}\"/' compose.yaml && "
+             f"docker compose up -d")
+        time.sleep(WORKER_DOCKER_SETTLE)
+        return
     kubectl("set", "env", f"ds/{WORKER_DS}", f"SCALEPLEX_FORCE_HW={val}")
     kubectl("rollout", "status", f"ds/{WORKER_DS}", "--timeout=180s")
 
@@ -92,6 +120,17 @@ def worker_pods():
     r = kubectl("get", "pods", "-l", "app.kubernetes.io/controller=worker",
                 "-o", "name")
     return [p.split("/", 1)[1] for p in r.stdout.split() if p.strip()]
+
+
+def worker_logs(since):
+    """Combined worker log text for the given lookback window.
+    k8s: concat of each Arc pod's logs. docker: the external container's logs."""
+    if WORKER_MODE == "docker":
+        return _ssh(f"docker logs {WORKER_DOCKER_NAME} --since={since} 2>&1").stdout
+    out = []
+    for pod in worker_pods():
+        out.append(kubectl("logs", pod, "-c", WORKER_CONTAINER, f"--since={since}").stdout)
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -188,22 +227,20 @@ def verify(title, since="40s"):
     spawned = first_seg = False
     tags = ""
     errors = []
-    for pod in worker_pods():
-        r = kubectl("logs", pod, "-c", WORKER_CONTAINER, f"--since={since}")
-        for line in r.stdout.splitlines():
-            if slug not in line:
-                continue
-            if "spawned ffmpeg" in line:
-                spawned = True
-            if "first segment ready" in line:
-                first_seg = True
-            mt = TAG_RE.search(line)
-            if mt:
-                tags = mt.group(1)
-            # error scan only on lines that aren't the source's stream dump
-            head = line.split("stderr_tail=", 1)[0]
-            if ERR_RE.search(head):
-                errors.append(ERR_RE.search(head).group(0))
+    for line in worker_logs(since).splitlines():
+        if slug not in line:
+            continue
+        if "spawned ffmpeg" in line:
+            spawned = True
+        if "first segment ready" in line:
+            first_seg = True
+        mt = TAG_RE.search(line)
+        if mt:
+            tags = mt.group(1)
+        # error scan only on lines that aren't the source's stream dump
+        head = line.split("stderr_tail=", 1)[0]
+        if ERR_RE.search(head):
+            errors.append(ERR_RE.search(head).group(0))
     ok = first_seg and not errors
     return {"ok": ok, "spawned": spawned, "first_seg": first_seg,
             "tags": tags, "errors": sorted(set(errors))}
