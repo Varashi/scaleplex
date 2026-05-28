@@ -164,6 +164,17 @@ func main() {
 	activeDialect = selectDialect()
 	log.Printf("worker backend: %s", activeDialect.backendName())
 
+	// L1 Plex-Pass warning (scaleplex#78). SCALEPLEX_FORCE_HW=1 and the
+	// cross-backend reshape both RE-ACCELERATE sessions onto HW that Plex
+	// would otherwise have emitted as SW. Plex HW transcoding is a Plex-Pass
+	// feature; using it without an active Pass on the PMS account is a TOS
+	// violation. The worker does not yet verify Pass (L2/L3 enforcement
+	// pending) — this WARN puts the operator on notice.
+	if envBool("SCALEPLEX_FORCE_HW") {
+		log.Printf("WARN: SCALEPLEX_FORCE_HW=1 — HW re-acceleration is a Plex-Pass-only feature; " +
+			"ensure the PMS account has an active Plex Pass. See scaleplex#78.")
+	}
+
 	engineSamplerInst = startEngineSampler()
 	log.Printf("gpu engines discovered: %d (mode=%s)", engineSamplerInst.numEngines(), engineSamplerInst.modeTag())
 
