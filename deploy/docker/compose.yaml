@@ -13,7 +13,7 @@
 # /dev/dri/renderD128); switch to NVIDIA by uncommenting the
 # `runtime: nvidia` + `NVIDIA_*` block and removing the device bind.
 # Mixed-backend hosts (both devices present) auto-pick NVIDIA; pin
-# via WORKER_BACKEND=vaapi/nvidia env.
+# via WORKER_BACKEND=vaapi/nvenc env ("nvidia" accepted as an alias).
 #
 # Adjust IMAGE_TAG, paths, and PMS_CLAIM in .env before `docker
 # compose up -d`.
@@ -129,7 +129,7 @@ services:
       # algo baked in.
       SCALEPLEX_TONEMAP: "${SCALEPLEX_TONEMAP:-opencl}"
       WORKER_MAX_SESSIONS: "${WORKER_MAX_SESSIONS:-0}"
-      # --- NVIDIA passthrough (uncomment when WORKER_BACKEND=nvidia /
+      # --- NVIDIA passthrough (uncomment when WORKER_BACKEND=nvenc /
       # auto on an NVIDIA host). The image bakes these as defaults but
       # explicit compose values are clearer for operators. ---
       # NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-all}"

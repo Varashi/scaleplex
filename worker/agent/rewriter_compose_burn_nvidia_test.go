@@ -12,7 +12,7 @@ import "testing"
 // useOpenCL=true to VAAPI). So `nv` here is the only NVIDIA shape; we
 // don't bother re-running every case under a useOpenCL=true variant.
 func TestComposeBurn_NVIDIA(t *testing.T) {
-	nv := tonemapConfig{algo: "hable", d: nvidiaDialect{}}
+	nv := tonemapConfig{algo: "hable", d: nvencDialect{}}
 
 	cases := []struct {
 		name      string
@@ -84,7 +84,7 @@ func TestComposeBurn_NVIDIA(t *testing.T) {
 // SCALEPLEX_TONEMAP env. SCALEPLEX_TONEMAP_ALGO still honored.
 func TestResolveTonemapConfig_NVIDIA_NoOpenCL(t *testing.T) {
 	prev := activeDialect
-	activeDialect = nvidiaDialect{}
+	activeDialect = nvencDialect{}
 	defer func() { activeDialect = prev }()
 
 	t.Run("default", func(t *testing.T) {
@@ -97,8 +97,8 @@ func TestResolveTonemapConfig_NVIDIA_NoOpenCL(t *testing.T) {
 		if c.algo != "hable" {
 			t.Errorf("default algo: got %q, want hable", c.algo)
 		}
-		if c.d.backendName() != "nvidia" {
-			t.Errorf("dialect: got %q, want nvidia", c.d.backendName())
+		if c.d.backendName() != "nvenc" {
+			t.Errorf("dialect: got %q, want nvenc", c.d.backendName())
 		}
 	})
 	t.Run("SCALEPLEX_TONEMAP=opencl is ignored on NVIDIA", func(t *testing.T) {

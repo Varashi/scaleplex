@@ -18,8 +18,10 @@ func TestSelectDialect(t *testing.T) {
 		{"vaapi pin", "vaapi", "vaapi"},
 		{"VAAPI uppercase", "VAAPI", "vaapi"},
 		{"vaapi padded", "  vaapi  ", "vaapi"},
-		{"nvidia pin", "nvidia", "nvidia"},
-		{"NVIDIA uppercase", "NVIDIA", "nvidia"},
+		{"nvenc pin", "nvenc", "nvenc"},
+		{"NVENC uppercase", "NVENC", "nvenc"},
+		{"nvidia alias → nvenc", "nvidia", "nvenc"},
+		{"NVIDIA alias uppercase", "NVIDIA", "nvenc"},
 		{"unknown falls back to vaapi", "intel-qsv", "vaapi"},
 	}
 	for _, tc := range cases {
@@ -32,7 +34,7 @@ func TestSelectDialect(t *testing.T) {
 		})
 	}
 	// "auto" is tested only for the negative path here — positive
-	// (/dev/nvidia0 present → nvidiaDialect) requires the dev box
+	// (/dev/nvidia0 present → nvencDialect) requires the dev box
 	// or a CDI-mocked fs and lives in integration tests.
 	t.Run("auto without /dev/nvidia0 falls back to vaapi", func(t *testing.T) {
 		t.Setenv("WORKER_BACKEND", "auto")
@@ -43,7 +45,7 @@ func TestSelectDialect(t *testing.T) {
 }
 
 func TestNvidiaDialect_EncoderMap(t *testing.T) {
-	d := nvidiaDialect{}
+	d := nvencDialect{}
 	want := map[string]string{
 		"libx264": "h264_nvenc",
 		"libx265": "hevc_nvenc",
@@ -69,7 +71,7 @@ func TestDialect_BackendIdentity(t *testing.T) {
 		wantFilterHWName string
 	}{
 		{"vaapi", vaapiDialect{}, "vaapi", "vaapi", "vaapi", "vaapi"},
-		{"nvidia", nvidiaDialect{}, "nvidia", "nvdec", "cuda", "cuda"},
+		{"nvenc", nvencDialect{}, "nvenc", "nvdec", "cuda", "cuda"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,8 +100,8 @@ func TestDialect_InitHWDeviceArg(t *testing.T) {
 	}{
 		{"vaapi devIdx ignored", vaapiDialect{}, 0, "vaapi=vaapi:"},
 		{"vaapi devIdx still ignored", vaapiDialect{}, 7, "vaapi=vaapi:"},
-		{"nvidia 0", nvidiaDialect{}, 0, "cuda=cuda:0"},
-		{"nvidia 3", nvidiaDialect{}, 3, "cuda=cuda:3"},
+		{"nvidia 0", nvencDialect{}, 0, "cuda=cuda:0"},
+		{"nvidia 3", nvencDialect{}, 3, "cuda=cuda:3"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -120,8 +122,8 @@ func TestDialect_ScaleFilter(t *testing.T) {
 	}{
 		{"vaapi nv12", vaapiDialect{}, "1280", "720", "nv12", "scale_vaapi=w=1280:h=720:format=nv12"},
 		{"vaapi p010 hdr stage", vaapiDialect{}, "3840", "2160", "p010", "scale_vaapi=w=3840:h=2160:format=p010"},
-		{"nvidia nv12", nvidiaDialect{}, "1280", "720", "nv12", "scale_cuda=w=1280:h=720:format=nv12"},
-		{"nvidia p010 hdr stage", nvidiaDialect{}, "3840", "2160", "p010", "scale_cuda=w=3840:h=2160:format=p010"},
+		{"nvidia nv12", nvencDialect{}, "1280", "720", "nv12", "scale_cuda=w=1280:h=720:format=nv12"},
+		{"nvidia p010 hdr stage", nvencDialect{}, "3840", "2160", "p010", "scale_cuda=w=3840:h=2160:format=p010"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,8 +144,8 @@ func TestDialect_TonemapFilter(t *testing.T) {
 	}{
 		{"vaapi ignores algo", vaapiDialect{}, "hable", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
 		{"vaapi empty algo same", vaapiDialect{}, "", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
-		{"nvidia hable nv12 — corpus shape", nvidiaDialect{}, "hable", "nv12", "tonemap_cuda=tonemap=hable:format=nv12"},
-		{"nvidia bt2390 nv12", nvidiaDialect{}, "bt2390", "nv12", "tonemap_cuda=tonemap=bt2390:format=nv12"},
+		{"nvidia hable nv12 — corpus shape", nvencDialect{}, "hable", "nv12", "tonemap_cuda=tonemap=hable:format=nv12"},
+		{"nvidia bt2390 nv12", nvencDialect{}, "bt2390", "nv12", "tonemap_cuda=tonemap=bt2390:format=nv12"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -155,7 +157,7 @@ func TestDialect_TonemapFilter(t *testing.T) {
 }
 
 func TestDialect_HWUploadDownload(t *testing.T) {
-	for _, d := range []dialect{vaapiDialect{}, nvidiaDialect{}} {
+	for _, d := range []dialect{vaapiDialect{}, nvencDialect{}} {
 		t.Run(d.backendName(), func(t *testing.T) {
 			if got := d.hwUploadFilter(); got != "hwupload" {
 				t.Errorf("hwUploadFilter: got %q, want hwupload", got)
@@ -172,7 +174,7 @@ func TestNvidiaDialect_SharedMaps(t *testing.T) {
 	// VAAPI — Plex's SW decoder names + HW-decode short codecs don't
 	// depend on the worker's HW backend.
 	v := vaapiDialect{}
-	n := nvidiaDialect{}
+	n := nvencDialect{}
 	if len(v.decoderMap()) != len(n.decoderMap()) {
 		t.Errorf("decoderMap diverges: vaapi=%d nvidia=%d", len(v.decoderMap()), len(n.decoderMap()))
 	}
