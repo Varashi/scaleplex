@@ -2,6 +2,43 @@
 
 ## [1.9.0](https://github.com/Varashi/scaleplex/compare/v1.8.0...v1.9.0) (2026-05-28)
 
+### Images shipped
+
+| Image | Tag | Status |
+|---|---|---|
+| `scaleplex_worker` | `v1.9.0` | **new** — NVIDIA (`nvenc`) dialect, cross-backend reshape, CPU `swDialect`, Pass-gate L1/L3 |
+| `scaleplex_orchestrator` | `v1.4.0` | **new** — capability-aware routing + configurable LB scheduling |
+| `scaleplex_pms_dockermod` | `v1.3.0` | **new** — Pass-gate L2 (shim reads `Preferences.xml`) |
+
+The headline of 1.9.0 is **heterogeneous-fleet support** (epic #77). A worker
+now reshapes *any* incoming argv — VAAPI, NVENC, or software — to its own
+backend, so a single orchestrator can front a mix of Intel-Arc, NVIDIA, and
+CPU-only workers regardless of what GPU (if any) the PMS host advertised when
+it built the command line. The worker auto-detects its backend at startup
+(`/dev/nvidia0` → nvenc, else `/dev/dri/renderD*` → vaapi, else sw) or honors
+an explicit `WORKER_BACKEND`. A new `swDialect` gives full CPU-only fallback.
+
+The orchestrator gains **capability-aware routing**: each worker reports its
+backend on `/capability`, and `schedule()` tiers HW-capable workers ahead of
+CPU-only ones (`SCALEPLEX_PREFER_HW`), with a configurable load-balancing
+strategy within a tier (`SCALEPLEX_LB_STRATEGY` = `load` | `round-robin` |
+`least-sessions` | `random`).
+
+A three-layer **Plex-Pass gate** guards HW re-acceleration so the fork is only
+used where Plex's own licensing would permit it: L1 warns at worker startup,
+L2 has the shim read the PMS `Preferences.xml` subscription state into
+`SCALEPLEX_PASS_ACTIVE` per session, and L3 fails closed in the worker if the
+session is unlicensed (overridable via `SCALEPLEX_FORCE_HW=1`, the homelab
+default).
+
+Testing is now **API-driven and exhaustive** (#96): `test/qa_matrix.py` drives
+real Plex playback across every transcode shape (HLS + DASH, SDR/HDR,
+text/bitmap sub-burn, audio-only mkv, Windows seg-mkv) and classifies each
+cell PASS/FAIL/SKIP/NODISPATCH with spawn-confirmation and Plex/orchestrator
+log cross-checks — a `SKIP` is verified as a genuine direct-stream decision in
+PMS logs, and `NODISPATCH` (which should never happen) triggers orchestrator
+forensics.
+
 
 ### Features
 
