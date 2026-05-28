@@ -14,59 +14,92 @@ import (
 	"strings"
 )
 
-// swTonemapBody is the CPU HDR(bt2020 PQ/HLG)→SDR(bt709) tonemap chain, WITHOUT
-// a trailing format node (composeBurnSW appends Plex's `format=pix_fmts=...`).
-// Standard jellyfin zscale→tonemap→zscale form.
-//
-// NOTE: CONSTRUCTED — plex-test never emits a pure-SW HDR chain (its PMS
-// HW-decodes HDR even when SW-encoding), so this isn't corpus-matched yet.
-// Pending a real capture (flip plex-test PMS HardwareAcceleratedCodecs=0 + play
-// a 4K HDR title) to replace with Plex's genuine shape.
-func swTonemapBody(algo string) string {
+// swDecoderForShort is the inverse of decoderMap: a bare short codec → Plex's SW
+// decoder lib (av1→libdav1d, hevc→libhevc, h264→libx264). Used by
+// reshapeToSoftware to turn a HW-decode hint into a CPU decoder. Derived from
+// decoderMap so it stays in sync.
+var swDecoderForShort = func() map[string]string {
+	m := make(map[string]string, len(decoderMap))
+	for lib, short := range decoderMap {
+		m[short] = lib
+	}
+	return m
+}()
+
+// swTonemapNode is Plex's stock CPU HDR→SDR tonemap node, captured verbatim
+// from a plex-test software session (HardwareAcceleratedCodecs=0 +
+// TranscoderToneMapping=1, client forced to SDR): `format=p010,tonemap=<algo>`.
+// The algo is the server's TranscoderToneMapAlgorithm (mobius/hable/…), carried
+// through from the source argv (facts.algo). composeBurnSW inserts this between
+// the main scale and the final pix_fmts format, exactly as Plex does. Only
+// emitted when the source argv declared a tonemap (burnSpec.hdr) — Plex omits it
+// when the client advertises HDR (passthrough), and so do we.
+func swTonemapNode(algo string) string {
 	if !validTonemapAlgo(algo) {
 		algo = "hable"
 	}
-	return "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709," +
-		"tonemap=tonemap=" + algo + ":desat=0," +
-		"zscale=t=bt709:m=bt709:r=tv"
+	return "format=p010,tonemap=" + algo
 }
 
-// swTonemapChain is swTonemapBody with the trailing format — the form
-// swDialect.tonemapFilter returns for interface completeness (not on the
-// composeBurnSW path).
+// swTonemapChain is the swDialect.tonemapFilter return (interface completeness;
+// NOT on the composeBurnSW path, which builds the node inline).
 func swTonemapChain(algo, pix string) string {
-	return swTonemapBody(algo) + ",format=" + pix
+	return swTonemapNode(algo) + ",format=" + pix
 }
 
-// composeBurnSW is the pure-software analog of composeBurn. [0:0] is a CPU frame
-// (SW decode), so there's no hwupload / HW surface. Emits Plex's captured SW
-// shape: SW scale → [SW tonemap]? → format=pix_fmts=yuv420p|nv12 → [inlineass]?.
-// vaResident is ignored (always sysmem). Bitmap subs are NOT handled here (the
-// caller defers them, mirroring the HW cross-backend bitmap deferral, #76).
+// composeBurnSW is the pure-software analog of composeBurn, emitting Plex's
+// stock CPU filtergraph shapes verbatim (captured from plex-test software
+// sessions) so the fork sees stock-Plex args — no SW-specific patch needed.
+// [0:0] is a CPU frame (SW decode), so there's no hwupload / HW surface.
+//
+//	SDR no-sub:  [0:0]scale=W:H:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1]
+//	HDR:         …[0];[0]format=p010,tonemap=ALGO[1];[1]format=pix_fmts=…[2]
+//	text-sub:    …[fmt];[fmt]inlineass=PARAMS[out]
+//	bitmap-sub:  [0:N]scale=W:H[s];[0:0]scale=…[v];[v]…format…[fmt];[fmt][s]overlay[out]
+//
+// vaResident + animatedTierDown are ignored (CPU; Plex flattens animated ASS to
+// an SRT sidecar → the text/inlineass path).
 func (tm tonemapConfig) composeBurnSW(s burnSpec) (filter, newLabel string) {
 	n := 0
 	next := func() string { l := strconv.Itoa(n); n++; return l }
 	var b strings.Builder
 
+	// Bitmap sub: the image stream is sub2video-scaled to output size UP FRONT
+	// (gets label 0, matching Plex's node ordering), overlaid after the main
+	// chain.
+	bitmap := s.burnSub && s.subKind == "bitmap"
+	subLabel := ""
+	if bitmap {
+		subLabel = next()
+		fmt.Fprintf(&b, "[%s]scale=%s:%s[%s];", s.subSpec, s.w, s.h, subLabel)
+	}
+
 	scaled := next()
 	fmt.Fprintf(&b, "[0:0]scale=w=%s:h=%s:force_divisible_by=4[%s]", s.w, s.h, scaled)
+	cur := scaled
 
-	fmtLabel := next()
 	if s.hdr {
-		fmt.Fprintf(&b, ";[%s]%s,format=pix_fmts=yuv420p|nv12[%s]", scaled, swTonemapBody(s.algo), fmtLabel)
-	} else {
-		fmt.Fprintf(&b, ";[%s]format=pix_fmts=yuv420p|nv12[%s]", scaled, fmtLabel)
+		tmL := next()
+		fmt.Fprintf(&b, ";[%s]%s[%s]", cur, swTonemapNode(s.algo), tmL)
+		cur = tmL
 	}
-	out := fmtLabel
+
+	fmtL := next()
+	fmt.Fprintf(&b, ";[%s]format=pix_fmts=yuv420p|nv12[%s]", cur, fmtL)
+	cur = fmtL
 
 	if s.burnSub {
 		o := next()
-		// Plex's SW inlineass carries only its font params (no render_height —
-		// that's a HW-band optimization). Preserve Plex's params verbatim.
-		fmt.Fprintf(&b, ";[%s]inlineass=%s[%s]", fmtLabel, s.subParams, o)
-		out = o
+		if bitmap {
+			fmt.Fprintf(&b, ";[%s][%s]overlay[%s]", cur, subLabel, o)
+		} else {
+			// Text: Plex's inlineass with its font params verbatim (no
+			// render_height — that's a HW-band optimization).
+			fmt.Fprintf(&b, ";[%s]inlineass=%s[%s]", cur, s.subParams, o)
+		}
+		cur = o
 	}
-	return b.String(), "[" + out + "]"
+	return b.String(), "[" + cur + "]"
 }
 
 // reshapeToSoftware downgrades an incoming argv to a pure-CPU pipeline for a
@@ -112,10 +145,27 @@ func reshapeToSoftware(args []string, tm tonemapConfig) ([]string, []string) {
 		changes = append(changes, TagToSWStripHWDecode)
 	}
 
-	// 2. Filter graph → SW (foreign HW graphs only; SW graphs are kept).
+	// 1b. Decoder: once hwaccel is gone, Plex's bare short-codec HW-decode hint
+	// (`hevc`/`av1`/`h264`) must become its SW decoder lib (`libhevc`/`libdav1d`/
+	// `libx264`) — both so it decodes on the CPU and so it matches Plex's stock
+	// SW decoder shape (the rewriter's decoder phase + the drop-in goal). An
+	// already-SW decoder lib (Plex emitted SW) is left untouched. The decoder
+	// slot is the first `-codec:0`, before `-i`.
+	if dc := indexOfArg(args, "-codec:0", 0); dc >= 0 && dc+1 < len(args) {
+		if in := indexOfArg(args, "-i", 0); in < 0 || dc < in {
+			if sw, ok := swDecoderForShort[args[dc+1]]; ok {
+				changes = append(changes, TagPrefixToSWDecode+args[dc+1]+"->"+sw)
+				args[dc+1] = sw
+			}
+		}
+	}
+
+	// 2. Filter graph → SW (foreign HW graphs only; an already-SW `[0:0]scale=w=`
+	// graph is Plex's own shape — honor-source keeps it). Text + bitmap both
+	// handled (composeBurnSW emits inlineass / sub2video→overlay respectively).
 	if vfIdx := filterComplexIndex(args); vfIdx >= 0 && !isSWFilterGraph(args[vfIdx]) {
 		facts := extractGraphFacts(args[vfIdx], nil)
-		if facts.ok && facts.subKind != "bitmap" {
+		if facts.ok {
 			oldLabel := ""
 			if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
 				oldLabel = "[" + m[1] + "]"
@@ -125,8 +175,10 @@ func reshapeToSoftware(args []string, tm tonemapConfig) ([]string, []string) {
 				h:         facts.h,
 				hdr:       facts.hdr,
 				algo:      facts.algo,
-				burnSub:   facts.subKind == "text",
+				burnSub:   facts.subKind != "",
 				subParams: facts.subParams,
+				subKind:   facts.subKind,
+				subSpec:   facts.subSpec,
 			})
 			args[vfIdx] = nf
 			retargetMapLabel(args, oldLabel, nl)

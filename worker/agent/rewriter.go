@@ -600,6 +600,13 @@ type burnSpec struct {
 	// are unaffected. Caller computes via subtitleIsAnimated(); ignored on
 	// !burnSub.
 	animatedTierDown bool
+	// subKind + subSpec: SW path only (composeBurnSW). subKind distinguishes
+	// "text" (inlineass) from "bitmap" (sub2video→overlay, Plex's stock SW PGS
+	// shape); subSpec is the bitmap subtitle stream spec (e.g. "0:5") overlaid.
+	// The HW composeBurn ignores these (it uses burnSub for text + the unified
+	// inlineass bitmap branch).
+	subKind string
+	subSpec string
 }
 
 // composeBurn builds the orthogonal stage chain and returns the filtergraph
@@ -2012,6 +2019,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				args = reshaped
 				changes = append(changes, ccChanges...)
 			}
+		}
+		// reshapeToSoftware REMOVES args (strips HW decode flags), changing the
+		// arg length — unlike reshapeForeignHWArgv's in-place value swaps. Recompute
+		// inputIdx so the decoder/encoder phases below index the right -i.
+		inputIdx = indexOfArg(args, "-i", 0)
+		if inputIdx < 0 {
+			return bail(TagBailReasonNoInput)
 		}
 
 		// 1. Decoder.

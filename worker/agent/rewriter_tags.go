@@ -88,6 +88,7 @@ const (
 	TagPrefixToSW                        = "to-sw:"                                   // <sourceBackend>  (#77 PR3 — swDialect downgrade)
 	TagPrefixToSWFilter                  = "to-sw:filter:"                            // <composeMode>
 	TagPrefixToSWEncode                  = "to-sw:encode:"                            // <hwEncoder>-><swEncoder>
+	TagPrefixToSWDecode                  = "to-sw:decode:"                            // <shortCodec>-><swDecoderLib>
 )
 
 // Bail-only reason strings — passed to bail() which produces `"skip:" + reason`.

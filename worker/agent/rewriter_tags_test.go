@@ -463,6 +463,7 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagPrefixToSW":                        "to-sw:",
 		"TagPrefixToSWFilter":                  "to-sw:filter:",
 		"TagPrefixToSWEncode":                  "to-sw:encode:",
+		"TagPrefixToSWDecode":                  "to-sw:decode:",
 
 		// TagBailReason* static bail() arguments
 		"TagBailReasonHWDecodeSubBitmapUnsupported": "hw-decode-sub:bitmap-unsupported",
