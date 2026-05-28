@@ -62,7 +62,11 @@ func hwAccelAllowed(inputEnv map[string]string) bool {
 	// — trust it directly and skip the per-session HTTP probe (which can flake
 	// and fail-closed a legit Pass user into degraded SW). "1" → allow, anything
 	// else ("0") → deny. Absent → fall through to the L3 HTTP probe below.
-	if v := envFrom(inputEnv, "SCALEPLEX_PASS_ACTIVE"); v != "" {
+	//
+	// Read from the PER-SESSION inputEnv ONLY (not envFrom, which also reads the
+	// worker process env): a static worker-level SCALEPLEX_PASS_ACTIVE would
+	// defeat the per-spawn freshness contract + could mis-gate every session.
+	if v, ok := inputEnv["SCALEPLEX_PASS_ACTIVE"]; ok && v != "" {
 		return v == "1"
 	}
 
