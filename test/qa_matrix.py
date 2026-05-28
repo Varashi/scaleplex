@@ -65,6 +65,19 @@ CLIENT_HEADERS = {
     "X-Plex-Model": "hosted",
 }
 
+# Plex-for-Windows identity → Plex emits the segmented-matroska output muxer
+# (-f segment -segment_format matroska), a distinct worker path vs Web's DASH /
+# HLS-mpegts. Used by the windows-mkv muxer case.
+WINDOWS_HEADERS = {
+    "X-Plex-Product": "Plex for Windows",
+    "X-Plex-Version": "1.112.0",
+    "X-Plex-Platform": "Windows",
+    "X-Plex-Platform-Version": "10",
+    "X-Plex-Device": "Windows",
+    "X-Plex-Device-Name": "scaleplex-QA-win",
+    "X-Plex-Model": "standalone",
+}
+
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
     "HardwareAcceleratedCodecs": [1, 0],     # HW decode
@@ -145,6 +158,38 @@ def worker_logs(since):
     return "\n".join(out)
 
 
+PMS_POD_PREFIX = os.environ.get("PMS_POD_PREFIX", f"{NS}-pms")
+ORCH_POD_PREFIX = os.environ.get("ORCH_POD_PREFIX", f"{NS}-orchestrator")
+
+
+def _pod_by_prefix(prefix):
+    r = kubectl("get", "pods", "-o", "name")
+    for p in r.stdout.split():
+        n = p.split("/", 1)[1] if "/" in p else p
+        if n.startswith(prefix):
+            return n
+    return ""
+
+
+def pms_logs(since):
+    """plex-test PMS pod logs (the 'plex' container) — the Plex-side ground
+    truth for SKIP/NODISPATCH cross-checks (decision + transcode-session spawn).
+    k8s only; empty in docker mode."""
+    if WORKER_MODE == "docker":
+        return ""
+    pod = _pod_by_prefix(PMS_POD_PREFIX)
+    return kubectl("logs", pod, "-c", "plex", f"--since={since}").stdout if pod else ""
+
+
+def orch_logs(since):
+    """Orchestrator pod logs — did the PMS-side shim's /task reach the
+    orchestrator + get dispatched? Used to localize a NODISPATCH."""
+    if WORKER_MODE == "docker":
+        return ""
+    pod = _pod_by_prefix(ORCH_POD_PREFIX)
+    return kubectl("logs", pod, f"--since={since}").stdout if pod else ""
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -188,38 +233,129 @@ def content_streams(rk):
     return aud, sub
 
 
+SUB_TEXT = {"srt", "subrip", "ass", "ssa", "webvtt", "mov_text"}
+SUB_BITMAP = {"pgs", "pgssub", "vobsub", "dvd_subtitle", "dvdsub"}
+
+
+def find_sub_stream(rk):
+    """Return {'text': id, 'bitmap': id} of the first matching subtitle stream
+    IDs on this item (for forcing sub-burn). Missing kinds are absent."""
+    code, body = plex(f"/library/metadata/{rk}")
+    out = {}
+    if code != 200:
+        return out
+    for sid, codec in re.findall(r"<Stream id=\"(\d+)\"[^>]*?streamType=\"3\"[^>]*?codec=\"([a-z0-9_]+)\"", body):
+        c = codec.lower()
+        if c in SUB_TEXT and "text" not in out:
+            out["text"] = sid
+        elif c in SUB_BITMAP and "bitmap" not in out:
+            out["bitmap"] = sid
+    return out
+
+
+def build_cases(content):
+    """Curate a content/subtitle case list that exercises every worker SHAPE
+    axis: resolution + HDR (via content) and subtitle kind none/text/bitmap
+    (via forced burn). Decode/encode/HDR-tonemap come from the server-pref
+    axis; protocol (hls/dash) is layered in the main loop. One representative
+    item per axis-value, discovered from the library."""
+    def first(pred):
+        return next((c for c in content if pred(c)), None)
+
+    def case(rk, title, label, extra=None, client=None, protocols=None):
+        return {"rk": rk, "title": title, "label": label,
+                "extra": extra or {}, "client": client, "protocols": protocols}
+
+    cases = []
+    sdr1080 = first(lambda c: c[3] in ("1080", "720") and c[4] == "sdr")
+    # The section listing omits colorTrc, so HDR items mislabel as "sdr" — confirm
+    # via the metadata call (is_hdr). Prefer a 4K HDR item; fall back to any HDR.
+    hdr4k = first(lambda c: c[3] == "4k" and is_hdr(c[0])) or first(lambda c: is_hdr(c[0]))
+    if sdr1080:
+        cases.append(case(sdr1080[0], sdr1080[1], "sdr-nosub"))
+    if hdr4k:
+        cases.append(case(hdr4k[0], hdr4k[1], "hdr-nosub"))
+    # sub-burn: scan content for items carrying a text / bitmap sub stream.
+    text_done = bitmap_done = False
+    for rk, title, *_ in content:
+        if text_done and bitmap_done:
+            break
+        subs = find_sub_stream(rk)
+        if not text_done and "text" in subs:
+            cases.append(case(rk, title, "text-burn",
+                              {"subtitleStreamID": subs["text"], "subtitles": "burn"}))
+            text_done = True
+        if not bitmap_done and "bitmap" in subs:
+            cases.append(case(rk, title, "bitmap-burn",
+                              {"subtitleStreamID": subs["bitmap"], "subtitles": "burn"}))
+            bitmap_done = True
+
+    # Muxer coverage beyond the protocol param (the HLS segment container +
+    # Plex-Windows shapes the corpus showed are real):
+    #  - ssegment+matroska: force mpegts-INCOMPATIBLE audio kept as-is
+    #    (directStreamAudio=1) on an EAC3/TrueHD/DTS title → Plex picks mkv
+    #    segments over .ts. hls only.
+    #  - segment+matroska: a Plex-for-Windows client → its native seg-mkv muxer.
+    AUDIO_MKV = {"eac3", "truehd", "dca", "dts", "mlp"}
+    audio_item = None
+    for rk, title, *_ in content:
+        aud, _ = content_streams(rk)
+        if aud & AUDIO_MKV:
+            audio_item = (rk, title, sorted(aud & AUDIO_MKV)[0])
+            break
+    if audio_item:
+        cases.append(case(audio_item[0], audio_item[1], f"audio-mkv({audio_item[2]})",
+                          {"directStreamAudio": 1}, protocols=["hls"]))
+    win_item = sdr1080 or hdr4k or (content[0] if content else None)
+    if win_item:
+        cases.append(case(win_item[0], win_item[1], "windows-segmkv",
+                          client=WINDOWS_HEADERS, protocols=["hls"]))
+    return cases
+
+
 # ---------------------------------------------------------------------------
 
 
-def start_session(rating_key, extra_params=None):
-    sid = str(uuid.uuid4())
-    params = {
+def build_params(rating_key, sid, proto, extra):
+    p = {
         "hasMDE": 1, "path": f"/library/metadata/{rating_key}",
-        "mediaIndex": 0, "partIndex": 0, "protocol": "hls", "fastSeek": 1,
+        "mediaIndex": 0, "partIndex": 0, "protocol": proto, "fastSeek": 1,
         "directPlay": 0, "directStream": 0, "directStreamAudio": 0,
         "subtitleSize": 100, "audioBoost": 100, "location": "lan",
         "mediaBufferSize": 50000, "videoQuality": 100,
         "session": sid, "X-Plex-Session-Identifier": sid,
     }
-    params.update(extra_params or {})
-    # X-Plex-Client-Identifier must be a HEADER, consistent across decision +
-    # start, so Plex binds the session + spawns the transcode (as a param it
-    # 200s but never reaches the worker).
-    hdrs = {**CLIENT_HEADERS, "X-Plex-Client-Identifier": f"qa-{sid[:8]}"}
-    # hasMDE=1 requires a transcode DECISION before start.m3u8 will serve
-    # ("Denying access due to session lacking decision" → 400 otherwise).
-    plex("/video/:/transcode/universal/decision", params, headers=hdrs, timeout=30)
-    code, body = plex("/video/:/transcode/universal/start.m3u8", params,
-                      headers=hdrs, timeout=30)
-    # Transcode is lazy: start.m3u8 returns a master playlist with a RELATIVE
-    # index URL (session/<guid>/base/index.m3u8). Fetching the resolved index
-    # is what actually spawns ffmpeg + produces the first segment.
+    p.update(extra or {})
+    return p
+
+
+def transcode_decision(params, hdrs):
+    """Return (video_decision, code). The MDE decision body marks each Stream
+    with decision="transcode|copy|directplay"; we read the VIDEO stream
+    (streamType="1"). Only 'transcode' is a worker test — 'copy' (remux) /
+    'directplay' mean PMS won't feed the worker an encode (→ SKIP). Attr order
+    varies, so match within each <Stream> tag."""
+    code, body = plex("/video/:/transcode/universal/decision", params, headers=hdrs, timeout=30)
+    for stream in re.findall(r'<Stream\b[^>]*>', body):
+        if 'streamType="1"' in stream:
+            d = re.search(r'decision="([a-z]+)"', stream)
+            if d:
+                return d.group(1), code
+    return "", code
+
+
+def trigger_spawn(params, hdrs):
+    """Force the lazy ffmpeg spawn: fetch the manifest then follow its first
+    resolved sub-URLs (HLS index → segment). Idempotent — safe to re-call as a
+    retry when the worker hasn't spawned yet."""
+    code, body = plex("/video/:/transcode/universal/start.m3u8", params, headers=hdrs, timeout=30)
     if code == 200:
-        for rel in [ln.strip() for ln in body.splitlines()
-                    if ln.strip() and not ln.startswith("#")][:1]:
+        for rel in [s for s in (ln.strip() for ln in body.splitlines())
+                    if s and not s.startswith("#")][:2]:
             plex(f"/video/:/transcode/universal/{rel}",
-                 {"X-Plex-Session-Identifier": sid}, headers=hdrs, timeout=20)
-    return sid, code
+                 {"X-Plex-Session-Identifier": params["X-Plex-Session-Identifier"]},
+                 headers=hdrs, timeout=20)
+    return code
 
 
 def stop_session(sid):
@@ -233,9 +369,7 @@ ERR_RE = re.compile(
 TAG_RE = re.compile(r"rewriter applied: ([^\"]+)")
 
 
-def verify(title, since="40s"):
-    """Grep worker logs for this title's session; classify pass/fail."""
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")[:18]
+def _scan_logs(slug, since):
     spawned = first_seg = False
     tags = ""
     errors = []
@@ -249,13 +383,86 @@ def verify(title, since="40s"):
         mt = TAG_RE.search(line)
         if mt:
             tags = mt.group(1)
-        # error scan only on lines that aren't the source's stream dump
-        head = line.split("stderr_tail=", 1)[0]
-        if ERR_RE.search(head):
-            errors.append(ERR_RE.search(head).group(0))
-    ok = first_seg and not errors
-    return {"ok": ok, "spawned": spawned, "first_seg": first_seg,
-            "tags": tags, "errors": sorted(set(errors))}
+        head = line.split("stderr_tail=", 1)[0]  # skip the source stream dump
+        m = ERR_RE.search(head)
+        if m:
+            errors.append(m.group(0))
+    return spawned, first_seg, tags, errors
+
+
+def _poll_logs(slug, started_at, max_wait, want_seg):
+    """Poll worker logs in a window that grows only from started_at (so it can't
+    reach a prior same-slug case — see drive_cell). Stops once the wanted signal
+    (spawn, or first-segment when want_seg) or an error appears, or on timeout."""
+    spawned = first_seg = False
+    tags = ""
+    errors = []
+    while True:
+        elapsed = int(time.time() - started_at) + 4
+        spawned, first_seg, tags, errors = _scan_logs(slug, f"{elapsed}s")
+        hit = errors or (first_seg if want_seg else spawned)
+        if hit or time.time() - started_at >= max_wait:
+            break
+        time.sleep(2)
+    return spawned, first_seg, tags, errors
+
+
+def drive_cell(case, proto, settle):
+    """Drive one cell to an AUTHORITATIVE verdict:
+      SKIP       — PMS chose not to transcode (directplay/copy) → not a worker test
+      NODISPATCH — PMS decided transcode but no ffmpeg ever spawned (harness/
+                   orchestrator dispatch miss; retried) → not a worker correctness fail
+      PASS       — worker spawned + produced a first segment, no errors
+      FAIL       — worker spawned but errored, or produced no segment
+    Returns (status, info, sid)."""
+    sid = str(uuid.uuid4())
+    params = build_params(case["rk"], sid, proto, case["extra"])
+    hdrs = {**(case["client"] or CLIENT_HEADERS), "X-Plex-Client-Identifier": f"qa-{sid[:8]}"}
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", case["title"]).strip("_")[:18]
+
+    vdec, dcode = transcode_decision(params, hdrs)
+    if dcode != 200:
+        return "FAIL", {"reason": f"decision={dcode}"}, sid
+
+    # Trigger + confirm a worker spawn (re-trigger the lazy spawn). Run for BOTH
+    # decisions so SKIP is cross-checked: a genuine non-transcode must NOT spawn
+    # a worker.
+    started = time.time()
+    spawned = False
+    errs = []
+    for _ in range(1 if vdec != "transcode" else 4):
+        trigger_spawn(params, hdrs)
+        spawned, _, _, errs = _poll_logs(slug, started, min(8, settle), want_seg=False)
+        if spawned or errs:
+            break
+
+    if vdec != "transcode":
+        if not (spawned or errs):
+            # Genuine SKIP — Plex chose copy/directplay AND no worker ran.
+            # Double-check against the PMS log (Frank: confirm it really was a
+            # direct-stream decision).
+            pms = pms_logs("90s")
+            return "SKIP", {"video_decision": vdec or "none",
+                            "pms_directplay": bool(re.search(r"(?i)direct ?(play|stream)", pms))
+                            if pms else None}, sid
+        # else: decision read non-transcode but a worker DID run → not a real
+        # skip; fall through and verify it like a transcode.
+
+    if not spawned and not errs:
+        # NODISPATCH should never happen for a real transcode — capture PMS +
+        # orchestrator evidence to localize where the dispatch dropped.
+        pms = pms_logs("120s")
+        orch = orch_logs("120s")
+        return "NODISPATCH", {"reason": "decided-transcode, no worker spawn (4 triggers)",
+                              "pms_started_transcode": bool(re.search(r"(?i)transcod", pms)),
+                              "orch_got_task": ("/task" in orch or sid[:8] in orch)}, sid
+
+    _, seg, tags, errors = _poll_logs(slug, started, settle, want_seg=True)
+    if errors:
+        return "FAIL", {"errors": sorted(set(errors)), "tags": tags}, sid
+    if seg:
+        return "PASS", {"tags": tags}, sid
+    return "FAIL", {"reason": "spawned, no first-segment", "tags": tags}, sid
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +482,9 @@ def main():
     ap.add_argument("--quick", action="store_true", help="small slice, FORCE_HW=1 only")
     ap.add_argument("--force-hw", default="1,0", help="comma list, e.g. 1,0")
     ap.add_argument("--settle", type=float, default=12, help="secs to wait per session")
+    ap.add_argument("--protocols", default="hls,dash", help="comma list, e.g. hls,dash")
     args = ap.parse_args()
+    protocols = [p.strip() for p in args.protocols.split(",") if p.strip()]
     if not TOKEN:
         sys.exit("set PLEX_TOKEN")
 
@@ -300,8 +509,17 @@ def main():
                 rich = c
                 break
     rich = rich or content[0]
+    cases = build_cases(content)
+    if not cases:  # fall back to the single rich backbone if discovery is thin
+        cases = [{"rk": rich[0], "title": rich[1], "label": "backbone",
+                  "extra": {}, "client": None, "protocols": None}]
     print(f"backbone content: {rich[0]} {rich[1]} ({rich[2]}/{rich[3]}/{rich[4]})")
-    print(f"discovered {len(content)} content shapes\n")
+    print(f"discovered {len(content)} content shapes; cases:")
+    for c in cases:
+        ps = c["protocols"] or protocols
+        print(f"  - {c['label']}: {c['title']} (rk={c['rk']}) protos={ps}"
+              f"{' [windows]' if c['client'] else ''}")
+    print(f"default protocols: {protocols}\n")
 
     fhw_vals = [1] if args.quick else [int(x) for x in args.force_hw.split(",")]
     combos = server_combos(args.quick)
@@ -314,23 +532,35 @@ def main():
                 print(f"  PREFS-FAIL {combo}")
                 continue
             time.sleep(2)
-            label = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
-                             for k, v in combo.items())
-            sid, code = start_session(rich[0])
-            time.sleep(args.settle)
-            res = verify(rich[1]) if code == 200 else {"ok": False, "errors": [f"start={code}"], "tags": "", "spawned": False, "first_seg": False}
-            stop_session(sid)
-            status = "PASS" if res["ok"] else "FAIL"
-            results.append((fhw, label, status, res))
-            print(f"  [{status}] FORCE_HW={fhw} {label} "
-                  f"seg={res['first_seg']} err={res['errors']}")
-            time.sleep(2)
+            plabel = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
+                              for k, v in combo.items())
+            for c in cases:
+                for proto in (c["protocols"] or protocols):
+                    label = f"{c['label']}/{proto} | {plabel}"
+                    status, info, sid = drive_cell(c, proto, args.settle)
+                    stop_session(sid)
+                    results.append((fhw, label, status, info))
+                    print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
+                    time.sleep(4)  # let this session's logs age out of the next cell's window
 
-    npass = sum(1 for *_, r in results if r["ok"])
-    print(f"\n=== {npass}/{len(results)} PASS ===")
-    for fhw, label, status, res in results:
-        if not res["ok"]:
-            print(f"  FAIL FORCE_HW={fhw} {label} :: {res['errors']} tags={res['tags'][:80]}")
+    from collections import Counter
+    tally = Counter(s for *_, s, _ in results)
+    worker_cells = tally["PASS"] + tally["FAIL"]
+    print(f"\n=== worker: {tally['PASS']}/{worker_cells} PASS "
+          f"| SKIP(no-transcode)={tally['SKIP']} | NODISPATCH={tally['NODISPATCH']} "
+          f"| total cells={len(results)} ===")
+    if tally["FAIL"]:
+        print("FAILURES (worker errored / no segment):")
+        for fhw, label, status, info in results:
+            if status == "FAIL":
+                print(f"  FAIL FORCE_HW={fhw} {label} :: {info}")
+    if tally["NODISPATCH"]:
+        print("NODISPATCH (decided-transcode but never reached the worker — investigate dispatch):")
+        for fhw, label, status, info in results:
+            if status == "NODISPATCH":
+                print(f"  NODISPATCH FORCE_HW={fhw} {label} :: {info}")
+    # Ironclad gate: any real worker FAIL is a hard fail.
+    sys.exit(1 if tally["FAIL"] else 0)
 
 
 if __name__ == "__main__":
