@@ -14,17 +14,16 @@ import (
 	"strings"
 )
 
-// swDecoderForShort is the inverse of decoderMap: a bare short codec → Plex's SW
-// decoder lib (av1→libdav1d, hevc→libhevc, h264→libx264). Used by
-// reshapeToSoftware to turn a HW-decode hint into a CPU decoder. Derived from
-// decoderMap so it stays in sync.
-var swDecoderForShort = func() map[string]string {
-	m := make(map[string]string, len(decoderMap))
-	for lib, short := range decoderMap {
-		m[short] = lib
-	}
-	return m
-}()
+// swDecoderForShort maps a bare short codec (Plex's HW-decode hint) to the SW
+// decoder Plex actually uses for CPU decode, captured from plex-test full-SW
+// sessions: av1→libdav1d (the native "av1" name is libaom/ambiguous; Plex +
+// jellyfin-ffmpeg use libdav1d). hevc and h264 are DELIBERATELY absent — their
+// bare names ARE the native SW decoders ffmpeg accepts (Plex's full-SW argvs use
+// bare `hevc`/`h264`), so converting them (e.g. to a non-existent `libhevc`)
+// breaks ffmpeg. So only av1 needs a rename.
+var swDecoderForShort = map[string]string{
+	"av1": "libdav1d",
+}
 
 // swTonemapNode is Plex's stock CPU HDR→SDR tonemap node, captured verbatim
 // from a plex-test software session (HardwareAcceleratedCodecs=0 +
