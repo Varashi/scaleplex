@@ -1,5 +1,70 @@
 # Changelog
 
+## [1.9.0](https://github.com/Varashi/scaleplex/compare/v1.8.0...v1.9.0) (2026-05-28)
+
+### Images shipped
+
+| Image | Tag | Status |
+|---|---|---|
+| `scaleplex_worker` | `v1.9.0` | **new** — NVIDIA (`nvenc`) dialect, cross-backend reshape, CPU `swDialect`, Pass-gate L1/L3 |
+| `scaleplex_orchestrator` | `v1.4.0` | **new** — capability-aware routing + configurable LB scheduling |
+| `scaleplex_pms_dockermod` | `v1.3.0` | **new** — Pass-gate L2 (shim reads `Preferences.xml`) |
+
+The headline of 1.9.0 is **heterogeneous-fleet support** (epic #77). A worker
+now reshapes *any* incoming argv — VAAPI, NVENC, or software — to its own
+backend, so a single orchestrator can front a mix of Intel-Arc, NVIDIA, and
+CPU-only workers regardless of what GPU (if any) the PMS host advertised when
+it built the command line. The worker auto-detects its backend at startup
+(`/dev/nvidia0` → nvenc, else `/dev/dri/renderD*` → vaapi, else sw) or honors
+an explicit `WORKER_BACKEND`. A new `swDialect` gives full CPU-only fallback.
+
+The orchestrator gains **capability-aware routing**: each worker reports its
+backend on `/capability`, and `schedule()` tiers HW-capable workers ahead of
+CPU-only ones (`SCALEPLEX_PREFER_HW`), with a configurable load-balancing
+strategy within a tier (`SCALEPLEX_LB_STRATEGY` = `load` | `round-robin` |
+`least-sessions` | `random`).
+
+A three-layer **Plex-Pass gate** guards HW re-acceleration so the fork is only
+used where Plex's own licensing would permit it: L1 warns at worker startup,
+L2 has the shim read the PMS `Preferences.xml` subscription state into
+`SCALEPLEX_PASS_ACTIVE` per session, and L3 fails closed in the worker if the
+session is unlicensed (overridable via `SCALEPLEX_FORCE_HW=1`, the homelab
+default).
+
+Testing is now **API-driven and exhaustive** (#96): `test/qa_matrix.py` drives
+real Plex playback across every transcode shape (HLS + DASH, SDR/HDR,
+text/bitmap sub-burn, audio-only mkv, Windows seg-mkv) and classifies each
+cell PASS/FAIL/SKIP/NODISPATCH with spawn-confirmation and Plex/orchestrator
+log cross-checks — a `SKIP` is verified as a genuine direct-stream decision in
+PMS logs, and `NODISPATCH` (which should never happen) triggers orchestrator
+forensics.
+
+
+### Features
+
+* **orchestrator:** capability-aware routing + configurable scheduling ([#77](https://github.com/Varashi/scaleplex/issues/77) PR4) ([#92](https://github.com/Varashi/scaleplex/issues/92)) ([28303ce](https://github.com/Varashi/scaleplex/commit/28303ceb268578e13145c7002d7b6071c277403e))
+* Plex-Pass gate L2 — shim reads Preferences.xml ([#78](https://github.com/Varashi/scaleplex/issues/78)) ([#95](https://github.com/Varashi/scaleplex/issues/95)) ([62cc0c2](https://github.com/Varashi/scaleplex/commit/62cc0c2b9646f0d1f72f1e4dc0af33c68d4e050c))
+* **worker:** cross-backend PR1 — source-backend detector + reverse map ([#79](https://github.com/Varashi/scaleplex/issues/79)) ([eff048d](https://github.com/Varashi/scaleplex/commit/eff048df07c9e2b55e59dc404b7a91a6052ed7c7))
+* **worker:** cross-backend PR2 — reshape foreign HW argv to worker backend ([#83](https://github.com/Varashi/scaleplex/issues/83)) ([6208852](https://github.com/Varashi/scaleplex/commit/62088527d941bace63d39d5649bacc594a82477f))
+* **worker:** NVIDIA dialect (Phase 1 PR [#2](https://github.com/Varashi/scaleplex/issues/2)) ([#61](https://github.com/Varashi/scaleplex/issues/61)) ([df90c08](https://github.com/Varashi/scaleplex/commit/df90c08c17932c2031031915a34941414cc69d38))
+* **worker:** Plex-Pass gate (L1 warn + L3 enforce) for HW re-accel ([#84](https://github.com/Varashi/scaleplex/issues/84)) ([bc13221](https://github.com/Varashi/scaleplex/commit/bc1322133f4aa965a240fb67e67042ac83442b1c))
+* **worker:** swDialect — CPU-only cross-backend reshape ([#77](https://github.com/Varashi/scaleplex/issues/77) PR3) ([#90](https://github.com/Varashi/scaleplex/issues/90)) ([4d818e9](https://github.com/Varashi/scaleplex/commit/4d818e946ec83476e58e9aafdbee6641e86e58c0))
+
+
+### Fixes
+
+* **ffmpeg:** accept Plex's tonemap_cuda=ALGO:PIX positional shape ([#67](https://github.com/Varashi/scaleplex/issues/67)) ([8e36146](https://github.com/Varashi/scaleplex/commit/8e36146e0e59dcd41b9a2430a476699469b75d1c))
+* **nvidia:** T2 dialect bugs — nvenc preset + scale_cuda sub-burn download ([#75](https://github.com/Varashi/scaleplex/issues/75)) ([fff5603](https://github.com/Varashi/scaleplex/commit/fff560386f51d76ad6a24a0794fff281a26f7da5))
+* **rewriter:** close two cross-backend reshape gaps on hybrid Plex shapes ([#85](https://github.com/Varashi/scaleplex/issues/85)) ([#89](https://github.com/Varashi/scaleplex/issues/89)) ([8126d16](https://github.com/Varashi/scaleplex/commit/8126d163f3390a03b8b3dea13a07e996f2821e16))
+* **test:** replay harness initializes HW dialect from WORKER_BACKEND ([#71](https://github.com/Varashi/scaleplex/issues/71)) ([85ad8d9](https://github.com/Varashi/scaleplex/commit/85ad8d975a82d1b3fea89de3da90d3ab620de867))
+* **test:** replay harness stubs the Plex-Pass gate active ([#86](https://github.com/Varashi/scaleplex/issues/86)) ([f1d9f6a](https://github.com/Varashi/scaleplex/commit/f1d9f6a3fd21f2b7f13d5c6947fb031e9682e097))
+
+
+### Refactor
+
+* **worker:** dialect interface — backend abstraction (Phase 1 PR [#1](https://github.com/Varashi/scaleplex/issues/1)) ([#59](https://github.com/Varashi/scaleplex/issues/59)) ([f34ebc2](https://github.com/Varashi/scaleplex/commit/f34ebc2dd94b8ca6eb9e27f217182c46ae012969))
+* **worker:** rename NVIDIA dialect to "nvenc" ([#81](https://github.com/Varashi/scaleplex/issues/81)) ([64b1fb0](https://github.com/Varashi/scaleplex/commit/64b1fb0b16833d67109189fef382dd5ea13f5703))
+
 ## [1.8.0](https://github.com/Varashi/scaleplex/compare/v1.7.2...v1.8.0) (2026-05-27)
 
 **Images shipped:**
