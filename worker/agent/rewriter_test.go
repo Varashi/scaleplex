@@ -14,6 +14,10 @@ import (
 // for the whole package. Honor-SW tests opt out with t.Setenv(...,"0").
 func TestMain(m *testing.M) {
 	os.Setenv("SCALEPLEX_FORCE_HW", "1")
+	// Rewriter tests assume an active Plex Pass (they exercise the HW-accel
+	// paths, not the gate). Stub the gate's PMS query so it never does real
+	// HTTP; pass_gate_test.go overrides this per-test to exercise denial.
+	passCheck = func(base, tok string) (bool, error) { return true, nil }
 	os.Exit(m.Run())
 }
 

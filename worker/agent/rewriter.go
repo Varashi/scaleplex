@@ -1971,17 +1971,34 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			return bail(TagBailReasonNoInput)
 		}
 
-		// 0. Cross-backend reshape (scaleplex#77). If PMS shaped this argv for
+		// 0. Plex-Pass gate (scaleplex#78, L3, fail-closed). Both HW
+		// re-acceleration paths — the cross-backend reshape just below and
+		// SCALEPLEX_FORCE_HW further down — require an active Plex Pass. Query
+		// PMS only when a re-accel path would actually trigger (FORCE_HW set or
+		// a foreign-HW source), so plain honor-source sessions pay no network
+		// cost. On no-Pass: deny both, fall back to honoring Plex's emitted
+		// pipeline.
+		forceHWEnv := envBool("SCALEPLEX_FORCE_HW")
+		hwReaccelOK := true
+		if forceHWEnv || isForeignHWSource(args) {
+			hwReaccelOK = hwAccelAllowed(inputEnv)
+			if !hwReaccelOK {
+				changes = append(changes, TagPassGateDenied)
+			}
+		}
+
+		// 0b. Cross-backend reshape (scaleplex#77). If PMS shaped this argv for
 		// a HW backend other than the worker's (e.g. a VAAPI-configured PMS
 		// dispatching to a NVIDIA worker), translate decode flags + filter
 		// graph + encoder to the worker's native backend FIRST, so the
 		// honor-source logic below runs on a native argv. No-op when source ==
 		// worker or source is SW/none. In-place value swaps only — no length
-		// change, so inputIdx stays valid. Re-accelerates onto the worker's HW
-		// → must respect the Plex-Pass gate (scaleplex#78, added next).
-		if reshaped, ccChanges := reshapeForeignHWArgv(args, tm); len(ccChanges) > 0 {
-			args = reshaped
-			changes = append(changes, ccChanges...)
+		// change, so inputIdx stays valid. Gated on the Pass check above.
+		if hwReaccelOK {
+			if reshaped, ccChanges := reshapeForeignHWArgv(args, tm); len(ccChanges) > 0 {
+				args = reshaped
+				changes = append(changes, ccChanges...)
+			}
 		}
 
 		// 1. Decoder.
@@ -2016,7 +2033,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		//     (+ device) and SW-encode on CPU. The smart CPU-offload mode: the
 		//     heavy decode stays on the GPU, only the encode is CPU (realtime even
 		//     for 4K sources, unlike full SW which is decode-bound).
-		forceHW := envBool("SCALEPLEX_FORCE_HW")
+		// forceHW honors the Plex-Pass gate computed above (#78): the env asks
+		// for re-accel, but without a confirmed Pass we fall back to honoring
+		// Plex's SW pipeline (fail-closed).
+		forceHW := forceHWEnv && hwReaccelOK
 		plexSWEncoder := false
 		if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
 			_, plexSWEncoder = activeDialect.encoderMap()[args[peer+1]]
