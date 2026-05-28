@@ -95,3 +95,9 @@ func (nvidiaDialect) tonemapFilter(algo, pix string) string {
 
 func (nvidiaDialect) hwUploadFilter() string   { return "hwupload" }
 func (nvidiaDialect) hwDownloadFilter() string { return "hwdownload" }
+
+// vf_inlineass (CPU/libass) has no CUDA branch, so a scale_cuda/tonemap_cuda
+// surface must come down to system nv12 before the burn. Matches Plex's own
+// nvenc sub-burn chain (`...tonemap_cuda=...nv12,hwdownload,format=nv12,inlineass`);
+// h264_nvenc ingests the resulting sysmem nv12 directly, no re-upload.
+func (nvidiaDialect) subBurnDownloadFilter() string { return "hwdownload,format=nv12" }

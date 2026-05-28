@@ -1,0 +1,124 @@
+Description: nvenc: accept libx264 -preset names and swallow x264/x265 opt blobs
+ NVENC counterpart to 0118 (which did this for the VAAPI encoder). Plex
+ Media Server emits `-preset NAME` (libx264 preset names like "veryfast")
+ plus encoder-private `-x264opts` / `-x265-params` blobs on what it
+ believes is a SW encode. After the scaleplex worker swaps the encoder to
+ h264_nvenc/hevc_nvenc on force-HW / bare-HW-upgrade sessions the stock
+ NVENC encoder rejects all three: the libx264 names are not registered in
+ the `preset` enum namespace, so option parsing fails with
+ "[h264_nvenc] Undefined constant or missing '(' in 'veryfast'", and the
+ opt blobs hit unknown private options.
+ .
+ Unlike VAAPI's preset (a STRING option mapped at init in 0118), NVENC's
+ `preset` is already an AV_OPT_TYPE_INT enum, so a libx264 string cannot
+ reach init -- it is rejected during av_opt_set option parsing. The
+ idiomatic fix is therefore to register the missing libx264 preset names
+ as AV_OPT_TYPE_CONST entries in the existing `.unit = "preset"`
+ namespace, each resolving directly to a modern p1..p7 enum value. The
+ native nvenc_map_preset() table then maps those to the corresponding
+ preset GUID (and pass count) with no init-time code:
+ .
+   ultrafast -> p1   superfast -> p1   veryfast -> p1
+   faster    -> p2   slower    -> p6
+   veryslow  -> p7   placebo   -> p7
+ .
+ fast/medium/slow are intentionally NOT added: they are already valid
+ nvenc preset names and nvenc_map_preset() already routes them to
+ p1/p4/p7 (one/one/two-pass) respectively, which matches the desired
+ libx264 ordering. Re-defining them would clobber that native mapping.
+ The new constants live inside the NVENC_HAVE_NEW_PRESETS guard so they
+ only exist when the p1..p7 enum values do. Unknown names are unaffected
+ (still rejected) -- only the fixed libx264 ladder is added; latency-
+ favouring (fastest) bias matches the worker's playback-latency goal.
+ .
+ Adds to both per-codec option tables (the preset block is duplicated in
+ nvenc_h264.c and nvenc_hevc.c -- no shared macro): the seven missing
+ libx264 preset constants, plus `x264opts` / `x265-params` string options
+ (accepted and ignored) backed by two new char* fields on NvencContext.
+ .
+ Effect: PMS's `-preset NAME` / `-x264opts` / `-x265-params` argv reaches
+ an NVENC encoder without error, parity with 0118 for VAAPI, so the Go
+ rewriter can leave them untouched after an libx264/libx265 -> nvenc swap.
+ Unblocks the 28/70 cases that failed at encoder-open in T2 NVIDIA replay.
+Origin: scaleplex
+Forwarded: not-needed
+Author: scaleplex
+Last-Update: 2026-05-28
+---
+--- a/libavcodec/nvenc.h
++++ b/libavcodec/nvenc.h
+@@ -285,6 +285,12 @@
+     int lookahead_level;
+     int unidir_b;
+     int split_encode_mode;
++
++    // scaleplex: swallow the libx264/libx265 private option blobs PMS
++    // emits on what it believes is a SW encode. Accepted and ignored so
++    // the NVENC encoder does not error on unknown options (parity 0118).
++    char           *x264opts;
++    char           *x265_params;
+ } NvencContext;
+ 
+ int ff_nvenc_encode_init(AVCodecContext *avctx);
+--- a/libavcodec/nvenc_h264.c
++++ b/libavcodec/nvenc_h264.c
+@@ -51,6 +51,16 @@
+     { "p5",          "slow (good quality)",                 0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P5 },                  0, 0, VE, .unit = "preset" },
+     { "p6",          "slower (better quality)",             0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P6 },                  0, 0, VE, .unit = "preset" },
+     { "p7",          "slowest (best quality)",              0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P7 },                  0, 0, VE, .unit = "preset" },
++    // scaleplex: libx264 preset names mapped onto the p1..p7 ladder so
++    // PMS's `-preset NAME` argv reaches NVENC unchanged (parity 0118).
++    // fast/medium/slow are already native nvenc names (-> p1/p4/p7).
++    { "ultrafast",   "scaleplex: libx264 alias -> p1",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P1 },                  0, 0, VE, .unit = "preset" },
++    { "superfast",   "scaleplex: libx264 alias -> p1",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P1 },                  0, 0, VE, .unit = "preset" },
++    { "veryfast",    "scaleplex: libx264 alias -> p1",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P1 },                  0, 0, VE, .unit = "preset" },
++    { "faster",      "scaleplex: libx264 alias -> p2",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P2 },                  0, 0, VE, .unit = "preset" },
++    { "slower",      "scaleplex: libx264 alias -> p6",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P6 },                  0, 0, VE, .unit = "preset" },
++    { "veryslow",    "scaleplex: libx264 alias -> p7",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P7 },                  0, 0, VE, .unit = "preset" },
++    { "placebo",     "scaleplex: libx264 alias -> p7",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P7 },                  0, 0, VE, .unit = "preset" },
+     { "tune",        "Set the encoding tuning info",        OFFSET(tuning_info),  AV_OPT_TYPE_INT,   { .i64 = NV_ENC_TUNING_INFO_HIGH_QUALITY }, NV_ENC_TUNING_INFO_HIGH_QUALITY, NV_ENC_TUNING_INFO_LOSSLESS,  VE, .unit = "tune" },
+     { "hq",          "High quality",                        0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_TUNING_INFO_HIGH_QUALITY },             0, 0, VE, .unit = "tune" },
+     { "ll",          "Low latency",                         0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_TUNING_INFO_LOW_LATENCY },              0, 0, VE, .unit = "tune" },
+@@ -224,6 +234,11 @@
+     { "2",            "",                                   0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_LOOKAHEAD_LEVEL_2 }, 0, 0, VE, .unit = "lookahead_level" },
+     { "3",            "",                                   0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_LOOKAHEAD_LEVEL_3 }, 0, 0, VE, .unit = "lookahead_level" },
+ #endif
++    // scaleplex: accepted and ignored (libx264/libx265 passthrough compat).
++    { "x264opts",     "Accepted and ignored (libx264 passthrough compatibility)",
++      OFFSET(x264opts),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
++    { "x265-params",  "Accepted and ignored (libx265 passthrough compatibility)",
++      OFFSET(x265_params), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
+     { NULL }
+ };
+ 
+--- a/libavcodec/nvenc_hevc.c
++++ b/libavcodec/nvenc_hevc.c
+@@ -51,6 +51,16 @@
+     { "p5",          "slow (good quality)",                 0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P5 },                  0, 0, VE, .unit = "preset" },
+     { "p6",          "slower (better quality)",             0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P6 },                  0, 0, VE, .unit = "preset" },
+     { "p7",          "slowest (best quality)",              0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P7 },                  0, 0, VE, .unit = "preset" },
++    // scaleplex: libx264 preset names mapped onto the p1..p7 ladder so
++    // PMS's `-preset NAME` argv reaches NVENC unchanged (parity 0118).
++    // fast/medium/slow are already native nvenc names (-> p1/p4/p7).
++    { "ultrafast",   "scaleplex: libx264 alias -> p1",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P1 },                  0, 0, VE, .unit = "preset" },
++    { "superfast",   "scaleplex: libx264 alias -> p1",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P1 },                  0, 0, VE, .unit = "preset" },
++    { "veryfast",    "scaleplex: libx264 alias -> p1",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P1 },                  0, 0, VE, .unit = "preset" },
++    { "faster",      "scaleplex: libx264 alias -> p2",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P2 },                  0, 0, VE, .unit = "preset" },
++    { "slower",      "scaleplex: libx264 alias -> p6",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P6 },                  0, 0, VE, .unit = "preset" },
++    { "veryslow",    "scaleplex: libx264 alias -> p7",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P7 },                  0, 0, VE, .unit = "preset" },
++    { "placebo",     "scaleplex: libx264 alias -> p7",      0,                    AV_OPT_TYPE_CONST, { .i64 = PRESET_P7 },                  0, 0, VE, .unit = "preset" },
+     { "tune",        "Set the encoding tuning info",        OFFSET(tuning_info),  AV_OPT_TYPE_INT,   { .i64 = NV_ENC_TUNING_INFO_HIGH_QUALITY }, NV_ENC_TUNING_INFO_HIGH_QUALITY, NV_ENC_TUNING_INFO_COUNT - 1, VE, .unit = "tune" },
+     { "hq",          "High quality",                        0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_TUNING_INFO_HIGH_QUALITY },             0, 0, VE, .unit = "tune" },
+ #ifdef NVENC_HAVE_UHQ_TUNING
+@@ -228,6 +238,11 @@
+     { "2",                 "Enabled with number of horizontal strips forced to 2 when number of NVENCs > 1", 0, AV_OPT_TYPE_CONST, { .i64 = NV_ENC_SPLIT_TWO_FORCED_MODE },   0, 0, VE, .unit = "split_encode_mode" },
+     { "3",                 "Enabled with number of horizontal strips forced to 3 when number of NVENCs > 2", 0, AV_OPT_TYPE_CONST, { .i64 = NV_ENC_SPLIT_THREE_FORCED_MODE }, 0, 0, VE, .unit = "split_encode_mode" },
+ #endif
++    // scaleplex: accepted and ignored (libx264/libx265 passthrough compat).
++    { "x264opts",     "Accepted and ignored (libx264 passthrough compatibility)",
++      OFFSET(x264opts),    AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
++    { "x265-params",  "Accepted and ignored (libx265 passthrough compatibility)",
++      OFFSET(x265_params), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VE },
+     { NULL }
+ };
+ 
