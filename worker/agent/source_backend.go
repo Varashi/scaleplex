@@ -27,6 +27,20 @@ const (
 	srcNVENC sourceBackend = "nvenc" // NVIDIA: -hwaccel nvdec / scale_cuda / h264_nvenc / tonemap_cuda
 )
 
+// Drift guard: the cross-backend no-op check compares string(sourceBackend)
+// directly against dialect.backendName(), so the source-backend constants MUST
+// stay equal to the dialect names. Panic at startup if they ever diverge (e.g.
+// a future dialect rename that misses one side) — cheaper to catch here than to
+// silently mis-route a cross-backend reshape.
+func init() {
+	if string(srcVAAPI) != (vaapiDialect{}).backendName() ||
+		string(srcNVENC) != (nvencDialect{}).backendName() {
+		panic("source-backend/dialect name drift: srcVAAPI=" + string(srcVAAPI) +
+			" vaapi=" + (vaapiDialect{}).backendName() +
+			"; srcNVENC=" + string(srcNVENC) + " nvenc=" + (nvencDialect{}).backendName())
+	}
+}
+
 // hwEncoderCodec reverse-maps a hardware encoder name to its bare codec, so a
 // foreign HW encoder (e.g. h264_nvenc received by a VAAPI worker) can be
 // renormalized to a codec and re-forwarded through the worker dialect's

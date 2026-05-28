@@ -129,6 +129,37 @@ func TestCrossBackend_NativeIsNoOp(t *testing.T) {
 	}
 }
 
+// Bitmap/PGS: reshapeForeignHWArgv DEFERS the filter-graph reshape for bitmap
+// subs (facts.subKind=="bitmap") — but still normalizes decode flags + encoder,
+// and the downstream detectBitmapOverlayBurn branch reshapes the overlay graph
+// to the worker dialect. End result must be native NVENC, no VAAPI literals.
+// (PGS-NVENC is unvalidated live, #76 — this only locks the argv shape.)
+func TestCrossBackend_VAAPI_bitmap_to_NVENC(t *testing.T) {
+	withDialect(t, nvencDialect{})
+	args := []string{
+		"-codec:0", "hevc",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi", "-hwaccel_device:0", "vaapi",
+		"-i", "/media/x.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:5]scale=1920:1080,hwupload[s];[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[v];[v][s]overlay_vaapi[1]",
+		"-map", "[1]",
+		"-codec:0", "h264_vaapi",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied || !containsString(out.Changes, "cross-backend:vaapi->nvenc") {
+		t.Fatalf("not reshaped: applied=%v changes=%v", out.Applied, out.Changes)
+	}
+	joined := strings.Join(out.Args, " ")
+	for _, banned := range []string{"vaapi", "h264_vaapi"} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("VAAPI literal %q leaked (bitmap cross-backend): %s", banned, joined)
+		}
+	}
+	if !argvHasSeq(out.Args, "-hwaccel:0", "nvdec") || !containsString(out.Args, "h264_nvenc") {
+		t.Errorf("decode/encoder not native nvenc: %v", out.Args)
+	}
+}
+
 // Symmetric: NVENC argv → VAAPI worker.
 func TestCrossBackend_NVENC_to_VAAPI(t *testing.T) {
 	withDialect(t, vaapiDialect{})
