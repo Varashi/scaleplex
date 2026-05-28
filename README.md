@@ -34,6 +34,25 @@ bookkeeping is unchanged.
 
 ## Status
 
+**v1.9.0 — multi-backend workers + heterogeneous fleet + complete Plex-Pass gate.**
+scaleplex workers now transcode on **Intel (VAAPI)**, **NVIDIA (NVENC/NVDEC)**, or
+**CPU (software)** from a single image — `WORKER_BACKEND=auto` auto-detects the
+hardware (`/dev/nvidia0` → nvenc, else a DRM render node → vaapi, else sw). Every
+worker **reshapes whatever argv PMS emits into its own backend** (the cross-backend
+rewriter), so a VAAPI-configured PMS can dispatch to an NVIDIA *or* CPU worker and
+a mixed fleet needs no per-worker tuning. The orchestrator is **capability-aware** —
+it tiers HW workers above SW and offers pluggable load-balancing
+(`SCALEPLEX_LB_STRATEGY` = `load` | `round-robin` | `least-sessions`,
+`SCALEPLEX_PREFER_HW`). HW transcoding is **Plex-Pass-gated** end-to-end (L1 startup
+warning + L2 dockermod reads `myPlexSubscription` from Preferences.xml + L3 worker
+self-gate, fail-closed), so `SCALEPLEX_FORCE_HW` can't hand a non-Pass account HW it
+isn't entitled to. Validated by an every-shape T3 sweep (dash+hls × all four
+playback muxers × sdr/hdr-tonemap × text/bitmap sub-burn × HW/SW) — **40/40 worker
+PASS**. See [Backends & heterogeneous fleet](#backends--heterogeneous-fleet) and
+[`docs/HW_PROFILE.md`](docs/HW_PROFILE.md). *(v1.7.0: rewriter orthogonality
+complete; v1.8.0: Docker / docker-compose deployment + 3 worker-discovery modes —
+see CHANGELOG.)*
+
 **v1.6.1 — bitmap sub-burn unified onto `inlineass` + PGS cue-clear fix +
 orthogonal SW-reshape detector.** v1.3.0 put all sub burn-in into one fork-side
 `inlineass` filter; v1.6.1 completes the unification on the **rewriter side**:
@@ -123,6 +142,48 @@ independent operational decision, not gated on this tag.
 **Images** are sha-pinned — CI publishes `ghcr.io/varashi/scaleplex_worker`,
 `scaleplex_orchestrator`, and `scaleplex_pms_dockermod` as `sha-<short>`;
 the Helm release pins each tag explicitly.
+
+## Backends & heterogeneous fleet
+
+scaleplex workers transcode on three backends, selected per worker at startup via
+`WORKER_BACKEND`:
+
+| `WORKER_BACKEND` | Hardware | Pipeline |
+|---|---|---|
+| `auto` *(default)* | probe | `/dev/nvidia0` → nvenc; else a DRM render node (`/dev/dri/renderD*`) → vaapi; else sw |
+| `vaapi` | Intel / AMD GPU (`/dev/dri`) | VAAPI HW decode + `h264_vaapi` / `hevc_vaapi`, iHD/OpenCL tonemap |
+| `nvenc` *(alias `nvidia`)* | NVIDIA GPU | NVDEC + `h264_nvenc` / `hevc_nvenc`, `tonemap_cuda` |
+| `sw` *(alias `cpu`)* | none | SW decode + `libx264` / `libx265`, zscale tonemap |
+
+**One image** carries every runtime (VAAPI userspace + CUDA + the fork ffmpeg); the
+deployment's hardware grant decides what a worker *becomes* — docker `devices: /dev/dri`
+(Intel) / `runtime: nvidia` (NVIDIA) / nothing (CPU), or the matching k8s
+device-plugin + nodeSelector. Plex only transcodes to **h264/hevc** (no AV1 encode),
+both handled by every backend, so there's no per-codec capability gap.
+
+**Cross-backend reshape.** Each worker rewrites whatever argv PMS emits — VAAPI,
+NVENC, or pure-SW shape — into its *own* backend before running it: decode flags, the
+filter graph (scale / tonemap / sub-burn), and the encoder. So a heterogeneous fleet
+(some Intel, some NVIDIA, some CPU; a PMS with or without a GPU) needs no per-worker
+tuning — add a worker of any kind and it adapts. The reshaper is orthogonal
+(`extractGraphFacts → composeBurn`), and emits Plex's own stock shapes so the fork
+sees stock-Plex args.
+
+**Scheduling** (orchestrator env). `SCALEPLEX_PREFER_HW=1` (default) tiers HW workers
+above SW (a CPU worker is overflow, not first pick); `SCALEPLEX_LB_STRATEGY` =
+`load` *(default)* | `round-robin` | `least-sessions` | `random` orders within a
+tier. NVIDIA + CPU load is reported on `/capability` alongside Intel so routing is
+capacity-aware. On a homogeneous fleet this collapses to the prior least-loaded
+behaviour. Workers expose their `backend` on `/capability` and the orchestrator's
+`/workers` JSON.
+
+**Plex-Pass gate.** Plex HW transcoding is a Plex-Pass feature — PMS only emits HW
+argv with an active Pass. scaleplex's HW *re-acceleration* (`SCALEPLEX_FORCE_HW=1`,
+or a cross-backend reshape) is gated on a confirmed active Pass: **L1** startup
+warning, **L2** the PMS dockermod reads `myPlexSubscription` from `Preferences.xml`
+and forwards `SCALEPLEX_PASS_ACTIVE` per session, **L3** a worker self-gate
+(fail-closed). Without a Pass, a forced session falls back to Plex's emitted SW
+pipeline. Detail + the override semantics in [`docs/HW_PROFILE.md`](docs/HW_PROFILE.md).
 
 ## Architecture
 
@@ -283,7 +344,8 @@ auth, no TLS; LAN-only by design.
 
 ## Docs
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, data flow, where state lives.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, data flow, where state lives, backend dialects + cross-backend reshape.
+- [`docs/HW_PROFILE.md`](docs/HW_PROFILE.md) — backends, heterogeneous-fleet config, orchestrator scheduling knobs, the Plex-Pass gate.
 - [`docs/REWRITER.md`](docs/REWRITER.md) — every Plex-private argv quirk and its stock-ffmpeg translation.
 - [`docs/TUNING.md`](docs/TUNING.md) — operator env knobs for transcode quality + behaviour.
 - [`docs/SEEK.md`](docs/SEEK.md) — DASH and HLS seek deep-dive (the hardest problems we shipped).
