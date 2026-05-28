@@ -27,6 +27,20 @@ const (
 	srcNVENC sourceBackend = "nvenc" // NVIDIA: -hwaccel nvdec / scale_cuda / h264_nvenc / tonemap_cuda
 )
 
+// Drift guard: the cross-backend no-op check compares string(sourceBackend)
+// directly against dialect.backendName(), so the source-backend constants MUST
+// stay equal to the dialect names. Panic at startup if they ever diverge (e.g.
+// a future dialect rename that misses one side) — cheaper to catch here than to
+// silently mis-route a cross-backend reshape.
+func init() {
+	if string(srcVAAPI) != (vaapiDialect{}).backendName() ||
+		string(srcNVENC) != (nvencDialect{}).backendName() {
+		panic("source-backend/dialect name drift: srcVAAPI=" + string(srcVAAPI) +
+			" vaapi=" + (vaapiDialect{}).backendName() +
+			"; srcNVENC=" + string(srcNVENC) + " nvenc=" + (nvencDialect{}).backendName())
+	}
+}
+
 // hwEncoderCodec reverse-maps a hardware encoder name to its bare codec, so a
 // foreign HW encoder (e.g. h264_nvenc received by a VAAPI worker) can be
 // renormalized to a codec and re-forwarded through the worker dialect's
@@ -146,4 +160,103 @@ func hasVideoEncoder(args []string) bool {
 	}
 	enc := args[e+1]
 	return enc != "copy" && enc != ""
+}
+
+// filterComplexIndex returns the index of the first -filter_complex VALUE
+// (the token after the flag), or -1.
+func filterComplexIndex(args []string) int {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-filter_complex" {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+// setArgValue replaces the value token following `flag` with `val`, in place.
+// No-op when the flag is absent. Used by the cross-backend reshape to REPLACE
+// foreign decode-flag values (vs the honor-source paths which inject-when-
+// missing).
+func setArgValue(args []string, flag, val string) bool {
+	if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
+		args[i+1] = val
+		return true
+	}
+	return false
+}
+
+// reshapeForeignHWArgv translates an argv shaped for a HW backend DIFFERENT
+// from the worker's into the worker's native backend, so the honor-source
+// logic downstream runs on it unchanged. No-op when source == worker, or
+// source is SW/none (SW is reshaped by the backend-agnostic rewriteVideoFilter
+// path; none has no video to transcode).
+//
+// Three normalizations:
+//  1. Decode flags — REPLACE -hwaccel:0 / -hwaccel_output_format:0 /
+//     -hwaccel_device:0 / -init_hw_device / -filter_hw_device with the worker
+//     dialect's. The decoder codec (hevc/av1/h264) is backend-agnostic, kept.
+//  2. Filter graph — extractGraphFacts (backend-agnostic) → composeBurn (worker
+//     dialect). vaResident=true: with -hwaccel_output_format now the worker's,
+//     [0:0] lands as the worker's HW surface. Covers no-sub + text-sub; bitmap
+//     is left for the downstream bitmap branch (PGS cross-backend unvalidated,
+//     scaleplex#76). animatedTierDown is added by the downstream pass which has
+//     the authoritative subSrc — the composeBurn here is idempotent under it.
+//  3. Encoder — foreign HW encoder → hwEncoderCodec → codecCanonicalSWEncoder
+//     → activeDialect.encoderMap() → worker HW encoder.
+//
+// This re-accelerates onto the worker's HW; the caller gates it on the
+// Plex-Pass check (scaleplex#78).
+func reshapeForeignHWArgv(args []string, tm tonemapConfig) ([]string, []string) {
+	src := detectSourceBackend(args)
+	if src != srcVAAPI && src != srcNVENC {
+		return args, nil
+	}
+	if string(src) == activeDialect.backendName() {
+		return args, nil // already native (srcVAAPI/srcNVENC match the dialect names directly)
+	}
+	d := activeDialect
+
+	// 1. Decode flags → worker's.
+	setArgValue(args, "-hwaccel:0", d.hwaccelName())
+	setArgValue(args, "-hwaccel_output_format:0", d.hwaccelOutputFormat())
+	setArgValue(args, "-hwaccel_device:0", d.filterHWDeviceName())
+	setArgValue(args, "-init_hw_device", d.initHWDeviceArg(0))
+	setArgValue(args, "-filter_hw_device", d.filterHWDeviceName())
+
+	// 2. Filter graph → worker dialect (no-sub + text-sub; bitmap deferred).
+	if vfIdx := filterComplexIndex(args); vfIdx >= 0 {
+		facts := extractGraphFacts(args[vfIdx], nil)
+		if facts.ok && facts.subKind != "bitmap" {
+			oldLabel := ""
+			if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
+				oldLabel = "[" + m[1] + "]"
+			}
+			newFilter, newLabel := tm.composeBurn(burnSpec{
+				vaResident: true,
+				w:          facts.w,
+				h:          facts.h,
+				hdr:        facts.hdr,
+				algo:       facts.algo,
+				burnSub:    facts.subKind == "text",
+				subParams:  facts.subParams,
+			})
+			args[vfIdx] = newFilter
+			retargetMapLabel(args, oldLabel, newLabel)
+		}
+	}
+
+	// 3. Encoder → worker's HW encoder.
+	if in := indexOfArg(args, "-i", 0); in >= 0 {
+		if e := indexOfArg(args, "-codec:0", in+1); e >= 0 && e+1 < len(args) {
+			if codec, isHW := hwEncoderCodec[args[e+1]]; isHW {
+				if lib, ok := codecCanonicalSWEncoder[codec]; ok {
+					if hwEnc, ok := d.encoderMap()[lib]; ok {
+						args[e+1] = hwEnc
+					}
+				}
+			}
+		}
+	}
+
+	return args, []string{"cross-backend:" + string(src) + "->" + d.backendName()}
 }
