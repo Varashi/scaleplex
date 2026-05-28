@@ -1982,16 +1982,22 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			return bail(TagBailReasonNoInput)
 		}
 
-		// 0. Plex-Pass gate (scaleplex#78, L3, fail-closed). Both HW
-		// re-acceleration paths — the cross-backend reshape just below and
-		// SCALEPLEX_FORCE_HW further down — require an active Plex Pass. Query
-		// PMS only when a re-accel path would actually trigger (FORCE_HW set or
-		// a foreign-HW source), so plain honor-source sessions pay no network
-		// cost. On no-Pass: deny both, fall back to honoring Plex's emitted
-		// pipeline.
+		// 0. Plex-Pass gate (scaleplex#78, L3, fail-closed). Gate ONLY the path
+		// that genuinely GRANTS HW the user may not be entitled to:
+		// SCALEPLEX_FORCE_HW=1 forcing HW onto an argv Plex emitted as SW (Plex
+		// chose SW → the user may have no Pass). A foreign-HW source is NOT gated
+		// — Plex only ever emits a HW argv for an active Pass (it gates HW
+		// transcode itself), so the foreign HW IS proof of entitlement, and
+		// reshaping it cross-backend (e.g. VAAPI→NVENC, #77) grants nothing Plex
+		// didn't already grant. Gating it was both wrong (over-gates a Pass user)
+		// and fragile: an EXTERNAL worker can't reach the in-cluster
+		// SCALEPLEX_PMS_BASE_URL for the L3 probe → it fail-closed every
+		// cross-backend session into an un-runnable foreign-HW passthrough (#99).
+		// Query PMS only for the FORCE_HW-on-SW case, so honor-source +
+		// cross-backend sessions pay no network cost.
 		forceHWEnv := envBool("SCALEPLEX_FORCE_HW")
 		hwReaccelOK := true
-		if forceHWEnv || isForeignHWSource(args) {
+		if forceHWEnv && !isForeignHWSource(args) {
 			hwReaccelOK = hwAccelAllowed(inputEnv)
 			if !hwReaccelOK {
 				changes = append(changes, TagPassGateDenied)
@@ -2004,7 +2010,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// graph + encoder to the worker's native backend FIRST, so the
 		// honor-source logic below runs on a native argv. No-op when source ==
 		// worker or source is SW/none. In-place value swaps only — no length
-		// change, so inputIdx stays valid. Gated on the Pass check above.
+		// change, so inputIdx stays valid. NOT Pass-gated: a foreign HW source
+		// is itself proof of Pass (see gate note above), so hwReaccelOK is
+		// always true here for a foreign-HW source.
 		if activeDialect.backendName() == "sw" {
 			// No-GPU worker: downgrade ANY incoming argv (foreign HW / hybrid)
 			// to a pure-CPU pipeline, so the honor-source path below keeps it.

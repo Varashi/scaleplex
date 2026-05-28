@@ -136,9 +136,13 @@ func TestRewriter_PassGate_DeniesForceHW(t *testing.T) {
 	}
 }
 
-// Cross-backend reshape is also gated: a foreign VAAPI argv on a NVENC worker
-// with no Pass must NOT be reshaped (stays foreign, not re-accelerated).
-func TestRewriter_PassGate_DeniesCrossBackend(t *testing.T) {
+// Cross-backend reshape is NOT Pass-gated (#99): a foreign VAAPI argv only
+// exists because Plex emitted HW, which Plex does only for an active Pass — so
+// it's proof of entitlement. Even with the L3 Pass probe failing (no Pass
+// confirmable — e.g. an external NVENC worker that can't reach the in-cluster
+// PMS), the worker MUST reshape VAAPI→NVENC and run it, never leave the
+// un-runnable foreign argv. Without this the session 234s on a non-VAAPI box.
+func TestRewriter_PassGate_CrossBackendNotGated(t *testing.T) {
 	withDialect(t, nvencDialect{})
 	stubPass(t, func(_, _ string) (bool, error) { return false, nil })
 	args := []string{
@@ -150,13 +154,14 @@ func TestRewriter_PassGate_DeniesCrossBackend(t *testing.T) {
 		"-map", "[1]", "-codec:0", "h264_vaapi",
 	}
 	out := Rewrite(args, wiredEnv(), nil)
-	if !containsString(out.Changes, TagPassGateDenied) {
-		t.Fatalf("expected pass-gate denial: %v", out.Changes)
+	if containsString(out.Changes, TagPassGateDenied) {
+		t.Fatalf("cross-backend must NOT consult the Pass gate: %v", out.Changes)
 	}
-	if containsString(out.Changes, "cross-backend:vaapi->nvenc") {
-		t.Errorf("no-Pass cross-backend session must NOT be reshaped: %v", out.Changes)
+	if !containsString(out.Changes, "cross-backend:vaapi->nvenc") {
+		t.Errorf("foreign-HW source must be reshaped to the worker's backend: %v", out.Changes)
 	}
-	if !strings.Contains(strings.Join(out.Args, " "), "scale_vaapi") {
-		t.Errorf("foreign graph should be left untouched (not reshaped) without Pass: %v", out.Args)
+	joined := strings.Join(out.Args, " ")
+	if !containsString(out.Args, "h264_nvenc") || strings.Contains(joined, "scale_vaapi") {
+		t.Errorf("expected VAAPI→NVENC reshape (h264_nvenc, no scale_vaapi): %v", out.Args)
 	}
 }
