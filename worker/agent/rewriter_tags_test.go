@@ -426,6 +426,7 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagInjectInitHWDevice":               "inject:init_hw_device+filter_hw_device",
 		"TagInjectSEIA53CC":                   "inject:sei+a53_cc",
 		"TagReplaceForeignInitHWDevice":       "replace:foreign-init_hw_device",
+		"TagToSWStripHWDecode":                "to-sw:strip-hwdecode",
 		"TagLoglevelInfo":                     "loglevel:->info",
 		"TagMapLabelUpdate":                   "map-label-update",
 		"TagProgressAppendXPlexToken":         "progress:append-X-Plex-Token",
@@ -459,6 +460,9 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagPrefixSkipToSegmentPassthrough":    "skip_to_segment:passthrough=",
 		"TagPrefixSubtitleBitmap":              "subtitle:bitmap:",
 		"TagPrefixVideoHDRSource":              "video:hdr-source(",
+		"TagPrefixToSW":                        "to-sw:",
+		"TagPrefixToSWFilter":                  "to-sw:filter:",
+		"TagPrefixToSWEncode":                  "to-sw:encode:",
 
 		// TagBailReason* static bail() arguments
 		"TagBailReasonHWDecodeSubBitmapUnsupported": "hw-decode-sub:bitmap-unsupported",

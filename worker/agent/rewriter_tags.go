@@ -44,6 +44,7 @@ const (
 	TagInjectCanThrottleURL            = "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)"
 	TagInjectInitHWDevice              = "inject:init_hw_device+filter_hw_device"
 	TagReplaceForeignInitHWDevice      = "replace:foreign-init_hw_device" // #85 — drop a foreign-backend -init_hw_device so it's re-injected for the worker dialect
+	TagToSWStripHWDecode               = "to-sw:strip-hwdecode"           // #77 PR3 — swDialect stripped HW decode flags + device init
 	TagInjectSEIA53CC                  = "inject:sei+a53_cc"
 	TagLoglevelInfo                    = "loglevel:->info"
 	TagMapLabelUpdate                  = "map-label-update"
@@ -84,6 +85,9 @@ const (
 	TagPrefixSkipToSegmentPassthrough    = "skip_to_segment:passthrough="             // <segment-number>
 	TagPrefixSubtitleBitmap              = "subtitle:bitmap:"                         // <StreamSpec>[(<Codec>)]
 	TagPrefixVideoHDRSource              = "video:hdr-source("                        // <transfer>)
+	TagPrefixToSW                        = "to-sw:"                                   // <sourceBackend>  (#77 PR3 — swDialect downgrade)
+	TagPrefixToSWFilter                  = "to-sw:filter:"                            // <composeMode>
+	TagPrefixToSWEncode                  = "to-sw:encode:"                            // <hwEncoder>-><swEncoder>
 )
 
 // Bail-only reason strings — passed to bail() which produces `"skip:" + reason`.
