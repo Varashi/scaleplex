@@ -1,0 +1,23 @@
+ARGC: 18
+PID: 19189
+TS_NS: 1779913159290258207
+SID: unknown
+---
+-codec:v
+libdav1d
+-y
+-threads
+12
+-skip_frame
+noref
+-ss
+5118
+-i
+/mnt/media/Movies/100 Girls (2000)/100 Girls (2000) {tmdb-10035} [WEBDL-1080p][10bit][EAC3 5.1][AV1]-NTb.mkv
+-vf
+[in]fps=0.5,scale=w=320:h=320:force_original_aspect_ratio=increase,showinfo[out]
+-vsync
+passthrough
+-f
+image2
+thumb-%05d.jpeg

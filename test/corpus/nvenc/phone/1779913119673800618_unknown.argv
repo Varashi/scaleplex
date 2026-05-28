@@ -1,0 +1,23 @@
+ARGC: 18
+PID: 18817
+TS_NS: 1779913119673800618
+SID: unknown
+---
+-codec:v
+libdav1d
+-y
+-threads
+12
+-skip_frame
+noref
+-ss
+4705
+-i
+/mnt/media/Movies/10 Lives (2024)/10 Lives (2024) {tmdb-567811} [Remux-1080p][10bit][EAC3 5.1][AV1]-playBD.mkv
+-vf
+[in]fps=0.5,scale=w=320:h=320:force_original_aspect_ratio=increase,showinfo[out]
+-vsync
+passthrough
+-f
+image2
+thumb-%05d.jpeg

@@ -57,6 +57,64 @@ type dialect interface {
 	// these alongside the matching -hwaccel flag, the rest of the
 	// argv is already in this backend's shape and we pass through.
 	hwDecodeShortCodecs() map[string]struct{}
+
+	// hwaccelName is the value passed to `-hwaccel:N` for HW decode.
+	// VAAPI: "vaapi". NVIDIA: "nvdec" (matches Plex's emitted value;
+	// CUVID-side decoders also accept "cuda" but Plex picks nvdec).
+	hwaccelName() string
+
+	// hwaccelOutputFormat is the value passed to `-hwaccel_output_format:N`
+	// — the surface format ffmpeg uses for HW-decoded frames before they
+	// enter the filter graph. VAAPI: "vaapi". NVIDIA: "cuda".
+	hwaccelOutputFormat() string
+
+	// filterHWDeviceName is the value passed to `-filter_hw_device`,
+	// binding HW filters in the graph to this backend's device.
+	// VAAPI: "vaapi". NVIDIA: "cuda".
+	filterHWDeviceName() string
+
+	// initHWDeviceArg returns the `-init_hw_device` value targeting the
+	// worker's local device index `devIdx`.
+	//
+	// VAAPI: returns "vaapi=vaapi:" — empty path; the scaleplex-ffmpeg
+	// fork patch 0116-vaapi-device-env-retarget retargets the VAAPI device
+	// at open time from SCALEPLEX_RENDER_DEVICE, so the path content here
+	// is intentionally blank. devIdx is ignored on this backend.
+	//
+	// NVIDIA: returns "cuda=cuda:N". PMS's `-init_hw_device cuda=cuda:pci:BBBB:BB:DD.F`
+	// PCI form is host-local and meaningless on a remote worker, so the
+	// rewriter normalizes to the worker-local device index always.
+	initHWDeviceArg(devIdx int) string
+
+	// scaleFilter emits a HW scale filter targeting pixel format `pix`
+	// (typical values: "nv12", "p010"). The format is appended via
+	// `:format=PIX`. Filter name is backend-specific:
+	//   VAAPI: scale_vaapi=w=W:h=H:format=PIX
+	//   NVIDIA: scale_cuda=w=W:h=H:format=PIX
+	scaleFilter(w, h, pix string) string
+
+	// tonemapFilter emits a single-stage HW tonemap targeting pixel
+	// format `pix` (typical "nv12"). Algo precedence is backend-specific:
+	//
+	//   VAAPI: tonemap_vaapi=transfer=bt709:format=PIX
+	//          (iHD fixed BT.2390 EETF — algo is IGNORED. The OpenCL-derive
+	//          alternative used by the existing VAAPI tonemapConfig is
+	//          NOT a single-stage filter and is composed elsewhere.)
+	//   NVIDIA: tonemap_cuda=ALGO:PIX
+	//          (algo is honored; matches Plex's argv shape captured
+	//          2026-05-27 from the dev box.)
+	tonemapFilter(algo, pix string) string
+
+	// hwUploadFilter is the filter name that uploads CPU frames to this
+	// backend's HW surface. Both backends accept the bare "hwupload" name
+	// when -filter_hw_device steers the right device; method kept for
+	// symmetry + future divergence (e.g. hwupload_cuda explicit form).
+	hwUploadFilter() string
+
+	// hwDownloadFilter is the filter name that pulls HW frames back to
+	// system memory. Same string ("hwdownload") on both backends today;
+	// kept for symmetry.
+	hwDownloadFilter() string
 }
 
 // vaapiDialect — Intel iHD / VAAPI. The historical default; tested
@@ -80,6 +138,28 @@ func (vaapiDialect) hwDecodeShortCodecs() map[string]struct{} {
 	return hwDecodeShortCodecs
 }
 
+func (vaapiDialect) hwaccelName() string         { return "vaapi" }
+func (vaapiDialect) hwaccelOutputFormat() string { return "vaapi" }
+func (vaapiDialect) filterHWDeviceName() string  { return "vaapi" }
+
+func (vaapiDialect) initHWDeviceArg(_ int) string {
+	// devIdx ignored — the scaleplex-ffmpeg fork patch 0116 retargets
+	// the VAAPI device at open time from SCALEPLEX_RENDER_DEVICE.
+	return "vaapi=vaapi:"
+}
+
+func (vaapiDialect) scaleFilter(w, h, pix string) string {
+	return "scale_vaapi=w=" + w + ":h=" + h + ":format=" + pix
+}
+
+func (vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+	// iHD fixed-curve BT.2390 EETF — no algo slot. Algo arg ignored.
+	return "tonemap_vaapi=transfer=bt709:format=" + pix
+}
+
+func (vaapiDialect) hwUploadFilter() string   { return "hwupload" }
+func (vaapiDialect) hwDownloadFilter() string { return "hwdownload" }
+
 // activeDialect is the worker's selected backend. Populated in main()
 // via selectDialect() before any rewrite occurs. Default vaapi for
 // callers that still hold a static reference; once all references go
@@ -87,25 +167,23 @@ func (vaapiDialect) hwDecodeShortCodecs() map[string]struct{} {
 var activeDialect dialect = vaapiDialect{}
 
 // selectDialect picks the backend at worker startup based on
-// WORKER_BACKEND env. Values: "vaapi" (default), "nvidia" (Phase 1+),
-// "auto" (probe /dev/nvidia0 first, then /dev/dri/renderD*).
+// WORKER_BACKEND env. Values: "auto" (default — probes /dev/nvidia0
+// first, falls back to VAAPI), "vaapi", "nvidia".
 //
-// On unknown values: log a WARN and fall back to vaapi (safe default —
-// matches every existing prod deployment). Phase 1 NVIDIA dialect is
-// not yet implemented; "nvidia" / "auto" currently log + fall back to
-// vaapi so the env knob is wired but inert until [PR #2 of this
-// sequence] lands the nvidiaDialect impl.
+// The unified worker image carries both runtimes (VAAPI userspace +
+// CUDA runtime); the device-probe picks the one matching the host.
+// Operators can pin via the env knob; unknown values log a WARN and
+// fall back to VAAPI (safe default — matches every pre-PR-#61
+// deployment).
 func selectDialect() dialect {
 	switch want := strings.ToLower(strings.TrimSpace(os.Getenv("WORKER_BACKEND"))); want {
-	case "", "vaapi":
+	case "vaapi":
 		return vaapiDialect{}
 	case "nvidia":
-		log.Printf("WORKER_BACKEND=nvidia requested but nvidia dialect not yet implemented; falling back to vaapi")
-		return vaapiDialect{}
-	case "auto":
+		return nvidiaDialect{}
+	case "", "auto":
 		if _, err := os.Stat("/dev/nvidia0"); err == nil {
-			log.Printf("WORKER_BACKEND=auto: /dev/nvidia0 present, but nvidia dialect not yet implemented; falling back to vaapi")
-			return vaapiDialect{}
+			return nvidiaDialect{}
 		}
 		return vaapiDialect{}
 	default:

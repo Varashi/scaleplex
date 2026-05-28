@@ -57,6 +57,30 @@ func TestExtractGraphFacts(t *testing.T) {
 			graph: "[0:0]scale=w=1920:h=1080[0];[0]crop=100:100[1];[1]format=pix_fmts=nv12[2]",
 			want:  graphFacts{w: "1920", h: "1080"}, // ok=false
 		},
+		// NVIDIA shapes — directly from test/corpus/nvenc/persistent/ 2026-05-27.
+		// Sub-burn path on NVIDIA downloads to system memory for inlineass
+		// (libass is CPU-only); the rewriter's text-sub branch picks it up the
+		// same way as VAAPI since subKind comes from subSrc or `inlineass=`.
+		{
+			name:  "NVIDIA HW no-sub SDR (corpus shape)",
+			graph: "[0:0]hwupload[0];[0]scale_cuda=w=1280:h=720:format=nv12[1]",
+			want:  graphFacts{w: "1280", h: "720", ok: true},
+		},
+		{
+			name:  "NVIDIA HW text SDR (corpus shape)",
+			graph: "[0:0]hwupload[0];[0]scale_cuda=w=1280:h=720:format=nv12[1];[1]hwdownload,format=nv12[2];[2]inlineass=font_size=54[3]",
+			want:  graphFacts{w: "1280", h: "720", subKind: "text", subParams: "font_size=54", ok: true},
+		},
+		{
+			name:  "NVIDIA HW no-sub HDR (corpus shape — tonemap_cuda)",
+			graph: "[0:0]hwupload[0];[0]scale_cuda=w=1280:h=720:format=p010[1];[1]tonemap_cuda=hable:nv12[2]",
+			want:  graphFacts{w: "1280", h: "720", hdr: true, algo: "hable", ok: true},
+		},
+		{
+			name:  "NVIDIA HW text HDR (corpus shape)",
+			graph: "[0:0]hwupload[0];[0]scale_cuda=w=1280:h=720:format=p010[1];[1]tonemap_cuda=hable:nv12[2];[2]hwdownload,format=nv12[3];[3]inlineass=font_size=54[4]",
+			want:  graphFacts{w: "1280", h: "720", hdr: true, algo: "hable", subKind: "text", subParams: "font_size=54", ok: true},
+		},
 		{
 			name:  "no scale → bail",
 			graph: "[0:0]format=pix_fmts=nv12[0]",

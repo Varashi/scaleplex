@@ -6,9 +6,17 @@
 # For multi-host deployments — orchestrator on one host, workers on
 # many — see ./multi-host.md.
 #
-# Defaults assume an Intel iGPU / Arc card at /dev/dri/renderD128 (the
-# scaleplex worker's hardware path). Adjust IMAGE_TAG, paths, and
-# PMS_CLAIM in .env before `docker compose up -d`.
+# Single worker image carries BOTH HW backends — Intel iHD VAAPI AND
+# NVIDIA NVENC/NVDEC. The worker probes /dev/nvidia0 + /dev/dri/
+# renderD* at startup and picks the right dialect (WORKER_BACKEND=auto).
+# The stanza below defaults to the Intel iGPU/Arc shape (device bind
+# /dev/dri/renderD128); switch to NVIDIA by uncommenting the
+# `runtime: nvidia` + `NVIDIA_*` block and removing the device bind.
+# Mixed-backend hosts (both devices present) auto-pick NVIDIA; pin
+# via WORKER_BACKEND=vaapi/nvidia env.
+#
+# Adjust IMAGE_TAG, paths, and PMS_CLAIM in .env before `docker
+# compose up -d`.
 #
 # Security posture: LAN-only, HTTP plaintext. scaleplex does NOT ship
 # auth or TLS — wrap the deployment in a reverse proxy (Caddy/Traefik)
@@ -61,13 +69,26 @@ services:
     # leave commented to keep the surface minimal.
     # ports:
     #   - "3501:3501"
+    # --- HW passthrough: pick ONE ---
+    #
+    # Intel iGPU / Arc — the default. Bind /dev/dri/renderD128 (or
+    # whatever WORKER_RENDER_DEV points at) into the container.
     devices:
       - "${WORKER_RENDER_DEV:-/dev/dri/renderD128}:/dev/dri/renderD128"
+    #
+    # NVIDIA — uncomment `runtime: nvidia` + the NVIDIA_* env block
+    # below, and comment out the `devices:` block above. Requires
+    # nvidia-container-toolkit on the host. WORKER_BACKEND=auto in the
+    # image will probe /dev/nvidia0 and pick the NVIDIA dialect.
+    # runtime: nvidia
+    #
     # The worker binary expects uid 1000 / gid 100. Supplementary
     # groups 44 (video) + 568 (lsio/render) come from the k8s
     # DaemonSet posture; they cover the typical Intel iGPU/Arc render
     # node ownership across distros. Adjust if your renderD* node is
-    # owned by a different gid (`stat /dev/dri/renderD128`).
+    # owned by a different gid (`stat /dev/dri/renderD128`). NVIDIA
+    # hosts use the CDI-injected device nodes; render-group bind is a
+    # no-op there.
     user: "1000:100"
     group_add:
       - "44"
@@ -87,15 +108,32 @@ services:
       # uid 1000 and the PMS container's own uid (typically also 1000
       # under LSIO). On multi-host, mount the same NFS export here.
       - "${TRANSCODE_DIR:-./transcode}:/transcode"
+      # --- WSL gotcha (nvidia-container-toolkit 1.19) ---
+      # The CDI spec on WSL omits libnvidia-encode / libnvcuvid /
+      # libnvidia-opticalflow → NVENC/NVDEC fail to open. Bind manually
+      # from /usr/lib/wsl/lib/. Uncomment on a WSL host:
+      # - "/usr/lib/wsl/lib/libnvidia-encode.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-encode.so.1:ro"
+      # - "/usr/lib/wsl/lib/libnvcuvid.so.1:/usr/lib/x86_64-linux-gnu/libnvcuvid.so.1:ro"
+      # - "/usr/lib/wsl/lib/libnvidia-opticalflow.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-opticalflow.so.1:ro"
     environment:
+      # HW backend selection. `auto` (image default) probes /dev/nvidia0
+      # and falls back to VAAPI. Pin to `vaapi` or `nvidia` to override.
+      WORKER_BACKEND: "${WORKER_BACKEND:-auto}"
       # Force HW re-acceleration even when Plex emits a SW argv. Set
       # to 0 (or unset) for honor-Plex behavior — useful for hetero or
       # CPU-only fleets. Homelab default = 1.
       SCALEPLEX_FORCE_HW: "${SCALEPLEX_FORCE_HW:-1}"
-      # Tonemap path: opencl (algo-honored, Plex's chosen algorithm)
-      # or vaapi (fixed-curve BT.2390 EETF, lower CPU).
+      # Tonemap path (VAAPI only): opencl (algo-honored, Plex's chosen
+      # algorithm) or vaapi (fixed-curve BT.2390 EETF, lower CPU).
+      # Ignored on NVIDIA — Plex emits tonemap_cuda directly with the
+      # algo baked in.
       SCALEPLEX_TONEMAP: "${SCALEPLEX_TONEMAP:-opencl}"
       WORKER_MAX_SESSIONS: "${WORKER_MAX_SESSIONS:-0}"
+      # --- NVIDIA passthrough (uncomment when WORKER_BACKEND=nvidia /
+      # auto on an NVIDIA host). The image bakes these as defaults but
+      # explicit compose values are clearer for operators. ---
+      # NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-all}"
+      # NVIDIA_DRIVER_CAPABILITIES: "video,compute,utility"
       # PUSH-mode self-registration (optional). Leave SCALEPLEX_ORCHESTRATOR_URL
       # unset on the local worker — the orchestrator's WORKERS_DNS already
       # picks it up over the compose network. Set it ONLY when this

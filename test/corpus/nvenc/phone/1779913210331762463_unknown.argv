@@ -1,0 +1,23 @@
+ARGC: 18
+PID: 19444
+TS_NS: 1779913210331762463
+SID: unknown
+---
+-codec:v
+libdav1d
+-y
+-threads
+12
+-skip_frame
+noref
+-ss
+5119
+-i
+/mnt/media/Movies/100 Women (2002)/100 Women (2002) {tmdb-20648} [WEBDL-1080p][8bit][EAC3 2.0][AV1]-DiMEPiECE.mkv
+-vf
+[in]fps=0.5,scale=w=320:h=320:force_original_aspect_ratio=increase,showinfo[out]
+-vsync
+passthrough
+-f
+image2
+thumb-%05d.jpeg

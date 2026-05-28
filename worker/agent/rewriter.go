@@ -489,8 +489,21 @@ type filterRewrite struct {
 //     algorithm isn't carried through; substituteOpenCLTonemap keeps
 //     the algorithm straight off Plex's own chain.
 type tonemapConfig struct {
-	useOpenCL bool   // false = iHD fixed-curve tonemap_vaapi
+	useOpenCL bool   // VAAPI only: false = iHD fixed-curve tonemap_vaapi
 	algo      string // fallback algorithm for the SW-chain reshapes
+	// d is the worker's HW backend. nil = vaapiDialect{} fallback (kept
+	// for test ergonomics — tests construct tonemapConfig{...} literals
+	// without specifying d and expect VAAPI shapes).
+	d dialect
+}
+
+// backend returns tm.d with a VAAPI fallback for tests that construct
+// tonemapConfig literals without setting d.
+func (tm tonemapConfig) backend() dialect {
+	if tm.d == nil {
+		return vaapiDialect{}
+	}
+	return tm.d
 }
 
 func validTonemapAlgo(a string) bool {
@@ -502,11 +515,16 @@ func validTonemapAlgo(a string) bool {
 }
 
 // resolveTonemapConfig builds the tone-mapping backend policy from the
-// worker-pod env.
+// worker-pod env + the active HW dialect. useOpenCL is gated to VAAPI
+// — NVIDIA has no OpenCL-derive tonemap path (Plex emits `tonemap_cuda`
+// directly and the worker passes it through, see tm.stage).
 func resolveTonemapConfig() tonemapConfig {
 	cfg := tonemapConfig{
-		useOpenCL: !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi"),
-		algo:      "hable",
+		d:    activeDialect,
+		algo: "hable",
+	}
+	if cfg.d.backendName() == "vaapi" {
+		cfg.useOpenCL = !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi")
 	}
 	if a := strings.ToLower(os.Getenv("SCALEPLEX_TONEMAP_ALGO")); validTonemapAlgo(a) {
 		cfg.algo = a
@@ -514,15 +532,17 @@ func resolveTonemapConfig() tonemapConfig {
 	return cfg
 }
 
-// stage returns the filter fragment that converts an HDR p010 VAAPI
-// surface into an SDR (BT.709) nv12 VAAPI surface. It is inserted
-// directly after a `scale_vaapi=...:format=p010` step and its output is
-// a VAAPI surface either way, so it is drop-in wherever `tonemap_vaapi`
+// stage returns the filter fragment that converts an HDR p010 HW
+// surface into an SDR (BT.709) nv12 HW surface. It is inserted directly
+// after a `scale_*=...:format=p010` step and its output is a same-backend
+// surface either way, so it is drop-in wherever a single-stage tonemap
 // stood. `algo` overrides the config's algorithm (used when Plex's argv
-// carried its own); empty uses cfg.algo. Ignored in vaapi mode.
+// carried its own); empty uses cfg.algo. Ignored on VAAPI when useOpenCL
+// is false (iHD fixed-curve has no algo slot).
 //
-//	opencl: hwmap→opencl, tonemap_opencl=<algo>, hwmap→vaapi:reverse=1
-//	vaapi:  tonemap_vaapi (iHD fixed BT.2390 EETF)
+//	VAAPI, useOpenCL: hwmap→opencl, tonemap_opencl=<algo>, hwmap→vaapi:reverse=1
+//	VAAPI, fixed:     tonemap_vaapi (iHD fixed BT.2390 EETF)
+//	NVIDIA:           tonemap_cuda=<algo>:nv12 (algo-driven, no OpenCL derive)
 //
 // On ffmpeg-7 `hwmap=derive_device=opencl` does NOT self-create the OpenCL
 // device inside a -filter_complex (ffmpeg-6 did) — gpuResidentOpenCLTonemap
@@ -530,7 +550,7 @@ func resolveTonemapConfig() tonemapConfig {
 // VA-resident so this fragment's va→opencl derive succeeds.
 func (tm tonemapConfig) stage(algo string) string {
 	if !tm.useOpenCL {
-		return "tonemap_vaapi=transfer=bt709:format=nv12"
+		return tm.backend().tonemapFilter(algo, "nv12")
 	}
 	if !validTonemapAlgo(algo) {
 		algo = tm.algo
@@ -541,8 +561,8 @@ func (tm tonemapConfig) stage(algo string) string {
 		"hwmap=derive_device=vaapi:reverse=1"
 }
 
-// hdrScale returns the combined `scale_vaapi(p010) + tonemap` chain that
-// downscales and tone-maps an HDR source to an SDR nv12 VAAPI surface.
+// hdrScale returns the combined `scale(p010) + tonemap` chain that
+// downscales and tone-maps an HDR source to an SDR nv12 HW surface.
 // Used by the reFilterHDR/HDRAss reshapes — i.e. only where Plex's argv
 // already declared a tonemap.
 func (tm tonemapConfig) hdrScale(w, h string) string {
@@ -552,7 +572,7 @@ func (tm tonemapConfig) hdrScale(w, h string) string {
 // hdrScaleAlgo is hdrScale with an explicit tonemap algo (Plex's captured
 // algo on the SW-HDR reshape path). Empty algo falls back to tm.algo.
 func (tm tonemapConfig) hdrScaleAlgo(w, h, algo string) string {
-	return "scale_vaapi=w=" + w + ":h=" + h + ":format=p010," + tm.stage(algo)
+	return tm.backend().scaleFilter(w, h, "p010") + "," + tm.stage(algo)
 }
 
 // burnSpec captures the orthogonal axes of a HW scale / sub-burn graph. One
@@ -595,22 +615,23 @@ type burnSpec struct {
 // HDR-agnostic and the tonemap stage is sub-agnostic. gpuResidentOpenCLTonemap
 // later injects the OpenCL device + asserts VA-residency for the tonemap stage.
 func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
+	d := tm.backend()
 	n := 0
 	next := func() string { l := strconv.Itoa(n); n++; return l }
 	var b strings.Builder
 	src := "[0:0]"
 	if !s.vaResident {
 		u := next()
-		fmt.Fprintf(&b, "%shwupload[%s];", src, u)
+		fmt.Fprintf(&b, "%s%s[%s];", src, d.hwUploadFilter(), u)
 		src = "[" + u + "]"
 	}
 	scaled := next()
 	if s.hdr {
-		fmt.Fprintf(&b, "%sscale_vaapi=w=%s:h=%s:format=p010,%s[%s]",
-			src, s.w, s.h, tm.stage(s.algo), scaled)
+		fmt.Fprintf(&b, "%s%s,%s[%s]",
+			src, d.scaleFilter(s.w, s.h, "p010"), tm.stage(s.algo), scaled)
 	} else {
-		fmt.Fprintf(&b, "%sscale_vaapi=w=%s:h=%s:format=nv12[%s]",
-			src, s.w, s.h, scaled)
+		fmt.Fprintf(&b, "%s%s[%s]",
+			src, d.scaleFilter(s.w, s.h, "nv12"), scaled)
 	}
 	out := scaled
 	if s.burnSub {
@@ -634,8 +655,11 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 var reBitmapSubBranch = regexp.MustCompile(`\[(0:[0-9]+)\]scale=[0-9]+:[0-9]+,hwupload\[`)
 
 // reBitmapMainScale extracts the main-video target W/H from the overlay graph:
-// `[0:0]hwupload[..];[..]scale_vaapi=w=W:h=H`.
-var reBitmapMainScale = regexp.MustCompile(`\[0:0\]hwupload\[\d+\];\[\d+\]scale_vaapi=w=([0-9]+):h=([0-9]+)`)
+// `[0:0]hwupload[..];[..]scale_{vaapi,cuda}=w=W:h=H`. Matches both HW
+// backends for parity with reGraphScaleWH — NVIDIA PGS-burn graphs use
+// scale_cuda. NOTE: the NVIDIA bitmap-overlay path is not yet
+// live-validated (no PGS NVENC capture in the corpus); see scaleplex#66.
+var reBitmapMainScale = regexp.MustCompile(`\[0:0\]hwupload\[\d+\];\[\d+\]scale_(?:vaapi|cuda)=w=([0-9]+):h=([0-9]+)`)
 
 // reTonemapOpenCLAlgo extracts Plex's tonemap algorithm from an (already
 // substituteOpenCLTonemap-normalized) tonemap_opencl node.
@@ -682,12 +706,27 @@ type graphFacts struct {
 }
 
 var (
-	// reGraphScaleWH: the main-video scale (scale= or scale_vaapi=) target.
-	reGraphScaleWH = regexp.MustCompile(`scale(?:_vaapi)?=w=(\d+):h=(\d+)`)
+	// reGraphScaleWH: the main-video scale target. Matches the bare SW
+	// `scale=w=…:h=…` and both HW backends — `scale_vaapi=` (Intel) and
+	// `scale_cuda=` (NVIDIA). Backend identification is via the leading
+	// hwupload/hwaccel context, not this regex.
+	reGraphScaleWH = regexp.MustCompile(`scale(?:_(?:vaapi|cuda))?=w=(\d+):h=(\d+)`)
 	// reGraphTonemapSW: a bare `tonemap=<algo>` filter (Plex's SW HDR chain),
-	// excluding tonemap_opencl=/tonemap_vaapi= (those are matched separately).
+	// excluding tonemap_opencl=/tonemap_vaapi=/tonemap_cuda= (those are
+	// matched separately).
 	reGraphTonemapSW = regexp.MustCompile(`(?:^|[,;\]])tonemap=([A-Za-z0-9]+)`)
-	reGraphInlineass = regexp.MustCompile(`inlineass=([^\[]*)`)
+	// reGraphTonemapCUDA: NVIDIA HW tonemap. Matches BOTH:
+	//  - Plex's positional form `tonemap_cuda=ALGO:PIX` (Plex-fork
+	//    ffmpeg accepts positional 2 = `format`).
+	//  - jellyfin-ffmpeg's named form `tonemap_cuda=tonemap=ALGO:format=PIX`
+	//    (jellyfin parses positional 2 as `tonemap_mode`, so the named
+	//    form is the portable shape — see nvidiaDialect.tonemapFilter
+	//    for why the rewriter emits named-arg form even though Plex's
+	//    incoming argv uses positional).
+	// Optional `tonemap=` prefix skipped so the captured group is the
+	// algo string in either shape.
+	reGraphTonemapCUDA = regexp.MustCompile(`tonemap_cuda=(?:tonemap=)?([A-Za-z0-9]+)`)
+	reGraphInlineass   = regexp.MustCompile(`inlineass=([^\[]*)`)
 	// reGraphFilterName: a filtergraph node name — an identifier preceded by a
 	// chain boundary (start, ';', ',', ']') possibly followed by whitespace,
 	// and followed by '=', '[', ',', ';' or end. Arg values (after '=' or ':')
@@ -703,10 +742,12 @@ var (
 // else, so an unrecognized shape falls through to the existing bail/SW path
 // instead of being mis-recomposed — preserving the strict reFilter* behavior.
 var modeledFilterNodes = map[string]bool{
-	"scale": true, "scale_vaapi": true, "hwupload": true, "hwdownload": true,
+	"scale": true, "scale_vaapi": true, "scale_cuda": true,
+	"hwupload": true, "hwdownload": true,
 	"hwmap": true, "format": true, "setparams": true, "tonemap": true,
-	"tonemap_opencl": true, "tonemap_vaapi": true, "zscale": true,
-	"inlineass": true, "overlay_vaapi": true,
+	"tonemap_opencl": true, "tonemap_vaapi": true, "tonemap_cuda": true,
+	"zscale":    true,
+	"inlineass": true, "overlay_vaapi": true, "overlay_cuda": true,
 }
 
 // graphNodesModeled reports whether every filter node in the graph is in
@@ -746,6 +787,8 @@ func extractGraphFacts(graph string, subSrc *subtitleSource) graphFacts {
 	switch {
 	case reTonemapOpenCLAlgo.MatchString(graph):
 		f.hdr, f.algo = true, reTonemapOpenCLAlgo.FindStringSubmatch(graph)[1]
+	case reGraphTonemapCUDA.MatchString(graph):
+		f.hdr, f.algo = true, reGraphTonemapCUDA.FindStringSubmatch(graph)[1]
 	case reGraphTonemapSW.MatchString(graph):
 		f.hdr, f.algo = true, reGraphTonemapSW.FindStringSubmatch(graph)[1]
 	case strings.Contains(graph, "tonemap_vaapi"):
@@ -779,7 +822,7 @@ func extractGraphFacts(graph string, subSrc *subtitleSource) graphFacts {
 // video and overlay_vaapi (the HDR variant) no longer escapes the optimizer.
 // Returns ok=false when the graph isn't a bitmap overlay burn.
 func detectBitmapOverlayBurn(graph string) (streamSpec, w, h, algo string, hdr, ok bool) {
-	if !strings.Contains(graph, "overlay_vaapi") {
+	if !strings.Contains(graph, "overlay_vaapi") && !strings.Contains(graph, "overlay_cuda") {
 		return
 	}
 	sb := reBitmapSubBranch.FindStringSubmatch(graph)
@@ -1982,18 +2025,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					return bail(TagPrefixBailUnknownDecoder + swDecoder)
 				}
 				args = spliceArgs(args, decCodecIdx+2,
-					"-hwaccel:0", "vaapi",
-					"-hwaccel_output_format:0", "vaapi",
-					"-hwaccel_device:0", "vaapi",
+					"-hwaccel:0", activeDialect.hwaccelName(),
+					"-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat(),
+					"-hwaccel_device:0", activeDialect.filterHWDeviceName(),
 				)
 				changes = append(changes, TagPrefixDecodeBareHWUpgrade+swDecoder)
 			}
 		} else if hwDecoder, ok := activeDialect.decoderMap()[swDecoder]; ok {
 			args[decCodecIdx+1] = hwDecoder
 			args = spliceArgs(args, decCodecIdx+2,
-				"-hwaccel:0", "vaapi",
-				"-hwaccel_output_format:0", "vaapi",
-				"-hwaccel_device:0", "vaapi",
+				"-hwaccel:0", activeDialect.hwaccelName(),
+				"-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat(),
+				"-hwaccel_device:0", activeDialect.filterHWDeviceName(),
 			)
 			changes = append(changes, TagPrefixDecode+swDecoder+"->"+hwDecoder)
 		} else {
@@ -2035,9 +2078,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// env below. So the device path Plex baked in (its own host's
 		// HardwareDevicePath) is irrelevant on the worker — we leave Plex's
 		// -init_hw_device untouched and only inject the option when Plex
-		// emitted none (a pure SW session being HW-accelerated). The empty
-		// `vaapi=vaapi:` is filled by the fork's env override at device-open.
-		// Skipped entirely when honoring a SW session — no VAAPI device needed.
+		// emitted none (a pure SW session being HW-accelerated). On VAAPI
+		// the injected `vaapi=vaapi:` is filled by the fork's env override
+		// at device-open; on NVIDIA the dialect emits `cuda=cuda:N` against
+		// the worker-local device index. Skipped entirely when honoring a
+		// SW session — no HW device needed.
 		if !honorSW && indexOfArg(args, "-init_hw_device", 0) < 0 {
 			// Inject -init_hw_device + -filter_hw_device BEFORE the first
 			// -i so they're parsed as global options. Placing them after
@@ -2054,8 +2099,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// to global position.
 			newInputIdx := indexOfArg(args, "-i", 0)
 			args = spliceArgs(args, newInputIdx,
-				"-init_hw_device", "vaapi=vaapi:",
-				"-filter_hw_device", "vaapi",
+				"-init_hw_device", activeDialect.initHWDeviceArg(0),
+				"-filter_hw_device", activeDialect.filterHWDeviceName(),
 			)
 			changes = append(changes, TagInjectInitHWDevice)
 		}
@@ -2232,14 +2277,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// scrubs below apply.
 			changes = append(changes, TagHonorPlexHWDecSWEnc)
 		} else {
-			// HW-decode mode: PMS already emitted a VAAPI encoder. Validate
-			// that, but leave the filter chain, map labels, and encoder
-			// argument intact.
+			// HW-decode mode: PMS already emitted a HW encoder for the
+			// active backend. Validate that, but leave the filter chain,
+			// map labels, and encoder argument intact. The accepted set
+			// is whatever encoderMap maps to — VAAPI:
+			// {h264_vaapi, hevc_vaapi}; NVIDIA: {h264_nvenc, hevc_nvenc}.
 			swEncoder := args[encCodecIdx+1]
-			switch swEncoder {
-			case "h264_vaapi", "hevc_vaapi":
-				// expected
-			default:
+			expected := false
+			for _, hw := range activeDialect.encoderMap() {
+				if hw == swEncoder {
+					expected = true
+					break
+				}
+			}
+			if !expected {
 				return bail(TagPrefixBailUnexpectedEncoder + swEncoder)
 			}
 			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
@@ -2314,16 +2365,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
 						oldLabel = "[" + m[1] + "]"
 					}
-					// vaResident=true: Plex's argv carries `-hwaccel:0 vaapi
-					// -hwaccel_output_format:0 vaapi`, so [0:0] is already a VA
-					// surface — composeBurn skips the leading hwupload (Plex's
-					// own leading `[0:0]hwupload[0]` was a redundant passthrough
-					// on a VA-tagged frame). Force -hwaccel_output_format:0 vaapi
-					// defensively (parity with the HW-decode-bitmap branch).
+					// vaResident=true: Plex's argv carries the HW decode flags
+					// (`-hwaccel:0 <vaapi|nvdec> -hwaccel_output_format:0
+					// <vaapi|cuda>`), so [0:0] is already a backend surface —
+					// composeBurn skips the leading hwupload (Plex's own leading
+					// `[0:0]hwupload[0]` was a redundant passthrough on a
+					// HW-tagged frame). Force -hwaccel_output_format:0 to the
+					// backend's surface format defensively (parity with the
+					// HW-decode-bitmap branch).
 					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
-						args[ofIdx+1] = "vaapi"
+						args[ofIdx+1] = activeDialect.hwaccelOutputFormat()
 					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
-						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat())
 						vfIdx = indexOfArg(args, "-filter_complex", 0) + 1
 					}
 					animated := subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile)
@@ -2394,14 +2447,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					burnSub: true,
 				})
 				args[i+1] = newFilter
-				// Make [0:0] a real VA surface (Plex's bitmap argv decodes to
+				// Make [0:0] a real HW surface (Plex's bitmap argv decodes to
 				// sysmem) so the no-hwupload composer is valid + the round-trip is
 				// gone. Idempotent with gpuResidentOpenCLTonemap's own force.
 				if vaResident {
 					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
-						args[ofIdx+1] = "vaapi"
+						args[ofIdx+1] = activeDialect.hwaccelOutputFormat()
 					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
-						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
+						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat())
 					}
 				}
 				retargetMapLabel(args, oldLabel, newLabel)
