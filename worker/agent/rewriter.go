@@ -1971,6 +1971,19 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			return bail(TagBailReasonNoInput)
 		}
 
+		// 0. Cross-backend reshape (scaleplex#77). If PMS shaped this argv for
+		// a HW backend other than the worker's (e.g. a VAAPI-configured PMS
+		// dispatching to a NVIDIA worker), translate decode flags + filter
+		// graph + encoder to the worker's native backend FIRST, so the
+		// honor-source logic below runs on a native argv. No-op when source ==
+		// worker or source is SW/none. In-place value swaps only — no length
+		// change, so inputIdx stays valid. Re-accelerates onto the worker's HW
+		// → must respect the Plex-Pass gate (scaleplex#78, added next).
+		if reshaped, ccChanges := reshapeForeignHWArgv(args, tm); len(ccChanges) > 0 {
+			args = reshaped
+			changes = append(changes, ccChanges...)
+		}
+
 		// 1. Decoder.
 		//
 		// Two argv shapes:
