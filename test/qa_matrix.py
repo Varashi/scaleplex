@@ -65,6 +65,19 @@ CLIENT_HEADERS = {
     "X-Plex-Model": "hosted",
 }
 
+# Plex-for-Windows identity → Plex emits the segmented-matroska output muxer
+# (-f segment -segment_format matroska), a distinct worker path vs Web's DASH /
+# HLS-mpegts. Used by the windows-mkv muxer case.
+WINDOWS_HEADERS = {
+    "X-Plex-Product": "Plex for Windows",
+    "X-Plex-Version": "1.112.0",
+    "X-Plex-Platform": "Windows",
+    "X-Plex-Platform-Version": "10",
+    "X-Plex-Device": "Windows",
+    "X-Plex-Device-Name": "scaleplex-QA-win",
+    "X-Plex-Model": "standalone",
+}
+
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
     "HardwareAcceleratedCodecs": [1, 0],     # HW decode
@@ -188,10 +201,90 @@ def content_streams(rk):
     return aud, sub
 
 
+SUB_TEXT = {"srt", "subrip", "ass", "ssa", "webvtt", "mov_text"}
+SUB_BITMAP = {"pgs", "pgssub", "vobsub", "dvd_subtitle", "dvdsub"}
+
+
+def find_sub_stream(rk):
+    """Return {'text': id, 'bitmap': id} of the first matching subtitle stream
+    IDs on this item (for forcing sub-burn). Missing kinds are absent."""
+    code, body = plex(f"/library/metadata/{rk}")
+    out = {}
+    if code != 200:
+        return out
+    for sid, codec in re.findall(r"<Stream id=\"(\d+)\"[^>]*?streamType=\"3\"[^>]*?codec=\"([a-z0-9_]+)\"", body):
+        c = codec.lower()
+        if c in SUB_TEXT and "text" not in out:
+            out["text"] = sid
+        elif c in SUB_BITMAP and "bitmap" not in out:
+            out["bitmap"] = sid
+    return out
+
+
+def build_cases(content):
+    """Curate a content/subtitle case list that exercises every worker SHAPE
+    axis: resolution + HDR (via content) and subtitle kind none/text/bitmap
+    (via forced burn). Decode/encode/HDR-tonemap come from the server-pref
+    axis; protocol (hls/dash) is layered in the main loop. One representative
+    item per axis-value, discovered from the library."""
+    def first(pred):
+        return next((c for c in content if pred(c)), None)
+
+    def case(rk, title, label, extra=None, client=None, protocols=None):
+        return {"rk": rk, "title": title, "label": label,
+                "extra": extra or {}, "client": client, "protocols": protocols}
+
+    cases = []
+    sdr1080 = first(lambda c: c[3] in ("1080", "720") and c[4] == "sdr")
+    # The section listing omits colorTrc, so HDR items mislabel as "sdr" — confirm
+    # via the metadata call (is_hdr). Prefer a 4K HDR item; fall back to any HDR.
+    hdr4k = first(lambda c: c[3] == "4k" and is_hdr(c[0])) or first(lambda c: is_hdr(c[0]))
+    if sdr1080:
+        cases.append(case(sdr1080[0], sdr1080[1], "sdr-nosub"))
+    if hdr4k:
+        cases.append(case(hdr4k[0], hdr4k[1], "hdr-nosub"))
+    # sub-burn: scan content for items carrying a text / bitmap sub stream.
+    text_done = bitmap_done = False
+    for rk, title, *_ in content:
+        if text_done and bitmap_done:
+            break
+        subs = find_sub_stream(rk)
+        if not text_done and "text" in subs:
+            cases.append(case(rk, title, "text-burn",
+                              {"subtitleStreamID": subs["text"], "subtitles": "burn"}))
+            text_done = True
+        if not bitmap_done and "bitmap" in subs:
+            cases.append(case(rk, title, "bitmap-burn",
+                              {"subtitleStreamID": subs["bitmap"], "subtitles": "burn"}))
+            bitmap_done = True
+
+    # Muxer coverage beyond the protocol param (the HLS segment container +
+    # Plex-Windows shapes the corpus showed are real):
+    #  - ssegment+matroska: force mpegts-INCOMPATIBLE audio kept as-is
+    #    (directStreamAudio=1) on an EAC3/TrueHD/DTS title → Plex picks mkv
+    #    segments over .ts. hls only.
+    #  - segment+matroska: a Plex-for-Windows client → its native seg-mkv muxer.
+    AUDIO_MKV = {"eac3", "truehd", "dca", "dts", "mlp"}
+    audio_item = None
+    for rk, title, *_ in content:
+        aud, _ = content_streams(rk)
+        if aud & AUDIO_MKV:
+            audio_item = (rk, title, sorted(aud & AUDIO_MKV)[0])
+            break
+    if audio_item:
+        cases.append(case(audio_item[0], audio_item[1], f"audio-mkv({audio_item[2]})",
+                          {"directStreamAudio": 1}, protocols=["hls"]))
+    win_item = sdr1080 or hdr4k or (content[0] if content else None)
+    if win_item:
+        cases.append(case(win_item[0], win_item[1], "windows-segmkv",
+                          client=WINDOWS_HEADERS, protocols=["hls"]))
+    return cases
+
+
 # ---------------------------------------------------------------------------
 
 
-def start_session(rating_key, extra_params=None):
+def start_session(rating_key, extra_params=None, client_headers=None):
     sid = str(uuid.uuid4())
     params = {
         "hasMDE": 1, "path": f"/library/metadata/{rating_key}",
@@ -205,7 +298,7 @@ def start_session(rating_key, extra_params=None):
     # X-Plex-Client-Identifier must be a HEADER, consistent across decision +
     # start, so Plex binds the session + spawns the transcode (as a param it
     # 200s but never reaches the worker).
-    hdrs = {**CLIENT_HEADERS, "X-Plex-Client-Identifier": f"qa-{sid[:8]}"}
+    hdrs = {**(client_headers or CLIENT_HEADERS), "X-Plex-Client-Identifier": f"qa-{sid[:8]}"}
     # hasMDE=1 requires a transcode DECISION before start.m3u8 will serve
     # ("Denying access due to session lacking decision" → 400 otherwise).
     plex("/video/:/transcode/universal/decision", params, headers=hdrs, timeout=30)
@@ -233,9 +326,7 @@ ERR_RE = re.compile(
 TAG_RE = re.compile(r"rewriter applied: ([^\"]+)")
 
 
-def verify(title, since="40s"):
-    """Grep worker logs for this title's session; classify pass/fail."""
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")[:18]
+def _scan_logs(slug, since):
     spawned = first_seg = False
     tags = ""
     errors = []
@@ -249,13 +340,33 @@ def verify(title, since="40s"):
         mt = TAG_RE.search(line)
         if mt:
             tags = mt.group(1)
-        # error scan only on lines that aren't the source's stream dump
-        head = line.split("stderr_tail=", 1)[0]
+        head = line.split("stderr_tail=", 1)[0]  # skip the source stream dump
         if ERR_RE.search(head):
             errors.append(ERR_RE.search(head).group(0))
-    ok = first_seg and not errors
-    return {"ok": ok, "spawned": spawned, "first_seg": first_seg,
-            "tags": tags, "errors": sorted(set(errors))}
+    return spawned, first_seg, tags, errors
+
+
+def verify(title, started_at, max_wait):
+    """Poll the worker logs for THIS session, time-windowed from the case start.
+
+    Correlation by title-slug breaks when consecutive cases reuse a title (only
+    one 4K-HDR item carries both sub types), so a fixed 40s window picked up the
+    PREVIOUS same-slug case. Instead poll a window that grows only from this
+    case's start and break the instant a first-segment (or error) appears — the
+    first segment lands ~1-3s after spawn, so the window stays small and can't
+    reach the prior case (which is >=1 settle+gap older)."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")[:18]
+    spawned = first_seg = False
+    tags = ""
+    errors = []
+    while True:
+        elapsed = int(time.time() - started_at) + 4
+        spawned, first_seg, tags, errors = _scan_logs(slug, f"{elapsed}s")
+        if first_seg or errors or time.time() - started_at >= max_wait:
+            break
+        time.sleep(3)
+    return {"ok": first_seg and not errors, "spawned": spawned,
+            "first_seg": first_seg, "tags": tags, "errors": sorted(set(errors))}
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +386,9 @@ def main():
     ap.add_argument("--quick", action="store_true", help="small slice, FORCE_HW=1 only")
     ap.add_argument("--force-hw", default="1,0", help="comma list, e.g. 1,0")
     ap.add_argument("--settle", type=float, default=12, help="secs to wait per session")
+    ap.add_argument("--protocols", default="hls,dash", help="comma list, e.g. hls,dash")
     args = ap.parse_args()
+    protocols = [p.strip() for p in args.protocols.split(",") if p.strip()]
     if not TOKEN:
         sys.exit("set PLEX_TOKEN")
 
@@ -300,8 +413,17 @@ def main():
                 rich = c
                 break
     rich = rich or content[0]
+    cases = build_cases(content)
+    if not cases:  # fall back to the single rich backbone if discovery is thin
+        cases = [{"rk": rich[0], "title": rich[1], "label": "backbone",
+                  "extra": {}, "client": None, "protocols": None}]
     print(f"backbone content: {rich[0]} {rich[1]} ({rich[2]}/{rich[3]}/{rich[4]})")
-    print(f"discovered {len(content)} content shapes\n")
+    print(f"discovered {len(content)} content shapes; cases:")
+    for c in cases:
+        ps = c["protocols"] or protocols
+        print(f"  - {c['label']}: {c['title']} (rk={c['rk']}) protos={ps}"
+              f"{' [windows]' if c['client'] else ''}")
+    print(f"default protocols: {protocols}\n")
 
     fhw_vals = [1] if args.quick else [int(x) for x in args.force_hw.split(",")]
     combos = server_combos(args.quick)
@@ -314,17 +436,25 @@ def main():
                 print(f"  PREFS-FAIL {combo}")
                 continue
             time.sleep(2)
-            label = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
-                             for k, v in combo.items())
-            sid, code = start_session(rich[0])
-            time.sleep(args.settle)
-            res = verify(rich[1]) if code == 200 else {"ok": False, "errors": [f"start={code}"], "tags": "", "spawned": False, "first_seg": False}
-            stop_session(sid)
-            status = "PASS" if res["ok"] else "FAIL"
-            results.append((fhw, label, status, res))
-            print(f"  [{status}] FORCE_HW={fhw} {label} "
-                  f"seg={res['first_seg']} err={res['errors']}")
-            time.sleep(2)
+            plabel = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
+                              for k, v in combo.items())
+            for c in cases:
+                for proto in (c["protocols"] or protocols):
+                    label = f"{c['label']}/{proto} | {plabel}"
+                    started = time.time()
+                    sid, code = start_session(c["rk"], {**c["extra"], "protocol": proto},
+                                              client_headers=c["client"])
+                    if code == 200:
+                        res = verify(c["title"], started, args.settle)
+                    else:
+                        res = {"ok": False, "errors": [f"start={code}"], "tags": "",
+                               "spawned": False, "first_seg": False}
+                    stop_session(sid)
+                    status = "PASS" if res["ok"] else "FAIL"
+                    results.append((fhw, label, status, res))
+                    print(f"  [{status}] FORCE_HW={fhw} {label} "
+                          f"seg={res['first_seg']} err={res['errors']}")
+                    time.sleep(4)  # let this session's segments age out of the next verify window
 
     npass = sum(1 for *_, r in results if r["ok"])
     print(f"\n=== {npass}/{len(results)} PASS ===")
