@@ -22,6 +22,7 @@ import argparse
 import itertools
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -43,6 +44,8 @@ MOVIE_SECTION = os.environ.get("SECTION", "1")
 # typically scale the Arc DS to 0 first so the orchestrator routes every
 # session to the external worker.
 WORKER_MODE = os.environ.get("WORKER_MODE", "k8s")
+if WORKER_MODE not in ("k8s", "docker"):
+    sys.exit(f"WORKER_MODE={WORKER_MODE!r} invalid; expected 'k8s' or 'docker'")
 WORKER_SSH = os.environ.get("WORKER_SSH", "")               # e.g. root@skw-d-frank.boeye.net
 WORKER_COMPOSE_DIR = os.environ.get("WORKER_COMPOSE_DIR", "/root/scaleplex-deploy")
 WORKER_DOCKER_NAME = os.environ.get("WORKER_DOCKER_NAME", "scaleplex-deploy-worker-1")
@@ -97,19 +100,25 @@ def kubectl(*args, timeout=200):
                           text=True, timeout=timeout)
 
 
-def _ssh(cmd, timeout=200):
-    return subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", WORKER_SSH, cmd],
-                          capture_output=True, text=True, timeout=timeout)
+def _ssh(cmd, timeout=200, check=False):
+    r = subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", WORKER_SSH, cmd],
+                       capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        raise subprocess.CalledProcessError(r.returncode, cmd, r.stdout, r.stderr)
+    return r
 
 
 def set_force_hw(val):
     if WORKER_MODE == "docker":
         # Rewrite the compose FORCE_HW env + recreate the container; the agent
         # re-registers (PUSH) within a few seconds. Quoted value matches the
-        # `SCALEPLEX_FORCE_HW: "N"` compose form.
-        _ssh(f"cd {WORKER_COMPOSE_DIR} && "
-             f"sed -i 's/SCALEPLEX_FORCE_HW: .*/SCALEPLEX_FORCE_HW: \"{val}\"/' compose.yaml && "
-             f"docker compose up -d")
+        # `SCALEPLEX_FORCE_HW: "N"` compose form. check=True — a failed
+        # recreate invalidates the cells that follow, so fail fast.
+        _ssh("cd {d} && "
+             "sed -i 's/SCALEPLEX_FORCE_HW: .*/SCALEPLEX_FORCE_HW: \"{v}\"/' compose.yaml && "
+             "docker compose up -d".format(
+                 d=shlex.quote(WORKER_COMPOSE_DIR), v=int(val)),
+             check=True)
         time.sleep(WORKER_DOCKER_SETTLE)
         return
     kubectl("set", "env", f"ds/{WORKER_DS}", f"SCALEPLEX_FORCE_HW={val}")
@@ -126,7 +135,10 @@ def worker_logs(since):
     """Combined worker log text for the given lookback window.
     k8s: concat of each Arc pod's logs. docker: the external container's logs."""
     if WORKER_MODE == "docker":
-        return _ssh(f"docker logs {WORKER_DOCKER_NAME} --since={since} 2>&1").stdout
+        # Tolerant (no check): a transient non-zero log read shouldn't abort
+        # the matrix; an empty result surfaces as a cell FAIL anyway.
+        return _ssh("docker logs {n} --since={s} 2>&1".format(
+            n=shlex.quote(WORKER_DOCKER_NAME), s=shlex.quote(since))).stdout
     out = []
     for pod in worker_pods():
         out.append(kubectl("logs", pod, "-c", WORKER_CONTAINER, f"--since={since}").stdout)
