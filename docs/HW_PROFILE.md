@@ -143,3 +143,38 @@ a node with no HW for a session honors SW → runs CPU.
 - unset / `0` → honor Plex's HW-vs-SW decision; SW stays SW (CPU on worker).
 - Backend is always the node's (device already via `SCALEPLEX_RENDER_DEVICE`
   / patch `0116`).
+
+## Heterogeneous fleet + scheduling (PR4, scaleplex#77)
+
+The worker self-detects its backend; the admin's only real lever is **which
+hardware each worker gets**. Same image everywhere.
+
+### Per-worker (deployment) config
+- Assign hardware → backend is auto-detected (`WORKER_BACKEND=auto`, the default):
+  - NVIDIA: `runtime: nvidia` / `gpus: all` (docker) or NVIDIA device-plugin +
+    runtimeClass (k8s) → `/dev/nvidia0` present → **nvenc**.
+  - Intel/AMD: `/dev/dri` (docker `devices:` / Intel GPU device-plugin) →
+    a `renderD*` node → **vaapi**.
+  - No GPU assigned → **sw** (CPU).
+- Pin explicitly with `WORKER_BACKEND=vaapi|nvenc|sw` only for edge cases
+  (dual-GPU host, force-SW for testing).
+- `WORKER_MAX_SESSIONS=N` — soft concurrency cap; worth setting low on a CPU
+  worker. `SCALEPLEX_FORCE_HW` is meaningful only on HW workers (forced off on sw).
+- The worker reports `backend` + `gpu_load` on `/capability` (NVIDIA `gpu_load`
+  via an `nvidia-smi` utilization reader; Intel via i915 sysfs/PMU).
+
+k8s shape: one worker Deployment/DaemonSet **per hardware class** (its own
+nodeSelector + device-plugin), all the same image + `WORKER_BACKEND=auto`. The
+orchestrator's DNS/LIST/PUSH discovery sweeps them into one pool. Adding a
+NVIDIA/CPU tier = deploy another worker set — **no orchestrator reconfig**.
+
+### Orchestrator scheduling knobs (env)
+- `SCALEPLEX_LB_STRATEGY` = `load` (default) | `round-robin` | `least-sessions`
+  | `random` — the within-tier ordering.
+- `SCALEPLEX_PREFER_HW` = `1` (default) | `0`. On → tier `[HW, SW]`, order each
+  by the strategy, HW first (CPU node is overflow). `0` → one flat pool.
+
+Both default to the pre-PR4 behavior (`load`, HW-preferred). On a homogeneous
+fleet the tiering collapses to a single tier — no-op. The orchestrator needs no
+per-worker config; it tiers + ranks from the reported `backend` + load.
+`/workers` JSON gains a per-worker `backend` for observability.

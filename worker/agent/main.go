@@ -64,6 +64,11 @@ type capabilityResponse struct {
 	// GPUEngines counts the discovered video engines so the orchestrator
 	// (or a dashboard) can sanity-check the gpu_load reading.
 	GPUEngines int `json:"gpu_engines"`
+	// Backend is the worker's selected transcode dialect: "vaapi", "nvenc",
+	// or "sw" (#77 PR4). The orchestrator tiers HW (vaapi/nvenc) above SW for
+	// routing. Plex only transcodes to h264/hevc — both handled by every HW
+	// backend and by SW — so no per-codec capability set is reported.
+	Backend string `json:"backend"`
 }
 
 type taskRegistry struct {
@@ -271,6 +276,7 @@ func handleCapability(w http.ResponseWriter, r *http.Request) {
 		resp.GPULoad = engineSamplerInst.load()
 		resp.GPUEngines = engineSamplerInst.numEngines()
 	}
+	resp.Backend = activeDialect.backendName()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }

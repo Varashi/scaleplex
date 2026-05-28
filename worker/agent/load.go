@@ -19,10 +19,12 @@ package main
 // pre-Phase-3, no regression on CPU-only or unsupported workers.
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -235,6 +237,81 @@ func (r *pmuReader) close() {
 	}
 }
 
+// ─── NVIDIA reader ────────────────────────────────────────────────────
+//
+// NVIDIA exposes no i915-style monotonic busy-ns counter, only instantaneous
+// utilization via NVML / nvidia-smi. To fit the engineReader contract (which
+// returns monotonic ns-busy counters the sampler diffs over elapsed time), this
+// reader ACCUMULATES `util_frac * dt` into a synthetic per-engine ns counter
+// between samples. The sampler then diffs/÷elapsed back to the mean utilization,
+// no sampler change needed. Two "engines" map to NVENC (encoder) + NVDEC
+// (decoder) utilization — the analog of Intel's vcs/vecs.
+//
+// nvidia-smi is exec'd (~tens of ms) on the sampler's 2s cadence; cheap enough.
+// The container scopes the GPU via NVIDIA_VISIBLE_DEVICES, so GPU 0 is this
+// worker's card.
+type nvidiaReader struct {
+	lastTime time.Time
+	accEnc   float64 // accumulated busy-ns, encoder
+	accDec   float64 // accumulated busy-ns, decoder
+}
+
+func newNvidiaReader() (*nvidiaReader, error) {
+	if _, err := exec.LookPath("nvidia-smi"); err != nil {
+		return nil, errors.New("nvidia-smi not found")
+	}
+	r := &nvidiaReader{}
+	if _, _, err := r.query(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// query returns instantaneous encoder + decoder utilization as fractions 0..1.
+// Bounded by a 5s context timeout so a hung nvidia-smi can't stall the sampler.
+func (r *nvidiaReader) query() (enc, dec float64, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "nvidia-smi",
+		"--query-gpu=utilization.encoder,utilization.decoder",
+		"--format=csv,noheader,nounits", "-i", "0").Output()
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Split(strings.TrimSpace(string(out)), ",")
+	if len(fields) < 2 {
+		return 0, 0, errors.New("nvidia-smi: unexpected output: " + string(out))
+	}
+	e, err1 := strconv.ParseFloat(strings.TrimSpace(fields[0]), 64)
+	d, err2 := strconv.ParseFloat(strings.TrimSpace(fields[1]), 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, errors.New("nvidia-smi: parse utilization: " + string(out))
+	}
+	return e / 100, d / 100, nil
+}
+
+func (r *nvidiaReader) sample() ([]uint64, error) {
+	enc, dec, err := r.query()
+	if err != nil {
+		// Propagate the error so engineSampler keeps its cached fraction.
+		// Returning a nil error with unchanged counters would make the sampler
+		// recompute a zero delta and drive cached load to 0 on a transient
+		// nvidia-smi hiccup (fail-soft = hold last good, not go idle).
+		return nil, err
+	}
+	now := time.Now()
+	if !r.lastTime.IsZero() {
+		dt := float64(now.Sub(r.lastTime).Nanoseconds())
+		r.accEnc += enc * dt
+		r.accDec += dec * dt
+	}
+	r.lastTime = now
+	return []uint64{uint64(r.accEnc), uint64(r.accDec)}, nil
+}
+
+func (r *nvidiaReader) names() []string { return []string{"nvenc", "nvdec"} }
+func (r *nvidiaReader) close()          {}
+
 // ─── detection + sampler ──────────────────────────────────────────────
 
 // detectReader returns the best available reader plus a tag describing
@@ -254,6 +331,13 @@ func detectReader() (engineReader, string) {
 		return r, "pmu"
 	} else {
 		log.Printf("gpu PMU reader unavailable: %v", err)
+	}
+	// NVIDIA fallback — only succeeds where nvidia-smi works (an NVENC worker);
+	// Intel readers fail first there (no i915), so this is reached cleanly.
+	if r, err := newNvidiaReader(); err == nil {
+		return r, "nvidia-smi"
+	} else {
+		log.Printf("gpu NVIDIA reader unavailable: %v", err)
 	}
 	return nil, "none"
 }
