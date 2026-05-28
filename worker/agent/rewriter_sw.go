@@ -111,8 +111,12 @@ func (tm tonemapConfig) composeBurnSW(s burnSpec) (filter, newLabel string) {
 //  1. Strip HW decode flags + HW device init.
 //  2. Filter graph: a foreign HW graph (scale_vaapi/scale_cuda/hwupload/tonemap_*)
 //     → extractGraphFacts → composeBurnSW. An already-SW `[0:0]scale=w=` graph is
-//     left untouched (Plex's own SW shape; honor-source keeps it). Bitmap subs
-//     are deferred (kept as-is) — SW bitmap burn is out of scope here (#76).
+//     left untouched (Plex's own SW shape; honor-source keeps it). Both text AND
+//     bitmap subs are reshaped: extractGraphFacts derives bitmap subKind/subSpec
+//     from the overlay_vaapi|overlay_cuda branch (no probe needed, so the nil
+//     subSrc arg is fine), and composeBurnSW emits text→inlineass / bitmap→stock
+//     `overlay` (Plex's SW PGS shape). Unlike the HW cross-backend path, bitmap
+//     is NOT deferred here.
 //  3. Encoder: foreign HW encoder → libx264/libx265.
 //
 // Decoder stays: a bare short codec or libdav1d decodes on the CPU once the

@@ -199,12 +199,13 @@ type swDialect struct{}
 
 func (swDialect) backendName() string { return "sw" }
 
-// encoderMap is identity over the SW encoders: a libx264/libx265 encoder is
+// swEncoderMap is identity over the SW encoders: a libx264/libx265 encoder is
 // already the SW target, so honor-source detection (plexSWEncoder) reads it as
-// "known" and the encoder reshape is a no-op.
-func (swDialect) encoderMap() map[string]string {
-	return map[string]string{"libx264": "libx264", "libx265": "libx265"}
-}
+// "known" and the encoder reshape is a no-op. Package-level (reused, not
+// per-call allocated) — same pattern as vaapiDialect.encoderMap. Do not mutate.
+var swEncoderMap = map[string]string{"libx264": "libx264", "libx265": "libx265"}
+
+func (swDialect) encoderMap() map[string]string { return swEncoderMap }
 
 // decoderMap is empty — a SW worker never injects a HW-decode hint; Plex's SW
 // decoder (libdav1d/…) or the bare codec decodes on the CPU.
