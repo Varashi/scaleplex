@@ -954,6 +954,14 @@ var openclTonemapRE = regexp.MustCompile(
 var tonemapOptRE = regexp.MustCompile(`(?:^|:)(tonemap|format|m|p|r|t)=([a-z0-9-]+)`)
 
 func substituteOpenCLTonemap(args []string, tm tonemapConfig) ([]string, bool) {
+	// VAAPI-only: the OpenCL-derive tonemap chain (hwmap→opencl→vaapi) is an
+	// Intel-pipeline construct. On any other worker backend this is a no-op
+	// (the tonemap is reshaped via composeBurn → the dialect's tonemapFilter
+	// instead). Belt-and-suspenders for cross-backend (scaleplex#77): a NVIDIA
+	// worker receiving a foreign VAAPI tonemap_opencl graph must NOT run this.
+	if tm.backend().backendName() != "vaapi" {
+		return args, false
+	}
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] != "-filter_complex" {
 			continue
@@ -1068,6 +1076,12 @@ var reInitHwDeviceVaapiName = regexp.MustCompile(`^vaapi=([A-Za-z0-9_]+):`)
 // to feed and is left untouched. No-op when SCALEPLEX_TONEMAP=vaapi (no
 // tonemap_opencl is ever emitted).
 func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
+	// VAAPI-only — see substituteOpenCLTonemap. The OpenCL device injection +
+	// VA-residency assertions are Intel-pipeline constructs; a non-VAAPI
+	// worker must never run them (scaleplex#77 cross-backend).
+	if activeDialect.backendName() != "vaapi" {
+		return args, nil
+	}
 	if indexOfArg(args, "-hwaccel:0", 0) < 0 {
 		return args, nil
 	}
