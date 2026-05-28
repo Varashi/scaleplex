@@ -19,38 +19,38 @@ package main
 // Full-literal tags — exact strings rewriter.go emits via
 // `append(changes, "<literal>")`.
 const (
-	TagAddMapInlineass                = "add:-map_inlineass"
-	TagBailSegmentListRewriteToRelay  = "bail:segment_list:rewrite-to-relay"
-	TagCanThrottleDisabledByEnv       = "canthrottle:disabled-by-env"
-	TagDropEAEPrefixBail              = "drop:-eae_prefix(bail)"
-	TagDropInlineassDecodeSink        = "drop:inlineass-decode-sink"
-	TagDropNostats                    = "drop:-nostats"
-	TagDropProgressurlBail            = "drop:-progressurl(bail)"
-	TagEnvHOME                        = "env:HOME"
-	TagEnvLIBVA                       = "env:LIBVA"
-	TagFilterTonemapOpenCLNormalized  = "filter:tonemap_opencl-normalized"
-	TagFilterTonemapOpenCLToVAAPI     = "filter:tonemap_opencl->tonemap_vaapi"
-	TagForceHWWouldHonorHWDecSWEnc    = "force-hw:would-honor-hwdec-swenc"
-	TagForceHWWouldHonorSW            = "force-hw:would-honor-sw"
-	TagPassGateDenied                 = "pass-gate:denied-honor-sw" // #78 — no active Plex Pass → HW re-accel denied
+	TagAddMapInlineass               = "add:-map_inlineass"
+	TagBailSegmentListRewriteToRelay = "bail:segment_list:rewrite-to-relay"
+	TagCanThrottleDisabledByEnv      = "canthrottle:disabled-by-env"
+	TagDropEAEPrefixBail             = "drop:-eae_prefix(bail)"
+	TagDropInlineassDecodeSink       = "drop:inlineass-decode-sink"
+	TagDropNostats                   = "drop:-nostats"
+	TagDropProgressurlBail           = "drop:-progressurl(bail)"
+	TagEnvHOME                       = "env:HOME"
+	TagEnvLIBVA                      = "env:LIBVA"
+	TagFilterTonemapOpenCLNormalized = "filter:tonemap_opencl-normalized"
+	TagFilterTonemapOpenCLToVAAPI    = "filter:tonemap_opencl->tonemap_vaapi"
+	TagForceHWWouldHonorHWDecSWEnc   = "force-hw:would-honor-hwdec-swenc"
+	TagForceHWWouldHonorSW           = "force-hw:would-honor-sw"
+	TagPassGateDenied                = "pass-gate:denied-honor-sw" // #78 — no active Plex Pass → HW re-accel denied
 
-	TagHLSSegmentListRewriteToRelay   = "hls:segment_list:rewrite-to-relay"
-	TagHWDecodeFilterBitmapInlineassVA = "hw-decode:filter:bitmap-inlineass-vaapi"
-	TagHWDecodeFilterInlineassVA       = "hw-decode:filter:inlineass-vaapi"
-	TagHWDecodeFilterOCLToVAAPIIA      = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi"
-	TagHWDecodeMapLabelUpdate          = "hw-decode:map-label-update"
-	TagHonorPlexHWDecSWEnc             = "honor:plex-hwdec-swenc"
-	TagHonorPlexSW                     = "honor:plex-sw"
-	TagInjectCanThrottleURL            = "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)"
-	TagInjectInitHWDevice              = "inject:init_hw_device+filter_hw_device"
-	TagReplaceForeignInitHWDevice      = "replace:foreign-init_hw_device" // #85 — drop a foreign-backend -init_hw_device so it's re-injected for the worker dialect
-	TagToSWStripHWDecode               = "to-sw:strip-hwdecode"           // #77 PR3 — swDialect stripped HW decode flags + device init
-	TagInjectSEIA53CC                  = "inject:sei+a53_cc"
-	TagLoglevelInfo                    = "loglevel:->info"
-	TagMapLabelUpdate                  = "map-label-update"
-	TagProgressAppendXPlexToken        = "progress:append-X-Plex-Token"
-	TagProgressURLCapturedForReporter  = "progressurl:captured-for-reporter"
-	TagSubsSideChannelSegListToRelay   = "subs:side-channel-segment_list:rewrite-to-relay"
+	TagHLSSegmentListRewriteToRelay     = "hls:segment_list:rewrite-to-relay"
+	TagHWDecodeFilterBitmapInlineassVA  = "hw-decode:filter:bitmap-inlineass-vaapi"
+	TagHWDecodeFilterInlineassVA        = "hw-decode:filter:inlineass-vaapi"
+	TagHWDecodeFilterOCLToVAAPIIA       = "hw-decode:filter:opencl-tonemap->vaapi:inlineass-vaapi"
+	TagHWDecodeMapLabelUpdate           = "hw-decode:map-label-update"
+	TagHonorPlexHWDecSWEnc              = "honor:plex-hwdec-swenc"
+	TagHonorPlexSW                      = "honor:plex-sw"
+	TagInjectCanThrottleURL             = "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)"
+	TagInjectInitHWDevice               = "inject:init_hw_device+filter_hw_device"
+	TagReplaceForeignInitHWDevice       = "replace:foreign-init_hw_device" // #85 — drop a foreign-backend -init_hw_device so it's re-injected for the worker dialect
+	TagToSWStripHWDecode                = "to-sw:strip-hwdecode"           // #77 PR3 — swDialect stripped HW decode flags + device init
+	TagInjectSEIA53CC                   = "inject:sei+a53_cc"
+	TagLoglevelInfo                     = "loglevel:->info"
+	TagMapLabelUpdate                   = "map-label-update"
+	TagProgressAppendXPlexToken         = "progress:append-X-Plex-Token"
+	TagProgressURLCapturedForReporter   = "progressurl:captured-for-reporter"
+	TagSubsSideChannelSegListToRelay    = "subs:side-channel-segment_list:rewrite-to-relay"
 	TagTonemapOCLCollapseRevmapDownload = "tonemap:ocl:collapse-revmap-download"
 	TagTonemapOCLDropLeadHWUpload       = "tonemap:ocl:drop-lead-hwupload"
 	TagTonemapOCLForceOutputFormatVA    = "tonemap:ocl:force-output-format-vaapi"
@@ -63,32 +63,32 @@ const (
 // Suffix shape comments document what the runtime value looks like; they
 // are not enforced (the assertion test only checks the prefix).
 const (
-	TagPrefixAudio                       = "audio:"                                   // <src>-><dst>  or  <src>-><dst>(bail)
-	TagPrefixBailFilterPattern           = "filter-pattern:"                          // <filter-string>  (only as bail reason)
-	TagPrefixBailHWDecodeSubUnmodeled    = "hw-decode-sub:unmodeled-graph:"           // <graph-string>  (only as bail reason)
-	TagPrefixBailUnexpectedEncoder       = "hw-decode:unexpected-encoder:"            // <encoder>       (only as bail reason)
-	TagPrefixBailUnknownDecoder          = "unknown-decoder:"                         // <decoder>       (only as bail reason)
-	TagPrefixBailUnknownEncoder          = "unknown-encoder:"                         // <encoder>       (only as bail reason)
-	TagPrefixDecode                      = "decode:"                                  // <swDecoder>-><hwDecoder>
-	TagPrefixDecodeBareHWUpgrade         = "decode:bare-hw-upgrade:"                  // <swDecoder>
-	TagPrefixDecodeHWPassthrough         = "decode:hw-passthrough:"                   // <swDecoder>
-	TagPrefixDrop                        = "drop:"                                    // <arg> or <arg>(bail)
-	TagPrefixEncode                      = "encode:"                                  // <swEncoder>-><hwEncoder>
-	TagPrefixEncodeHWPassthrough         = "encode:hw-passthrough:"                   // <swEncoder>
-	TagPrefixEnvStrip                    = "env:strip:"                               // <env-var-name>
-	TagPrefixFilter                      = "filter:"                                  // <mode>  (composeMode → bitmap-inlineass-vaapi | text-inlineass-vaapi | hdr-tonemap-vaapi | plain)
-	TagPrefixForceHWReshapeHybrid        = "force-hw:reshape-hybrid:"                 // <swDecoder>
-	TagPrefixHWDecodeFilterBitmapHDRTM   = "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap("  // <algo>)
-	TagPrefixHWDecodeSubTonemapPreserved = "hw-decode-sub:tonemap-preserved("         // <algo>)
-	TagPrefixSeekOffsetCaptured          = "seek-offset:captured=%.3fs"               // fmt.Sprintf format — emitted via Sprintf, prefix matches the literal format string
-	TagPrefixSkip                        = "skip:"                                    // <reason>
-	TagPrefixSkipToSegmentPassthrough    = "skip_to_segment:passthrough="             // <segment-number>
-	TagPrefixSubtitleBitmap              = "subtitle:bitmap:"                         // <StreamSpec>[(<Codec>)]
-	TagPrefixVideoHDRSource              = "video:hdr-source("                        // <transfer>)
-	TagPrefixToSW                        = "to-sw:"                                   // <sourceBackend>  (#77 PR3 — swDialect downgrade)
-	TagPrefixToSWFilter                  = "to-sw:filter:"                            // <composeMode>
-	TagPrefixToSWEncode                  = "to-sw:encode:"                            // <hwEncoder>-><swEncoder>
-	TagPrefixToSWDecode                  = "to-sw:decode:"                            // <shortCodec>-><swDecoderLib>
+	TagPrefixAudio                       = "audio:"                                               // <src>-><dst>  or  <src>-><dst>(bail)
+	TagPrefixBailFilterPattern           = "filter-pattern:"                                      // <filter-string>  (only as bail reason)
+	TagPrefixBailHWDecodeSubUnmodeled    = "hw-decode-sub:unmodeled-graph:"                       // <graph-string>  (only as bail reason)
+	TagPrefixBailUnexpectedEncoder       = "hw-decode:unexpected-encoder:"                        // <encoder>       (only as bail reason)
+	TagPrefixBailUnknownDecoder          = "unknown-decoder:"                                     // <decoder>       (only as bail reason)
+	TagPrefixBailUnknownEncoder          = "unknown-encoder:"                                     // <encoder>       (only as bail reason)
+	TagPrefixDecode                      = "decode:"                                              // <swDecoder>-><hwDecoder>
+	TagPrefixDecodeBareHWUpgrade         = "decode:bare-hw-upgrade:"                              // <swDecoder>
+	TagPrefixDecodeHWPassthrough         = "decode:hw-passthrough:"                               // <swDecoder>
+	TagPrefixDrop                        = "drop:"                                                // <arg> or <arg>(bail)
+	TagPrefixEncode                      = "encode:"                                              // <swEncoder>-><hwEncoder>
+	TagPrefixEncodeHWPassthrough         = "encode:hw-passthrough:"                               // <swEncoder>
+	TagPrefixEnvStrip                    = "env:strip:"                                           // <env-var-name>
+	TagPrefixFilter                      = "filter:"                                              // <mode>  (composeMode → bitmap-inlineass-vaapi | text-inlineass-vaapi | hdr-tonemap-vaapi | plain)
+	TagPrefixForceHWReshapeHybrid        = "force-hw:reshape-hybrid:"                             // <swDecoder>
+	TagPrefixHWDecodeFilterBitmapHDRTM   = "hw-decode:filter:bitmap-inlineass-vaapi:hdr-tonemap(" // <algo>)
+	TagPrefixHWDecodeSubTonemapPreserved = "hw-decode-sub:tonemap-preserved("                     // <algo>)
+	TagPrefixSeekOffsetCaptured          = "seek-offset:captured=%.3fs"                           // fmt.Sprintf format — emitted via Sprintf, prefix matches the literal format string
+	TagPrefixSkip                        = "skip:"                                                // <reason>
+	TagPrefixSkipToSegmentPassthrough    = "skip_to_segment:passthrough="                         // <segment-number>
+	TagPrefixSubtitleBitmap              = "subtitle:bitmap:"                                     // <StreamSpec>[(<Codec>)]
+	TagPrefixVideoHDRSource              = "video:hdr-source("                                    // <transfer>)
+	TagPrefixToSW                        = "to-sw:"                                               // <sourceBackend>  (#77 PR3 — swDialect downgrade)
+	TagPrefixToSWFilter                  = "to-sw:filter:"                                        // <composeMode>
+	TagPrefixToSWEncode                  = "to-sw:encode:"                                        // <hwEncoder>-><swEncoder>
+	TagPrefixToSWDecode                  = "to-sw:decode:"                                        // <shortCodec>-><swDecoderLib>
 )
 
 // Bail-only reason strings — passed to bail() which produces `"skip:" + reason`.

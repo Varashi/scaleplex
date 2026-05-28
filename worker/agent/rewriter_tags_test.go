@@ -528,7 +528,6 @@ func loadTagInventoryByName() map[string]string {
 	return out
 }
 
-
 // TestWalker_TracksAssignedLiterals exercises the := / = / var
 // assignment-tracking added to extractEmittedLiterals so an emit
 // site that goes through a local variable (`tag := "foo"; append(c,

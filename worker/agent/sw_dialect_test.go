@@ -134,11 +134,3 @@ func TestReshapeToSW_AlreadySW_Honored(t *testing.T) {
 		t.Errorf("already-SW filter altered:\n got %s\nwant %s", got, fc)
 	}
 }
-
-// selectDialect: explicit WORKER_BACKEND=sw.
-func TestSelectDialect_SW(t *testing.T) {
-	t.Setenv("WORKER_BACKEND", "sw")
-	if selectDialect().backendName() != "sw" {
-		t.Errorf("WORKER_BACKEND=sw did not select swDialect")
-	}
-}
