@@ -2140,6 +2140,26 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// at device-open; on NVIDIA the dialect emits `cuda=cuda:N` against
 		// the worker-local device index. Skipped entirely when honoring a
 		// SW session — no HW device needed.
+		// Cross-backend (#85): if a -init_hw_device for a DIFFERENT backend is
+		// present (e.g. a VAAPI-shaped argv — or a SW argv carrying a stale
+		// `vaapi=vaapi:` rewrite artifact — landing on a nvenc worker), the
+		// fork's same-backend device retarget (patch 0116) does NOT apply, so
+		// leaving it causes `Device creation failed … 'vaapi=vaapi:'`. Drop the
+		// foreign pair so the inject-below recreates them for the worker dialect
+		// in correct global (pre -i) position. A matching-backend init is left
+		// untouched (the fork env-retargets it).
+		if !honorSW {
+			if ihd := indexOfArg(args, "-init_hw_device", 0); ihd >= 0 && ihd+1 < len(args) {
+				if hwDeviceBackend(args[ihd+1]) != hwDeviceBackend(activeDialect.initHWDeviceArg(0)) {
+					for _, flag := range []string{"-init_hw_device", "-filter_hw_device"} {
+						if i := indexOfArg(args, flag, 0); i >= 0 && i+1 < len(args) {
+							args = removeArgs(args, i, 2)
+						}
+					}
+					changes = append(changes, TagReplaceForeignInitHWDevice)
+				}
+			}
+		}
 		if !honorSW && indexOfArg(args, "-init_hw_device", 0) < 0 {
 			// Inject -init_hw_device + -filter_hw_device BEFORE the first
 			// -i so they're parsed as global options. Placing them after
