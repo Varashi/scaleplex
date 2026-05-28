@@ -1,20 +1,17 @@
 package main
 
 import (
+	"os"
 	"testing"
 )
 
 func TestSelectDialect(t *testing.T) {
+	// Explicit pins are deterministic regardless of the runner's hardware.
 	cases := []struct {
 		name        string
 		envBackend  string
 		wantBackend string
 	}{
-		// Unset → auto-probe — on the CI runner /dev/nvidia0 is absent
-		// → falls back to vaapi. Same observable outcome as a literal
-		// "vaapi" pin in CI; the auto-default semantics are exercised
-		// via the dedicated subtest below.
-		{"unset auto-probes (no /dev/nvidia0 → vaapi)", "", "vaapi"},
 		{"vaapi pin", "vaapi", "vaapi"},
 		{"VAAPI uppercase", "VAAPI", "vaapi"},
 		{"vaapi padded", "  vaapi  ", "vaapi"},
@@ -22,6 +19,9 @@ func TestSelectDialect(t *testing.T) {
 		{"NVENC uppercase", "NVENC", "nvenc"},
 		{"nvidia alias → nvenc", "nvidia", "nvenc"},
 		{"NVIDIA alias uppercase", "NVIDIA", "nvenc"},
+		{"sw pin", "sw", "sw"},
+		{"cpu alias → sw", "cpu", "sw"},
+		{"software alias → sw", "software", "sw"},
 		{"unknown falls back to vaapi", "intel-qsv", "vaapi"},
 	}
 	for _, tc := range cases {
@@ -33,15 +33,24 @@ func TestSelectDialect(t *testing.T) {
 			}
 		})
 	}
-	// "auto" is tested only for the negative path here — positive
-	// (/dev/nvidia0 present → nvencDialect) requires the dev box
-	// or a CDI-mocked fs and lives in integration tests.
-	t.Run("auto without /dev/nvidia0 falls back to vaapi", func(t *testing.T) {
-		t.Setenv("WORKER_BACKEND", "auto")
-		if got := selectDialect().backendName(); got != "vaapi" {
-			t.Fatalf("auto without /dev/nvidia0: got %q, want vaapi", got)
-		}
-	})
+	// "auto"/unset probes real devices, so the expected backend is
+	// runner-dependent: /dev/nvidia0 → nvenc; else a DRM render node → vaapi;
+	// else (no GPU) → sw. Derive the expectation from the same probes
+	// selectDialect uses so this passes on any host (GPU-less CI → sw).
+	wantAuto := "sw"
+	if _, err := os.Stat("/dev/nvidia0"); err == nil {
+		wantAuto = "nvenc"
+	} else if hasRenderNode() {
+		wantAuto = "vaapi"
+	}
+	for _, be := range []string{"", "auto"} {
+		t.Run("auto-probe WORKER_BACKEND="+be, func(t *testing.T) {
+			t.Setenv("WORKER_BACKEND", be)
+			if got := selectDialect().backendName(); got != wantAuto {
+				t.Fatalf("auto (WORKER_BACKEND=%q): got %q, want %q (device-probe derived)", be, got, wantAuto)
+			}
+		})
+	}
 }
 
 func TestNvidiaDialect_EncoderMap(t *testing.T) {

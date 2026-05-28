@@ -600,6 +600,13 @@ type burnSpec struct {
 	// are unaffected. Caller computes via subtitleIsAnimated(); ignored on
 	// !burnSub.
 	animatedTierDown bool
+	// subKind + subSpec: SW path only (composeBurnSW). subKind distinguishes
+	// "text" (inlineass) from "bitmap" (sub2video→overlay, Plex's stock SW PGS
+	// shape); subSpec is the bitmap subtitle stream spec (e.g. "0:5") overlaid.
+	// The HW composeBurn ignores these (it uses burnSub for text + the unified
+	// inlineass bitmap branch).
+	subKind string
+	subSpec string
 }
 
 // composeBurn builds the orthogonal stage chain and returns the filtergraph
@@ -616,6 +623,10 @@ type burnSpec struct {
 // later injects the OpenCL device + asserts VA-residency for the tonemap stage.
 func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 	d := tm.backend()
+	if d.backendName() == "sw" {
+		// Software target: no HW surfaces — emit Plex's CPU filtergraph shape.
+		return tm.composeBurnSW(s)
+	}
 	n := 0
 	next := func() string { l := strconv.Itoa(n); n++; return l }
 	var b strings.Builder
@@ -1994,11 +2005,27 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// honor-source logic below runs on a native argv. No-op when source ==
 		// worker or source is SW/none. In-place value swaps only — no length
 		// change, so inputIdx stays valid. Gated on the Pass check above.
-		if hwReaccelOK {
+		if activeDialect.backendName() == "sw" {
+			// No-GPU worker: downgrade ANY incoming argv (foreign HW / hybrid)
+			// to a pure-CPU pipeline, so the honor-source path below keeps it.
+			// Not Pass-gated — HW→SW grants no entitlement (isForeignHWSource
+			// already reports not-foreign for SW, so the gate stayed inert).
+			if reshaped, swChanges := reshapeToSoftware(args, tm); len(swChanges) > 0 {
+				args = reshaped
+				changes = append(changes, swChanges...)
+			}
+		} else if hwReaccelOK {
 			if reshaped, ccChanges := reshapeForeignHWArgv(args, tm); len(ccChanges) > 0 {
 				args = reshaped
 				changes = append(changes, ccChanges...)
 			}
+		}
+		// reshapeToSoftware REMOVES args (strips HW decode flags), changing the
+		// arg length — unlike reshapeForeignHWArgv's in-place value swaps. Recompute
+		// inputIdx so the decoder/encoder phases below index the right -i.
+		inputIdx = indexOfArg(args, "-i", 0)
+		if inputIdx < 0 {
+			return bail(TagBailReasonNoInput)
 		}
 
 		// 1. Decoder.
@@ -2036,7 +2063,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// forceHW honors the Plex-Pass gate computed above (#78): the env asks
 		// for re-accel, but without a confirmed Pass we fall back to honoring
 		// Plex's SW pipeline (fail-closed).
-		forceHW := forceHWEnv && hwReaccelOK
+		// A SW worker has no HW to force onto — FORCE_HW is meaningless there;
+		// keep honor-SW so reshapeToSoftware's output is kept as-is.
+		forceHW := forceHWEnv && hwReaccelOK && activeDialect.backendName() != "sw"
 		plexSWEncoder := false
 		if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
 			_, plexSWEncoder = activeDialect.encoderMap()[args[peer+1]]

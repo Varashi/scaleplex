@@ -28,8 +28,17 @@ package main
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 )
+
+// hasRenderNode reports whether a DRM render node (/dev/dri/renderD*) exists —
+// the signal that a VAAPI-capable GPU is present. Used by selectDialect's auto
+// mode to distinguish a GPU-less host (→ swDialect) from an Intel/AMD one.
+func hasRenderNode() bool {
+	m, _ := filepath.Glob("/dev/dri/renderD*")
+	return len(m) > 0
+}
 
 // dialect captures the per-backend specifics of HW transcode argv
 // emission. Implementations are stateless — pure value types.
@@ -176,6 +185,50 @@ func (vaapiDialect) hwDownloadFilter() string { return "hwdownload" }
 // download needed before the burn stage.
 func (vaapiDialect) subBurnDownloadFilter() string { return "" }
 
+// swDialect — pure-software (CPU) transcode, for no-GPU fleet members in a
+// heterogeneous cluster (scaleplex#77 PR3). It reshapes ANY incoming argv
+// (VAAPI/NVENC HW or already-SW) down to a CPU pipeline: SW decode, SW
+// `scale=`/zscale tonemap, libx264/libx265 encode, SW (FFDraw) inlineass burn.
+// No HW device, no hwaccel, no HW filters.
+//
+// The HW-shaped interface methods (hwaccelName, initHWDeviceArg, the scale/
+// tonemap HW nodes, ...) are NOT on the SW code path — composeBurn early-returns
+// to composeBurnSW and reshapeToSoftware strips/rebuilds the HW constructs — so
+// they return inert SW-safe values for interface completeness.
+type swDialect struct{}
+
+func (swDialect) backendName() string { return "sw" }
+
+// encoderMap is identity over the SW encoders: a libx264/libx265 encoder is
+// already the SW target, so honor-source detection (plexSWEncoder) reads it as
+// "known" and the encoder reshape is a no-op.
+func (swDialect) encoderMap() map[string]string {
+	return map[string]string{"libx264": "libx264", "libx265": "libx265"}
+}
+
+// decoderMap is empty — a SW worker never injects a HW-decode hint; Plex's SW
+// decoder (libdav1d/…) or the bare codec decodes on the CPU.
+func (swDialect) decoderMap() map[string]string { return map[string]string{} }
+
+// hwDecodeShortCodecs is empty — a SW worker never HW-decodes, so no bare short
+// codec is treated as a HW-passthrough.
+func (swDialect) hwDecodeShortCodecs() map[string]struct{} { return map[string]struct{}{} }
+
+func (swDialect) hwaccelName() string          { return "" }
+func (swDialect) hwaccelOutputFormat() string  { return "" }
+func (swDialect) filterHWDeviceName() string   { return "" }
+func (swDialect) initHWDeviceArg(_ int) string { return "" }
+
+func (swDialect) scaleFilter(w, h, pix string) string {
+	return "scale=w=" + w + ":h=" + h + ",format=" + pix
+}
+
+func (swDialect) tonemapFilter(algo, pix string) string { return swTonemapChain(algo, pix) }
+
+func (swDialect) hwUploadFilter() string        { return "" }
+func (swDialect) hwDownloadFilter() string      { return "" }
+func (swDialect) subBurnDownloadFilter() string { return "" }
+
 // activeDialect is the worker's selected backend. Populated in main()
 // via selectDialect() before any rewrite occurs. Default vaapi for
 // callers that still hold a static reference; once all references go
@@ -197,11 +250,17 @@ func selectDialect() dialect {
 		return vaapiDialect{}
 	case "nvenc", "nvidia": // "nvidia" kept as an operator-facing alias
 		return nvencDialect{}
+	case "sw", "cpu", "software":
+		return swDialect{}
 	case "", "auto":
 		if _, err := os.Stat("/dev/nvidia0"); err == nil {
 			return nvencDialect{}
 		}
-		return vaapiDialect{}
+		if hasRenderNode() {
+			return vaapiDialect{}
+		}
+		// No NVIDIA char dev and no DRM render node → no usable GPU → CPU.
+		return swDialect{}
 	default:
 		log.Printf("WORKER_BACKEND=%q unknown; falling back to vaapi", want)
 		return vaapiDialect{}
