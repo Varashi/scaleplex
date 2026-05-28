@@ -69,8 +69,11 @@ func hwAccelAllowed(inputEnv map[string]string) bool {
 		return true
 	}
 
+	// Composite key (base + token): a bad/expired token must not reuse a
+	// good token's "active" entry for the same PMS base.
+	key := base + "\x00" + tok
 	passCacheMu.Lock()
-	if e, ok := passCache[base]; ok && time.Since(e.at) < passCacheTTL {
+	if e, ok := passCache[key]; ok && time.Since(e.at) < passCacheTTL {
 		passCacheMu.Unlock()
 		return e.active
 	}
@@ -81,7 +84,7 @@ func hwAccelAllowed(inputEnv map[string]string) bool {
 		return false // fail-closed; don't cache (retry next session)
 	}
 	passCacheMu.Lock()
-	passCache[base] = passCacheEntry{active: active, at: time.Now()}
+	passCache[key] = passCacheEntry{active: active, at: time.Now()}
 	passCacheMu.Unlock()
 	return active
 }
