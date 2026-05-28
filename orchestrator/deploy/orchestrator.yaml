@@ -64,6 +64,13 @@ spec:
               value: "5"
             - name: WORKERS_PROBE_SECONDS
               value: "5"
+            # Scheduling (heterogeneous fleet). PREFER_HW=1 tiers HW-capable
+            # workers ahead of CPU-only ones; LB_STRATEGY orders within a tier:
+            # load (default) | round-robin | least-sessions | random.
+            - name: SCALEPLEX_PREFER_HW
+              value: "1"
+            - name: SCALEPLEX_LB_STRATEGY
+              value: "load"
           resources:
             requests:
               cpu: 50m

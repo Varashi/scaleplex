@@ -50,6 +50,12 @@ services:
       # drops them after WORKERS_PUSH_TIMEOUT_SECONDS of silence.
       WORKERS_PUSH_REAP_SECONDS: "5"
       WORKERS_PUSH_TIMEOUT_SECONDS: "15"
+      # Scheduling (heterogeneous fleet). PREFER_HW tiers HW workers ahead
+      # of CPU-only; LB_STRATEGY orders within a tier (load | round-robin |
+      # least-sessions | random). Defaults collapse to least-loaded on a
+      # homogeneous fleet — only worth setting when you mix backends.
+      SCALEPLEX_PREFER_HW: "${SCALEPLEX_PREFER_HW:-1}"
+      SCALEPLEX_LB_STRATEGY: "${SCALEPLEX_LB_STRATEGY:-load}"
     healthcheck:
       # /readyz returns 200 when at least one healthy worker is
       # registered. Use /healthz if you'd rather not wait for workers.

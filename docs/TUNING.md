@@ -20,14 +20,28 @@ reference cluster (3× Intel Arc A310, iHD driver).
 | `SCALEPLEX_TONEMAP` | `opencl` | Backend for the HDR→SDR tonemap **Plex's argv asked for** — scaleplex never decides whether to tonemap, only how. `opencl` keeps Plex's algorithm-selectable `tonemap_opencl` chain (~15% slower than the fixed curve, still ~10× realtime at 4K HDR→1080p on an Arc A310). `vaapi` collapses it to iHD's fixed BT.2390 EETF `tonemap_vaapi`. | Set to `vaapi` to fall back to the fixed curve (no rebuild) if OpenCL misbehaves on a worker. |
 | `SCALEPLEX_TONEMAP_ALGO` | `hable` | Fallback algorithm — one of `hable`, `mobius`, `reinhard`, `bt2390`, `linear`, `gamma`, `clip`. The orthogonal detector (`extractGraphFacts`) captures Plex's algo from any tonemap node it sees (`tonemap_opencl=tonemap=X`, bare `tonemap=X`, …) and hands it to `composeBurn`, so this knob only kicks in when no algo is in the argv at all. No effect under `SCALEPLEX_TONEMAP=vaapi` (fixed curve). | Rarely needs tuning. |
 
+## Backend & scheduling (heterogeneous fleets)
+
+The first two are **worker** env; the last two are **orchestrator** env. On a
+homogeneous fleet the defaults reproduce the prior single-backend,
+least-loaded behaviour — these only matter when you mix Intel / NVIDIA / CPU
+workers or run a non-Intel worker.
+
+| Env var | Where | Default | Effect | When to tune |
+|---|---|---|---|---|
+| `WORKER_BACKEND` | worker | `auto` | Which transcode backend the worker becomes. `auto` probes hardware: `/dev/nvidia0` → `nvenc`, else a DRM render node (`/dev/dri/renderD*`) → `vaapi`, else `sw`. Pin to `vaapi`, `nvenc` (alias `nvidia`), or `sw` (alias `cpu`) to override the probe. One image carries every runtime; the device grant (`/dev/dri` mount, NVIDIA runtime, or nothing) decides what's actually usable. | Set explicitly only if auto-detect picks wrong, or to force a GPU host into CPU mode for testing. |
+| `SCALEPLEX_FORCE_HW` | worker | `1` | Force HW re-acceleration even when Plex emits a software argv (homelab default). `0` honors Plex's HW/SW decision — correct for hetero or CPU-only fleets. Gated by the Plex-Pass check (see HW_PROFILE.md): without a confirmed Pass a forced session falls back to Plex's SW pipeline. | Set `0` on a fleet with CPU-only workers, or where you want strict honor-Plex behaviour. |
+| `SCALEPLEX_PREFER_HW` | orchestrator | `1` | Tier HW-capable workers ahead of CPU-only ones (a `sw` worker becomes overflow, not first pick). `0` flattens into one pool ordered purely by `SCALEPLEX_LB_STRATEGY`. | Leave `1` unless you deliberately want CPU workers in the primary rotation. |
+| `SCALEPLEX_LB_STRATEGY` | orchestrator | `load` | Within-tier ordering: `load` (lowest GPU-busy / session ratio), `round-robin`, `least-sessions`, or `random`. Workers report backend + load on `/capability`. | `round-robin` / `least-sessions` if `load` telemetry is noisy on your GPUs; `random` for cheap spread. |
+
 ## Deployment / bootstrap
 
 | Env var | Default | Effect |
 |---|---|---|
 | `SCALEPLEX_PMS_BASE_URL` | (required) | Cluster URL of the PMS relay sidecar, e.g. `http://<pms-service>.<namespace>.svc:32499`. The rewriter uses it to retarget `-progressurl`, `-segment_list`, `-canthrottleurl`, and `-manifest_name` away from PMS loopback so worker pods can reach them. |
 | `X_PLEX_TOKEN` | (required) | Per-session Plex auth token, appended as a query param to the relay URLs above so the relay can re-issue authenticated PUTs to PMS. Supplied per session by the shim. |
-| `HW_RENDER_DEVICE` | `/dev/dri/renderD128` | VAAPI render node passed to `-init_hw_device`. |
-| `HW_VAAPI_DRIVER` | `iHD` | libva driver name. `iHD` for Intel Gen9+ / Arc. |
+| `SCALEPLEX_PMS_PREFS` | `/config/Library/Application Support/Plex Media Server/Preferences.xml` | **Set on the PMS dockermod / shim**, not the worker. Path the shim reads to detect `myPlexSubscription` (active Plex Pass) and forward it as `SCALEPLEX_PASS_ACTIVE` per session (Pass-gate L2). Override only if your PMS config lives elsewhere. |
+| `HW_VAAPI_DRIVER` | `iHD` | libva driver name. `iHD` for Intel Gen9+ / Arc. The VAAPI render node itself is the `/dev/dri/render*` device you mount/grant — there is no env knob for it; the rewriter derives `-init_hw_device` from Plex's argv. |
 | `HW_LIBVA_DRIVERS_PATH` | (libva auto-discovers) | Only needed to override the driver search path, e.g. when pointing at a bundled driver cache. |
 | `WORKER_MAX_SESSIONS` | `0` (unlimited) | Soft cap on concurrent sessions per worker. At the cap the worker refuses new dispatch so the orchestrator routes elsewhere. |
 
