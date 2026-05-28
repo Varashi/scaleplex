@@ -60,6 +60,38 @@ func TestHWAccelAllowed(t *testing.T) {
 			t.Error("missing token → inert → allow")
 		}
 	})
+
+	// L2 (#78): the shim-supplied SCALEPLEX_PASS_ACTIVE is authoritative and
+	// skips the HTTP probe entirely.
+	t.Run("L2 PASS_ACTIVE=1 → allow without probe", func(t *testing.T) {
+		stubPass(t, func(_, _ string) (bool, error) {
+			t.Fatal("should not HTTP-probe when PASS_ACTIVE set")
+			return false, nil
+		})
+		env := wiredEnv()
+		env["SCALEPLEX_PASS_ACTIVE"] = "1"
+		if !hwAccelAllowed(env) {
+			t.Error("PASS_ACTIVE=1 should allow")
+		}
+	})
+	t.Run("L2 PASS_ACTIVE=0 → deny without probe", func(t *testing.T) {
+		stubPass(t, func(_, _ string) (bool, error) {
+			t.Fatal("should not HTTP-probe when PASS_ACTIVE set")
+			return false, nil
+		})
+		env := wiredEnv()
+		env["SCALEPLEX_PASS_ACTIVE"] = "0"
+		if hwAccelAllowed(env) {
+			t.Error("PASS_ACTIVE=0 should deny")
+		}
+	})
+	t.Run("L2 absent → falls back to HTTP probe", func(t *testing.T) {
+		probed := false
+		stubPass(t, func(_, _ string) (bool, error) { probed = true; return true, nil })
+		if !hwAccelAllowed(wiredEnv()) || !probed {
+			t.Errorf("no PASS_ACTIVE should fall back to probe (probed=%v)", probed)
+		}
+	})
 }
 
 func TestHWAccelAllowed_Caches(t *testing.T) {

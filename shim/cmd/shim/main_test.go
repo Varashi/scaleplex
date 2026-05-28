@@ -1,9 +1,54 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestPassActiveFromPrefs(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "Preferences.xml")
+	t.Setenv("SCALEPLEX_PMS_PREFS", p)
+
+	if err := os.WriteFile(p, []byte(`<?xml version="1.0"?><Preferences other="x" myPlexSubscription="1" z="y"/>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := passActiveFromPrefs(); got != "1" {
+		t.Errorf("active Pass: got %q want 1", got)
+	}
+	if err := os.WriteFile(p, []byte(`<Preferences myPlexSubscription="0"/>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := passActiveFromPrefs(); got != "0" {
+		t.Errorf("no Pass: got %q want 0", got)
+	}
+	// attr absent → "" (worker falls back to the HTTP probe)
+	if err := os.WriteFile(p, []byte(`<Preferences foo="bar"/>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := passActiveFromPrefs(); got != "" {
+		t.Errorf("absent attr: got %q want empty", got)
+	}
+	// missing file → ""
+	t.Setenv("SCALEPLEX_PMS_PREFS", filepath.Join(dir, "nope.xml"))
+	if got := passActiveFromPrefs(); got != "" {
+		t.Errorf("missing file: got %q want empty", got)
+	}
+}
+
+func TestCollectEnv_SetsPassActive(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "Preferences.xml")
+	if err := os.WriteFile(p, []byte(`<Preferences myPlexSubscription="1"/>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SCALEPLEX_PMS_PREFS", p)
+	if got := collectEnv()["SCALEPLEX_PASS_ACTIVE"]; got != "1" {
+		t.Errorf("collectEnv should forward PASS_ACTIVE=1, got %q", got)
+	}
+}
 
 func TestDeriveSessionID_FromInputPath(t *testing.T) {
 	args := []string{"-codec:0", "libdav1d", "-i", "/media/Movies/Inception.mkv", "-c:v", "libx264"}

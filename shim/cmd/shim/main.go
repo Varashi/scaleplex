@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -345,7 +346,40 @@ func collectEnv() map[string]string {
 		}
 		out["SCALEPLEX_PMS_BASE_URL"] = "http://" + host + ":" + port
 	}
+	// L2 Plex-Pass gate (#78): the shim runs inside the PMS container, so it can
+	// read the account's Pass state straight from Preferences.xml
+	// (myPlexSubscription) and forward it as SCALEPLEX_PASS_ACTIVE. The worker
+	// trusts this over its own per-session HTTP probe (L3) — local, fresh, can't
+	// flake. Read fresh per spawn (one cheap file read), so a lapsed Pass is
+	// caught on the next session. Absent/unreadable → unset, worker falls back to
+	// the HTTP probe. An explicit env override (already copied above) wins.
+	if _, has := out["SCALEPLEX_PASS_ACTIVE"]; !has {
+		if pa := passActiveFromPrefs(); pa != "" {
+			out["SCALEPLEX_PASS_ACTIVE"] = pa
+		}
+	}
 	return out
+}
+
+var reMyPlexSubscription = regexp.MustCompile(`myPlexSubscription="(\d)"`)
+
+// passActiveFromPrefs reads myPlexSubscription ("1"/"0") from the PMS
+// Preferences.xml (the in-container account-state cache). Returns "" when it
+// can't be determined (file missing/unreadable, attr absent) — the worker then
+// falls back to its own HTTP Pass probe. Path is SCALEPLEX_PMS_PREFS or the
+// standard LSIO/Plex location.
+func passActiveFromPrefs() string {
+	path := envOr("SCALEPLEX_PMS_PREFS",
+		"/config/Library/Application Support/Plex Media Server/Preferences.xml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	m := reMyPlexSubscription.FindSubmatch(b)
+	if m == nil {
+		return ""
+	}
+	return string(m[1])
 }
 
 func envOr(k, dflt string) string {
