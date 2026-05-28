@@ -131,3 +131,24 @@ func TestForeignEncoderRenormalizes(t *testing.T) {
 		})
 	}
 }
+
+// hwDeviceBackend must extract the backend token from both the named
+// (`type=name:device`) and FFmpeg-valid name-less (`type:device`) -init_hw_device
+// forms — splitting on '=' OR ':' — so a name-less foreign init doesn't read as a
+// whole-string backend and falsely trip the cross-backend foreign-init replace (#85).
+func TestHWDeviceBackend(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"cuda=cuda:0", "cuda"},
+		{"vaapi=vaapi:/dev/dri/renderD128,driver=iHD", "vaapi"},
+		{"vaapi=vaapi:", "vaapi"},
+		{"cuda:1", "cuda"},
+		{"vaapi:/dev/dri/renderD128", "vaapi"},
+		{" cuda=cuda:0 ", "cuda"},
+		{"cuda", "cuda"},
+	}
+	for _, tc := range cases {
+		if got := hwDeviceBackend(tc.in); got != tc.want {
+			t.Errorf("hwDeviceBackend(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

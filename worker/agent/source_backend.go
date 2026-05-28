@@ -147,11 +147,15 @@ func isSWFilterGraph(fc string) bool {
 }
 
 // hwDeviceBackend returns the backend type of an -init_hw_device value — the
-// token before the first '=' (e.g. "vaapi" from "vaapi=vaapi:/dev/dri/...",
+// token before the first '=' or ':' (e.g. "vaapi" from "vaapi=vaapi:/dev/dri/...",
 // "cuda" from "cuda=cuda:0"). Used by the cross-backend reshape to tell whether
-// a present -init_hw_device is foreign to the worker dialect.
+// a present -init_hw_device is foreign to the worker dialect. FFmpeg also accepts
+// the name-less forms `type[:device]` (e.g. `cuda:1`, `vaapi:/dev/dri/renderD128`);
+// splitting on ':' too keeps those from reading as a whole-string "backend" and
+// falsely tripping the foreign-init replace path.
 func hwDeviceBackend(v string) string {
-	if k := strings.IndexByte(v, '='); k >= 0 {
+	v = strings.TrimSpace(v)
+	if k := strings.IndexAny(v, "=:"); k >= 0 {
 		return v[:k]
 	}
 	return v
