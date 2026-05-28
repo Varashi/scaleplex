@@ -635,6 +635,16 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 	}
 	out := scaled
 	if s.burnSub {
+		// inlineass is a CPU/libass stage. On backends whose vf_inlineass
+		// can't consume the HW surface directly (NVIDIA: no CUDA branch),
+		// splice a download stage so libass gets a system frame. VAAPI
+		// returns "" — its merged HW branch takes the VAAPI surface.
+		inlineassSrc := scaled
+		if dl := d.subBurnDownloadFilter(); dl != "" {
+			dlLabel := next()
+			fmt.Fprintf(&b, ";[%s]%s[%s]", scaled, dl, dlLabel)
+			inlineassSrc = dlLabel
+		}
 		o := next()
 		params := s.subParams
 		if params != "" {
@@ -644,7 +654,7 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 		if s.animatedTierDown {
 			params += ":animated_tier_down=1"
 		}
-		fmt.Fprintf(&b, ";[%s]inlineass=%s[%s]", scaled, params, o)
+		fmt.Fprintf(&b, ";[%s]inlineass=%s[%s]", inlineassSrc, params, o)
 		out = o
 	}
 	return b.String(), "[" + out + "]"

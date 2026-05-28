@@ -115,6 +115,18 @@ type dialect interface {
 	// system memory. Same string ("hwdownload") on both backends today;
 	// kept for symmetry.
 	hwDownloadFilter() string
+
+	// subBurnDownloadFilter returns the filter(s) to splice between the
+	// scaled/tonemapped HW surface and the CPU `inlineass` (libass) burn
+	// stage, or "" when none is needed.
+	//
+	//   VAAPI: "" — the fork's vf_inlineass merged HW branch (patch 0115)
+	//          consumes a VAAPI surface directly; no download.
+	//   NVIDIA: "hwdownload,format=nv12" — vf_inlineass has no CUDA branch,
+	//          so the CUDA surface must come down to system nv12 first.
+	//          Matches Plex's own nvenc sub-burn chain; h264_nvenc then
+	//          ingests the sysmem nv12 directly (no re-upload).
+	subBurnDownloadFilter() string
 }
 
 // vaapiDialect — Intel iHD / VAAPI. The historical default; tested
@@ -159,6 +171,10 @@ func (vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
 
 func (vaapiDialect) hwUploadFilter() string   { return "hwupload" }
 func (vaapiDialect) hwDownloadFilter() string { return "hwdownload" }
+
+// vf_inlineass consumes the VAAPI surface directly (fork patch 0115) — no
+// download needed before the burn stage.
+func (vaapiDialect) subBurnDownloadFilter() string { return "" }
 
 // activeDialect is the worker's selected backend. Populated in main()
 // via selectDialect() before any rewrite occurs. Default vaapi for
