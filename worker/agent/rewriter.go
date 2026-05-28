@@ -730,7 +730,7 @@ var (
 	//    ffmpeg accepts positional 2 = `format`).
 	//  - jellyfin-ffmpeg's named form `tonemap_cuda=tonemap=ALGO:format=PIX`
 	//    (jellyfin parses positional 2 as `tonemap_mode`, so the named
-	//    form is the portable shape — see nvidiaDialect.tonemapFilter
+	//    form is the portable shape — see nvencDialect.tonemapFilter
 	//    for why the rewriter emits named-arg form even though Plex's
 	//    incoming argv uses positional).
 	// Optional `tonemap=` prefix skipped so the captured group is the

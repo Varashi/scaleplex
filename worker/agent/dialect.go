@@ -35,7 +35,7 @@ import (
 // emission. Implementations are stateless — pure value types.
 type dialect interface {
 	// backendName is the canonical short tag. Reported in /capability
-	// and worker logs. "vaapi" or "nvidia".
+	// and worker logs. "vaapi" or "nvenc".
 	backendName() string
 
 	// encoderMap maps PMS-emitted software encoder names to this
@@ -184,7 +184,7 @@ var activeDialect dialect = vaapiDialect{}
 
 // selectDialect picks the backend at worker startup based on
 // WORKER_BACKEND env. Values: "auto" (default — probes /dev/nvidia0
-// first, falls back to VAAPI), "vaapi", "nvidia".
+// first, falls back to VAAPI), "vaapi", "nvenc" (alias: "nvidia").
 //
 // The unified worker image carries both runtimes (VAAPI userspace +
 // CUDA runtime); the device-probe picks the one matching the host.
@@ -195,11 +195,11 @@ func selectDialect() dialect {
 	switch want := strings.ToLower(strings.TrimSpace(os.Getenv("WORKER_BACKEND"))); want {
 	case "vaapi":
 		return vaapiDialect{}
-	case "nvidia":
-		return nvidiaDialect{}
+	case "nvenc", "nvidia": // "nvidia" kept as an operator-facing alias
+		return nvencDialect{}
 	case "", "auto":
 		if _, err := os.Stat("/dev/nvidia0"); err == nil {
-			return nvidiaDialect{}
+			return nvencDialect{}
 		}
 		return vaapiDialect{}
 	default:

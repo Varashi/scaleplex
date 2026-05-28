@@ -6,7 +6,7 @@ import (
 )
 
 // NVIDIA bare-HW-upgrade sister test of TestRewriter_BareHEVC_NoHWAccel_UpgradesToVAAPI.
-// Swaps activeDialect to nvidiaDialect{}; asserts the spliced hwaccel flags
+// Swaps activeDialect to nvencDialect{}; asserts the spliced hwaccel flags
 // match the NVIDIA shape:
 //
 //	-hwaccel:0 nvdec
@@ -18,7 +18,7 @@ import (
 // the hwaccel inject site.
 func TestRewriter_BareHEVC_NoHWAccel_UpgradesToNVIDIA_HWAccelFlags(t *testing.T) {
 	prev := activeDialect
-	activeDialect = nvidiaDialect{}
+	activeDialect = nvencDialect{}
 	defer func() { activeDialect = prev }()
 
 	args := []string{

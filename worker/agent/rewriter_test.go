@@ -490,11 +490,11 @@ func TestRewriter_InitHwDevice_Inject(t *testing.T) {
 }
 
 // NVIDIA sister test of TestRewriter_InitHwDevice_Inject — same input
-// args, activeDialect swapped to nvidiaDialect, expects cuda=cuda:0
+// args, activeDialect swapped to nvencDialect, expects cuda=cuda:0
 // and -filter_hw_device cuda. Locks the call-site migration in Rewrite().
 func TestRewriter_InitHwDevice_Inject_NVIDIA(t *testing.T) {
 	prev := activeDialect
-	activeDialect = nvidiaDialect{}
+	activeDialect = nvencDialect{}
 	defer func() { activeDialect = prev }()
 
 	args := []string{

@@ -11,7 +11,7 @@ import (
 
 // Corpus replay smoke test — feeds every .argv in test/corpus/nvenc/
 // through Rewrite() under WORKER_BACKEND=nvidia (activeDialect =
-// nvidiaDialect{}) and asserts the basic invariants that the migrated
+// nvencDialect{}) and asserts the basic invariants that the migrated
 // rewriter layers (PR #2 of the dialect rollout) guarantee today:
 //
 //  1. No panics. Rewrite() must terminate for every captured argv.
@@ -32,7 +32,7 @@ import (
 // branches still need work.
 func TestRewriter_NVENCCorpus_NoVAAPILeakage(t *testing.T) {
 	prev := activeDialect
-	activeDialect = nvidiaDialect{}
+	activeDialect = nvencDialect{}
 	defer func() { activeDialect = prev }()
 
 	corpus, err := findCorpusFiles("../../test/corpus/nvenc")
