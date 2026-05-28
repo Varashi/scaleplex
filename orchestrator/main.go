@@ -37,9 +37,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +70,7 @@ type capabilityResponse struct {
 	MaxSessions    int     `json:"max_sessions"`
 	GPULoad        float64 `json:"gpu_load"`    // 0..1 mean across video engines
 	GPUEngines     int     `json:"gpu_engines"` // vcs/vecs engine count
+	Backend        string  `json:"backend"`     // "vaapi" | "nvenc" | "sw" (#77 PR4)
 }
 
 // sourceBits is a bit-set of the discovery sources currently vouching
@@ -109,6 +112,7 @@ type worker struct {
 	maxSessions    int
 	gpuLoad        float64 // 0..1 mean across video engines (last reported)
 	gpuEngines     int
+	backend        string // "vaapi" | "nvenc" | "sw" (#77 PR4 — routing tier)
 	lastErr        string
 	lastUpdated    time.Time
 	lastHeartbeat  time.Time // only meaningful when sources&srcPush != 0
@@ -152,9 +156,45 @@ func (w *worker) load() float64 {
 func (w *worker) dispatchBegin() { atomic.AddInt32(&w.inFlight, 1) }
 func (w *worker) dispatchEnd()   { atomic.AddInt32(&w.inFlight, -1) }
 
+// isHW reports whether this worker has a hardware backend (vaapi/nvenc). A
+// worker that hasn't reported a backend yet ("" — e.g. a pre-PR4 image during a
+// rolling upgrade) is treated as HW, so it stays in the primary tier rather than
+// being demoted to the SW overflow tier.
+func (w *worker) isHW() bool {
+	w.mu.Lock()
+	b := w.backend
+	w.mu.Unlock()
+	return b != "sw"
+}
+
+// sessions is the active+in-flight session count, the ranking key for the
+// least-sessions strategy.
+func (w *worker) sessions() int {
+	w.mu.Lock()
+	a := w.activeSessions
+	w.mu.Unlock()
+	return a + int(atomic.LoadInt32(&w.inFlight))
+}
+
+func (w *worker) backendStr() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.backend == "" {
+		return "unknown"
+	}
+	return w.backend
+}
+
 type pool struct {
 	mu      sync.RWMutex
 	workers map[string]*worker // keyed by url ("http://host:port")
+
+	// Scheduling policy, set once from env at startup (#77 PR4). Zero values
+	// are the defaults: lbLoad + tiered (flatPool=false) = HW-preferred,
+	// least-loaded — the pre-PR4 behavior on a homogeneous fleet.
+	strategy lbStrategy
+	flatPool bool   // SCALEPLEX_PREFER_HW=0 → one flat pool (no HW/SW tier split)
+	rrCursor uint64 // round-robin dispatch cursor (atomic)
 }
 
 // hostPort is the parsed form of a single WORKERS_LIST entry.
@@ -388,15 +428,65 @@ func probeWorker(client *http.Client, w *worker) {
 	w.maxSessions = c.MaxSessions
 	w.gpuLoad = c.GPULoad
 	w.gpuEngines = c.GPUEngines
+	w.backend = c.Backend
 	w.lastErr = ""
 	w.lastUpdated = time.Now()
 	w.mu.Unlock()
 }
 
-// pickWorker returns workers ordered by ascending load. The caller iterates
-// and tries each in turn (worker may 503 if it raced to cap between
-// probe and request).
-func (p *pool) pickOrder() []*worker {
+// lbStrategy is the within-tier worker-ordering policy (SCALEPLEX_LB_STRATEGY).
+type lbStrategy int
+
+const (
+	lbLoad          lbStrategy = iota // ascending load() — default
+	lbRoundRobin                      // even rotation via an atomic cursor
+	lbLeastSessions                   // fewest active+in-flight sessions
+	lbRandom                          // shuffle
+)
+
+func parseLBStrategy(s string) lbStrategy {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "round-robin", "roundrobin", "rr":
+		return lbRoundRobin
+	case "least-sessions", "least_sessions", "sessions":
+		return lbLeastSessions
+	case "random":
+		return lbRandom
+	default: // "", "load", or anything unrecognized
+		return lbLoad
+	}
+}
+
+func (s lbStrategy) String() string {
+	switch s {
+	case lbRoundRobin:
+		return "round-robin"
+	case lbLeastSessions:
+		return "least-sessions"
+	case lbRandom:
+		return "random"
+	default:
+		return "load"
+	}
+}
+
+// schedule returns the healthy workers in dispatch-preference order. The caller
+// iterates and tries each in turn (a worker may 503 if it raced to cap between
+// probe and request). Computed ONCE per dispatch — round-robin needs a stable
+// rotation, so the order can't be re-derived per retry.
+//
+// Two knobs (set once from env in main):
+//   - flatPool=false (default): partition into [HW tier, SW tier] and order each
+//     by the strategy, HW first — so a heavy job prefers a GPU and only spills to
+//     a CPU worker when the GPU tier is saturated/absent. flatPool=true
+//     (SCALEPLEX_PREFER_HW=0) makes one flat pool.
+//   - strategy: the within-tier ordering (load | round-robin | least-sessions |
+//     random).
+//
+// A homogeneous fleet (all one backend) collapses to a single tier, so the
+// behavior reduces to the chosen strategy — and load (the default) reproduces
+// the pre-PR4 ranking exactly.
+func (p *pool) schedule() []*worker {
 	all := p.list()
 	healthy := make([]*worker, 0, len(all))
 	for _, w := range all {
@@ -404,13 +494,45 @@ func (p *pool) pickOrder() []*worker {
 			healthy = append(healthy, w)
 		}
 	}
-	// stable sort by load ascending
-	for i := 1; i < len(healthy); i++ {
-		for j := i; j > 0 && healthy[j].load() < healthy[j-1].load(); j-- {
-			healthy[j], healthy[j-1] = healthy[j-1], healthy[j]
+	var rr uint64
+	if p.strategy == lbRoundRobin {
+		rr = atomic.AddUint64(&p.rrCursor, 1)
+	}
+	if p.flatPool {
+		return p.orderTier(healthy, rr)
+	}
+	hw := make([]*worker, 0, len(healthy))
+	sw := make([]*worker, 0, len(healthy))
+	for _, w := range healthy {
+		if w.isHW() {
+			hw = append(hw, w)
+		} else {
+			sw = append(sw, w)
 		}
 	}
-	return healthy
+	return append(p.orderTier(hw, rr), p.orderTier(sw, rr)...)
+}
+
+// orderTier sorts one tier in place per the strategy. rr is the per-dispatch
+// round-robin offset (ignored by other strategies).
+func (p *pool) orderTier(ws []*worker, rr uint64) []*worker {
+	switch p.strategy {
+	case lbLeastSessions:
+		sort.SliceStable(ws, func(i, j int) bool { return ws[i].sessions() < ws[j].sessions() })
+	case lbRandom:
+		rand.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
+	case lbRoundRobin:
+		// Stable base order by url, then rotate by the per-dispatch cursor so
+		// successive dispatches start on the next worker.
+		sort.SliceStable(ws, func(i, j int) bool { return ws[i].url < ws[j].url })
+		if n := len(ws); n > 0 {
+			off := int((rr - 1) % uint64(n)) // rr is post-increment ≥1; first dispatch → offset 0
+			ws = append(ws[off:], ws[:off]...)
+		}
+	default: // lbLoad
+		sort.SliceStable(ws, func(i, j int) bool { return ws[i].load() < ws[j].load() })
+	}
+	return ws
 }
 
 // sessionTracker records which worker URL a given session_id was sent to,
@@ -471,6 +593,11 @@ func main() {
 
 	pushReap := envSecondsOr("WORKERS_PUSH_REAP_SECONDS", defaultPushReapSeconds)
 	pushTimeout := envSecondsOr("WORKERS_PUSH_TIMEOUT_SECONDS", defaultPushTimeoutSeconds)
+
+	// Scheduling policy (#77 PR4). Defaults: load + HW-preferred tiering.
+	pl.strategy = parseLBStrategy(os.Getenv("SCALEPLEX_LB_STRATEGY"))
+	pl.flatPool = os.Getenv("SCALEPLEX_PREFER_HW") == "0"
+	log.Printf("scheduler: strategy=%s prefer-hw=%t", pl.strategy, !pl.flatPool)
 
 	go discoveryLoop(workersDNS, workerPort, refresh, probe)
 	go pushReaperLoop(time.Duration(pushReap)*time.Second, time.Duration(pushTimeout)*time.Second)
@@ -594,6 +721,7 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 		MaxSessions    int     `json:"max_sessions"`
 		GPULoad        float64 `json:"gpu_load"`
 		GPUEngines     int     `json:"gpu_engines"`
+		Backend        string  `json:"backend,omitempty"`
 		Load           float64 `json:"load"`
 		LastErr        string  `json:"last_err,omitempty"`
 		LastUpdatedAgo string  `json:"last_updated_ago,omitempty"`
@@ -611,6 +739,7 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 			MaxSessions:    wk.maxSessions,
 			GPULoad:        wk.gpuLoad,
 			GPUEngines:     wk.gpuEngines,
+			Backend:        wk.backend,
 			Load:           load,
 			LastErr:        wk.lastErr,
 		}
@@ -659,23 +788,19 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		metricDispatchTotal.WithLabelValues("resumed").Inc()
 	}
 
-	// Re-pick before each try so the in-flight count from earlier
-	// dispatches is reflected — sequential candidates after a 503 should
-	// also be ranked freshly.
-	tried := make(map[*worker]bool)
-	for {
-		var wk *worker
-		for _, c := range pl.pickOrder() {
-			if !tried[c] {
-				wk = c
-				break
-			}
-		}
-		if wk == nil {
-			break
-		}
-		tried[wk] = true
-		log.Printf("session %s: try worker %s (load=%.3f, attempt=%d)", req.SessionID, wk.url, wk.load(), len(tried))
+	// Compute the candidate order ONCE per dispatch (round-robin needs a
+	// stable rotation). The in-flight count is folded into load()/sessions()
+	// so concurrent dispatches still spread; on a 503 we fall through to the
+	// next candidate in this order.
+	order := pl.schedule()
+	if len(order) == 0 {
+		metricDispatchTotal.WithLabelValues("no_workers").Inc()
+		http.Error(w, "all workers at capacity", http.StatusServiceUnavailable)
+		return
+	}
+	for i, wk := range order {
+		log.Printf("session %s: try worker %s (load=%.3f, backend=%s, attempt=%d/%d)",
+			req.SessionID, wk.url, wk.load(), wk.backendStr(), i+1, len(order))
 		wk.dispatchBegin()
 		// Start a checkpoint poller scoped to this PMS-facing request
 		// — it shuts down when the request context is cancelled.
@@ -685,18 +810,14 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		cancelPoll()
 		wk.dispatchEnd()
 		if ok {
-			metricDispatchAttempts.Observe(float64(len(tried)))
+			metricDispatchAttempts.Observe(float64(i + 1))
 			metricDispatchTotal.WithLabelValues("success").Inc()
 			return
 		}
 		metricDispatchTotal.WithLabelValues("fallthrough_503").Inc()
 	}
-	if len(tried) == 0 {
-		metricDispatchTotal.WithLabelValues("no_workers").Inc()
-	} else {
-		metricDispatchTotal.WithLabelValues("all_at_cap").Inc()
-		metricDispatchAttempts.Observe(float64(len(tried)))
-	}
+	metricDispatchTotal.WithLabelValues("all_at_cap").Inc()
+	metricDispatchAttempts.Observe(float64(len(order)))
 	http.Error(w, "all workers at capacity", http.StatusServiceUnavailable)
 }
 
@@ -858,7 +979,7 @@ func streamFromUpstream(
 // dispatch loop because we may need to swap to a previously-tried-and-
 // rejected (503) worker if it's the only healthy option left.
 func pickRecoveryWorker(tried map[string]bool) *worker {
-	for _, w := range pl.pickOrder() {
+	for _, w := range pl.schedule() {
 		if !tried[w.url] {
 			return w
 		}

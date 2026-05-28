@@ -73,7 +73,7 @@ func TestPickOrder_LeastLoadedFirst(t *testing.T) {
 	d := addWorker(t, "http://d", 9, 10, true) // capped, ratio 0.9
 	e := addWorker(t, "http://e", 0, 0, false) // unhealthy
 
-	got := pl.pickOrder()
+	got := pl.schedule()
 	if len(got) != 4 {
 		t.Fatalf("expected 4 healthy, got %d", len(got))
 	}
@@ -183,7 +183,7 @@ func TestPickOrder_InFlightBreaksTie(t *testing.T) {
 	// should now rank first.
 	a.dispatchBegin()
 	defer a.dispatchEnd()
-	got := pl.pickOrder()
+	got := pl.schedule()
 	if got[0] != b {
 		t.Fatalf("expected b first (a is in-flight), got %v", got[0].url)
 	}
@@ -318,4 +318,86 @@ func abs(f float64) float64 {
 		return -f
 	}
 	return f
+}
+
+// #77 PR4 — HW-preferred tiering: a SW worker that looks idle (load 0) must NOT
+// outrank busier HW workers; it's the overflow tier.
+func TestSchedule_HWBeforeSW(t *testing.T) {
+	resetGlobals()
+	hwBusy := addWorker(t, "http://hw-busy", 5, 0, true)
+	hwIdle := addWorker(t, "http://hw-idle", 1, 0, true)
+	swIdle := addWorker(t, "http://sw-idle", 0, 0, true) // idlest, but SW
+	hwBusy.backend, hwIdle.backend, swIdle.backend = "vaapi", "nvenc", "sw"
+
+	got := pl.schedule()
+	if len(got) != 3 {
+		t.Fatalf("want 3, got %d", len(got))
+	}
+	if got[0] != hwIdle || got[1] != hwBusy {
+		t.Errorf("HW tier should come first by load: got %v,%v", got[0].url, got[1].url)
+	}
+	if got[2] != swIdle {
+		t.Errorf("SW worker must be last (overflow) despite load 0; got %v", got[2].url)
+	}
+}
+
+// flatPool (SCALEPLEX_PREFER_HW=0) disables tiering → pure load order, so the
+// idle SW worker ranks first.
+func TestSchedule_FlatPool(t *testing.T) {
+	resetGlobals()
+	pl.flatPool = true
+	hw := addWorker(t, "http://hw", 5, 0, true)
+	sw := addWorker(t, "http://sw", 0, 0, true)
+	hw.backend, sw.backend = "vaapi", "sw"
+	got := pl.schedule()
+	if got[0] != sw {
+		t.Errorf("flat pool should rank idle SW first; got %v", got[0].url)
+	}
+}
+
+// round-robin rotates the starting worker across successive dispatches.
+func TestSchedule_RoundRobin(t *testing.T) {
+	resetGlobals()
+	pl.strategy = lbRoundRobin
+	for _, u := range []string{"http://a", "http://b", "http://c"} {
+		w := addWorker(t, u, 0, 0, true)
+		w.backend = "vaapi"
+	}
+	var firsts []string
+	for i := 0; i < 3; i++ {
+		firsts = append(firsts, pl.schedule()[0].url)
+	}
+	want := []string{"http://a", "http://b", "http://c"}
+	for i := range want {
+		if firsts[i] != want[i] {
+			t.Errorf("round-robin dispatch %d: first=%s want=%s (all=%v)", i, firsts[i], want[i], firsts)
+		}
+	}
+}
+
+// least-sessions orders by active+in-flight, ignoring the GPU-engine math.
+func TestSchedule_LeastSessions(t *testing.T) {
+	resetGlobals()
+	pl.strategy = lbLeastSessions
+	a := addWorker(t, "http://a", 3, 0, true)
+	b := addWorker(t, "http://b", 1, 0, true)
+	a.backend, b.backend = "vaapi", "vaapi"
+	got := pl.schedule()
+	if got[0] != b {
+		t.Errorf("least-sessions should rank b (1 session) first; got %v", got[0].url)
+	}
+}
+
+// An unreported backend ("" — e.g. a pre-PR4 worker mid-rolling-upgrade) counts
+// as HW so it isn't demoted to the SW overflow tier.
+func TestWorker_isHW_UnknownIsHW(t *testing.T) {
+	resetGlobals()
+	w := addWorker(t, "http://legacy", 0, 0, true) // backend stays ""
+	if !w.isHW() {
+		t.Errorf("empty backend should be treated as HW")
+	}
+	w.backend = "sw"
+	if w.isHW() {
+		t.Errorf("sw backend should not be HW")
+	}
 }
