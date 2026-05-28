@@ -43,6 +43,7 @@ const (
 	TagHonorPlexSW                     = "honor:plex-sw"
 	TagInjectCanThrottleURL            = "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)"
 	TagInjectInitHWDevice              = "inject:init_hw_device+filter_hw_device"
+	TagReplaceForeignInitHWDevice      = "replace:foreign-init_hw_device" // #85 — drop a foreign-backend -init_hw_device so it's re-injected for the worker dialect
 	TagInjectSEIA53CC                  = "inject:sei+a53_cc"
 	TagLoglevelInfo                    = "loglevel:->info"
 	TagMapLabelUpdate                  = "map-label-update"

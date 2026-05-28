@@ -166,6 +166,80 @@ func TestCrossBackend_VAAPI_bitmap_to_NVENC(t *testing.T) {
 	}
 }
 
+// #85 Fix B — VAAPI HW-decode + SW filter graph hybrid (Plex's "HW decode,
+// SW scale" shape: -hwaccel vaapi but a bare `[0:0]scale=w=…` graph + libx264).
+// The cross-backend translator must NOT reshape the backend-agnostic SW filter
+// (doing so produced a scale_cuda graph the main SW→HW path then rejected →
+// bail → original vaapi argv leaked). It swaps decode flags only; the main
+// force-HW path reshapes the SW filter to scale_cuda + h264_nvenc. No bail, no
+// vaapi residue.
+func TestCrossBackend_VAAPI_HWDecSWFilter_Hybrid_to_NVENC(t *testing.T) {
+	withDialect(t, nvencDialect{})
+	t.Setenv("SCALEPLEX_FORCE_HW", "1")
+	args := []string{
+		"-codec:0", "av1",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi", "-hwaccel_device:0", "vaapi",
+		"-i", "/media/x.mkv",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_hw_device", "vaapi",
+		"-filter_complex", "[0:0]scale=w=1280:h=720:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "libx264", "-preset:0", "veryfast",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("hybrid bailed (must reshape, not bail): %v", out.Changes)
+	}
+	joined := strings.Join(out.Args, " ")
+	for _, banned := range []string{"vaapi", "renderD128", "iHD", "opencl"} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("VAAPI literal %q leaked (hybrid cross-backend): %s", banned, joined)
+		}
+	}
+	if !argvHasSeq(out.Args, "-hwaccel:0", "nvdec") {
+		t.Errorf("decode not swapped to nvdec: %v", out.Args)
+	}
+	if !strings.Contains(joined, "scale_cuda") {
+		t.Errorf("SW scale not reshaped to scale_cuda by main path: %s", joined)
+	}
+	if !containsString(out.Args, "h264_nvenc") {
+		t.Errorf("encoder not reshaped to h264_nvenc: %v", out.Args)
+	}
+}
+
+// #85 Fix A — a pure-SW argv (libdav1d decode, SW scale=/tonemap= filter,
+// libx264) that carries a STALE foreign -init_hw_device (a `vaapi=vaapi:`
+// rewrite artifact from an upstream VAAPI capture). Under FORCE_HW the SW→HW
+// reshape converts filters + encoder to CUDA, but the leftover vaapi init must
+// be dropped + re-injected for the worker dialect — otherwise ffmpeg fails with
+// "Device creation failed … 'vaapi=vaapi:'".
+func TestCrossBackend_SW_StaleVAAPIInit_to_NVENC(t *testing.T) {
+	withDialect(t, nvencDialect{})
+	t.Setenv("SCALEPLEX_FORCE_HW", "1")
+	args := []string{
+		"-codec:0", "libdav1d",
+		"-i", "/media/x.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]scale=w=3840:h=1608:force_divisible_by=4[0];[0]format=p010,tonemap=mobius[1];[1]format=pix_fmts=yuv420p|nv12[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("not applied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, "replace:foreign-init_hw_device") {
+		t.Errorf("expected foreign-init replace tag: %v", out.Changes)
+	}
+	joined := strings.Join(out.Args, " ")
+	if strings.Contains(joined, "vaapi") {
+		t.Errorf("stale vaapi init leaked: %s", joined)
+	}
+	if !argvHasSeq(out.Args, "-init_hw_device", "cuda=cuda:0") {
+		t.Errorf("init not re-injected as cuda=cuda:0: %v", out.Args)
+	}
+}
+
 // Symmetric: NVENC argv → VAAPI worker.
 func TestCrossBackend_NVENC_to_VAAPI(t *testing.T) {
 	withDialect(t, vaapiDialect{})

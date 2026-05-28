@@ -136,6 +136,27 @@ func detectSourceBackend(args []string) sourceBackend {
 	return srcNone
 }
 
+// isSWFilterGraph reports whether the main video filtergraph opens with a
+// software scale (`[0:0]scale=w=…`) — a backend-agnostic graph that the
+// SW→HW reshape path (rewriteVideoFilter) owns. The inverse of that path's
+// accept anchor, so the two partition the filtergraph space cleanly: SW graphs
+// to the main path, HW graphs (scale_vaapi/scale_cuda/overlay_*) to the
+// cross-backend translator.
+func isSWFilterGraph(fc string) bool {
+	return strings.HasPrefix(fc, "[0:0]scale=w=")
+}
+
+// hwDeviceBackend returns the backend type of an -init_hw_device value — the
+// token before the first '=' (e.g. "vaapi" from "vaapi=vaapi:/dev/dri/...",
+// "cuda" from "cuda=cuda:0"). Used by the cross-backend reshape to tell whether
+// a present -init_hw_device is foreign to the worker dialect.
+func hwDeviceBackend(v string) string {
+	if k := strings.IndexByte(v, '='); k >= 0 {
+		return v[:k]
+	}
+	return v
+}
+
 // filterComplexValue returns the first -filter_complex value, or "".
 func filterComplexValue(args []string) string {
 	for i := 0; i+1 < len(args); i++ {
@@ -232,7 +253,13 @@ func reshapeForeignHWArgv(args []string, tm tonemapConfig) ([]string, []string) 
 	setArgValue(args, "-filter_hw_device", d.filterHWDeviceName())
 
 	// 2. Filter graph → worker dialect (no-sub + text-sub; bitmap deferred).
-	if vfIdx := filterComplexIndex(args); vfIdx >= 0 {
+	// Only a FOREIGN HW filter graph (scale_vaapi/overlay_vaapi/tonemap_*) is
+	// translated here. A backend-agnostic SW graph (`[0:0]scale=w=…`, the
+	// HW-decode+SW-filter hybrid) is left untouched: it's not foreign, and the
+	// main SW→HW reshape path (rewriteVideoFilter, built for the `[0:0]scale=w=`
+	// anchor) owns it. Reshaping it here too produced a `scale_cuda` graph that
+	// rewriteVideoFilter then rejected → bail → original vaapi argv leaked (#85).
+	if vfIdx := filterComplexIndex(args); vfIdx >= 0 && !isSWFilterGraph(args[vfIdx]) {
 		facts := extractGraphFacts(args[vfIdx], nil)
 		if facts.ok && facts.subKind != "bitmap" {
 			oldLabel := ""

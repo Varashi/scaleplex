@@ -425,6 +425,7 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagInjectCanThrottleURL":             "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)",
 		"TagInjectInitHWDevice":               "inject:init_hw_device+filter_hw_device",
 		"TagInjectSEIA53CC":                   "inject:sei+a53_cc",
+		"TagReplaceForeignInitHWDevice":       "replace:foreign-init_hw_device",
 		"TagLoglevelInfo":                     "loglevel:->info",
 		"TagMapLabelUpdate":                   "map-label-update",
 		"TagProgressAppendXPlexToken":         "progress:append-X-Plex-Token",
