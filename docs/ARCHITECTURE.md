@@ -69,13 +69,22 @@ DOCKER_MOD that lays down the shim.
 
 **Worker discovery.** DNS lookup of `WORKERS_DNS` (a headless k8s
 Service in front of the worker DaemonSet), re-resolved every
-`WORKERS_REFRESH_SECONDS`. Each resolved pod IP is polled with `GET
-/capability` every `WORKERS_PROBE_SECONDS` to learn `(active_sessions,
-max_sessions, healthy)`.
+`WORKERS_REFRESH_SECONDS` — plus a static `WORKERS_LIST` and a PUSH
+self-register path (workers `POST /register` + heartbeat) for non-k8s
+deployments. Each known worker is polled with `GET /capability` every
+`WORKERS_PROBE_SECONDS` to learn `(active_sessions, max_sessions,
+healthy, gpu_load, backend)`.
 
-**Selection.** Lowest `(active_sessions / max_sessions)` ratio wins.
-`max_sessions=0` (unlimited) treats the worker as having one slot. If a
-worker returns 503, fall through to the next candidate.
+**Selection (`schedule()`).** Computed once per dispatch. With
+`SCALEPLEX_PREFER_HW=1` (default) the pool is split `[HW tier, SW tier]`
+and ordered within each tier by `SCALEPLEX_LB_STRATEGY` — `load`
+(default: `max(session-saturation, gpu_load)`) | `round-robin` |
+`least-sessions` | `random` — so a heavy job prefers a GPU and only
+spills onto a CPU worker when the GPU tier is saturated. A worker that
+hasn't reported a backend yet (pre-PR4 image mid-rolling-upgrade) counts
+as HW. On a homogeneous fleet the tiers collapse and it reduces to the
+prior least-loaded ranking. A 503 falls through to the next candidate;
+the in-flight counter keeps concurrent arrivals from colliding.
 
 **Race protection.** The orchestrator combines its `/capability` cache
 with a local in-flight counter, so two concurrent task arrivals don't
@@ -94,7 +103,7 @@ longer hold per-PMS-UUID state (no EAE, see [LESSONS-FROM-CLUSTERPLEX.md](LESSON
 **Endpoints:**
 - `POST /task` — receive `{session_id, args[], env{}, cwd}`. Spawns ffmpeg.
   Streams stdout/stderr/exit code back as a chunked response.
-- `GET /capability` — return `{active_sessions, max_sessions, healthy}`.
+- `GET /capability` — return `{active_sessions, max_sessions, healthy, gpu_load, gpu_engines, backend}` (`backend` ∈ `vaapi`/`nvenc`/`sw`).
 - `GET /healthz` — bound the moment HTTP listens.
 - `GET /readyz` — gated on pre-warm completion.
 - `GET /metrics` — Prometheus.
@@ -110,10 +119,13 @@ longer hold per-PMS-UUID state (no EAE, see [LESSONS-FROM-CLUSTERPLEX.md](LESSON
 
 ```
 POST /task ──┬─→ Rewrite(args, env)        worker/agent/rewriter.go
-             │     - Plex SW codecs → VAAPI HW chain
+             │     - reshape ANY source argv → this worker's backend
+             │       (cross-backend: VAAPI/NVENC/SW → activeDialect)
+             │     - Plex codecs → backend HW chain (or SW on the cpu node)
              │     - Plex-private filters → stock equivalents
              │     - URL rewrites (progress, manifest, segment_list)
              │     - HLS / DASH path branches
+             │     - Plex-Pass gate on HW re-acceleration
              │
              ├─→ Adaptive probesize        worker/agent/probesize.go
              │     - ffprobe with progressive sizes (1MB → 20MB)
@@ -140,6 +152,22 @@ POST /task ──┬─→ Rewrite(args, env)        worker/agent/rewriter.go
              │
              └─→ Stream stderr → response   stdout/stderr to PMS
 ```
+
+**Backend dialect + cross-backend reshape** (`worker/agent/dialect.go`,
+`rewriter_sw.go`, `source_backend.go`). At startup `selectDialect()` picks the
+worker's backend from `WORKER_BACKEND` (`auto` probes `/dev/nvidia0` → nvenc,
+else a DRM render node → vaapi, else sw). The rewriter emits all backend-specific
+tokens (encoder, hwaccel, scale/tonemap/sub-burn filters, device init) through
+the active `dialect`, so one binary serves Intel, NVIDIA, or CPU. PMS may emit an
+argv shaped for a *different* backend than the worker's (a VAAPI PMS dispatching
+to an NVIDIA or CPU node); `detectSourceBackend` + `reshapeForeignHWArgv`
+(→ `composeBurn`) / `reshapeToSoftware` (→ `composeBurnSW`) renormalize it to the
+worker's backend first — decode flags, the orthogonal filter graph, and the
+encoder — emitting Plex's own stock shapes so the fork needs no per-backend patch.
+HW *re-acceleration* (`SCALEPLEX_FORCE_HW=1` SW→HW, or a cross-backend HW→HW
+reshape) is gated by the Plex-Pass check (`pass_gate.go`, fail-closed); a SW
+worker downgrades everything and is never Pass-gated. Pre-warm above is
+backend-aware (VAAPI render-node JIT on Intel; NVIDIA/CPU skip it).
 
 **Session cleanup:** on receipt of a new task with the same `session_id`,
 the agent first SIGTERMs any running ffmpeg for that session (5s grace,

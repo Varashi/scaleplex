@@ -178,3 +178,34 @@ Both default to the pre-PR4 behavior (`load`, HW-preferred). On a homogeneous
 fleet the tiering collapses to a single tier — no-op. The orchestrator needs no
 per-worker config; it tiers + ranks from the reported `backend` + load.
 `/workers` JSON gains a per-worker `backend` for observability.
+
+## Plex-Pass gate (scaleplex#78)
+
+Plex HW transcoding is a Plex-Pass-only feature: without an active Pass, PMS's TPU
+emits SW-only argv. scaleplex's HW *re-acceleration* paths — `SCALEPLEX_FORCE_HW=1`
+(force HW on a SW argv) and the cross-backend reshape (HW→HW retarget) — would
+otherwise hand a non-Pass account HW transcoding it isn't entitled to (a TOS
+issue). The gate confirms an active Pass before either path runs; honor-source
+(running what Plex itself emitted) is never gated.
+
+Three layers, all shipped, fail-closed:
+
+- **L1 — startup warning.** The worker logs a WARN when `SCALEPLEX_FORCE_HW=1`,
+  flagging it as a Pass-only feature.
+- **L2 — dockermod reads Preferences.xml.** The PMS dockermod/shim (in the PMS
+  container) reads `myPlexSubscription` from `Preferences.xml` per spawn and
+  forwards `SCALEPLEX_PASS_ACTIVE=0|1` in the session env. Local + always fresh —
+  no per-session HTTP probe to flake. Path override: `SCALEPLEX_PMS_PREFS`.
+- **L3 — worker self-gate.** `hwAccelAllowed()` prefers the per-session
+  `SCALEPLEX_PASS_ACTIVE` when present; otherwise it falls back to a cached
+  (5 min) HTTPS query of `myPlexSubscription` via the session's PMS base + token.
+  Fail-CLOSED: a missing/`0` subscription, query error, or timeout DENIES
+  re-acceleration and the session falls back to Plex's emitted (SW) pipeline.
+  Inert (allow) only when no PMS base/token is wired at all (a bare/test worker).
+
+A SW (CPU) worker downgrades everything to software and grants no entitlement, so
+it is never Pass-gated (`isForeignHWSource` reports not-foreign for `sw`, and
+`SCALEPLEX_FORCE_HW` is forced off there).
+
+`SCALEPLEX_PASS_ACTIVE` is read from the per-session env only (not the worker
+process env), so a static worker-level value can't override the per-spawn freshness.
