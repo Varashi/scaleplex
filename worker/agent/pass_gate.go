@@ -56,6 +56,20 @@ const passCacheTTL = 5 * time.Minute
 // per PMS base (passCacheTTL) so it's one query per PMS per 5 min, not per
 // session. Query failures are NOT cached (next session retries).
 func hwAccelAllowed(inputEnv map[string]string) bool {
+	// L2 (#78): the shim runs inside the PMS container and reads the Plex-Pass
+	// state straight from Preferences.xml (myPlexSubscription), forwarding it as
+	// SCALEPLEX_PASS_ACTIVE per session. When present it's authoritative + fresh
+	// — trust it directly and skip the per-session HTTP probe (which can flake
+	// and fail-closed a legit Pass user into degraded SW). "1" → allow, anything
+	// else ("0") → deny. Absent → fall through to the L3 HTTP probe below.
+	//
+	// Read from the PER-SESSION inputEnv ONLY (not envFrom, which also reads the
+	// worker process env): a static worker-level SCALEPLEX_PASS_ACTIVE would
+	// defeat the per-spawn freshness contract + could mis-gate every session.
+	if v, ok := inputEnv["SCALEPLEX_PASS_ACTIVE"]; ok && v != "" {
+		return v == "1"
+	}
+
 	base := envFrom(inputEnv, "SCALEPLEX_PMS_BASE_URL")
 	tok := envFrom(inputEnv, "X_PLEX_TOKEN")
 	if base == "" || tok == "" {
