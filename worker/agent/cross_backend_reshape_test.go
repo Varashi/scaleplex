@@ -158,6 +158,12 @@ func TestCrossBackend_VAAPI_bitmap_to_NVENC(t *testing.T) {
 	if !argvHasSeq(out.Args, "-hwaccel:0", "nvdec") || !containsString(out.Args, "h264_nvenc") {
 		t.Errorf("decode/encoder not native nvenc: %v", out.Args)
 	}
+	// Positive: the overlay graph was rewritten to the CUDA filter. (Bitmap
+	// burn was unified onto inlineass in v1.6.1, so the downstream branch
+	// emits scale_cuda + inlineass, not overlay_cuda.)
+	if !strings.Contains(joined, "scale_cuda") {
+		t.Errorf("expected scale_cuda in reshaped bitmap graph: %s", joined)
+	}
 }
 
 // Symmetric: NVENC argv → VAAPI worker.
