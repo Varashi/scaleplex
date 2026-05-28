@@ -30,7 +30,7 @@ COPY worker/agent/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
       -o /out/scaleplex-agent ./...
 
-FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+FROM nvidia/cuda:12.9.2-runtime-ubuntu24.04
 LABEL org.opencontainers.image.source=https://github.com/Varashi/scaleplex
 LABEL org.opencontainers.image.description="scaleplex worker — scaleplex-ffmpeg + Intel VAAPI + NVIDIA NVENC + Go agent"
 LABEL org.opencontainers.image.licenses=MIT
