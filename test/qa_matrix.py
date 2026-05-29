@@ -119,19 +119,18 @@ CLIENT_PROFILES = {
     },
 }
 
-# Deferred (harvested but not yet drivable): smart-TV / console clients register
-# their codec limits via `X-Plex-Client-Profile-Extra` (a long capability string
-# the client POSTs, cached by PMS per client-identifier). The LogVerbose harvest
-# only captured the `transcode/universal/start` line, not that extra string, so
-# PMS 400s ("unable to find a matching profile") on the bare identity. Raw headers
-# are preserved in the harvest JSON for when the capability string is captured:
-#   lg_webos_old  (Plex for LG, webOS 3.9.0, 1080p, widevine)
-#   lg_webos_new  (Plex for LG, webOS 5.6.2, 1080p, widevine)
-#   ps4           (Plex for PlayStation 4, 720p, playready)
-#   xbox          (Plex for Xbox, Xbox Series X, 720p, playready)
-# These are the most differentiated shapes (720p downscale, restricted codecs) —
-# revisit by re-running the LogVerbose capture and harvesting X-Plex-Client-
-# Profile-Extra per device, then add them here. See issue #74.
+# More real profiles can be pulled live with test/harvest_client_profiles.py — it
+# mines the full X-Plex-Client-Profile-Extra (codec/res capability string) from
+# vcflogs and emits ready-to-paste entries for every client that TRANSCODES
+# (Apple TV, iOS, Android TV variants, Android mobile, web). Fold those in here.
+#
+# Known NOT drivable on this PMS: smart-TV / console identities (LG webOS, PS4,
+# Xbox). PMS 400s their decision request ("Unable to find client profile for
+# device") EVEN WITH the harvested profile-extra attached — the server has no
+# transcode profile for them, so they only ever direct-play here (helped by the
+# Plex Optimize pre-optimiser). Capturing the extra does NOT unlock them; that
+# needs a PMS-side profile or a forced transcode that PMS can actually shape.
+# See #74 / #115.
 
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
