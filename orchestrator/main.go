@@ -648,15 +648,24 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleReady(w http.ResponseWriter, r *http.Request) {
+	// Readiness = "the orchestrator HTTP server is up and can accept worker
+	// registrations + dispatch" — NOT "has at least one worker". PUSH workers
+	// (external, e.g. an NVIDIA box) register THROUGH this readiness-gated
+	// Service LB, so gating readiness on worker presence deadlocks a push-only
+	// fleet (scaleplex#93): the orchestrator can't become Ready until a worker
+	// registers, and the worker can't register until the orchestrator is Ready
+	// (in the LB). Zero-worker dispatch already fails closed (503 no_workers in
+	// handleTask), so worker presence is a dispatch concern, not a readiness
+	// one — keeping the pod out of the LB bought nothing (the shim has no local
+	// fallback; a no-worker transcode fails either way).
+	n := 0
 	for _, wk := range pl.list() {
 		if _, _, _, healthy := wk.snapshot(); healthy {
-			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, "ready\n")
-			return
+			n++
 		}
 	}
-	w.WriteHeader(http.StatusServiceUnavailable)
-	io.WriteString(w, "no healthy workers\n")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "ready (%d healthy workers)\n", n)
 }
 
 // registerRequest is the body shape for POST /register. Fields beyond
