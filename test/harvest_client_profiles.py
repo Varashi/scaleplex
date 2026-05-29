@@ -55,9 +55,13 @@ _CTX.verify_mode = ssl.CERT_NONE
 # Identity headers worth keeping for a CLIENT_PROFILES entry (canonical case).
 IDENTITY = [
     "X-Plex-Product", "X-Plex-Version", "X-Plex-Platform", "X-Plex-Platform-Version",
-    "X-Plex-Client-Platform", "X-Plex-Device", "X-Plex-Device-Name", "X-Plex-Model",
-    "X-Plex-Device-Screen-Resolution", "X-Plex-Drm", "X-Plex-Features",
-    "X-Plex-Client-Profile-Extra",
+    "X-Plex-Client-Platform", "X-Plex-Device", "X-Plex-Device-Name", "X-Plex-Device-Vendor",
+    "X-Plex-Model", "X-Plex-Device-Screen-Resolution", "X-Plex-Drm", "X-Plex-Features",
+    "X-Plex-Language",
+    # X-Plex-Client-Profile-Name is the SEED profile (e.g. "Generic") onto which
+    # the profile-extra layers — TV/console identities 400 without it (verified
+    # 2026-05-29 on PS4, see #115).
+    "X-Plex-Client-Profile-Name", "X-Plex-Client-Profile-Extra",
 ]
 PROFILE_EXTRA = "X-Plex-Client-Profile-Extra"
 
