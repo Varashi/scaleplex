@@ -49,7 +49,7 @@ import urllib.request
 HOST = os.environ.get("VCFLOGS_HOST", "skw-vcflogs.boeye.net")
 PORT = 9543
 _CTX = ssl.create_default_context()
-_CTX.check_hostname = False
+_CTX.check_hostname = False  # vcflogs serves a self-signed cert (internal infra only)
 _CTX.verify_mode = ssl.CERT_NONE
 
 # Identity headers worth keeping for a CLIENT_PROFILES entry (canonical case).
@@ -119,7 +119,7 @@ def parse_event(text):
     header wins."""
     segs = text.split(" / ")
     headers, qs = {}, {}
-    mu = re.search(r"GET (\S+)", segs[0])
+    mu = re.search(r"\b(?:GET|POST|PUT|DELETE|PATCH)\s+(\S+)", segs[0])
     if mu:
         qs = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(mu.group(1)).query))
     # Header names are logged in mixed case (clients send lowercase, PMS adds
@@ -144,8 +144,11 @@ def _slug(headers):
 
 
 def main():
+    global HOST
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default=HOST,
+                    help=f"vcflogs host (default {HOST}; env: VCFLOGS_HOST)")
     ap.add_argument("--days", type=int, default=7, help="lookback window (default 7)")
     ap.add_argument("--limit", type=int, default=2000, help="events per page (<=2000)")
     ap.add_argument("--pages", type=int, default=3, help="max pages to paginate")
@@ -156,6 +159,7 @@ def main():
     ap.add_argument("--emit-python", action="store_true",
                     help="print ready-to-paste CLIENT_PROFILES python entries")
     args = ap.parse_args()
+    HOST = args.host
 
     window_ms = args.days * 86400000
     token = auth()
