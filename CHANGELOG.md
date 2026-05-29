@@ -2,6 +2,34 @@
 
 ## [1.9.1](https://github.com/Varashi/scaleplex/compare/v1.9.0...v1.9.1) (2026-05-29)
 
+### Images shipped
+
+| Image | Tag | Status |
+|---|---|---|
+| `scaleplex_worker` | `v1.9.1` | **new** — cross-backend Pass-gate fix + backend-aware pre-warm |
+| `scaleplex_orchestrator` | `v1.4.0` | unchanged (no orchestrator changes since v1.9.0) |
+| `scaleplex_pms_dockermod` | `v1.3.0` | unchanged (no shim changes since v1.9.0) |
+
+A worker-only patch release, both fixes surfaced by the v1.9.0 heterogeneous
+(Arc + NVIDIA) validation on plex-test:
+
+- **Cross-backend reshape was wrongly Pass-gated (#99).** A foreign HW argv only
+  exists because Plex emitted HW — which Plex does only for an active Pass — so it
+  is itself proof of entitlement; reshaping it onto the worker's backend
+  (VAAPI→NVENC) grants nothing new. Gating it also broke external workers, which
+  can't reach the in-cluster `SCALEPLEX_PMS_BASE_URL` for the L3 probe and so
+  fail-closed every cross-backend session into an un-runnable foreign-HW
+  passthrough (exit 234). The gate now fires only for `SCALEPLEX_FORCE_HW=1` on a
+  genuinely-software source — the one path that actually grants HW a non-Pass user
+  isn't entitled to. Verified end-to-end on an isolated NVENC worker: 160/160 PASS
+  (was 160/160 FAIL).
+
+- **Pre-warm was VAAPI-hardcoded (#101).** The startup warm-up ran a `h264_vaapi`
+  dummy on every worker, erroring out on nvenc/sw boxes (no VA display) and warming
+  nothing. It now dispatches on the worker's backend (`h264_vaapi` / `h264_nvenc`,
+  skipped for sw), and both pre-warm ffmpeg calls are bounded by a 30s timeout so a
+  hung ffmpeg can't wedge `/readyz` permanently.
+
 
 ### Fixes
 
