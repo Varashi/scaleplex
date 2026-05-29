@@ -1,11 +1,18 @@
 // pass_gate — Plex-Pass gate for HW re-acceleration (scaleplex#78, L3).
 //
 // Plex HW transcoding is a Plex-Pass-only feature: without an active Pass,
-// PMS's TPU emits SW-only argv. scaleplex's HW RE-ACCELERATION paths —
-// SCALEPLEX_FORCE_HW=1 (force HW on a SW argv) and the cross-backend reshape
-// (translate a foreign HW argv onto the worker's backend) — would hand a
-// non-Pass user HW transcoding they're not entitled to (TOS violation). This
-// gate confirms an active Pass before either path runs.
+// PMS's TPU emits SW-only argv. The ONE path that could hand a non-Pass user
+// HW they're not entitled to is SCALEPLEX_FORCE_HW=1 forcing HW onto an argv
+// Plex emitted as SW (Plex chose SW → maybe no Pass). This gate confirms an
+// active Pass before THAT path runs.
+//
+// The cross-backend reshape (#77, translate a foreign HW argv onto the
+// worker's backend) is deliberately NOT gated: a foreign HW argv can only
+// exist if Plex emitted HW, which Plex itself does only for an active Pass —
+// so it's proof of entitlement, and retargeting VAAPI→NVENC grants nothing
+// new. Gating it also broke external workers, which can't reach the
+// in-cluster SCALEPLEX_PMS_BASE_URL for the L3 probe and so fail-closed every
+// cross-backend session (#99).
 //
 // ENFORCE-WHEN-WIRED, FAIL-CLOSED (Frank 2026-05-28): the gate enforces only
 // when the worker is wired to a PMS (SCALEPLEX_PMS_BASE_URL + X_PLEX_TOKEN
@@ -18,8 +25,9 @@
 // the env without also breaking progress reporting + manifest delivery.
 //
 // Honor-source HW passthrough (Plex emitted HW for its OWN Pass-gated
-// decision, worker just runs it) is NOT gated here — that's Plex's call, not a
-// re-acceleration. Only FORCE_HW + cross-backend reshape consult this.
+// decision, worker just runs it) and the cross-backend reshape are NOT gated
+// here — both run argv Plex already chose to emit as HW. Only
+// SCALEPLEX_FORCE_HW=1 on a SW source consults this.
 
 package main
 
