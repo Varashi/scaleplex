@@ -269,6 +269,53 @@ def find_sub_stream(rk):
     return out
 
 
+def _filter_cases_for_profile(cases, meta):
+    """Drop case variants the profile's harvested behaviour says never happen.
+
+    Skips `windows-segmkv` unless the device is Plex-for-Windows; drops sub-burn
+    cases unless 'burn' was observed in the harvest's `subtitles=` query param
+    (empty observation = keep, treat as unknown); drops `audio-mkv(...)` unless
+    the profile direct-streams audio (directStream=1 observed). #116."""
+    if not meta:
+        return cases
+    pclass = meta.get("product_class", "")
+    subs = set(meta.get("subtitles") or [])
+    dstream = set(meta.get("direct_stream") or [])
+    out = []
+    for c in cases:
+        lbl = c["label"]
+        if lbl == "windows-segmkv" and pclass != "desktop_windows":
+            continue
+        if lbl in ("text-burn", "bitmap-burn") and subs and "burn" not in subs:
+            continue
+        if lbl.startswith("audio-mkv(") and dstream and "1" not in dstream:
+            continue
+        out.append(c)
+    return out
+
+
+def _profile_proto(meta, default_protos):
+    """Most-common observed protocol for the profile, mapped to hls/dash. '*' (Plex
+    wildcard) and 'http' (direct-play) fall back to default."""
+    if not meta:
+        return default_protos
+    for p in meta.get("protocols") or []:
+        if p in ("hls", "dash"):
+            return [p]
+    return default_protos
+
+
+# Smart-mode prod-baseline server combo (the de-facto prod prefs). When
+# --client-profiles is active and smart-mode on, this single combo replaces the
+# 16-combo cartesian — profile axis is orthogonal to server-pref axis. #116.
+SMART_BASELINE_COMBO = {
+    "HardwareAcceleratedCodecs": 1,
+    "HardwareAcceleratedEncoders": 1,
+    "TranscoderHEVCEncodingMode": "hevc-sources",
+    "TranscoderToneMapping": 1,
+}
+
+
 def build_cases(content):
     """Curate a content/subtitle case list that exercises every worker SHAPE
     axis: resolution + HDR (via content) and subtitle kind none/text/bitmap
@@ -444,17 +491,16 @@ def drive_cell(case, proto, settle):
     if dcode != 200:
         return "FAIL", {"reason": f"decision={dcode}"}, sid
 
-    # Trigger + confirm a worker spawn (re-trigger the lazy spawn). Run for BOTH
-    # decisions so SKIP is cross-checked: a genuine non-transcode must NOT spawn
-    # a worker.
+    # Trigger + confirm a worker spawn. One trigger, then poll up to `settle` for
+    # the spawn signal. The older 4x trigger_spawn retry loop turned out to be
+    # counterproductive (#118): each retry started a NEW PMS transcode session +
+    # orchestrator dispatch, racing the original worker — av1->hevc inits that
+    # crossed the per-retry 8s window were misdiagnosed as NODISPATCH while the
+    # worker had actually spawned. A single trigger with a single longer poll
+    # gives slow inits room to land in the kubectl-log stream.
     started = time.time()
-    spawned = False
-    errs = []
-    for _ in range(1 if vdec != "transcode" else 4):
-        trigger_spawn(params, hdrs)
-        spawned, _, _, errs = _poll_logs(slug, started, min(8, settle), want_seg=False)
-        if spawned or errs:
-            break
+    trigger_spawn(params, hdrs)
+    spawned, _, _, errs = _poll_logs(slug, started, settle, want_seg=False)
 
     if vdec != "transcode":
         if not (spawned or errs):
@@ -473,7 +519,7 @@ def drive_cell(case, proto, settle):
         # orchestrator evidence to localize where the dispatch dropped.
         pms = pms_logs("120s")
         orch = orch_logs("120s")
-        return "NODISPATCH", {"reason": "decided-transcode, no worker spawn (4 triggers)",
+        return "NODISPATCH", {"reason": f"decided-transcode, no worker spawn ({settle:.0f}s)",
                               "pms_started_transcode": bool(re.search(r"(?i)transcod", pms)),
                               "orch_got_task": ("/task" in orch or sid[:8] in orch)}, sid
 
@@ -500,28 +546,41 @@ def server_combos(quick):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="small slice, FORCE_HW=1 only")
-    ap.add_argument("--force-hw", default="1,0", help="comma list, e.g. 1,0")
-    ap.add_argument("--settle", type=float, default=12, help="secs to wait per session")
+    ap.add_argument("--force-hw", default=None,
+                    help="comma list of SCALEPLEX_FORCE_HW values (e.g. '1,0'). "
+                         "Defaults to '1,0' in synthetic mode, '0' in smart-profile mode.")
+    ap.add_argument("--settle", type=float, default=20,
+                    help="secs to wait per session for spawn / first segment (default 20; "
+                         "av1->hevc HW transcodes need ~12-15s for first segment, #118)")
     ap.add_argument("--protocols", default="hls,dash", help="comma list, e.g. hls,dash")
     ap.add_argument("--client-profiles", default="",
                     help="iterate real captured client profiles as the client (outer axis), "
                          f"instead of the synthetic Plex-Web default. 'all' or a comma list of: "
-                         f"{','.join(CLIENT_PROFILES)}. Best combined with --quick.")
+                         f"{','.join(CLIENT_PROFILES)}. Smart-mode is enabled by default when "
+                         "this is set (see --no-smart).")
+    ap.add_argument("--no-smart", action="store_true",
+                    help="With --client-profiles, restore the full cartesian (all server-combos "
+                         "x force_hw x cases x protocols x profiles). Default = smart mode: "
+                         "single prod-baseline server combo, per-profile case filter + proto "
+                         "pinning, FORCE_HW=[0]. #116.")
     args = ap.parse_args()
     protocols = [p.strip() for p in args.protocols.split(",") if p.strip()]
     if not TOKEN:
         sys.exit("set PLEX_TOKEN")
 
-    # Client axis: synthetic default, or one entry per selected real profile.
+    # Client axis: synthetic default, or one entry per selected real profile (with meta).
     if args.client_profiles.strip():
         sel = (list(CLIENT_PROFILES) if args.client_profiles.strip() == "all"
                else [s.strip() for s in args.client_profiles.split(",") if s.strip()])
         bad = [s for s in sel if s not in CLIENT_PROFILES]
         if bad:
             sys.exit(f"unknown client profile(s): {bad}; known: {list(CLIENT_PROFILES)}")
-        client_axis = [(name, CLIENT_PROFILES[name]) for name in sel]
+        client_axis = [(name, CLIENT_PROFILES[name].get("headers"),
+                        CLIENT_PROFILES[name].get("meta") or {}) for name in sel]
+        smart = not args.no_smart
     else:
-        client_axis = [("", None)]  # synthetic per-case client (unchanged default)
+        client_axis = [("", None, None)]  # synthetic per-case client (unchanged default)
+        smart = False
 
     content = discover_content()
     if not content:
@@ -556,15 +615,40 @@ def main():
               f"{' [windows]' if c['client'] else ''}")
     print(f"default protocols: {protocols}\n")
 
-    fhw_vals = [1] if args.quick else [int(x) for x in args.force_hw.split(",")]
-    combos = server_combos(args.quick)
-    cells_per_combo = sum(len(c["protocols"] or protocols) for c in cases) * len(client_axis)
-    projected = len(fhw_vals) * len(combos) * cells_per_combo
+    # Resolve fhw + server_combos honouring smart-mode defaults.
+    if args.quick:
+        fhw_vals = [1]
+    elif args.force_hw is None:
+        fhw_vals = [0] if smart else [1, 0]
+    else:
+        fhw_vals = [int(x) for x in args.force_hw.split(",")]
+    combos = [SMART_BASELINE_COMBO] if smart else server_combos(args.quick)
+
+    # Precompute per-profile filtered cases (so the projected-count is honest).
+    def cases_for(meta):
+        return _filter_cases_for_profile(cases, meta) if smart else cases
+    def protos_for(case, meta):
+        if case["protocols"]:
+            return case["protocols"]
+        # Smart-mode: pin to the profile's observed proto (hls/dash); fall back to
+        # ['hls'] when the harvest only saw '*' or 'http' (the transcode proto
+        # Plex uses for TV/console/mobile clients by default).
+        if smart:
+            return _profile_proto(meta, ["hls"])
+        return protocols
+
+    projected = 0
+    for _, _, meta in client_axis:
+        pc = cases_for(meta)
+        projected += sum(len(protos_for(c, meta)) for c in pc)
+    projected *= len(fhw_vals) * len(combos)
+
     if client_axis[0][0]:
-        print(f"client profiles (axis): {', '.join(n for n, _ in client_axis)}")
+        mode = "smart" if smart else "cartesian (no-smart)"
+        print(f"client profiles ({mode}): {', '.join(n for n, _, _ in client_axis)}")
     print(f"projected cells: {projected} "
-          f"({len(fhw_vals)} force-hw x {len(combos)} server-combo x {len(client_axis)} client x "
-          f"{cells_per_combo // max(1, len(client_axis))} case-proto)\n")
+          f"({len(fhw_vals)} force-hw x {len(combos)} server-combo x "
+          f"{len(client_axis)} client x filtered cases-protos)\n")
     results = []
     for fhw in fhw_vals:
         print(f"### FORCE_HW={fhw} — rolling workers ###")
@@ -576,18 +660,18 @@ def main():
             time.sleep(2)
             plabel = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
                               for k, v in combo.items())
-            for pname, phdrs in client_axis:
-                for c in cases:
+            for pname, phdrs, pmeta in client_axis:
+                for c in cases_for(pmeta):
                     # When a real profile is selected it IS the client under test,
                     # so it overrides the case's synthetic client (e.g. WINDOWS_HEADERS).
                     cc = c if phdrs is None else {**c, "client": phdrs}
-                    for proto in (cc["protocols"] or protocols):
+                    for proto in protos_for(cc, pmeta):
                         label = (f"{pname+':' if pname else ''}{cc['label']}/{proto} | {plabel}")
                         status, info, sid = drive_cell(cc, proto, args.settle)
                         stop_session(sid)
                         results.append((fhw, label, status, info))
                         print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
-                        time.sleep(4)  # let this session's logs age out of the next cell's window
+                        time.sleep(8)  # let worker cleanup + logs age out before next cell (#118)
 
     from collections import Counter
     tally = Counter(s for *_, s, _ in results)

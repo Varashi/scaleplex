@@ -1,158 +1,557 @@
 {
-  "web_edge": {
-    "X-Plex-Product": "Plex Web",
-    "X-Plex-Version": "4.159.0",
-    "X-Plex-Platform": "Microsoft Edge",
-    "X-Plex-Platform-Version": "148.0",
-    "X-Plex-Device": "Windows",
-    "X-Plex-Device-Name": "Microsoft Edge",
-    "X-Plex-Model": "standalone",
-    "X-Plex-Device-Screen-Resolution": "2113x1273,3440x1440",
-    "X-Plex-Features": "external-media,indirect-media,hub-style-list",
-    "X-Plex-Language": "en",
-    "X-Plex-Client-Profile-Extra": "append-transcode-target-codec(type=videoProfile&context=streaming&protocol=http&videoCodec=hevc)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=http&type=match&name=video.colorTrc&list=bt709|bt470m|bt470bg|smpte170m|smpte240m|bt2020-10|smpte2084&isRequired=false)+append-transcode-target-codec(type=videoProfile&context=streaming&videoCodec=h264%2Chevc&audioCodec=aac&protocol=http)"
+  "plex_for_lg_webos_49sj800v_zb": {
+    "headers": {
+      "X-Plex-Product": "Plex for LG",
+      "X-Plex-Version": "5.94.1",
+      "X-Plex-Platform": "webOS",
+      "X-Plex-Platform-Version": "3.9.0",
+      "X-Plex-Device": "webOS 3.9.0",
+      "X-Plex-Device-Name": "LG 49SJ800V-ZB",
+      "X-Plex-Device-Vendor": "LG",
+      "X-Plex-Model": "49SJ800V-ZB",
+      "X-Plex-Device-Screen-Resolution": "1920x1080",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media",
+      "X-Plex-Language": "en-GB",
+      "X-Plex-Client-Profile-Name": "Generic",
+      "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mpegts&videoCodec=h264,hevc,mpeg2video,mpeg4&audioCodec=aac,ac3,eac3,mp2,mp3)+add-limitation(scope=videoAudioCodec&scopeName=mp2&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoAudioCodec&scopeName=mp3&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoCodec&scopeName=hevc&type=notMatch&name=video.DOVIProfile&value=5)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-transcode-target(type=subtitleProfile&protocol=http&context=all&subtitleCodec=srt&container=srt)"
+    },
+    "meta": {
+      "product_class": "tv_lg",
+      "protocols": [
+        "hls"
+      ],
+      "subtitles": [
+        "burn",
+        "none"
+      ],
+      "direct_play": [
+        "0"
+      ],
+      "direct_stream": [
+        "0"
+      ],
+      "sample_count": 8,
+      "user_agent": "Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/38.0.2125.122 Safari/537.36 WebAppManager",
+      "first_seen": "2026-05-29 21:03:49.737 GMT+00:00",
+      "last_seen": "2026-05-29 21:07:42.591 GMT+00:00"
+    }
   },
-  "ios_iphone": {
-    "X-Plex-Product": "Plex for iOS",
-    "X-Plex-Version": "2026.10.0",
-    "X-Plex-Platform": "iOS",
-    "X-Plex-Platform-Version": "18.7.9",
-    "X-Plex-Device": "iOS",
-    "X-Plex-Device-Name": "iPhone",
-    "X-Plex-Device-Vendor": "Apple",
-    "X-Plex-Model": "iPhone11,6",
-    "X-Plex-Device-Screen-Resolution": "1242x2688",
-    "X-Plex-Drm": "fairplay:video",
-    "X-Plex-Features": "external-media,indirect-media",
-    "X-Plex-Language": "en",
-    "X-Plex-Client-Profile-Name": "Generic",
-    "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mkv&videoCodec=h264,png,apng,bmp,mjpeg,thp,gif,vp8,vp9,dirac,ffv1,ffvhuff,huffyuv,rawvideo,ayuv,r210,v210,v210x,v308,v408,v410,y41p,yuv4,ansi,h263,mpeg1video,mpeg2video,mpeg4,hevc,av1,vc1&audioCodec=ape,aac,aac_latm,alac,dca,vorbis,opus,pcm,pcm_alaw,pcm_mulaw,pcm_bluray,pcm_dvd,mp1,mp2,ac3,eac3,mp3&subtitleCodec=ass,dvb_subtitle,eia_608,jacosub,microdvd,mov_text,mpl2,pgs,pjs,realtext,sami,srt,ssa,stl,subviewer,subviewer1,text,vobsub,vplayer,xsub)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=upperBound&name=audio.channels&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-transcode-target-settings(type=videoProfile&context=all&protocol=hls&CopyMatroskaAttachments=true)"
+  "plex_for_playstation_4_playstation_playstation_4": {
+    "headers": {
+      "X-Plex-Product": "Plex for PlayStation 4",
+      "X-Plex-Version": "5.94.1",
+      "X-Plex-Platform": "PlayStation",
+      "X-Plex-Platform-Version": "WebMAF/v3.1.6-0-g98e23f25",
+      "X-Plex-Device": "PlayStation 4",
+      "X-Plex-Device-Name": "PS4-375",
+      "X-Plex-Device-Vendor": "Sony",
+      "X-Plex-Model": "PlayStation 4",
+      "X-Plex-Device-Screen-Resolution": "1280x720",
+      "X-Plex-Drm": "playready:video",
+      "X-Plex-Features": "external-media,indirect-media",
+      "X-Plex-Language": "nl",
+      "X-Plex-Client-Profile-Name": "Generic",
+      "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mpegts&videoCodec=h264&audioCodec=aac,ac3,eac3)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=6)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=match&name=audio.samplingRate&list=32000|44100|48000)+add-limitation(scope=videoAudioCodec&scopeName=ac3&type=upperBound&name=audio.channels&value=6)+add-limitation(scope=videoAudioCodec&scopeName=ac3&type=lowerBound&name=audio.channels&value=2)+add-limitation(scope=videoAudioCodec&scopeName=ac3&type=match&name=audio.samplingRate&list=32000|44100|48000)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=upperBound&name=audio.channels&value=6)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=lowerBound&name=audio.channels&value=2)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=match&name=audio.samplingRate&list=32000|44100|48000)+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=41)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-transcode-target(type=subtitleProfile&protocol=http&context=all&subtitleCodec=pgs&container=mkv)+add-transcode-target-settings(type=videoProfile&context=all&protocol=hls&BreakNonKeyframes=true)"
+    },
+    "meta": {
+      "product_class": "console_playstation",
+      "protocols": [
+        "hls"
+      ],
+      "subtitles": [
+        "burn"
+      ],
+      "direct_play": [
+        "0"
+      ],
+      "direct_stream": [
+        "0"
+      ],
+      "sample_count": 6,
+      "user_agent": "libhttp libhttp/13.50 (PlayStation 4)",
+      "first_seen": "2026-05-29 20:55:55.756 GMT+00:00",
+      "last_seen": "2026-05-29 20:57:02.302 GMT+00:00"
+    }
   },
-  "android_mobile": {
-    "X-Plex-Product": "Plex for Android (Mobile)",
-    "X-Plex-Version": "2026.10.0",
-    "X-Plex-Platform": "Android",
-    "X-Plex-Platform-Version": "16",
-    "X-Plex-Device": "Android",
-    "X-Plex-Device-Name": "Frank OnePlus 15",
-    "X-Plex-Device-Vendor": "Google",
-    "X-Plex-Model": "CPH2747",
-    "X-Plex-Device-Screen-Resolution": "1272x2772",
-    "X-Plex-Drm": "widevine:video",
-    "X-Plex-Features": "external-media,indirect-media",
-    "X-Plex-Language": "en",
-    "X-Plex-Client-Profile-Name": "Generic",
-    "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mkv&videoCodec=h264,hevc,vp8,vp9&audioCodec=aac,pcm,mp3,ac3,dca,eac3,truehd&subtitleCodec=ass,ssa,pgs,srt,smi,dvd_subtitle,mov_text,eia_608,eia_708,vobsub,vtt,webvtt,text,ttxt,tx3g)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=8192)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=mp3&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=ac3&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=eac3&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=dca&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=opus&scopeType=audioCodec&context=all&protocol=http)"
+  "plex_for_android_tv_android_ph1m_ww_9972": {
+    "headers": {
+      "X-Plex-Product": "Plex for Android (TV)",
+      "X-Plex-Version": "10.30.8.4222",
+      "X-Plex-Platform": "Android",
+      "X-Plex-Platform-Version": "14",
+      "X-Plex-Client-Platform": "Android",
+      "X-Plex-Device": "Philips Google TV TA1",
+      "X-Plex-Device-Name": "Philips Google TV TA1",
+      "X-Plex-Device-Vendor": "TPV",
+      "X-Plex-Model": "PH1M_WW_9972",
+      "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+      "X-Plex-Language": "en-gb",
+      "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=60)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,mpeg2video&audioCodec=aac_latm,aac,aac,ac3,alac,dca,dca,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=mpeg2video)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+    },
+    "meta": {
+      "product_class": "tv_android",
+      "protocols": [
+        "*"
+      ],
+      "subtitles": [],
+      "direct_play": [
+        "1"
+      ],
+      "direct_stream": [
+        "1"
+      ],
+      "sample_count": 11,
+      "user_agent": "Mozilla/5.0 (Linux; Android 14; Philips Google TV TA1 Build/UKN2.241117.001; wv)PlexTV/10.30.8.4222",
+      "first_seen": "2026-05-27 19:31:42.851 GMT+00:00",
+      "last_seen": "2026-05-29 20:33:42.573 GMT+00:00"
+    }
   },
-  "apple_tv": {
-    "X-Plex-Product": "Plex for Apple TV",
-    "X-Plex-Version": "8.45",
-    "X-Plex-Platform": "tvOS",
-    "X-Plex-Platform-Version": "26.5",
-    "X-Plex-Device": "Apple TV",
-    "X-Plex-Device-Name": "Apple TV",
-    "X-Plex-Device-Vendor": "Apple",
-    "X-Plex-Model": "14,1",
-    "X-Plex-Device-Screen-Resolution": "3840x2160",
-    "X-Plex-Drm": "fairplay:video",
-    "X-Plex-Features": "external-media,hub-style-list",
-    "X-Plex-Language": "nl-BE",
-    "X-Plex-Client-Profile-Extra": "add-direct-play-profile(type=videoProfile&protocol=http&container=mkv&videoCodec=*&audioCodec=*&subtitleCodec=*)+add-direct-play-profile(type=videoProfile&protocol=hls&container=mkv&videoCodec=*&audioCodec=*&subtitleCodec=*)+add-direct-play-profile(type=subtitleProfile&protocol=http&container=srt&subtitleCodec=srt)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,png,apng,bmp,mjpeg,thp,gif,vp8,vp9,dirac,ffv1,ffvhuff,huffyuv,rawvideo,012v,ayuv,r210,v210,v210x,v308,v408,v410,y41p,yuv4,ansi,h263,mpeg1video,mpeg2video,mpeg4,vc1&audioCodec=ape,aac,aac_latm,alac,dca,vorbis,opus,pcm,pcm_alaw,pcm_mulaw,pcm_bluray,pcm_dvd,mp1,mp2,eac3,ac3,flac,mp3&subtitleCodec=srt&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=*&type=upperBound&name=audio.channels&value=10&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.bitDepth&value=10&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=notMatch&name=video.separateFields&value=dummy&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=4096&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=4096&onlyTranscodes=true&replace=false)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&onlyTranscodes=true&replace=false)"
+  "plex_for_ios_ios_iphone11_6": {
+    "headers": {
+      "X-Plex-Product": "Plex for iOS",
+      "X-Plex-Version": "2026.10.0",
+      "X-Plex-Platform": "iOS",
+      "X-Plex-Platform-Version": "18.7.9",
+      "X-Plex-Device": "iOS",
+      "X-Plex-Device-Name": "iPhone",
+      "X-Plex-Device-Vendor": "Apple",
+      "X-Plex-Model": "iPhone11,6",
+      "X-Plex-Device-Screen-Resolution": "1242x2688",
+      "X-Plex-Drm": "fairplay:video",
+      "X-Plex-Features": "external-media,indirect-media",
+      "X-Plex-Language": "en",
+      "X-Plex-Client-Profile-Name": "Generic",
+      "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mkv&videoCodec=h264,png,apng,bmp,mjpeg,thp,gif,vp8,vp9,dirac,ffv1,ffvhuff,huffyuv,rawvideo,ayuv,r210,v210,v210x,v308,v408,v410,y41p,yuv4,ansi,h263,mpeg1video,mpeg2video,mpeg4,hevc,av1,vc1&audioCodec=ape,aac,aac_latm,alac,dca,vorbis,opus,pcm,pcm_alaw,pcm_mulaw,pcm_bluray,pcm_dvd,mp1,mp2,ac3,eac3,mp3&subtitleCodec=ass,dvb_subtitle,eia_608,jacosub,microdvd,mov_text,mpl2,pgs,pjs,realtext,sami,srt,ssa,stl,subviewer,subviewer1,text,vobsub,vplayer,xsub)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=upperBound&name=audio.channels&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-transcode-target-settings(type=videoProfile&context=all&protocol=hls&CopyMatroskaAttachments=true)"
+    },
+    "meta": {
+      "product_class": "mobile_ios",
+      "protocols": [
+        "hls"
+      ],
+      "subtitles": [
+        "none",
+        "auto"
+      ],
+      "direct_play": [
+        "1",
+        "0"
+      ],
+      "direct_stream": [
+        "1",
+        "0"
+      ],
+      "sample_count": 46,
+      "user_agent": "Plex/1743 CFNetwork/3826.600.41.2.1 Darwin/24.6.0",
+      "first_seen": "2026-05-27 15:04:04.980 GMT+00:00",
+      "last_seen": "2026-05-29 20:08:24.478 GMT+00:00"
+    }
   },
-  "ps4": {
-    "X-Plex-Product": "Plex for PlayStation 4",
-    "X-Plex-Version": "5.94.1",
-    "X-Plex-Platform": "PlayStation",
-    "X-Plex-Platform-Version": "WebMAF/v3.1.6-0-g98e23f25",
-    "X-Plex-Device": "PlayStation 4",
-    "X-Plex-Device-Name": "PS4-375",
-    "X-Plex-Device-Vendor": "Sony",
-    "X-Plex-Model": "PlayStation 4",
-    "X-Plex-Device-Screen-Resolution": "1280x720",
-    "X-Plex-Drm": "playready:video",
-    "X-Plex-Features": "external-media,indirect-media",
-    "X-Plex-Language": "nl",
-    "X-Plex-Client-Profile-Name": "Generic",
-    "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mpegts&videoCodec=h264&audioCodec=aac,ac3,eac3)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=6)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=match&name=audio.samplingRate&list=32000|44100|48000)+add-limitation(scope=videoAudioCodec&scopeName=ac3&type=upperBound&name=audio.channels&value=6)+add-limitation(scope=videoAudioCodec&scopeName=ac3&type=lowerBound&name=audio.channels&value=2)+add-limitation(scope=videoAudioCodec&scopeName=ac3&type=match&name=audio.samplingRate&list=32000|44100|48000)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=upperBound&name=audio.channels&value=6)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=lowerBound&name=audio.channels&value=2)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=match&name=audio.samplingRate&list=32000|44100|48000)+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=41)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-transcode-target(type=subtitleProfile&protocol=http&context=all&subtitleCodec=pgs&container=mkv)+add-transcode-target-settings(type=videoProfile&context=all&protocol=hls&BreakNonKeyframes=true)"
+  "plex_for_lg_webos_75un85006la": {
+    "headers": {
+      "X-Plex-Product": "Plex for LG",
+      "X-Plex-Version": "5.94.1",
+      "X-Plex-Platform": "webOS",
+      "X-Plex-Platform-Version": "5.6.2",
+      "X-Plex-Device": "webOS 5.6.2",
+      "X-Plex-Device-Name": "LG 75UN85006LA",
+      "X-Plex-Device-Vendor": "LG",
+      "X-Plex-Model": "75UN85006LA",
+      "X-Plex-Device-Screen-Resolution": "1920x1080",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media",
+      "X-Plex-Language": "nl",
+      "X-Plex-Client-Profile-Name": "Generic",
+      "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mpegts&videoCodec=h264,hevc,mpeg2video,mpeg4&audioCodec=aac,ac3,eac3,mp2,mp3)+add-limitation(scope=videoAudioCodec&scopeName=mp2&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoAudioCodec&scopeName=mp3&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-transcode-target(type=subtitleProfile&protocol=http&context=all&subtitleCodec=srt&container=srt)"
+    },
+    "meta": {
+      "product_class": "tv_lg",
+      "protocols": [
+        "hls",
+        "http"
+      ],
+      "subtitles": [
+        "sidecar",
+        "none"
+      ],
+      "direct_play": [
+        "1",
+        "0"
+      ],
+      "direct_stream": [
+        "0",
+        "1"
+      ],
+      "sample_count": 46,
+      "user_agent": "Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36 WebAppManager",
+      "first_seen": "2026-05-27 20:07:08.742 GMT+00:00",
+      "last_seen": "2026-05-29 20:04:29.367 GMT+00:00"
+    }
   },
-  "lg_webos_new": {
-    "X-Plex-Product": "Plex for LG",
-    "X-Plex-Version": "5.94.1",
-    "X-Plex-Platform": "webOS",
-    "X-Plex-Platform-Version": "5.6.2",
-    "X-Plex-Device": "webOS 5.6.2",
-    "X-Plex-Device-Name": "LG 75UN85006LA",
-    "X-Plex-Device-Vendor": "LG",
-    "X-Plex-Model": "75UN85006LA",
-    "X-Plex-Device-Screen-Resolution": "1920x1080",
-    "X-Plex-Drm": "widevine:video",
-    "X-Plex-Features": "external-media,indirect-media",
-    "X-Plex-Language": "nl",
-    "X-Plex-Client-Profile-Name": "Generic",
-    "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mpegts&videoCodec=h264,hevc,mpeg2video,mpeg4&audioCodec=aac,ac3,eac3,mp2,mp3)+add-limitation(scope=videoAudioCodec&scopeName=mp2&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoAudioCodec&scopeName=mp3&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-transcode-target(type=subtitleProfile&protocol=http&context=all&subtitleCodec=srt&container=srt)"
+  "plex_for_android_tv_android": {
+    "headers": {
+      "X-Plex-Product": "Plex for Android (TV)",
+      "X-Plex-Version": "10.30.8.4222",
+      "X-Plex-Platform": "Android",
+      "X-Plex-Platform-Version": "8.0.0",
+      "X-Plex-Client-Platform": "Android",
+      "X-Plex-Device": "QM161E",
+      "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-limitation(scope=videoCodec&scopeName=hevc&type=notMatch&name=video.DOVIProfile&value=5)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,mpeg2video&audioCodec=aac_latm,aac,aac,ac3,alac,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=mpeg2video)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+    },
+    "meta": {
+      "product_class": "tv_android",
+      "protocols": [
+        "hls"
+      ],
+      "subtitles": [
+        "embedded"
+      ],
+      "direct_play": [
+        "0"
+      ],
+      "direct_stream": [
+        "1"
+      ],
+      "sample_count": 23,
+      "user_agent": "Mozilla/5.0 (Linux; Android 8.0.0; QM161E Build/OPR5.170623.014; wv)PlexTV/10.30.8.4222",
+      "first_seen": "2026-05-27 11:58:32.461 GMT+00:00",
+      "last_seen": "2026-05-29 19:52:26.694 GMT+00:00"
+    }
   },
-  "lg_webos_old": {
-    "X-Plex-Product": "Plex for LG",
-    "X-Plex-Version": "5.94.1",
-    "X-Plex-Platform": "webOS",
-    "X-Plex-Platform-Version": "3.9.0",
-    "X-Plex-Device": "webOS 3.9.0",
-    "X-Plex-Device-Name": "LG 49SJ800V-ZB",
-    "X-Plex-Device-Vendor": "LG",
-    "X-Plex-Model": "49SJ800V-ZB",
-    "X-Plex-Device-Screen-Resolution": "1920x1080",
-    "X-Plex-Drm": "widevine:video",
-    "X-Plex-Features": "external-media,indirect-media",
-    "X-Plex-Language": "en-GB",
-    "X-Plex-Client-Profile-Name": "Generic",
-    "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mpegts&videoCodec=h264,hevc,mpeg2video,mpeg4&audioCodec=aac,ac3,eac3,mp2,mp3)+add-limitation(scope=videoAudioCodec&scopeName=mp2&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoAudioCodec&scopeName=mp3&type=upperBound&name=audio.bitrate&value=350)+add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoCodec&scopeName=hevc&type=notMatch&name=video.DOVIProfile&value=5)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg2video&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=8)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=1920)+add-limitation(scope=videoTranscodeTarget&scopeName=mpeg4&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=1080)+add-transcode-target(type=subtitleProfile&protocol=http&context=all&subtitleCodec=srt&container=srt)"
+  "plex_for_android_tv_android_qm16xe_ub": {
+    "headers": {
+      "X-Plex-Product": "Plex for Android (TV)",
+      "X-Plex-Version": "10.30.8.4222",
+      "X-Plex-Platform": "Android",
+      "X-Plex-Platform-Version": "8.0.0",
+      "X-Plex-Client-Platform": "Android",
+      "X-Plex-Device": "QM161E",
+      "X-Plex-Device-Name": "QM161E",
+      "X-Plex-Device-Vendor": "PHILIPS",
+      "X-Plex-Model": "QM16XE_UB",
+      "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+      "X-Plex-Language": "en-be",
+      "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-limitation(scope=videoCodec&scopeName=hevc&type=notMatch&name=video.DOVIProfile&value=5)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,mpeg2video&audioCodec=aac_latm,aac,aac,ac3,alac,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=mpeg2video)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+    },
+    "meta": {
+      "product_class": "tv_android",
+      "protocols": [
+        "*"
+      ],
+      "subtitles": [
+        "embedded"
+      ],
+      "direct_play": [
+        "0",
+        "1"
+      ],
+      "direct_stream": [
+        "1",
+        "0"
+      ],
+      "sample_count": 16,
+      "user_agent": "Mozilla/5.0 (Linux; Android 8.0.0; QM161E Build/OPR5.170623.014; wv)PlexTV/10.30.8.4222",
+      "first_seen": "2026-05-27 18:32:41.109 GMT+00:00",
+      "last_seen": "2026-05-29 19:52:26.169 GMT+00:00"
+    }
   },
-  "android_tv_chromecast": {
-    "X-Plex-Product": "Plex for Android (TV)",
-    "X-Plex-Version": "10.30.8.4222",
-    "X-Plex-Platform": "Android",
-    "X-Plex-Platform-Version": "14",
-    "X-Plex-Client-Platform": "Android",
-    "X-Plex-Device": "Chromecast",
-    "X-Plex-Device-Name": "Chromecast Google TV",
-    "X-Plex-Device-Vendor": "Google",
-    "X-Plex-Model": "sabrina",
-    "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
-    "X-Plex-Drm": "widevine:video",
-    "X-Plex-Features": "external-media,indirect-media,hub-style-list",
-    "X-Plex-Language": "nl-nl",
-    "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-limitation(scope=videoCodec&scopeName=hevc&type=notMatch&name=video.DOVIProfile&value=5)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc&audioCodec=aac_latm,aac,aac,ac3,alac,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+  "plex_for_apple_tv_tvos_14_1": {
+    "headers": {
+      "X-Plex-Product": "Plex for Apple TV",
+      "X-Plex-Version": "8.45",
+      "X-Plex-Platform": "tvOS",
+      "X-Plex-Platform-Version": "26.5",
+      "X-Plex-Device": "Apple TV",
+      "X-Plex-Device-Name": "Apple TV",
+      "X-Plex-Device-Vendor": "Apple",
+      "X-Plex-Model": "14,1",
+      "X-Plex-Device-Screen-Resolution": "3840x2160",
+      "X-Plex-Drm": "fairplay:video",
+      "X-Plex-Features": "external-media,hub-style-list",
+      "X-Plex-Language": "nl-BE",
+      "X-Plex-Client-Profile-Extra": "add-direct-play-profile(type=videoProfile&protocol=http&container=mkv&videoCodec=*&audioCodec=*&subtitleCodec=*)+add-direct-play-profile(type=videoProfile&protocol=hls&container=mkv&videoCodec=*&audioCodec=*&subtitleCodec=*)+add-direct-play-profile(type=subtitleProfile&protocol=http&container=srt&subtitleCodec=srt)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,png,apng,bmp,mjpeg,thp,gif,vp8,vp9,dirac,ffv1,ffvhuff,huffyuv,rawvideo,012v,ayuv,r210,v210,v210x,v308,v408,v410,y41p,yuv4,ansi,h263,mpeg1video,mpeg2video,mpeg4,vc1&audioCodec=ape,aac,aac_latm,alac,dca,vorbis,opus,pcm,pcm_alaw,pcm_mulaw,pcm_bluray,pcm_dvd,mp1,mp2,eac3,ac3,flac,mp3&subtitleCodec=srt&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=*&type=upperBound&name=audio.channels&value=10&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.bitDepth&value=10&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=notMatch&name=video.separateFields&value=dummy&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=4096&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=4096&onlyTranscodes=true&replace=false)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&onlyTranscodes=true&replace=false)"
+    },
+    "meta": {
+      "product_class": "tv_apple",
+      "protocols": [
+        "hls"
+      ],
+      "subtitles": [
+        "auto"
+      ],
+      "direct_play": [
+        "1",
+        "0"
+      ],
+      "direct_stream": [
+        "1"
+      ],
+      "sample_count": 11,
+      "user_agent": "PlexTV/8.45 (Apple TV; tvOS 26.5; Scale/2.00)",
+      "first_seen": "2026-05-28 17:12:55.062 GMT+00:00",
+      "last_seen": "2026-05-29 18:19:25.792 GMT+00:00"
+    }
   },
-  "android_tv_google_tv_streamer": {
-    "X-Plex-Product": "Plex for Android (TV)",
-    "X-Plex-Version": "10.30.8.4222",
-    "X-Plex-Platform": "Android",
-    "X-Plex-Platform-Version": "14",
-    "X-Plex-Client-Platform": "Android",
-    "X-Plex-Device": "Google TV Streamer",
-    "X-Plex-Device-Name": "Google TV Streamer",
-    "X-Plex-Device-Vendor": "Google",
-    "X-Plex-Model": "kirkwood",
-    "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
-    "X-Plex-Drm": "widevine:video",
-    "X-Plex-Features": "external-media,indirect-media,hub-style-list",
-    "X-Plex-Language": "en-be",
-    "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=52)+add-limitation(scope=videoCodec&scopeName=h264&type=Match&name=video.profile&list=baseline&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,mpeg2video&audioCodec=aac_latm,aac,aac,ac3,alac,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=mpeg2video)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+  "plex_for_android_tv_android_uiw4068pxm": {
+    "headers": {
+      "X-Plex-Product": "Plex for Android (TV)",
+      "X-Plex-Version": "10.30.8.4222",
+      "X-Plex-Platform": "Android",
+      "X-Plex-Platform-Version": "12",
+      "X-Plex-Client-Platform": "Android",
+      "X-Plex-Device": "tvbox",
+      "X-Plex-Device-Name": "e 8566N 3G PS8181MG",
+      "X-Plex-Device-Vendor": "Technicolor",
+      "X-Plex-Model": "uiw4068pxm",
+      "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+      "X-Plex-Language": "nl-nl",
+      "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=52)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-limitation(scope=videoCodec&scopeName=hevc&type=notMatch&name=video.DOVIProfile&value=5)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,mpeg2video&audioCodec=aac_latm,aac,aac,ac3,alac,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=mpeg2video)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+    },
+    "meta": {
+      "product_class": "tv_android",
+      "protocols": [
+        "*"
+      ],
+      "subtitles": [],
+      "direct_play": [
+        "1"
+      ],
+      "direct_stream": [
+        "1"
+      ],
+      "sample_count": 22,
+      "user_agent": "Mozilla/5.0 (Linux; Android 12; tvbox Build/STT5.251221.001; wv)PlexTV/10.30.8.4222",
+      "first_seen": "2026-05-27 06:45:46.819 GMT+00:00",
+      "last_seen": "2026-05-29 16:36:30.379 GMT+00:00"
+    }
   },
-  "android_tv_philips": {
-    "X-Plex-Product": "Plex for Android (TV)",
-    "X-Plex-Version": "10.30.8.4222",
-    "X-Plex-Platform": "Android",
-    "X-Plex-Platform-Version": "14",
-    "X-Plex-Client-Platform": "Android",
-    "X-Plex-Device": "Philips Google TV TA1",
-    "X-Plex-Device-Name": "Philips Google TV TA1",
-    "X-Plex-Device-Vendor": "TPV",
-    "X-Plex-Model": "PH1M_WW_9972",
-    "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
-    "X-Plex-Drm": "widevine:video",
-    "X-Plex-Features": "external-media,indirect-media,hub-style-list",
-    "X-Plex-Language": "en-gb",
-    "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=60)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,mpeg2video&audioCodec=aac_latm,aac,aac,ac3,alac,dca,dca,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=mpeg2video)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+  "plex_for_android_tv_android_sabrina": {
+    "headers": {
+      "X-Plex-Product": "Plex for Android (TV)",
+      "X-Plex-Version": "10.30.8.4222",
+      "X-Plex-Platform": "Android",
+      "X-Plex-Platform-Version": "14",
+      "X-Plex-Client-Platform": "Android",
+      "X-Plex-Device": "Chromecast",
+      "X-Plex-Device-Name": "Chromecast Google TV",
+      "X-Plex-Device-Vendor": "Google",
+      "X-Plex-Model": "sabrina",
+      "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+      "X-Plex-Language": "nl-nl",
+      "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=51)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-limitation(scope=videoCodec&scopeName=hevc&type=notMatch&name=video.DOVIProfile&value=5)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc&audioCodec=aac_latm,aac,aac,ac3,alac,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+    },
+    "meta": {
+      "product_class": "tv_android",
+      "protocols": [
+        "*"
+      ],
+      "subtitles": [
+        "embedded"
+      ],
+      "direct_play": [
+        "0"
+      ],
+      "direct_stream": [
+        "1"
+      ],
+      "sample_count": 13,
+      "user_agent": "Mozilla/5.0 (Linux; Android 14; Chromecast Build/UTTC.250917.004; wv)PlexTV/10.30.8.4222",
+      "first_seen": "2026-05-27 11:58:32.116 GMT+00:00",
+      "last_seen": "2026-05-29 15:06:24.301 GMT+00:00"
+    }
+  },
+  "plex_for_android_tv_android_kirkwood": {
+    "headers": {
+      "X-Plex-Product": "Plex for Android (TV)",
+      "X-Plex-Version": "10.30.8.4222",
+      "X-Plex-Platform": "Android",
+      "X-Plex-Platform-Version": "14",
+      "X-Plex-Client-Platform": "Android",
+      "X-Plex-Device": "Google TV Streamer",
+      "X-Plex-Device-Name": "Google TV Streamer",
+      "X-Plex-Device-Vendor": "Google",
+      "X-Plex-Model": "kirkwood",
+      "X-Plex-Device-Screen-Resolution": "1920x1080 (tv)",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+      "X-Plex-Language": "en-be",
+      "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=h264&type=upperBound&name=video.level&value=52)+add-limitation(scope=videoCodec&scopeName=h264&type=Match&name=video.profile&list=baseline&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)+add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2160&replace=true)+add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc,mpeg2video&audioCodec=aac_latm,aac,aac,ac3,alac,dca,eac3,flac,mp1,mp2,mp3,opus,vorbis,wmav1,wmav2,wmalossless,wmapro,wmavoice&subtitleCodec=ass,pgs,subrip,dvd_subtitle,mov_text,vtt,dvb_subtitle&replace=true)+add-transcode-target-settings(type=videoProfile&context=streaming&protocol=hls&CopyMatroskaAttachments=true)+add-limitation(scope=videoAudioCodec&scopeName=aac&type=upperBound&name=audio.channels&value=8&replace=true)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=mp3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=ac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=eac3)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=dca)+add-transcode-target-audio-codec(type=videoProfile&context=streaming&protocol=hls&audioCodec=opus)+add-limitation(scope=videoCodec&scopeName=*&type=NotMatch&name=video.anamorphic&value=999&replace=true)+add-transcode-target(type=subtitleProfile&context=streaming&protocol=http&container=mkv&subtitleCodec=srt)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=mpeg2video)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=hls&videoCodec=hevc)+add-limitation(scope=videoCodec&scopeName=hevc&type=Match&name=video.profile&list=main|main 10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=hls&type=match&name=video.colorTrc&list=smpte2084|bt709|bt470m|smpte240m|smpte170m|bt470bg|bt2020-10&isRequired=false)"
+    },
+    "meta": {
+      "product_class": "tv_android",
+      "protocols": [
+        "*"
+      ],
+      "subtitles": [],
+      "direct_play": [
+        "1"
+      ],
+      "direct_stream": [
+        "1"
+      ],
+      "sample_count": 9,
+      "user_agent": "Mozilla/5.0 (Linux; Android 14; Google TV Streamer Build/UTTK.250729.004; wv)PlexTV/10.30.8.4222",
+      "first_seen": "2026-05-28 11:00:55.795 GMT+00:00",
+      "last_seen": "2026-05-29 10:37:07.757 GMT+00:00"
+    }
+  },
+  "plex_for_ios_ios_ipad7_3": {
+    "headers": {
+      "X-Plex-Product": "Plex for iOS",
+      "X-Plex-Version": "2026.8.0",
+      "X-Plex-Platform": "iOS",
+      "X-Plex-Platform-Version": "16.1.1",
+      "X-Plex-Device": "iPadOS",
+      "X-Plex-Device-Name": "iPad",
+      "X-Plex-Device-Vendor": "Apple",
+      "X-Plex-Model": "iPad7,3",
+      "X-Plex-Device-Screen-Resolution": "1668x2224",
+      "X-Plex-Drm": "fairplay:video",
+      "X-Plex-Features": "external-media,indirect-media",
+      "X-Plex-Language": "en",
+      "X-Plex-Client-Profile-Name": "Generic",
+      "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mkv&videoCodec=h264,png,apng,bmp,mjpeg,thp,gif,vp8,vp9,dirac,ffv1,ffvhuff,huffyuv,rawvideo,ayuv,r210,v210,v210x,v308,v408,v410,y41p,yuv4,ansi,h263,mpeg1video,mpeg2video,mpeg4,hevc,av1,vc1&audioCodec=ape,aac,aac_latm,alac,dca,vorbis,opus,pcm,pcm_alaw,pcm_mulaw,pcm_bluray,pcm_dvd,mp1,mp2,ac3,eac3,mp3&subtitleCodec=ass,dvb_subtitle,eia_608,jacosub,microdvd,mov_text,mpl2,pgs,pjs,realtext,sami,srt,ssa,stl,subviewer,subviewer1,text,vobsub,vplayer,xsub)+add-limitation(scope=videoAudioCodec&scopeName=eac3&type=upperBound&name=audio.channels&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=3840)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=2160)+add-transcode-target-settings(type=videoProfile&context=all&protocol=hls&CopyMatroskaAttachments=true)"
+    },
+    "meta": {
+      "product_class": "mobile_ios",
+      "protocols": [
+        "hls"
+      ],
+      "subtitles": [
+        "auto",
+        "none"
+      ],
+      "direct_play": [
+        "0",
+        "1"
+      ],
+      "direct_stream": [
+        "0",
+        "1"
+      ],
+      "sample_count": 5,
+      "user_agent": "ExperimentalPlayer",
+      "first_seen": "2026-05-27 14:24:29.350 GMT+00:00",
+      "last_seen": "2026-05-27 14:33:31.721 GMT+00:00"
+    }
+  },
+  "plex_for_android_mobile_android_cph2747": {
+    "headers": {
+      "X-Plex-Product": "Plex for Android (Mobile)",
+      "X-Plex-Version": "2026.10.0",
+      "X-Plex-Platform": "Android",
+      "X-Plex-Platform-Version": "16",
+      "X-Plex-Device": "Android",
+      "X-Plex-Device-Name": "Frank OnePlus 15",
+      "X-Plex-Device-Vendor": "Google",
+      "X-Plex-Model": "CPH2747",
+      "X-Plex-Device-Screen-Resolution": "1272x2772",
+      "X-Plex-Drm": "widevine:video",
+      "X-Plex-Features": "external-media,indirect-media",
+      "X-Plex-Language": "en",
+      "X-Plex-Client-Profile-Name": "Generic",
+      "X-Plex-Client-Profile-Extra": "add-transcode-target(type=videoProfile&context=all&protocol=hls&container=mkv&videoCodec=h264,hevc,vp8,vp9&audioCodec=aac,pcm,mp3,ac3,dca,eac3,truehd&subtitleCodec=ass,ssa,pgs,srt,smi,dvd_subtitle,mov_text,eia_608,eia_708,vobsub,vtt,webvtt,text,ttxt,tx3g)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=av1&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=h264&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.bitDepth&value=10)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.width&value=8192)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=all&protocol=hls&type=upperBound&name=video.height&value=8192)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=mp3&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=ac3&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=eac3&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=dca&scopeType=audioCodec&context=all&protocol=http)+add-transcode-target-codec(scope=videoTranscodeTarget&scopeName=opus&scopeType=audioCodec&context=all&protocol=http)"
+    },
+    "meta": {
+      "product_class": "mobile_android",
+      "protocols": [
+        "hls"
+      ],
+      "subtitles": [
+        "auto"
+      ],
+      "direct_play": [
+        "0"
+      ],
+      "direct_stream": [
+        "0"
+      ],
+      "sample_count": 4,
+      "user_agent": "Mozilla/5.0 (Linux; Android 16; CPH2747 Build/BP2A.250605.015; wv)PlexMobile/2026.10.0",
+      "first_seen": "2026-05-27 12:13:08.056 GMT+00:00",
+      "last_seen": "2026-05-27 12:41:10.756 GMT+00:00"
+    }
+  },
+  "plex_web_microsoft_edge_standalone": {
+    "headers": {
+      "X-Plex-Product": "Plex Web",
+      "X-Plex-Version": "4.159.0",
+      "X-Plex-Platform": "Microsoft Edge",
+      "X-Plex-Platform-Version": "148.0",
+      "X-Plex-Device": "Windows",
+      "X-Plex-Device-Name": "Microsoft Edge",
+      "X-Plex-Model": "standalone",
+      "X-Plex-Device-Screen-Resolution": "2113x1273,3440x1440",
+      "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+      "X-Plex-Language": "en",
+      "X-Plex-Client-Profile-Extra": "append-transcode-target-codec(type=videoProfile&context=streaming&protocol=http&videoCodec=hevc)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=http&type=match&name=video.colorTrc&list=bt709|bt470m|bt470bg|smpte170m|smpte240m|bt2020-10|smpte2084&isRequired=false)+append-transcode-target-codec(type=videoProfile&context=streaming&videoCodec=h264%2Chevc&audioCodec=aac&protocol=http)"
+    },
+    "meta": {
+      "product_class": "web",
+      "protocols": [
+        "dash",
+        "http"
+      ],
+      "subtitles": [
+        "auto",
+        "sidecar"
+      ],
+      "direct_play": [
+        "0",
+        "1"
+      ],
+      "direct_stream": [
+        "0",
+        "1"
+      ],
+      "sample_count": 10,
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0",
+      "first_seen": "2026-05-28 11:05:55.850 GMT+00:00",
+      "last_seen": "2026-05-29 13:32:55.991 GMT+00:00"
+    }
+  },
+  "plex_web_chrome_standalone": {
+    "headers": {
+      "X-Plex-Product": "Plex Web",
+      "X-Plex-Version": "4.159.0",
+      "X-Plex-Platform": "Chrome",
+      "X-Plex-Platform-Version": "148.0",
+      "X-Plex-Device": "Windows",
+      "X-Plex-Device-Name": "Chrome",
+      "X-Plex-Model": "standalone",
+      "X-Plex-Device-Screen-Resolution": "1440x791,1440x960",
+      "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+      "X-Plex-Language": "nl",
+      "X-Plex-Client-Profile-Extra": "add-limitation(scope=videoCodec&scopeName=hevc&type=upperBound&name=video.bitDepth&value=10&replace=true)+append-transcode-target-codec(type=videoProfile&context=streaming&protocol=dash&videoCodec=hevc)+add-limitation(scope=videoTranscodeTarget&scopeName=hevc&scopeType=videoCodec&context=streaming&protocol=dash&type=match&name=video.colorTrc&list=bt709|bt470m|bt470bg|smpte170m|smpte240m|bt2020-10|smpte2084&isRequired=false)+append-transcode-target-codec(type=videoProfile&context=streaming&videoCodec=h264%2Chevc&audioCodec=aac&protocol=dash)"
+    },
+    "meta": {
+      "product_class": "web",
+      "protocols": [
+        "dash"
+      ],
+      "subtitles": [
+        "burn"
+      ],
+      "direct_play": [
+        "0",
+        "1"
+      ],
+      "direct_stream": [
+        "0",
+        "1"
+      ],
+      "sample_count": 4,
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+      "first_seen": "2026-05-27 19:17:58.013 GMT+00:00",
+      "last_seen": "2026-05-27 20:01:42.619 GMT+00:00"
+    }
   }
 }
