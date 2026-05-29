@@ -596,7 +596,20 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* SW branch (unchanged). */
      ff_draw_init(&ass->draw, link->format,
                   ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
-@@ -803,6 +1316,68 @@ static int config_output(AVFilterLink *o
+@@ -789,7 +1302,11 @@ static int config_output(AVFilterLink *o
+     AVFilterLink    *inlink  = avctx->inputs[0];
+     int err;
+ 
+-    if (inlink->format != AV_PIX_FMT_VAAPI) {
++    if (inlink->format != AV_PIX_FMT_VAAPI
++#if CONFIG_OVERLAY_CUDA_FILTER
++        && inlink->format != AV_PIX_FMT_CUDA   /* CUDA handled by its own block below */
++#endif
++    ) {
+         /* SW branch: geometry-preserving passthrough (previously implicit).
+          * frame_rate moved from AVFilterLink to the internal FilterLink in
+          * FFmpeg 7.x — propagate it there. */
+@@ -803,6 +1320,68 @@ static int config_output(AVFilterLink *o
          return 0;
      }
  
@@ -665,7 +678,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -1349,6 +1924,11 @@ static int filter_frame(AVFilterLink *in
+@@ -1349,6 +1928,11 @@ static int filter_frame(AVFilterLink *in
      if (inlink->format == AV_PIX_FMT_VAAPI)
          return filter_frame_hw(inlink, picref);
  
