@@ -241,9 +241,11 @@ func prewarm() {
 		renderFDs = append(renderFDs, f)
 	}
 
-	if err := exec.Command(ffmpegBin, "-hide_banner", "-version").Run(); err != nil {
+	vctx, vcancel := context.WithTimeout(context.Background(), prewarmCmdTimeout)
+	if err := exec.CommandContext(vctx, ffmpegBin, "-hide_banner", "-version").Run(); err != nil {
 		log.Printf("pre-warm: ffmpeg -version: %v", err)
 	}
+	vcancel()
 
 	// 3. Warm THIS worker's encoder so the first real session skips the
 	// driver's JIT/init cost. Backend-specific (#101): a VAAPI dummy on a
@@ -270,11 +272,19 @@ func prewarm() {
 	}
 }
 
+// prewarmCmdTimeout bounds each pre-warm ffmpeg invocation so a hung ffmpeg
+// (wedged GPU/driver) can't block the prewarm goroutine forever — which would
+// leave `ready` un-flipped and /readyz stuck 503 permanently. Generous vs the
+// ~1s dummy + driver JIT, but a hard ceiling on the cold path.
+const prewarmCmdTimeout = 30 * time.Second
+
 // runPrewarmDummy runs a 1s testsrc→encode→null warm-up. Best-effort: a failure
-// means a slower first session, not a broken worker.
+// (or the timeout) means a slower first session, not a broken worker.
 func runPrewarmDummy(backend string, args ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), prewarmCmdTimeout)
+	defer cancel()
 	full := append([]string{"-hide_banner", "-loglevel", "error"}, args...)
-	if out, err := exec.Command(ffmpegBin, full...).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, ffmpegBin, full...).CombinedOutput(); err != nil {
 		log.Printf("pre-warm: dummy %s transcode: %v: %s", backend, err, out)
 	}
 }
