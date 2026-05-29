@@ -20,6 +20,7 @@ Requires: kubectl context on the cluster; PMS reachable at PLEX_URL.
 """
 import argparse
 import itertools
+import json
 import os
 import re
 import shlex
@@ -77,6 +78,21 @@ WINDOWS_HEADERS = {
     "X-Plex-Device-Name": "scaleplex-QA-win",
     "X-Plex-Model": "standalone",
 }
+
+# Real client profiles harvested from prod via test/harvest_client_profiles.py
+# (LogVerbose X-Plex-* capture → vcflogs → distilled to the headers PMS needs to
+# profile that device). Each entry carries the full X-Plex-Client-Profile-Extra
+# capability string + the X-Plex-Client-Profile-Name seed, so PMS produces a real
+# transcode decision when --client-profiles selects it. Smart-TV/console identities
+# (PS4, LG webOS) need BOTH the seed and the extra; bare entries 400.
+# Refresh: re-run the harvester and overwrite test/client_profiles.json. See
+# scaleplex #74 / #115.
+_PROFILES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_profiles.json")
+try:
+    with open(_PROFILES_PATH) as _f:
+        CLIENT_PROFILES = json.load(_f)
+except FileNotFoundError:
+    CLIENT_PROFILES = {}
 
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
@@ -421,6 +437,10 @@ def drive_cell(case, proto, settle):
     slug = re.sub(r"[^A-Za-z0-9]+", "_", case["title"]).strip("_")[:18]
 
     vdec, dcode = transcode_decision(params, hdrs)
+    if dcode == 400:
+        # PMS could not match a client profile (TV/console identities need an
+        # X-Plex-Client-Profile-Extra we don't send) — not a worker fault.
+        return "SKIP", {"reason": "client-profile-unmatched(400)"}, sid
     if dcode != 200:
         return "FAIL", {"reason": f"decision={dcode}"}, sid
 
@@ -483,10 +503,25 @@ def main():
     ap.add_argument("--force-hw", default="1,0", help="comma list, e.g. 1,0")
     ap.add_argument("--settle", type=float, default=12, help="secs to wait per session")
     ap.add_argument("--protocols", default="hls,dash", help="comma list, e.g. hls,dash")
+    ap.add_argument("--client-profiles", default="",
+                    help="iterate real captured client profiles as the client (outer axis), "
+                         f"instead of the synthetic Plex-Web default. 'all' or a comma list of: "
+                         f"{','.join(CLIENT_PROFILES)}. Best combined with --quick.")
     args = ap.parse_args()
     protocols = [p.strip() for p in args.protocols.split(",") if p.strip()]
     if not TOKEN:
         sys.exit("set PLEX_TOKEN")
+
+    # Client axis: synthetic default, or one entry per selected real profile.
+    if args.client_profiles.strip():
+        sel = (list(CLIENT_PROFILES) if args.client_profiles.strip() == "all"
+               else [s.strip() for s in args.client_profiles.split(",") if s.strip()])
+        bad = [s for s in sel if s not in CLIENT_PROFILES]
+        if bad:
+            sys.exit(f"unknown client profile(s): {bad}; known: {list(CLIENT_PROFILES)}")
+        client_axis = [(name, CLIENT_PROFILES[name]) for name in sel]
+    else:
+        client_axis = [("", None)]  # synthetic per-case client (unchanged default)
 
     content = discover_content()
     if not content:
@@ -523,6 +558,13 @@ def main():
 
     fhw_vals = [1] if args.quick else [int(x) for x in args.force_hw.split(",")]
     combos = server_combos(args.quick)
+    cells_per_combo = sum(len(c["protocols"] or protocols) for c in cases) * len(client_axis)
+    projected = len(fhw_vals) * len(combos) * cells_per_combo
+    if client_axis[0][0]:
+        print(f"client profiles (axis): {', '.join(n for n, _ in client_axis)}")
+    print(f"projected cells: {projected} "
+          f"({len(fhw_vals)} force-hw x {len(combos)} server-combo x {len(client_axis)} client x "
+          f"{cells_per_combo // max(1, len(client_axis))} case-proto)\n")
     results = []
     for fhw in fhw_vals:
         print(f"### FORCE_HW={fhw} — rolling workers ###")
@@ -534,14 +576,18 @@ def main():
             time.sleep(2)
             plabel = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
                               for k, v in combo.items())
-            for c in cases:
-                for proto in (c["protocols"] or protocols):
-                    label = f"{c['label']}/{proto} | {plabel}"
-                    status, info, sid = drive_cell(c, proto, args.settle)
-                    stop_session(sid)
-                    results.append((fhw, label, status, info))
-                    print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
-                    time.sleep(4)  # let this session's logs age out of the next cell's window
+            for pname, phdrs in client_axis:
+                for c in cases:
+                    # When a real profile is selected it IS the client under test,
+                    # so it overrides the case's synthetic client (e.g. WINDOWS_HEADERS).
+                    cc = c if phdrs is None else {**c, "client": phdrs}
+                    for proto in (cc["protocols"] or protocols):
+                        label = (f"{pname+':' if pname else ''}{cc['label']}/{proto} | {plabel}")
+                        status, info, sid = drive_cell(cc, proto, args.settle)
+                        stop_session(sid)
+                        results.append((fhw, label, status, info))
+                        print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
+                        time.sleep(4)  # let this session's logs age out of the next cell's window
 
     from collections import Counter
     tally = Counter(s for *_, s, _ in results)
