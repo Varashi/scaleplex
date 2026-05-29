@@ -124,14 +124,15 @@ CLIENT_PROFILES = {
 # vcflogs and emits ready-to-paste entries for every client that TRANSCODES
 # (Apple TV, iOS, Android TV variants, Android mobile, web). Fold those in here.
 #
-# Not drivable via the matrix's forced-transcode probe: smart-TV / console
-# identities (LG webOS, PS4, Xbox). PMS 400s their decision request when we set
-# directPlay=0 ("Unable to find client profile for device") even with the
-# harvested profile-extra attached. Whether real playback also fails (vs falls
-# back to a default-profile transcode) is unverified — currently masked because
-# real prod sessions all direct-play (Optimize pre-optimiser + native codecs).
-# Will surface once the pre-optimiser is disabled (e.g. PS4 hitting a 1080p AV1
-# original that has no Optimize coverage). See #74 / #115.
+# Synthetic-probe gotcha: a bare CLIENT_PROFILES entry (identity headers only, no
+# X-Plex-Client-Profile-Extra) can 400 the decision endpoint with "Unable to find
+# client profile for device" for smart-TV/console identities. That's a property of
+# our synthetic probe, NOT of PMS — real PS4/LG/Xbox sessions with their real
+# headers + extra (incl. the X-Plex-Client-Profile-Extra carrying the codec/res
+# capability string) profile and transcode fine on this PMS (verified 2026-05-29:
+# real PS4 + Avatar 4K HDR AV1 → 1080p h264 + tonemap + PGS burn, clean). To drive
+# such an identity through the matrix, attach the harvested profile-extra (use
+# test/harvest_client_profiles.py). See #74 / #115.
 
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
