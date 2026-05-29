@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/Varashi/scaleplex/compare/v1.10.0...v1.10.1) (2026-05-29)
+
+
+### Fixes
+
+* **orchestrator:** /readyz must not gate on worker presence ([#93](https://github.com/Varashi/scaleplex/issues/93)) ([#111](https://github.com/Varashi/scaleplex/issues/111)) ([4ee6996](https://github.com/Varashi/scaleplex/commit/4ee69964ab6f7a8239a3399251ba8177db5d5b62))
+
 ## [1.10.0](https://github.com/Varashi/scaleplex/compare/v1.9.1...v1.10.0) (2026-05-29)
 
 
