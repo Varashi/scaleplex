@@ -234,11 +234,21 @@ construction, and the OpenCL detour collapses into the canonical
   resolution tier below `render_height`. Static cues are unaffected. Same knob
   applies on the SW-reshape path (`composeBurn`'s `animatedTierDown` axis).
 - Plex's `-map_inlineass <spec>` is **kept** — it drives the libass feed.
-- Plex's `-map <spec> -f null -codec ass` decode-sink is **stripped**
-  (`stripInlineassDecodeSink`, gated on `-map_inlineass` still being present).
-  As of fork patch `0120` (v1.5.0) the `-map_inlineass` binding self-decodes
-  via a sink-less decoder paced by the demux, so the null-mux is redundant —
-  see `docs/PACED_SELF_DECODE.md`.
+- Plex's `-map <spec> -f null -codec ass` decode-sink is **conditionally
+  stripped** by `stripInlineassDecodeSink`, gated on (a) `-map_inlineass`
+  still being present AND (b) the binding's `file_idx == 0` (embedded sub
+  stream — shares the main demuxer with video). As of fork patch `0120`
+  (v1.5.0) the `-map_inlineass` binding self-decodes via a sink-less
+  decoder paced by the demux; for embedded subs the shared demuxer is
+  pumped by main video, so the null-mux is redundant and competes with the
+  NFS read during the pre-throttle buffer fill (the original reason to
+  strip it). For **sidecar bindings** (`file_idx >= 1`, e.g.
+  `-map_inlineass 1:s:0` pointing at a PMS-staged `temp-0.srt`) the
+  sidecar has its own demuxer thread with no other downstream consumer; the
+  scheduler chokes after the first packet and the binding sees zero cues.
+  There the decode-sink is **kept** so the sidecar demuxer has a real
+  consumer (patch `0122` makes the dual-consumer state safe for
+  `dst_finished` allocation). See `docs/PACED_SELF_DECODE.md`.
 - Plex's full `inlineass` node is passed through **verbatim** — including
   the styling keys `language`/`overrides`/`outline`/`shadow`. As of patch
   `0119` the fork's `inlineass` parses them (`overrides` →
