@@ -165,3 +165,24 @@ func TestRewriter_PassGate_CrossBackendNotGated(t *testing.T) {
 		t.Errorf("expected VAAPI→NVENC reshape (h264_nvenc, no scale_vaapi): %v", out.Args)
 	}
 }
+
+// Same-backend HW passthrough under FORCE_HW=1 is also NOT gated: a VAAPI argv
+// on a VAAPI worker is proof of Pass just like a foreign one, so it must not
+// probe PMS (a probe flake would needlessly fail-close a licensed session).
+func TestRewriter_PassGate_SameBackendHWNotGated(t *testing.T) {
+	withDialect(t, vaapiDialect{})
+	t.Setenv("SCALEPLEX_FORCE_HW", "1")
+	stubPass(t, func(_, _ string) (bool, error) { return false, nil })
+	args := []string{
+		"-codec:0", "hevc",
+		"-hwaccel:0", "vaapi", "-hwaccel_output_format:0", "vaapi", "-hwaccel_device:0", "vaapi",
+		"-i", "/media/x.mkv",
+		"-init_hw_device", "vaapi=vaapi:",
+		"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=nv12[1]",
+		"-map", "[1]", "-codec:0", "h264_vaapi",
+	}
+	out := Rewrite(args, wiredEnv(), nil)
+	if containsString(out.Changes, TagPassGateDenied) {
+		t.Fatalf("same-backend HW passthrough must NOT consult the Pass gate: %v", out.Changes)
+	}
+}

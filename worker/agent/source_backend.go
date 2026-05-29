@@ -210,20 +210,6 @@ func setArgValue(args []string, flag, val string) bool {
 	return false
 }
 
-// isForeignHWSource reports whether the argv is shaped for a HW backend other
-// than the worker's — i.e. a cross-backend reshape would apply. Used to decide
-// whether the Plex-Pass gate query is needed (re-accel only).
-func isForeignHWSource(args []string) bool {
-	// A software worker never re-accelerates onto HW — it downgrades to SW
-	// (reshapeToSoftware), which grants no entitlement, so the Plex-Pass gate
-	// doesn't apply. Report not-foreign so the gate stays inert.
-	if activeDialect.backendName() == "sw" {
-		return false
-	}
-	src := detectSourceBackend(args)
-	return (src == srcVAAPI || src == srcNVENC) && string(src) != activeDialect.backendName()
-}
-
 // reshapeForeignHWArgv translates an argv shaped for a HW backend DIFFERENT
 // from the worker's into the worker's native backend, so the honor-source
 // logic downstream runs on it unchanged. No-op when source == worker, or

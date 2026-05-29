@@ -1984,20 +1984,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 		// 0. Plex-Pass gate (scaleplex#78, L3, fail-closed). Gate ONLY the path
 		// that genuinely GRANTS HW the user may not be entitled to:
-		// SCALEPLEX_FORCE_HW=1 forcing HW onto an argv Plex emitted as SW (Plex
-		// chose SW → the user may have no Pass). A foreign-HW source is NOT gated
-		// — Plex only ever emits a HW argv for an active Pass (it gates HW
-		// transcode itself), so the foreign HW IS proof of entitlement, and
-		// reshaping it cross-backend (e.g. VAAPI→NVENC, #77) grants nothing Plex
-		// didn't already grant. Gating it was both wrong (over-gates a Pass user)
-		// and fragile: an EXTERNAL worker can't reach the in-cluster
-		// SCALEPLEX_PMS_BASE_URL for the L3 probe → it fail-closed every
-		// cross-backend session into an un-runnable foreign-HW passthrough (#99).
-		// Query PMS only for the FORCE_HW-on-SW case, so honor-source +
-		// cross-backend sessions pay no network cost.
+		// SCALEPLEX_FORCE_HW=1 forcing HW onto an argv Plex emitted as SOFTWARE
+		// video (Plex chose SW → the user may have no Pass). ANY HW source —
+		// foreign (cross-backend, #77) OR same-backend passthrough — is NOT
+		// gated: Plex only ever emits a HW argv for an active Pass (it gates HW
+		// transcode itself), so the HW argv IS proof of entitlement and
+		// reshaping/forcing it grants nothing Plex didn't already grant. Gating
+		// HW sources was both wrong (over-gates a Pass user) and fragile: an
+		// EXTERNAL worker can't reach the in-cluster SCALEPLEX_PMS_BASE_URL for
+		// the L3 probe → it fail-closed every cross-backend session into an
+		// un-runnable foreign-HW passthrough (#99). Query PMS only for the
+		// FORCE_HW-on-SW case, so honor-source + cross-backend pay no network cost.
 		forceHWEnv := envBool("SCALEPLEX_FORCE_HW")
 		hwReaccelOK := true
-		if forceHWEnv && !isForeignHWSource(args) {
+		if forceHWEnv && detectSourceBackend(args) == srcSW {
 			hwReaccelOK = hwAccelAllowed(inputEnv)
 			if !hwReaccelOK {
 				changes = append(changes, TagPassGateDenied)
@@ -2016,8 +2016,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		if activeDialect.backendName() == "sw" {
 			// No-GPU worker: downgrade ANY incoming argv (foreign HW / hybrid)
 			// to a pure-CPU pipeline, so the honor-source path below keeps it.
-			// Not Pass-gated — HW→SW grants no entitlement (isForeignHWSource
-			// already reports not-foreign for SW, so the gate stayed inert).
+			// Not Pass-gated — downgrading HW→SW grants no entitlement; the gate
+			// above only probes for FORCE_HW on a SW source.
 			if reshaped, swChanges := reshapeToSoftware(args, tm); len(swChanges) > 0 {
 				args = reshaped
 				changes = append(changes, swChanges...)
