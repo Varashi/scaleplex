@@ -124,13 +124,14 @@ CLIENT_PROFILES = {
 # vcflogs and emits ready-to-paste entries for every client that TRANSCODES
 # (Apple TV, iOS, Android TV variants, Android mobile, web). Fold those in here.
 #
-# Known NOT drivable on this PMS: smart-TV / console identities (LG webOS, PS4,
-# Xbox). PMS 400s their decision request ("Unable to find client profile for
-# device") EVEN WITH the harvested profile-extra attached — the server has no
-# transcode profile for them, so they only ever direct-play here (helped by the
-# Plex Optimize pre-optimiser). Capturing the extra does NOT unlock them; that
-# needs a PMS-side profile or a forced transcode that PMS can actually shape.
-# See #74 / #115.
+# Not drivable via the matrix's forced-transcode probe: smart-TV / console
+# identities (LG webOS, PS4, Xbox). PMS 400s their decision request when we set
+# directPlay=0 ("Unable to find client profile for device") even with the
+# harvested profile-extra attached. Whether real playback also fails (vs falls
+# back to a default-profile transcode) is unverified — currently masked because
+# real prod sessions all direct-play (Optimize pre-optimiser + native codecs).
+# Will surface once the pre-optimiser is disabled (e.g. PS4 hitting a 1080p AV1
+# original that has no Optimize coverage). See #74 / #115.
 
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
