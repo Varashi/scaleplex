@@ -20,6 +20,7 @@ Requires: kubectl context on the cluster; PMS reachable at PLEX_URL.
 """
 import argparse
 import itertools
+import json
 import os
 import re
 import shlex
@@ -78,61 +79,20 @@ WINDOWS_HEADERS = {
     "X-Plex-Model": "standalone",
 }
 
-# Real client profiles harvested from prod (LogVerbose X-Plex-* capture,
-# 2026-05-26 → ~/scaleplex-corpus/_client-profiles/t3_matrix_2026-05-26.json,
-# issue #74). Sending a real client's identity + screen-resolution + DRM makes
-# PMS load that client's base profile, so it negotiates the codec / container /
-# resolution / subtitle-mode the real device actually gets — exercising worker
-# shapes the synthetic Chrome profile misses (e.g. 720p console downscale,
-# webOS TV codec support, playready vs widevine). Selected with --client-profiles;
-# the synthetic CLIENT_HEADERS stays the default. Headers are verbatim from the
-# harvest except a few sparse fields (marked) filled from a same-device-class
-# sibling so PMS can still match a base profile.
-CLIENT_PROFILES = {
-    "web_edge": {  # 9 sess; version/res/drm lost to capture truncation → from web_firefox sibling
-        "X-Plex-Product": "Plex Web", "X-Plex-Version": "4.159.0",
-        "X-Plex-Platform": "Microsoft Edge", "X-Plex-Platform-Version": "151.0",
-        "X-Plex-Device": "Windows", "X-Plex-Device-Name": "Microsoft Edge",
-        "X-Plex-Model": "bundled", "X-Plex-Device-Screen-Resolution": "2560x1440",
-        "X-Plex-DRM": "widevine", "X-Plex-Features": "external-media,indirect-media,hub-style-list",
-    },
-    "web_firefox": {  # 6 sess
-        "X-Plex-Product": "Plex Web", "X-Plex-Version": "4.159.0",
-        "X-Plex-Platform": "Firefox", "X-Plex-Platform-Version": "151.0",
-        "X-Plex-Device": "Windows", "X-Plex-Device-Name": "Firefox",
-        "X-Plex-Model": "bundled", "X-Plex-Device-Screen-Resolution": "2560x1307,2560x1440",
-        "X-Plex-DRM": "widevine", "X-Plex-Features": "external-media,indirect-media,hub-style-list",
-    },
-    "windows": {  # 2 sess; X-Plex-Device lost to truncation → "Windows"
-        "X-Plex-Product": "Plex for Windows", "X-Plex-Version": "1.112.0.359-0d79a49f",
-        "X-Plex-Platform": "windows", "X-Plex-Platform-Version": "10.0.26200",
-        "X-Plex-Device": "Windows", "X-Plex-Device-Name": "SKW-L-Frank",
-        "X-Plex-Model": "standalone", "X-Plex-Device-Screen-Resolution": "1219x776,1920x1200",
-        "X-Plex-DRM": "widevine:video", "X-Plex-Features": "external-media,indirect-media,hub-style-list",
-    },
-    "android": {  # 1 sess — portrait phone (1272x2772), widevine
-        "X-Plex-Product": "Plex for Android (Mobile)", "X-Plex-Version": "10.0.0",
-        "X-Plex-Platform": "Android", "X-Plex-Platform-Version": "16",
-        "X-Plex-Device": "Android", "X-Plex-Device-Name": "Frank OnePlus 15",
-        "X-Plex-Model": "CPH2747", "X-Plex-Device-Screen-Resolution": "1272x2772",
-        "X-Plex-DRM": "widevine:video", "X-Plex-Features": "external-media,indirect-media",
-    },
-}
-
-# More real profiles can be pulled live with test/harvest_client_profiles.py — it
-# mines the full X-Plex-Client-Profile-Extra (codec/res capability string) from
-# vcflogs and emits ready-to-paste entries for every client that TRANSCODES
-# (Apple TV, iOS, Android TV variants, Android mobile, web). Fold those in here.
-#
-# Synthetic-probe gotcha: a bare CLIENT_PROFILES entry (identity headers only, no
-# X-Plex-Client-Profile-Extra) can 400 the decision endpoint with "Unable to find
-# client profile for device" for smart-TV/console identities. That's a property of
-# our synthetic probe, NOT of PMS — real PS4/LG/Xbox sessions with their real
-# headers + extra (incl. the X-Plex-Client-Profile-Extra carrying the codec/res
-# capability string) profile and transcode fine on this PMS (verified 2026-05-29:
-# real PS4 + Avatar 4K HDR AV1 → 1080p h264 + tonemap + PGS burn, clean). To drive
-# such an identity through the matrix, attach the harvested profile-extra (use
-# test/harvest_client_profiles.py). See #74 / #115.
+# Real client profiles harvested from prod via test/harvest_client_profiles.py
+# (LogVerbose X-Plex-* capture → vcflogs → distilled to the headers PMS needs to
+# profile that device). Each entry carries the full X-Plex-Client-Profile-Extra
+# capability string + the X-Plex-Client-Profile-Name seed, so PMS produces a real
+# transcode decision when --client-profiles selects it. Smart-TV/console identities
+# (PS4, LG webOS) need BOTH the seed and the extra; bare entries 400.
+# Refresh: re-run the harvester and overwrite test/client_profiles.json. See
+# scaleplex #74 / #115.
+_PROFILES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_profiles.json")
+try:
+    with open(_PROFILES_PATH) as _f:
+        CLIENT_PROFILES = json.load(_f)
+except FileNotFoundError:
+    CLIENT_PROFILES = {}
 
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
