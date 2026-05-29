@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9.1](https://github.com/Varashi/scaleplex/compare/v1.9.0...v1.9.1) (2026-05-29)
+
+
+### Fixes
+
+* **worker:** backend-aware pre-warm dummy transcode ([#101](https://github.com/Varashi/scaleplex/issues/101)) ([#102](https://github.com/Varashi/scaleplex/issues/102)) ([c8daea1](https://github.com/Varashi/scaleplex/commit/c8daea17cca1a16a424171a778ea38eb450c5f87))
+* **worker:** don't Pass-gate cross-backend reshape ([#99](https://github.com/Varashi/scaleplex/issues/99)) ([#100](https://github.com/Varashi/scaleplex/issues/100)) ([ab3223e](https://github.com/Varashi/scaleplex/commit/ab3223e62c0c851231a8d625cb8e421a2fd245ce))
+
 ## [1.9.0](https://github.com/Varashi/scaleplex/compare/v1.8.0...v1.9.0) (2026-05-28)
 
 ### Images shipped
