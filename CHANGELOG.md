@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.10.0](https://github.com/Varashi/scaleplex/compare/v1.9.1...v1.10.0) (2026-05-29)
+
+
+### Features
+
+* **ffmpeg:** CUDA bitmap/PGS sub-burn — full nvenc↔vaapi parity ([#76](https://github.com/Varashi/scaleplex/issues/76)) ([#110](https://github.com/Varashi/scaleplex/issues/110)) ([6fe050d](https://github.com/Varashi/scaleplex/commit/6fe050d7b1e406695399ffe934411553b0339c4d))
+* GPU-resident NVIDIA sub-burn — vf_inlineass CUDA branch ([#76](https://github.com/Varashi/scaleplex/issues/76)) ([#106](https://github.com/Varashi/scaleplex/issues/106)) ([0b2b859](https://github.com/Varashi/scaleplex/commit/0b2b85929727242535bef8bf05146d15106eff10))
+
+
+### Fixes
+
+* **worker:** detect NVIDIA on WSL2 via /dev/dxg ([#63](https://github.com/Varashi/scaleplex/issues/63)) ([#105](https://github.com/Varashi/scaleplex/issues/105)) ([82bff90](https://github.com/Varashi/scaleplex/commit/82bff9054662f76a45b34f01c9d34b3a1e62db49))
+
 ## [1.9.1](https://github.com/Varashi/scaleplex/compare/v1.9.0...v1.9.1) (2026-05-29)
 
 ### Images shipped
