@@ -144,6 +144,7 @@ func TestRewriter_PassGate_DeniesForceHW(t *testing.T) {
 // un-runnable foreign argv. Without this the session 234s on a non-VAAPI box.
 func TestRewriter_PassGate_CrossBackendNotGated(t *testing.T) {
 	withDialect(t, nvencDialect{})
+	t.Setenv("SCALEPLEX_FORCE_HW", "1") // the #99 scenario: FORCE_HW on + foreign HW must still bypass the gate (explicit, not relying on TestMain's package default)
 	stubPass(t, func(_, _ string) (bool, error) { return false, nil })
 	args := []string{
 		"-codec:0", "hevc",
