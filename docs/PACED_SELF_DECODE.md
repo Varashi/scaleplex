@@ -90,9 +90,16 @@ So the scheduler gains an explicit *sink-less* concept.
 ### `fftools/ffmpeg_sched.{c,h}`
 - `SchDec` gains `int sink_less;`.
 - New API `void sch_dec_set_sinkless(Scheduler *sch, unsigned dec_idx);`.
-- `start_prepare()`: skip the per-output "not connected to any sink" check when
-  `dec->sink_less` (the source check still applies — a sink-less decoder must
-  still be fed by the demuxer).
+- `start_prepare()`: skip the per-output "not connected to any sink" check
+  when `dec->sink_less` AND the output has `nb_dst == 0` (the source check
+  still applies — a sink-less decoder must still be fed by the demuxer).
+  **Per-output gate** — patch `0122` refines this from the original
+  whole-decoder `if (dec->sink_less) continue` which skipped `dst_finished`
+  allocation for ALL outputs of the decoder, including real OST consumers
+  in the dual-consumer case (sidecar SRT path where the rewriter keeps
+  Plex's null-mux decode-sink). The original variant SIGSEGV'd in
+  `sch_dec_send` on the first decoded frame when `dst_finished` was NULL
+  for the real output.
 - `sch_dec_send()`: when the target output has `nb_dst == 0`, `av_frame_unref`
   the frame and `return 0` (consumed, discarded) instead of falling through to
   the `AVERROR_EOF` result. Universally safe — only sink-less outputs ever have
