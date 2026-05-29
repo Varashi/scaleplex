@@ -7,9 +7,10 @@ render-dims YUVA420P CUDA overlay surface; a per-plane alpha-blend kernel
 cached CUDA texture objects (normalized coords + hardware bilinear) and blends
 onto the CUDA video frame in place. The render->full upscale is folded into the
 blend (free HW bilinear), so there is no per-frame CPU swscale upscale (#107);
-the texture objects are created once over the stable overlay surface (no
-per-frame cuTexObjectCreate). Removes the per-frame full-frame hwdownload the
-interim path required (worker subBurnDownloadFilter -> "").
+texture objects created once over the stable overlay surface. animated_tier_down
+mirrors the VAAPI path: animated cues (\move/\t/\k/\fad) drop one resolution tier
+below render_height (re-alloc overlay + textures one-shot). Removes the per-frame
+full-frame hwdownload the interim path required (worker subBurnDownloadFilter -> "").
 
 Text/ASS only; bitmap (PGS) on CUDA out of scope. Gated on CONFIG_OVERLAY_CUDA_FILTER.
 
@@ -83,7 +84,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
  /* Display-window lifecycle for a single subtitle cue. Decoupled from
   * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
   * can share a small, testable primitive with the text path. INT64_MIN
-@@ -161,6 +194,33 @@ typedef struct {
+@@ -161,6 +194,36 @@ typedef struct {
      int          bmp_pending_clear;  /**< 1 = pending is a clear (no rects) */
      SubCueClock  bmp_clock;          /**< active display window (.active = was: have_bmp) */
      SubCueClock  bmp_pend_clock;     /**< pending presentation's display window */
@@ -110,6 +111,9 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    int                  cuda_rgba_stride;
 +    int                  cuda_render_w;    /**< libass RENDER dims (capped); swscale upscales */
 +    int                  cuda_render_h;    /**< to the FULL overlay/blend dims (ow x oh) */
++    int                  cuda_anim_render_w;/**< animated-tier render dims (one tier below) */
++    int                  cuda_anim_render_h;
++    int                  cuda_anim_active;  /**< overlay one-shot switched to the animated tier */
 +    struct SwsContext   *cuda_sws;         /**< RGBA(render dims) -> YUVA420P(full) converter */
 +    int                  cuda_have_overlay;/**< cached surface currently holds a visible cue */
 +    CUtexObject          cuda_tex[4];      /**< per-plane Y/U/V/A textures over cuda_overlay (created once) */
@@ -117,7 +121,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -604,6 +664,457 @@ static int refresh_bitmap(AVFilterContex
+@@ -604,6 +667,532 @@ static int refresh_bitmap(AVFilterContex
      return 0;
  }
  
@@ -129,7 +133,9 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 + *  call sites run under inlineass_lock (shared with SW/VAAPI + fftools).    *
 + * ======================================================================== */
 +
++static int inlineass_cuda_alloc_overlay(AVFilterContext *avctx);    /* fwd */
 +static int inlineass_cuda_create_overlay(AVFilterContext *avctx);   /* fwd */
++static void inlineass_cuda_free_overlay(AVFilterContext *avctx);    /* fwd */
 +
 +/* Composite the libass image list into the (cleared) STRAIGHT-alpha RGBA
 + * staging buffer. Plain source-over with per-pixel alpha; the result is NOT
@@ -243,11 +249,13 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    return err;
 +}
 +
-+/* Allocate the cached CUDA overlay surface (YUVA420P) sized to the band
-+ * (ow x oh) + the CPU YUVA420P staging frame + the straight-RGBA libass
-+ * render buffer + the RGBA->YUVA420P swscale converter. Mirrors
-+ * inlineass_create_overlay (VAAPI). Filter thread. */
-+static int inlineass_cuda_create_overlay(AVFilterContext *avctx)
++/* Allocate the cached CUDA overlay surface (YUVA420P) sized to the CURRENT
++ * cuda_render_w/h + the CPU YUVA420P staging frame + the straight-RGBA libass
++ * render buffer + the RGBA->YUVA420P swscale converter + the 4 per-plane
++ * textures. Mirrors inlineass_create_overlay (VAAPI). Re-callable after a tier
++ * switch (the realloc-able set is freed by inlineass_cuda_free_overlay first).
++ * Filter thread. */
++static int inlineass_cuda_alloc_overlay(AVFilterContext *avctx)
 +{
 +    AssContext        *ass = avctx->priv;
 +    AVHWFramesContext *frames;
@@ -394,6 +402,66 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    return 0;
 +}
 +
++/* config_output entry point: create the cached overlay set at the current
++ * cuda_render_w/h. Thin wrapper so the alloc body is re-callable after a tier
++ * switch. Filter thread. */
++static int inlineass_cuda_create_overlay(AVFilterContext *avctx)
++{
++    return inlineass_cuda_alloc_overlay(avctx);
++}
++
++/* Free the realloc-able overlay set: the 4 per-plane textures + the cached
++ * CUDA overlay surface + its frames ctx + the CPU staging frame + the RGBA
++ * libass buffer + the swscale converter. Does NOT touch cu_module / cuda_hwctx
++ * (those persist for the session and are torn down only in uninit). Mirrors the
++ * teardown half of uninit; used before re-allocating at a new tier. Filter
++ * thread. */
++static void inlineass_cuda_free_overlay(AVFilterContext *avctx)
++{
++    AssContext *ass = avctx->priv;
++
++    if (ass->cuda_hwctx) {
++        AVCUDADeviceContext *hwctx = ass->cuda_hwctx;
++        CudaFunctions       *cu    = hwctx->internal->cuda_dl;
++        CUcontext            dummy;
++        int                  i;
++        INLINEASS_CUDA_CHECK_CU(cu->cuCtxPushCurrent(hwctx->cuda_ctx));
++        for (i = 0; i < 4; i++)
++            if (ass->cuda_tex[i]) {
++                INLINEASS_CUDA_CHECK_CU(cu->cuTexObjectDestroy(ass->cuda_tex[i]));
++                ass->cuda_tex[i] = 0;
++            }
++        INLINEASS_CUDA_CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++    }
++    av_frame_free(&ass->cuda_overlay);
++    av_frame_free(&ass->cuda_cpu);
++    av_buffer_unref(&ass->cuda_overlay_frames_ref);
++    av_freep(&ass->cuda_rgba);
++    sws_freeContext(ass->cuda_sws);
++    ass->cuda_sws = NULL;
++}
++
++/* Switch the CUDA text overlay to the lower animated tier (one-shot, filter
++ * thread, caller holds inlineass_lock). Re-inits libass frame size + reallocs
++ * the cached overlay set at the animated render dims; the next render
++ * repopulates it. Mirrors switch_to_animated_tier (VAAPI). */
++static int inlineass_cuda_switch_to_animated_tier(AVFilterContext *avctx)
++{
++    AssContext *ass = avctx->priv;
++    int err;
++    ass_set_frame_size(ass->renderer, ass->cuda_anim_render_w, ass->cuda_anim_render_h);
++    inlineass_cuda_free_overlay(avctx);
++    ass->cuda_render_w     = ass->cuda_anim_render_w;
++    ass->cuda_render_h     = ass->cuda_anim_render_h;
++    ass->cuda_have_overlay = 0;
++    ass->cuda_anim_active  = 1;
++    av_log(avctx, AV_LOG_VERBOSE,
++           "inlineass(cuda): animation detected -> render %dx%d (tier down)\n",
++           ass->cuda_render_w, ass->cuda_render_h);
++    err = inlineass_cuda_alloc_overlay(avctx);
++    return err;
++}
++
 +/* Render the cue active at time_ms; on change, re-rasterise (straight RGBA),
 + * swscale to YUVA420P, and re-upload the cached CUDA overlay surface. Sets
 + * cuda_have_overlay = whether a cue is visible. Mirrors refresh_overlay. */
@@ -404,11 +472,22 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    ASS_Image  *img;
 +
 +    pthread_mutex_lock(&inlineass_lock);
++    /* One-shot drop to the animated tier once an animated cue is seen (mirrors
++     * the VAAPI refresh_overlay). Runs under inlineass_lock, which also covers
++     * ass_render_frame below, so the realloc + re-init are serialised against
++     * the decoder thread feeding libass. */
++    if (ass->animated && ass->animated_tier_down && !ass->cuda_anim_active &&
++        (ass->cuda_anim_render_w != ass->cuda_render_w ||
++         ass->cuda_anim_render_h != ass->cuda_render_h)) {
++        err = inlineass_cuda_switch_to_animated_tier(avctx);
++        if (err < 0) {
++            pthread_mutex_unlock(&inlineass_lock);
++            return err;
++        }
++    }
 +    /* libass rasterises into the REDUCED render canvas (cuda_render_w/h);
-+     * swscale upscales to the full-frame YUVA below. The animated-tier-down
-+     * mechanism (VAAPI-only) does not apply on CUDA; animated cues simply
-+     * re-render every frame at the (capped) render res, same shape as the SW
-+     * branch but cheaper. */
++     * swscale upscales to the full-frame YUVA below. Animated cues additionally
++     * drop one render tier (animated_tier_down) via the switch above. */
 +    img = ass_render_frame(ass->renderer, ass->track, time_ms, &change);
 +    if (change) {
 +        if (!img) {
@@ -575,7 +654,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
  /* ======================================================================== *
   *  init / uninit / format negotiation / link config (format-adaptive)      *
   * ======================================================================== */
-@@ -721,6 +1232,33 @@ static av_cold void uninit(AVFilterConte
+@@ -721,6 +1310,33 @@ static av_cold void uninit(AVFilterConte
      av_buffer_unref(&ass->bmp_frames_ref);
      av_freep(&ass->bmp_pending_buf);
  
@@ -609,7 +688,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* scaleplex: serialise libass teardown against the decoder thread's
       * append/replay and another instance's render. libass shares
       * process-global state (fontconfig/freetype) that is NOT reentrant;
-@@ -758,6 +1296,12 @@ static int query_formats(AVFilterContext
+@@ -758,6 +1374,12 @@ static int query_formats(AVFilterContext
      ret = ff_add_format(&fmts, AV_PIX_FMT_VAAPI);
      if (ret < 0)
          return ret;
@@ -622,7 +701,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      return ff_set_common_formats(ctx, fmts);
  }
  
-@@ -769,6 +1313,13 @@ static int config_input(AVFilterLink *li
+@@ -769,6 +1391,13 @@ static int config_input(AVFilterLink *li
      if (link->format == AV_PIX_FMT_VAAPI)
          return ff_vaapi_vpp_config_input(link);
  
@@ -636,7 +715,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* SW branch (unchanged). */
      ff_draw_init(&ass->draw, link->format,
                   ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
-@@ -789,7 +1340,11 @@ static int config_output(AVFilterLink *o
+@@ -789,7 +1418,11 @@ static int config_output(AVFilterLink *o
      AVFilterLink    *inlink  = avctx->inputs[0];
      int err;
  
@@ -649,7 +728,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
          /* SW branch: geometry-preserving passthrough (previously implicit).
           * frame_rate moved from AVFilterLink to the internal FilterLink in
           * FFmpeg 7.x — propagate it there. */
-@@ -803,6 +1358,68 @@ static int config_output(AVFilterLink *o
+@@ -803,6 +1436,89 @@ static int config_output(AVFilterLink *o
          return 0;
      }
  
@@ -688,15 +767,36 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +         * dims, so render == full (no-op, identical to the old behaviour). */
 +        ass->ow = in_w;
 +        ass->oh = in_h;
-+        ass->anim_ow = in_w;
-+        ass->anim_oh = in_h;
 +        compute_cap_dims(in_w, in_h, ass->render_height,
 +                         &ass->cuda_render_w, &ass->cuda_render_h);
++
++        /* Animated-tier render dims (one tier below the static render cap).
++         * Animated cues (\move/\t/\k/\fad) re-render every frame, so dropping
++         * them a tier cuts the per-frame libass cost (mirrors the VAAPI
++         * branch). When animated_tier_down is off, the animated dims == the
++         * static dims, so the switch never fires. */
++        if (ass->animated_tier_down) {
++            int eff = (ass->render_height > 0 && ass->render_height < in_h)
++                          ? ass->render_height : in_h;
++            compute_cap_dims(in_w, in_h, tier_down(eff),
++                             &ass->cuda_anim_render_w, &ass->cuda_anim_render_h);
++        } else {
++            ass->cuda_anim_render_w = ass->cuda_render_w;
++            ass->cuda_anim_render_h = ass->cuda_render_h;
++        }
++        /* If animation was already flagged (file mode) before config, start low. */
++        if (ass->animated && ass->animated_tier_down) {
++            ass->cuda_render_w    = ass->cuda_anim_render_w;
++            ass->cuda_render_h    = ass->cuda_anim_render_h;
++            ass->cuda_anim_active = 1;
++        }
 +        av_log(avctx, AV_LOG_VERBOSE,
 +               "inlineass(cuda): render %dx%d -> overlay/blend %dx%d at (0,0) "
-+               "(input %dx%d, render_height=%d)\n",
++               "(input %dx%d, render_height=%d, anim %dx%d%s)\n",
 +               ass->cuda_render_w, ass->cuda_render_h, ass->ow, ass->oh,
-+               in_w, in_h, ass->render_height);
++               in_w, in_h, ass->render_height,
++               ass->cuda_anim_render_w, ass->cuda_anim_render_h,
++               ass->cuda_anim_active ? " active" : "");
 +
 +        pthread_mutex_lock(&inlineass_lock);
 +        ass_set_frame_size(ass->renderer, ass->cuda_render_w, ass->cuda_render_h);
@@ -718,7 +818,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -1349,6 +1966,11 @@ static int filter_frame(AVFilterLink *in
+@@ -1349,6 +2065,11 @@ static int filter_frame(AVFilterLink *in
      if (inlink->format == AV_PIX_FMT_VAAPI)
          return filter_frame_hw(inlink, picref);
  
