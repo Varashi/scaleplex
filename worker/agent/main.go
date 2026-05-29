@@ -219,8 +219,9 @@ func handleReady(w http.ResponseWriter, r *http.Request) {
 // broken worker — log and move on):
 //  1. Open every /dev/dri/renderD* and hang on to the fd.
 //  2. Run `ffmpeg -version` so libavcodec/libavfilter/libva/libass mmap.
-//  3. Run a 1s testsrc → vaapi encode → null pipeline so the iHD driver
-//     JIT-compiles its VPP + encoder programs and caches them.
+//  3. Run a 1s testsrc → encode → null pipeline in the WORKER's backend
+//     (h264_vaapi / h264_nvenc; skipped for sw) so the driver JIT-compiles
+//     its encoder programs and caches them.
 func prewarm() {
 	t0 := time.Now()
 	defer func() {
@@ -240,25 +241,51 @@ func prewarm() {
 		renderFDs = append(renderFDs, f)
 	}
 
-	if err := exec.Command(ffmpegBin, "-hide_banner", "-version").Run(); err != nil {
+	vctx, vcancel := context.WithTimeout(context.Background(), prewarmCmdTimeout)
+	if err := exec.CommandContext(vctx, ffmpegBin, "-hide_banner", "-version").Run(); err != nil {
 		log.Printf("pre-warm: ffmpeg -version: %v", err)
 	}
+	vcancel()
 
-	dev := "/dev/dri/renderD128"
-	if len(renderFDs) > 0 {
-		dev = renderFDs[0].Name()
+	// 3. Warm THIS worker's encoder so the first real session skips the
+	// driver's JIT/init cost. Backend-specific (#101): a VAAPI dummy on a
+	// non-VAAPI worker just errors out ("No VA display") and warms nothing.
+	switch b := activeDialect.backendName(); b {
+	case "vaapi":
+		dev := "/dev/dri/renderD128"
+		if len(renderFDs) > 0 {
+			dev = renderFDs[0].Name()
+		}
+		runPrewarmDummy(b,
+			"-init_hw_device", "vaapi=va:"+dev, "-filter_hw_device", "va",
+			"-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
+			"-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-t", "1",
+			"-f", "null", "-")
+	case "nvenc":
+		// h264_nvenc accepts system-memory frames + uploads internally, so no
+		// hwupload/init_hw_device needed to JIT the NVENC encoder programs.
+		runPrewarmDummy(b,
+			"-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
+			"-c:v", "h264_nvenc", "-t", "1", "-f", "null", "-")
+	default:
+		// sw: no HW JIT to warm — `ffmpeg -version` above already paged libx264/libx265.
 	}
-	dummy := exec.Command(ffmpegBin,
-		"-hide_banner", "-loglevel", "error",
-		"-init_hw_device", "vaapi=va:"+dev,
-		"-filter_hw_device", "va",
-		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
-		"-vf", "format=nv12,hwupload",
-		"-c:v", "h264_vaapi", "-t", "1",
-		"-f", "null", "-",
-	)
-	if out, err := dummy.CombinedOutput(); err != nil {
-		log.Printf("pre-warm: dummy vaapi transcode: %v: %s", err, out)
+}
+
+// prewarmCmdTimeout bounds each pre-warm ffmpeg invocation so a hung ffmpeg
+// (wedged GPU/driver) can't block the prewarm goroutine forever — which would
+// leave `ready` un-flipped and /readyz stuck 503 permanently. Generous vs the
+// ~1s dummy + driver JIT, but a hard ceiling on the cold path.
+const prewarmCmdTimeout = 30 * time.Second
+
+// runPrewarmDummy runs a 1s testsrc→encode→null warm-up. Best-effort: a failure
+// (or the timeout) means a slower first session, not a broken worker.
+func runPrewarmDummy(backend string, args ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), prewarmCmdTimeout)
+	defer cancel()
+	full := append([]string{"-hide_banner", "-loglevel", "error"}, args...)
+	if out, err := exec.CommandContext(ctx, ffmpegBin, full...).CombinedOutput(); err != nil {
+		log.Printf("pre-warm: dummy %s transcode: %v: %s", backend, err, out)
 	}
 }
 
