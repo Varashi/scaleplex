@@ -78,6 +78,61 @@ WINDOWS_HEADERS = {
     "X-Plex-Model": "standalone",
 }
 
+# Real client profiles harvested from prod (LogVerbose X-Plex-* capture,
+# 2026-05-26 → ~/scaleplex-corpus/_client-profiles/t3_matrix_2026-05-26.json,
+# issue #74). Sending a real client's identity + screen-resolution + DRM makes
+# PMS load that client's base profile, so it negotiates the codec / container /
+# resolution / subtitle-mode the real device actually gets — exercising worker
+# shapes the synthetic Chrome profile misses (e.g. 720p console downscale,
+# webOS TV codec support, playready vs widevine). Selected with --client-profiles;
+# the synthetic CLIENT_HEADERS stays the default. Headers are verbatim from the
+# harvest except a few sparse fields (marked) filled from a same-device-class
+# sibling so PMS can still match a base profile.
+CLIENT_PROFILES = {
+    "web_edge": {  # 9 sess; version/res/drm lost to capture truncation → from web_firefox sibling
+        "X-Plex-Product": "Plex Web", "X-Plex-Version": "4.159.0",
+        "X-Plex-Platform": "Microsoft Edge", "X-Plex-Platform-Version": "151.0",
+        "X-Plex-Device": "Windows", "X-Plex-Device-Name": "Microsoft Edge",
+        "X-Plex-Model": "bundled", "X-Plex-Device-Screen-Resolution": "2560x1440",
+        "X-Plex-DRM": "widevine", "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+    },
+    "web_firefox": {  # 6 sess
+        "X-Plex-Product": "Plex Web", "X-Plex-Version": "4.159.0",
+        "X-Plex-Platform": "Firefox", "X-Plex-Platform-Version": "151.0",
+        "X-Plex-Device": "Windows", "X-Plex-Device-Name": "Firefox",
+        "X-Plex-Model": "bundled", "X-Plex-Device-Screen-Resolution": "2560x1307,2560x1440",
+        "X-Plex-DRM": "widevine", "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+    },
+    "windows": {  # 2 sess; X-Plex-Device lost to truncation → "Windows"
+        "X-Plex-Product": "Plex for Windows", "X-Plex-Version": "1.112.0.359-0d79a49f",
+        "X-Plex-Platform": "windows", "X-Plex-Platform-Version": "10.0.26200",
+        "X-Plex-Device": "Windows", "X-Plex-Device-Name": "SKW-L-Frank",
+        "X-Plex-Model": "standalone", "X-Plex-Device-Screen-Resolution": "1219x776,1920x1200",
+        "X-Plex-DRM": "widevine:video", "X-Plex-Features": "external-media,indirect-media,hub-style-list",
+    },
+    "android": {  # 1 sess — portrait phone (1272x2772), widevine
+        "X-Plex-Product": "Plex for Android (Mobile)", "X-Plex-Version": "10.0.0",
+        "X-Plex-Platform": "Android", "X-Plex-Platform-Version": "16",
+        "X-Plex-Device": "Android", "X-Plex-Device-Name": "Frank OnePlus 15",
+        "X-Plex-Model": "CPH2747", "X-Plex-Device-Screen-Resolution": "1272x2772",
+        "X-Plex-DRM": "widevine:video", "X-Plex-Features": "external-media,indirect-media",
+    },
+}
+
+# Deferred (harvested but not yet drivable): smart-TV / console clients register
+# their codec limits via `X-Plex-Client-Profile-Extra` (a long capability string
+# the client POSTs, cached by PMS per client-identifier). The LogVerbose harvest
+# only captured the `transcode/universal/start` line, not that extra string, so
+# PMS 400s ("unable to find a matching profile") on the bare identity. Raw headers
+# are preserved in the harvest JSON for when the capability string is captured:
+#   lg_webos_old  (Plex for LG, webOS 3.9.0, 1080p, widevine)
+#   lg_webos_new  (Plex for LG, webOS 5.6.2, 1080p, widevine)
+#   ps4           (Plex for PlayStation 4, 720p, playready)
+#   xbox          (Plex for Xbox, Xbox Series X, 720p, playready)
+# These are the most differentiated shapes (720p downscale, restricted codecs) —
+# revisit by re-running the LogVerbose capture and harvesting X-Plex-Client-
+# Profile-Extra per device, then add them here. See issue #74.
+
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
 SERVER_AXES = {
     "HardwareAcceleratedCodecs": [1, 0],     # HW decode
@@ -421,6 +476,10 @@ def drive_cell(case, proto, settle):
     slug = re.sub(r"[^A-Za-z0-9]+", "_", case["title"]).strip("_")[:18]
 
     vdec, dcode = transcode_decision(params, hdrs)
+    if dcode == 400:
+        # PMS could not match a client profile (TV/console identities need an
+        # X-Plex-Client-Profile-Extra we don't send) — not a worker fault.
+        return "SKIP", {"reason": "client-profile-unmatched(400)"}, sid
     if dcode != 200:
         return "FAIL", {"reason": f"decision={dcode}"}, sid
 
@@ -483,10 +542,25 @@ def main():
     ap.add_argument("--force-hw", default="1,0", help="comma list, e.g. 1,0")
     ap.add_argument("--settle", type=float, default=12, help="secs to wait per session")
     ap.add_argument("--protocols", default="hls,dash", help="comma list, e.g. hls,dash")
+    ap.add_argument("--client-profiles", default="",
+                    help="iterate real captured client profiles as the client (outer axis), "
+                         f"instead of the synthetic Plex-Web default. 'all' or a comma list of: "
+                         f"{','.join(CLIENT_PROFILES)}. Best combined with --quick.")
     args = ap.parse_args()
     protocols = [p.strip() for p in args.protocols.split(",") if p.strip()]
     if not TOKEN:
         sys.exit("set PLEX_TOKEN")
+
+    # Client axis: synthetic default, or one entry per selected real profile.
+    if args.client_profiles.strip():
+        sel = (list(CLIENT_PROFILES) if args.client_profiles.strip() == "all"
+               else [s.strip() for s in args.client_profiles.split(",") if s.strip()])
+        bad = [s for s in sel if s not in CLIENT_PROFILES]
+        if bad:
+            sys.exit(f"unknown client profile(s): {bad}; known: {list(CLIENT_PROFILES)}")
+        client_axis = [(name, CLIENT_PROFILES[name]) for name in sel]
+    else:
+        client_axis = [("", None)]  # synthetic per-case client (unchanged default)
 
     content = discover_content()
     if not content:
@@ -523,6 +597,13 @@ def main():
 
     fhw_vals = [1] if args.quick else [int(x) for x in args.force_hw.split(",")]
     combos = server_combos(args.quick)
+    cells_per_combo = sum(len(c["protocols"] or protocols) for c in cases) * len(client_axis)
+    projected = len(fhw_vals) * len(combos) * cells_per_combo
+    if client_axis[0][0]:
+        print(f"client profiles (axis): {', '.join(n for n, _ in client_axis)}")
+    print(f"projected cells: {projected} "
+          f"({len(fhw_vals)} force-hw x {len(combos)} server-combo x {len(client_axis)} client x "
+          f"{cells_per_combo // max(1, len(client_axis))} case-proto)\n")
     results = []
     for fhw in fhw_vals:
         print(f"### FORCE_HW={fhw} — rolling workers ###")
@@ -534,14 +615,18 @@ def main():
             time.sleep(2)
             plabel = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
                               for k, v in combo.items())
-            for c in cases:
-                for proto in (c["protocols"] or protocols):
-                    label = f"{c['label']}/{proto} | {plabel}"
-                    status, info, sid = drive_cell(c, proto, args.settle)
-                    stop_session(sid)
-                    results.append((fhw, label, status, info))
-                    print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
-                    time.sleep(4)  # let this session's logs age out of the next cell's window
+            for pname, phdrs in client_axis:
+                for c in cases:
+                    # When a real profile is selected it IS the client under test,
+                    # so it overrides the case's synthetic client (e.g. WINDOWS_HEADERS).
+                    cc = c if phdrs is None else {**c, "client": phdrs}
+                    for proto in (cc["protocols"] or protocols):
+                        label = (f"{pname+':' if pname else ''}{cc['label']}/{proto} | {plabel}")
+                        status, info, sid = drive_cell(cc, proto, args.settle)
+                        stop_session(sid)
+                        results.append((fhw, label, status, info))
+                        print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
+                        time.sleep(4)  # let this session's logs age out of the next cell's window
 
     from collections import Counter
     tally = Counter(s for *_, s, _ in results)
