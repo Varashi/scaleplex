@@ -1,15 +1,17 @@
-scaleplex: vf_inlineass CUDA branch — GPU-resident text/ASS sub-burn (#76)
+scaleplex: vf_inlineass CUDA branch — GPU-resident text/ASS sub-burn (#76, #107)
 
-Adds a CUDA hardware branch to vf_inlineass, mirroring the VAAPI branch.
-libass renders the active cue at render_height into a straight-alpha RGBA
-buffer; swscale upscales+converts it to a full-frame YUVA420P CUDA overlay
-surface; a per-plane alpha-blend kernel (adapted verbatim from
-vf_overlay_cuda.cu, LGPL-2.1) composites it onto the CUDA video frame in
-place. Eliminates the per-frame full-frame hwdownload the interim NVIDIA
-sub-burn path required (worker subBurnDownloadFilter -> "").
+CUDA hardware branch mirroring the VAAPI branch. libass renders the cue at
+render_height into a straight-alpha RGBA buffer; swscale converts it to a
+render-dims YUVA420P CUDA overlay surface; a per-plane alpha-blend kernel
+(adapted from vf_overlay_cuda.cu, LGPL-2.1) reads the overlay + alpha through
+cached CUDA texture objects (normalized coords + hardware bilinear) and blends
+onto the CUDA video frame in place. The render->full upscale is folded into the
+blend (free HW bilinear), so there is no per-frame CPU swscale upscale (#107);
+the texture objects are created once over the stable overlay surface (no
+per-frame cuTexObjectCreate). Removes the per-frame full-frame hwdownload the
+interim path required (worker subBurnDownloadFilter -> "").
 
-Text/ASS only; bitmap (PGS) on CUDA is out of scope for now. All new code +
-the .ptx/load_helper objects are gated on CONFIG_OVERLAY_CUDA_FILTER.
+Text/ASS only; bitmap (PGS) on CUDA out of scope. Gated on CONFIG_OVERLAY_CUDA_FILTER.
 
 Index: ffmpeg/libavfilter/Makefile
 ===================================================================
@@ -42,7 +44,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
  #include "libavcodec/avcodec.h"
  #include "libavfilter/avfilter.h"
  #include "libavutil/avstring.h"
-@@ -62,6 +63,31 @@
+@@ -62,6 +63,38 @@
  #include "video.h"
  #include "libavutil/frame.h"
  
@@ -65,6 +67,13 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +#include "libswscale/swscale.h"
 +#include "cuda/load_helper.h"
 +
++/* ffnvcodec's dynlink_cuda.h ships the texture filter/address-mode enums but
++ * NOT the sampler flags; the fork's tonemap/pixfmt CUDA patches work around it
++ * the same way. */
++#ifndef CU_TRSF_NORMALIZED_COORDINATES
++#define CU_TRSF_NORMALIZED_COORDINATES 2
++#endif
++
 +#define INLINEASS_CUDA_CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, hwctx->internal->cuda_dl, x)
 +#define INLINEASS_CUDA_DIV_UP(a, b) ( ((a) + (b) - 1) / (b) )
 +#define INLINEASS_CUDA_BLOCK_X 32
@@ -74,7 +83,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
  /* Display-window lifecycle for a single subtitle cue. Decoupled from
   * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
   * can share a small, testable primitive with the text path. INT64_MIN
-@@ -161,6 +187,32 @@ typedef struct {
+@@ -161,6 +194,33 @@ typedef struct {
      int          bmp_pending_clear;  /**< 1 = pending is a clear (no rects) */
      SubCueClock  bmp_clock;          /**< active display window (.active = was: have_bmp) */
      SubCueClock  bmp_pend_clock;     /**< pending presentation's display window */
@@ -103,11 +112,12 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    int                  cuda_render_h;    /**< to the FULL overlay/blend dims (ow x oh) */
 +    struct SwsContext   *cuda_sws;         /**< RGBA(render dims) -> YUVA420P(full) converter */
 +    int                  cuda_have_overlay;/**< cached surface currently holds a visible cue */
++    CUtexObject          cuda_tex[4];      /**< per-plane Y/U/V/A textures over cuda_overlay (created once) */
 +#endif /* CONFIG_OVERLAY_CUDA_FILTER */
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -604,6 +656,433 @@ static int refresh_bitmap(AVFilterContex
+@@ -604,6 +664,457 @@ static int refresh_bitmap(AVFilterContex
      return 0;
  }
  
@@ -219,12 +229,12 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +        goto exit;
 +
 +    err = INLINEASS_CUDA_CHECK_CU(cu->cuModuleGetFunction(&ass->cu_func_uchar,
-+                                  ass->cu_module, "Inlineass_Cuda_uchar"));
++                                  ass->cu_module, "Inlineass_Cuda_tex_uchar"));
 +    if (err < 0)
 +        goto exit;
 +
 +    err = INLINEASS_CUDA_CHECK_CU(cu->cuModuleGetFunction(&ass->cu_func_ushort,
-+                                  ass->cu_module, "Inlineass_Cuda_ushort"));
++                                  ass->cu_module, "Inlineass_Cuda_tex_ushort"));
 +    if (err < 0)
 +        goto exit;
 +
@@ -267,8 +277,8 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    frames = (AVHWFramesContext *)ass->cuda_overlay_frames_ref->data;
 +    frames->format            = AV_PIX_FMT_CUDA;
 +    frames->sw_format         = AV_PIX_FMT_YUVA420P;
-+    frames->width             = ass->ow;
-+    frames->height            = ass->oh;
++    frames->width             = ass->cuda_render_w;
++    frames->height            = ass->cuda_render_h;
 +    frames->initial_pool_size = 1;
 +    err = av_hwframe_ctx_init(ass->cuda_overlay_frames_ref);
 +    if (err < 0) {
@@ -287,8 +297,8 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    if (!ass->cuda_cpu)
 +        return AVERROR(ENOMEM);
 +    ass->cuda_cpu->format = AV_PIX_FMT_YUVA420P;
-+    ass->cuda_cpu->width  = ass->ow;
-+    ass->cuda_cpu->height = ass->oh;
++    ass->cuda_cpu->width  = ass->cuda_render_w;
++    ass->cuda_cpu->height = ass->cuda_render_h;
 +    /* LIMITED (MPEG/TV) range to match a typical decoded NV12/P010 main frame.
 +     * Because we blend with need_unpremul = 0, the kernel never applies its
 +     * overlay_full offset — the alpha blend uses the swscale Y/U/V verbatim,
@@ -303,21 +313,24 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    if (err < 0)
 +        return err;
 +
-+    /* RGBA libass buffer sized to the REDUCED render dims; swscale upscales it
-+     * to the FULL-frame YUVA cpu staging below. */
++    /* RGBA libass buffer sized to the RENDER dims; swscale only COLOR-converts
++     * it (no resize) to the render-dims YUVA cpu staging below. The GPU blend
++     * kernel samples this small overlay via a normalized-coord texture object,
++     * so the bilinear UPSCALE to the full-frame plane now happens in hardware
++     * at blend time (scaleplex #107) instead of a per-frame CPU swscale. */
 +    ass->cuda_rgba_stride = ass->cuda_render_w * 4;
 +    av_freep(&ass->cuda_rgba);
 +    ass->cuda_rgba = av_mallocz((size_t)ass->cuda_rgba_stride * ass->cuda_render_h);
 +    if (!ass->cuda_rgba)
 +        return AVERROR(ENOMEM);
 +
-+    /* src = render dims (small), dst = full frame (ow x oh): swscale upscales.
-+     * SWS_BILINEAR matches the VAAPI VPP upscale (smooth, not nearest-neighbour
-+     * SWS_POINT which would alias the now-upscaled overlay). */
++    /* src == dst == render dims: swscale converts RGBA->YUVA420P only, no
++     * resize. Filter flag is irrelevant when src and dst dims match; using
++     * SWS_POINT to make the convert-only intent explicit (no interpolation). */
 +    sws_freeContext(ass->cuda_sws);
 +    ass->cuda_sws = sws_getContext(ass->cuda_render_w, ass->cuda_render_h, AV_PIX_FMT_RGBA,
-+                                   ass->ow, ass->oh, AV_PIX_FMT_YUVA420P,
-+                                   SWS_BILINEAR, NULL, NULL, NULL);
++                                   ass->cuda_render_w, ass->cuda_render_h, AV_PIX_FMT_YUVA420P,
++                                   SWS_POINT, NULL, NULL, NULL);
 +    if (!ass->cuda_sws) {
 +        av_log(avctx, AV_LOG_ERROR, "inlineass(cuda): sws_getContext failed\n");
 +        return AVERROR(EINVAL);
@@ -330,6 +343,51 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +                                 inv, 1 /* srcRange: RGB is full */,
 +                                 inv, 0 /* dstRange: YUV limited */,
 +                                 0, 1 << 16, 1 << 16);
++    }
++
++    /* Create the per-plane texture objects ONCE over the (stable) overlay
++     * surface. filter_frame_cuda reuses them every frame: the surface device
++     * ptr does not change across cue-change re-uploads (av_hwframe_transfer_data
++     * writes in place), so there is no need to recreate textures per frame —
++     * that per-frame cuTexObjectCreate/Destroy was pure overhead. Destroyed in
++     * uninit. Y(0)/A(3) at render dims; U(1)/V(2) subsampled /2. */
++    {
++        AVCUDADeviceContext *hwctx = ass->cuda_hwctx;
++        CudaFunctions       *cu    = hwctx->internal->cuda_dl;
++        CUcontext            dummy;
++        int                  i;
++
++        err = INLINEASS_CUDA_CHECK_CU(cu->cuCtxPushCurrent(hwctx->cuda_ctx));
++        if (err < 0)
++            return err;
++        for (i = 0; i < 4; i++) {
++            CUDA_TEXTURE_DESC tex_desc = {
++                .addressMode = { CU_TR_ADDRESS_MODE_CLAMP, CU_TR_ADDRESS_MODE_CLAMP },
++                .filterMode  = CU_TR_FILTER_MODE_LINEAR,
++                .flags       = CU_TRSF_NORMALIZED_COORDINATES,
++            };
++            CUDA_RESOURCE_DESC res_desc = {
++                .resType                  = CU_RESOURCE_TYPE_PITCH2D,
++                .res.pitch2D.format       = CU_AD_FORMAT_UNSIGNED_INT8,
++                .res.pitch2D.numChannels  = 1,
++                .res.pitch2D.pitchInBytes = ass->cuda_overlay->linesize[i],
++                .res.pitch2D.devPtr       = (CUdeviceptr)ass->cuda_overlay->data[i],
++            };
++            if (i == 1 || i == 2) {
++                res_desc.res.pitch2D.width  = ass->cuda_render_w / 2;
++                res_desc.res.pitch2D.height = ass->cuda_render_h / 2;
++            } else {
++                res_desc.res.pitch2D.width  = ass->cuda_render_w;
++                res_desc.res.pitch2D.height = ass->cuda_render_h;
++            }
++            err = INLINEASS_CUDA_CHECK_CU(cu->cuTexObjectCreate(&ass->cuda_tex[i],
++                                                               &res_desc, &tex_desc, NULL));
++            if (err < 0) {
++                INLINEASS_CUDA_CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++                return err;
++            }
++        }
++        INLINEASS_CUDA_CHECK_CU(cu->cuCtxPopCurrent(&dummy));
 +    }
 +
 +    ass->cuda_have_overlay = 0;
@@ -372,13 +430,13 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    if (do_upload) {
 +        const uint8_t *src_data[4] = { ass->cuda_rgba, NULL, NULL, NULL };
 +        const int      src_stride[4] = { ass->cuda_rgba_stride, 0, 0, 0 };
-+        /* srcSliceH = full SOURCE (render) height; swscale upscales and emits
-+         * the full DESTINATION height (ass->oh), which is what it returns. */
++        /* srcSliceH = full SOURCE (render) height; swscale convert-only emits
++         * the same DESTINATION height (render dims), which is what it returns. */
 +        int h = sws_scale(ass->cuda_sws, src_data, src_stride, 0, ass->cuda_render_h,
 +                          ass->cuda_cpu->data, ass->cuda_cpu->linesize);
-+        if (h != ass->oh) {
++        if (h != ass->cuda_render_h) {
 +            av_log(avctx, AV_LOG_ERROR, "inlineass(cuda): sws_scale returned %d (want %d)\n",
-+                   h, ass->oh);
++                   h, ass->cuda_render_h);
 +            return AVERROR(EINVAL);
 +        }
 +        err = av_hwframe_transfer_data(ass->cuda_overlay, ass->cuda_cpu, 0);
@@ -391,34 +449,28 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    return 0;
 +}
 +
-+/* Launch the blend kernel for one plane. Mirrors overlay_cuda_call_kernel:
-+ * the kernel selects uchar vs ushort by main_depth (DEPTH_BYTES). The overlay
-+ * is planar YUVA420P (data[0..2] Y/U/V, data[3] alpha). */
++/* Launch the texture blend kernel for one plane. The kernel selects uchar vs
++ * ushort by main_depth (DEPTH_BYTES). The overlay Y/U/V/A planes are sampled
++ * via NORMALIZED-coord CUDA texture objects (hardware bilinear), so the small
++ * render-dims overlay is upscaled in HW to the FULL plane dims (out_w/out_h).
++ * The SAME alpha texture serves Y (out=full) and U/V (out=full/2) because the
++ * normalized coords absorb the resolution difference. */
 +static int inlineass_cuda_call_kernel(AVFilterContext *avctx,
-+    int x_position, int y_position,
 +    CUdeviceptr main_data, int main_linesize,
-+    int main_width, int main_height,
 +    int main_adj_x, int main_offset, int main_depth, int main_shift,
-+    CUdeviceptr overlay_data, int overlay_linesize,
-+    int overlay_width, int overlay_height,
-+    CUdeviceptr alpha_data, int alpha_linesize,
-+    int alpha_adj_x, int alpha_adj_y,
-+    int need_unpremul, int overlay_full)
++    CUtexObject overlay_tex, CUtexObject alpha_tex,
++    int out_w, int out_h)
 +{
 +    AssContext          *ass   = avctx->priv;
 +    AVCUDADeviceContext *hwctx = ass->cuda_hwctx;
 +    CudaFunctions       *cu    = hwctx->internal->cuda_dl;
 +
 +    void *kernel_args[] = {
-+        &x_position, &y_position,
 +        &main_data, &main_linesize,
 +        &main_adj_x, &main_offset,
 +        &main_depth, &main_shift,
-+        &overlay_data, &overlay_linesize,
-+        &overlay_width, &overlay_height,
-+        &alpha_data, &alpha_linesize,
-+        &alpha_adj_x, &alpha_adj_y,
-+        &need_unpremul, &overlay_full,
++        &overlay_tex, &alpha_tex,
++        &out_w, &out_h,
 +    };
 +
 +#define INLINEASS_CUDA_DEPTH_BYTES(depth) (((depth) + 7) / 8)
@@ -426,8 +478,8 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    return INLINEASS_CUDA_CHECK_CU(cu->cuLaunchKernel(
 +        INLINEASS_CUDA_DEPTH_BYTES(main_depth) == 1 ? ass->cu_func_uchar
 +                                                     : ass->cu_func_ushort,
-+        INLINEASS_CUDA_DIV_UP(main_width, INLINEASS_CUDA_BLOCK_X),
-+        INLINEASS_CUDA_DIV_UP(main_height, INLINEASS_CUDA_BLOCK_Y), 1,
++        INLINEASS_CUDA_DIV_UP(out_w, INLINEASS_CUDA_BLOCK_X),
++        INLINEASS_CUDA_DIV_UP(out_h, INLINEASS_CUDA_BLOCK_Y), 1,
 +        INLINEASS_CUDA_BLOCK_X, INLINEASS_CUDA_BLOCK_Y, 1,
 +        0, ass->cu_stream, kernel_args, NULL));
 +}
@@ -446,8 +498,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    CUcontext            dummy;
 +    int64_t              time_ms;
 +    int                  err;
-+    int                  is_main_semi, main_adj_x;
-+    int                  x_pos, y_pos;
++    int                  is_main_semi, main_adj_x, plane_v;
 +
 +    if (!hwctx) {
 +        err = AVERROR(EINVAL);
@@ -470,12 +521,6 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    if (err < 0)
 +        goto fail;
 +
-+    /* The overlay is rendered at full frame size (see config_output), so it
-+     * is blended at the origin with no offset. libass already positioned the
-+     * cue within the full canvas. */
-+    x_pos = 0;
-+    y_pos = 0;
-+
 +    err = INLINEASS_CUDA_CHECK_CU(cu->cuCtxPushCurrent(hwctx->cuda_ctx));
 +    if (err < 0)
 +        goto fail;
@@ -483,50 +528,39 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +    is_main_semi = ass->cuda_main_sw_fmt == AV_PIX_FMT_NV12 ||
 +                   ass->cuda_main_sw_fmt == AV_PIX_FMT_P010 ||
 +                   ass->cuda_main_sw_fmt == AV_PIX_FMT_P016;
++    main_adj_x   = is_main_semi ? 2 : 1;
++    plane_v      = is_main_semi ? 1 : 2;
 +
-+    /* Y plane: main_adj_x = 1, offset 0. Overlay Y = data[0], alpha = data[3]. */
++    /* Blend the cached overlay textures (created once in create_overlay) onto
++     * the input video frame IN PLACE. cuda_tex[0..3] = Y/U/V/A over the
++     * render-dims overlay surface; the kernel's normalized coords + HW bilinear
++     * upscale each plane to the FULL plane dims. The SAME alpha texture
++     * (cuda_tex[3]) serves Y and the subsampled U/V. */
++    /* Y plane: main_adj_x = 1, offset 0. */
 +    inlineass_cuda_call_kernel(avctx,
-+        x_pos, y_pos,
 +        (CUdeviceptr)input->data[0], input->linesize[0],
-+        input->width, input->height,
 +        1, 0,
 +        ass->cuda_main_desc->comp[0].depth, ass->cuda_main_desc->comp[0].shift,
-+        (CUdeviceptr)ass->cuda_overlay->data[0], ass->cuda_overlay->linesize[0],
-+        ass->ow, ass->oh,
-+        (CUdeviceptr)ass->cuda_overlay->data[3], ass->cuda_overlay->linesize[3], 1, 1,
-+        0 /* need_unpremul=0: overlay is straight-alpha (no unpremul) */,
-+        0 /* overlay_full: unused when need_unpremul=0 */);
++        ass->cuda_tex[0], ass->cuda_tex[3],
++        input->width, input->height);
 +
-+    /* U/V planes. The overlay (YUVA420P) is always planar (U=data[1], V=data[2],
-+     * subsampled /2). The main may be semi-planar (NV12/P010 → main_adj_x=2,
-+     * offset 0=U / 1=V into the shared data[1] UV plane) or planar
-+     * (YUV420P → main_adj_x=1, data[1]=U, data[2]=V). Mirrors overlay_cuda. */
-+    main_adj_x = is_main_semi ? 2 : 1;
-+    {
-+        int plane_v = is_main_semi ? 1 : 2;
-+        /* U */
-+        inlineass_cuda_call_kernel(avctx,
-+            x_pos / 2, y_pos / 2,
-+            (CUdeviceptr)input->data[1], input->linesize[1],
-+            input->width / 2, input->height / 2,
-+            main_adj_x, 0,
-+            ass->cuda_main_desc->comp[1].depth, ass->cuda_main_desc->comp[1].shift,
-+            (CUdeviceptr)ass->cuda_overlay->data[1], ass->cuda_overlay->linesize[1],
-+            ass->ow / 2, ass->oh / 2,
-+            (CUdeviceptr)ass->cuda_overlay->data[3], ass->cuda_overlay->linesize[3], 2, 2,
-+            0 /* need_unpremul */, 0 /* overlay_full (unused) */);
-+        /* V */
-+        inlineass_cuda_call_kernel(avctx,
-+            x_pos / 2, y_pos / 2,
-+            (CUdeviceptr)input->data[plane_v], input->linesize[plane_v],
-+            input->width / 2, input->height / 2,
-+            main_adj_x, 1,
-+            ass->cuda_main_desc->comp[plane_v].depth, ass->cuda_main_desc->comp[plane_v].shift,
-+            (CUdeviceptr)ass->cuda_overlay->data[2], ass->cuda_overlay->linesize[2],
-+            ass->ow / 2, ass->oh / 2,
-+            (CUdeviceptr)ass->cuda_overlay->data[3], ass->cuda_overlay->linesize[3], 2, 2,
-+            0 /* need_unpremul */, 0 /* overlay_full (unused) */);
-+    }
++    /* U/V planes. main semi-planar (NV12/P010 → main_adj_x=2, offset 0=U / 1=V
++     * into the shared data[1] UV plane) or planar (YUV420P → main_adj_x=1,
++     * data[1]=U, data[2]=V). out dims = FULL chroma plane (input/2). */
++    /* U */
++    inlineass_cuda_call_kernel(avctx,
++        (CUdeviceptr)input->data[1], input->linesize[1],
++        main_adj_x, 0,
++        ass->cuda_main_desc->comp[1].depth, ass->cuda_main_desc->comp[1].shift,
++        ass->cuda_tex[1], ass->cuda_tex[3],
++        input->width / 2, input->height / 2);
++    /* V */
++    inlineass_cuda_call_kernel(avctx,
++        (CUdeviceptr)input->data[plane_v], input->linesize[plane_v],
++        main_adj_x, 1,
++        ass->cuda_main_desc->comp[plane_v].depth, ass->cuda_main_desc->comp[plane_v].shift,
++        ass->cuda_tex[2], ass->cuda_tex[3],
++        input->width / 2, input->height / 2);
 +
 +    INLINEASS_CUDA_CHECK_CU(cu->cuCtxPopCurrent(&dummy));
 +
@@ -541,7 +575,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
  /* ======================================================================== *
   *  init / uninit / format negotiation / link config (format-adaptive)      *
   * ======================================================================== */
-@@ -721,6 +1200,27 @@ static av_cold void uninit(AVFilterConte
+@@ -721,6 +1232,33 @@ static av_cold void uninit(AVFilterConte
      av_buffer_unref(&ass->bmp_frames_ref);
      av_freep(&ass->bmp_pending_buf);
  
@@ -552,7 +586,13 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
 +        AVCUDADeviceContext *hwctx = ass->cuda_hwctx;
 +        CudaFunctions       *cu    = hwctx->internal->cuda_dl;
 +        CUcontext dummy;
++        int i;
 +        INLINEASS_CUDA_CHECK_CU(cu->cuCtxPushCurrent(hwctx->cuda_ctx));
++        for (i = 0; i < 4; i++)
++            if (ass->cuda_tex[i]) {
++                INLINEASS_CUDA_CHECK_CU(cu->cuTexObjectDestroy(ass->cuda_tex[i]));
++                ass->cuda_tex[i] = 0;
++            }
 +        INLINEASS_CUDA_CHECK_CU(cu->cuModuleUnload(ass->cu_module));
 +        INLINEASS_CUDA_CHECK_CU(cu->cuCtxPopCurrent(&dummy));
 +        ass->cu_module = NULL;
@@ -569,7 +609,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* scaleplex: serialise libass teardown against the decoder thread's
       * append/replay and another instance's render. libass shares
       * process-global state (fontconfig/freetype) that is NOT reentrant;
-@@ -758,6 +1258,12 @@ static int query_formats(AVFilterContext
+@@ -758,6 +1296,12 @@ static int query_formats(AVFilterContext
      ret = ff_add_format(&fmts, AV_PIX_FMT_VAAPI);
      if (ret < 0)
          return ret;
@@ -582,7 +622,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      return ff_set_common_formats(ctx, fmts);
  }
  
-@@ -769,6 +1275,13 @@ static int config_input(AVFilterLink *li
+@@ -769,6 +1313,13 @@ static int config_input(AVFilterLink *li
      if (link->format == AV_PIX_FMT_VAAPI)
          return ff_vaapi_vpp_config_input(link);
  
@@ -596,7 +636,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* SW branch (unchanged). */
      ff_draw_init(&ass->draw, link->format,
                   ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
-@@ -789,7 +1302,11 @@ static int config_output(AVFilterLink *o
+@@ -789,7 +1340,11 @@ static int config_output(AVFilterLink *o
      AVFilterLink    *inlink  = avctx->inputs[0];
      int err;
  
@@ -609,7 +649,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
          /* SW branch: geometry-preserving passthrough (previously implicit).
           * frame_rate moved from AVFilterLink to the internal FilterLink in
           * FFmpeg 7.x — propagate it there. */
-@@ -803,6 +1320,68 @@ static int config_output(AVFilterLink *o
+@@ -803,6 +1358,68 @@ static int config_output(AVFilterLink *o
          return 0;
      }
  
@@ -678,7 +718,7 @@ Index: ffmpeg/libavfilter/vf_inlineass.c
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -1349,6 +1928,11 @@ static int filter_frame(AVFilterLink *in
+@@ -1349,6 +1966,11 @@ static int filter_frame(AVFilterLink *in
      if (inlink->format == AV_PIX_FMT_VAAPI)
          return filter_frame_hw(inlink, picref);
  
@@ -694,7 +734,7 @@ Index: ffmpeg/libavfilter/vf_inlineass_cuda.cu
 ===================================================================
 --- /dev/null
 +++ ffmpeg/libavfilter/vf_inlineass_cuda.cu
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,104 @@
 +/*
 + * Copyright (c) 2020 Yaroslav Pogrebnyak <yyyaroslav@gmail.com>
 + *
@@ -718,94 +758,84 @@ Index: ffmpeg/libavfilter/vf_inlineass_cuda.cu
 +/*
 + * scaleplex: alpha-blend kernel for the vf_inlineass CUDA branch.
 + *
-+ * Verbatim adaptation of vf_overlay_cuda.cu's overlay_func (same fork) —
-+ * a per-plane source-over composite supporting 8-bit (NV12) and 16-bit
-+ * (P010/P016) semi-planar main frames via main_adj_x / main_offset /
-+ * main_depth / main_shift. The overlay (subtitle band) is supplied as
-+ * planar YUVA420P uchar planes + a separate alpha plane. Symbols are
-+ * namespaced Inlineass_Cuda_* so the module is independent of whether the
-+ * overlay_cuda filter is built.
++ * Derived from vf_overlay_cuda.cu's overlay_func (same fork), but the overlay
++ * (subtitle band, rendered by libass at render_height) and its alpha are read
++ * through CUDA TEXTURE OBJECTS with normalized coordinates + hardware bilinear
++ * filtering. That folds the render->full upscale into the blend (free HW
++ * bilinear), so the overlay surface stays small (render dims) and there is no
++ * per-frame CPU swscale upscale — the cost that hurt animated ASS (scaleplex
++ * #107, follow-up to #76).
++ *
++ * Both textures are UNSIGNED_INT8, sampled as float (LINEAR filter => values
++ * normalized to [0,1]); overlay luma/chroma scaled back to 8-bit, alpha used
++ * directly. Normalized coords (u,v)=((x+0.5)/out_w,(y+0.5)/out_h) address the
++ * same [0,1] canvas for every plane regardless of its resolution, so the same
++ * (u,v) samples the correct overlay + alpha for Y and the subsampled U/V.
++ *
++ * main is the video frame, blended IN PLACE: NV12 (uchar) or P010/P016
++ * (ushort) semi-planar via main_adj_x / main_offset / main_depth / main_shift.
++ * Straight-alpha source-over (no unpremultiply).
 + */
 +
-+template<typename T0, typename T1>
-+__inline__ __device__ void inlineass_overlay_func(
-+    int x_position, int y_position,
++template<typename T0>
++__inline__ __device__ void inlineass_overlay_tex(
 +    T0* main, int main_linesize,
 +    int main_adj_x, int main_offset,
 +    int main_depth, int main_shift,
-+    T1* overlay, int overlay_linesize,
-+    int overlay_w, int overlay_h,
-+    T1* overlay_alpha, int alpha_linesize,
-+    int alpha_adj_x, int alpha_adj_y,
-+    int need_unpremul, int overlay_full)
++    cudaTextureObject_t overlay_tex, cudaTextureObject_t alpha_tex,
++    int out_w, int out_h)
 +{
 +    int x = blockIdx.x * blockDim.x + threadIdx.x;
 +    int y = blockIdx.y * blockDim.y + threadIdx.y;
 +
-+    if (x >= overlay_w + x_position ||
-+        y >= overlay_h + y_position ||
-+        x < x_position ||
-+        y < y_position ) {
-+
++    if (x >= out_w || y >= out_h)
 +        return;
-+    }
 +
-+    int overlay_x = x - x_position;
-+    int overlay_y = y - y_position;
++    float u = (x + 0.5f) / (float)out_w;
++    float v = (y + 0.5f) / (float)out_h;
 +
-+    float alpha = 1.0f;
-+    T1 alpha_uchar = 255;
-+    if (alpha_linesize) {
-+        alpha_uchar = overlay_alpha[alpha_adj_x * overlay_x + alpha_adj_y * overlay_y * alpha_linesize];
-+        alpha = alpha_uchar / 255.0f;
-+    }
++    float alpha = tex2D<float>(alpha_tex, u, v);   /* [0,1] */
++    if (alpha <= 0.0f)
++        return;                                    /* fully transparent -> leave main */
 +
-+    T1 overlay_uchar = overlay[overlay_x + overlay_y * overlay_linesize];
++    float overlay = tex2D<float>(overlay_tex, u, v) * 255.0f;
 +
-+    T1 offset = overlay_full ? 0 : 16;
-+    overlay_uchar = need_unpremul && (alpha_linesize == overlay_linesize) && (alpha_uchar > 0 && alpha_uchar < 255)
-+                    ? min(max(overlay_uchar - offset, 0) * 255 / alpha_uchar + offset, 255) : overlay_uchar;
++    int main_pos = main_adj_x * x + y * (main_linesize / (int)sizeof(*main))
++                   + (main_adj_x > 1 ? main_offset : 0);
 +
-+    overlay_uchar = need_unpremul && (alpha_linesize > overlay_linesize) && (alpha_uchar > 0 && alpha_uchar < 255)
-+                    ? min((overlay_uchar - 128) * 255 / alpha_uchar + 128, 255) : overlay_uchar;
-+
-+    int main_pos = main_adj_x * x + y * (main_linesize / sizeof(*main)) + (main_adj_x > 1 ? main_offset : 0);
 +    if (main_depth > 8) {
-+        T0 overlay_res = (T0)(alpha * overlay_uchar) << (main_depth - 8);
-+        T0 main_res = (T0)((1.0f - alpha) * (main[main_pos] >> main_shift));
++        T0 overlay_res = (T0)(alpha * overlay) << (main_depth - 8);
++        T0 main_res    = (T0)((1.0f - alpha) * (main[main_pos] >> main_shift));
 +        main[main_pos] = (T0)(overlay_res + main_res) << main_shift;
 +    } else {
-+        main[main_pos] = alpha * overlay_uchar + (1.0f - alpha) * main[main_pos];
++        main[main_pos] = (T0)(alpha * overlay + (1.0f - alpha) * main[main_pos]);
 +    }
 +}
 +
 +extern "C" {
 +
-+#define INLINEASS_OVERLAY_VARIANT(NAME, TYPE0) \
-+__global__ void Inlineass_Cuda_ ## NAME( \
-+    int x_position, int y_position, \
-+    TYPE0* main, int main_linesize, \
-+    int main_adj_x, int main_offset, \
-+    int main_depth, int main_shift, \
-+    unsigned char* overlay, int overlay_linesize, \
-+    int overlay_w, int overlay_h, \
-+    unsigned char* overlay_alpha, int alpha_linesize, \
-+    int alpha_adj_x, int alpha_adj_y, \
-+    int need_unpremul, int overlay_full) \
-+{ \
-+    inlineass_overlay_func( \
-+        x_position, y_position, \
-+        main, main_linesize, \
-+        main_adj_x, main_offset, \
-+        main_depth, main_shift, \
-+        overlay, overlay_linesize, \
-+        overlay_w, overlay_h, \
-+        overlay_alpha, alpha_linesize, \
-+        alpha_adj_x, alpha_adj_y, \
-+        need_unpremul, overlay_full); \
++__global__ void Inlineass_Cuda_tex_uchar(
++    unsigned char* main, int main_linesize,
++    int main_adj_x, int main_offset,
++    int main_depth, int main_shift,
++    cudaTextureObject_t overlay_tex, cudaTextureObject_t alpha_tex,
++    int out_w, int out_h)
++{
++    inlineass_overlay_tex<unsigned char>(
++        main, main_linesize, main_adj_x, main_offset, main_depth, main_shift,
++        overlay_tex, alpha_tex, out_w, out_h);
 +}
 +
-+INLINEASS_OVERLAY_VARIANT(uchar, unsigned char)
-+INLINEASS_OVERLAY_VARIANT(ushort, unsigned short)
++__global__ void Inlineass_Cuda_tex_ushort(
++    unsigned short* main, int main_linesize,
++    int main_adj_x, int main_offset,
++    int main_depth, int main_shift,
++    cudaTextureObject_t overlay_tex, cudaTextureObject_t alpha_tex,
++    int out_w, int out_h)
++{
++    inlineass_overlay_tex<unsigned short>(
++        main, main_linesize, main_adj_x, main_offset, main_depth, main_shift,
++        overlay_tex, alpha_tex, out_w, out_h);
++}
 +
 +}
