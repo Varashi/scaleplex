@@ -160,6 +160,36 @@ with supplementary groups 44 + 568. The mount needs to be writable
 by uid 1000. On NFS with `root_squash`, the export must map uid 1000
 through (or the dir must already be owned 1000:1000 with `0775`).
 
+## Logs
+
+scaleplex containers (orchestrator, worker) are stateless and log to
+stdout/stderr — there is no in-container log file or PVC. Durable logging
+is the operator's responsibility, same as the k8s deployment (which relies
+on a cluster log pipeline):
+
+- **Recent / live:** `docker compose logs -f` or `docker logs <container>`.
+  The `compose.yaml` ships a `json-file` driver capped at 3×10 MB per
+  container (`x-logging` anchor) so a long-running worker can't fill the
+  host disk — but that's a small rolling window, not an archive.
+- **Durable / central (recommended for fleets):** point Docker's logging
+  driver at your log stack instead of `json-file`. Per-service override:
+
+  ```yaml
+  services:
+    worker:
+      logging:
+        driver: fluentd          # or loki / syslog / journald / gelf
+        options:
+          fluentd-address: "log-host.lan:24224"
+          tag: "scaleplex.worker"
+  ```
+
+  Or set it host-wide in `/etc/docker/daemon.json` (`"log-driver"` +
+  `"log-opts"`) so every container ships automatically. The per-session
+  rewriter lines (`rewriter applied: …`, incl. `force-hw:*` re-accel tags)
+  flow through whichever driver you choose — there is no scaleplex-side
+  log persistence to configure.
+
 ## What this deployment does NOT cover
 
 - **WAN / public-cloud workers.** Workers and PMS need to share a

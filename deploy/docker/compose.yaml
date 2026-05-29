@@ -23,6 +23,18 @@
 # or restrict the LAN if you need either. Cross-site / WAN workers
 # are a future feature; see the WAN-worker memo.
 
+# Default log rotation for the scaleplex containers. Docker's default
+# json-file driver has NO size cap, so a long-running worker that logs
+# per session grows unbounded and can fill the host disk. This caps each
+# container at 3×10 MB of recent logs (still reachable via `docker compose
+# logs`). For DURABLE / central logs, point the driver at your log stack
+# (fluentd / loki / syslog / journald) — see multi-host.md.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   orchestrator:
     image: ghcr.io/varashi/scaleplex_orchestrator:${IMAGE_TAG:-latest}
@@ -63,6 +75,7 @@ services:
       interval: 5s
       timeout: 2s
       retries: 30
+    logging: *default-logging
     networks:
       - scaleplex_net
 
@@ -152,6 +165,7 @@ services:
       timeout: 2s
       # Pre-warm + iHD VAAPI init can take 30-60s on cold start.
       retries: 60
+    logging: *default-logging
     networks:
       - scaleplex_net
 
