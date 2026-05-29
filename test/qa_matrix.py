@@ -491,17 +491,16 @@ def drive_cell(case, proto, settle):
     if dcode != 200:
         return "FAIL", {"reason": f"decision={dcode}"}, sid
 
-    # Trigger + confirm a worker spawn (re-trigger the lazy spawn). Run for BOTH
-    # decisions so SKIP is cross-checked: a genuine non-transcode must NOT spawn
-    # a worker.
+    # Trigger + confirm a worker spawn. One trigger, then poll up to `settle` for
+    # the spawn signal. The older 4x trigger_spawn retry loop turned out to be
+    # counterproductive (#118): each retry started a NEW PMS transcode session +
+    # orchestrator dispatch, racing the original worker — av1->hevc inits that
+    # crossed the per-retry 8s window were misdiagnosed as NODISPATCH while the
+    # worker had actually spawned. A single trigger with a single longer poll
+    # gives slow inits room to land in the kubectl-log stream.
     started = time.time()
-    spawned = False
-    errs = []
-    for _ in range(1 if vdec != "transcode" else 4):
-        trigger_spawn(params, hdrs)
-        spawned, _, _, errs = _poll_logs(slug, started, min(8, settle), want_seg=False)
-        if spawned or errs:
-            break
+    trigger_spawn(params, hdrs)
+    spawned, _, _, errs = _poll_logs(slug, started, settle, want_seg=False)
 
     if vdec != "transcode":
         if not (spawned or errs):
@@ -520,7 +519,7 @@ def drive_cell(case, proto, settle):
         # orchestrator evidence to localize where the dispatch dropped.
         pms = pms_logs("120s")
         orch = orch_logs("120s")
-        return "NODISPATCH", {"reason": "decided-transcode, no worker spawn (4 triggers)",
+        return "NODISPATCH", {"reason": f"decided-transcode, no worker spawn ({settle:.0f}s)",
                               "pms_started_transcode": bool(re.search(r"(?i)transcod", pms)),
                               "orch_got_task": ("/task" in orch or sid[:8] in orch)}, sid
 
@@ -550,7 +549,9 @@ def main():
     ap.add_argument("--force-hw", default=None,
                     help="comma list of SCALEPLEX_FORCE_HW values (e.g. '1,0'). "
                          "Defaults to '1,0' in synthetic mode, '0' in smart-profile mode.")
-    ap.add_argument("--settle", type=float, default=12, help="secs to wait per session")
+    ap.add_argument("--settle", type=float, default=20,
+                    help="secs to wait per session for spawn / first segment (default 20; "
+                         "av1->hevc HW transcodes need ~12-15s for first segment, #118)")
     ap.add_argument("--protocols", default="hls,dash", help="comma list, e.g. hls,dash")
     ap.add_argument("--client-profiles", default="",
                     help="iterate real captured client profiles as the client (outer axis), "
@@ -670,7 +671,7 @@ def main():
                         stop_session(sid)
                         results.append((fhw, label, status, info))
                         print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
-                        time.sleep(4)  # let this session's logs age out of the next cell's window
+                        time.sleep(8)  # let worker cleanup + logs age out before next cell (#118)
 
     from collections import Counter
     tally = Counter(s for *_, s, _ in results)
