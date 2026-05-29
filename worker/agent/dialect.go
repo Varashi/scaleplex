@@ -32,12 +32,29 @@ import (
 	"strings"
 )
 
+// deviceExists reports whether a device path is present. A package var so
+// tests can simulate host hardware without touching /dev.
+var deviceExists = func(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // hasRenderNode reports whether a DRM render node (/dev/dri/renderD*) exists —
 // the signal that a VAAPI-capable GPU is present. Used by selectDialect's auto
 // mode to distinguish a GPU-less host (→ swDialect) from an Intel/AMD one.
-func hasRenderNode() bool {
+// A package var so tests can override the probe.
+var hasRenderNode = func() bool {
 	m, _ := filepath.Glob("/dev/dri/renderD*")
 	return len(m) > 0
+}
+
+// hasNvidiaDevice reports whether the host exposes an NVIDIA GPU to the
+// container. /dev/nvidia0 appears on bare-metal / VFIO passthrough; /dev/dxg
+// is the WSL2 case — nvidia-container-toolkit synthesizes the NVIDIA
+// capability from the DirectX-on-Linux compute interface, and no /dev/nvidia*
+// nodes exist there.
+func hasNvidiaDevice() bool {
+	return deviceExists("/dev/nvidia0") || deviceExists("/dev/dxg")
 }
 
 // dialect captures the per-backend specifics of HW transcode argv
@@ -237,8 +254,9 @@ func (swDialect) subBurnDownloadFilter() string { return "" }
 var activeDialect dialect = vaapiDialect{}
 
 // selectDialect picks the backend at worker startup based on
-// WORKER_BACKEND env. Values: "auto" (default — probes /dev/nvidia0
-// first, falls back to VAAPI), "vaapi", "nvenc" (alias: "nvidia").
+// WORKER_BACKEND env. Values: "auto" (default — probes for an NVIDIA
+// device (/dev/nvidia0 or WSL2's /dev/dxg) first, then a DRM render
+// node for VAAPI, else CPU), "vaapi", "nvenc" (alias: "nvidia"), "sw".
 //
 // The unified worker image carries both runtimes (VAAPI userspace +
 // CUDA runtime); the device-probe picks the one matching the host.
@@ -254,13 +272,13 @@ func selectDialect() dialect {
 	case "sw", "cpu", "software":
 		return swDialect{}
 	case "", "auto":
-		if _, err := os.Stat("/dev/nvidia0"); err == nil {
+		if hasNvidiaDevice() {
 			return nvencDialect{}
 		}
 		if hasRenderNode() {
 			return vaapiDialect{}
 		}
-		// No NVIDIA char dev and no DRM render node → no usable GPU → CPU.
+		// No NVIDIA device and no DRM render node → no usable GPU → CPU.
 		return swDialect{}
 	default:
 		log.Printf("WORKER_BACKEND=%q unknown; falling back to vaapi", want)
