@@ -45,25 +45,25 @@ func TestComposeBurn_NVIDIA(t *testing.T) {
 			wantLabel: "[1]",
 		},
 		{
-			// sub-burn inserts hwdownload,format=nv12 before inlineass —
-			// vf_inlineass is CPU/libass with no CUDA branch; matches Plex's
-			// own nvenc sub chain. h264_nvenc takes the sysmem output directly.
+			// sub-burn stays CUDA-resident — vf_inlineass's CUDA branch
+			// (fork patch 0126) blends the libass band onto the GPU frame,
+			// no hwdownload. h264_nvenc takes the CUDA surface directly.
 			name:      "sdr/text-sub/sw-upload",
 			spec:      burnSpec{vaResident: false, w: "1920", h: "1080", burnSub: true, subParams: "overrides=Outline=2"},
-			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=1920:h=1080:format=nv12[1];[1]hwdownload,format=nv12[2];[2]inlineass=overrides=Outline=2:render_height=1080[3]",
-			wantLabel: "[3]",
+			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=1920:h=1080:format=nv12[1];[1]inlineass=overrides=Outline=2:render_height=1080[2]",
+			wantLabel: "[2]",
 		},
 		{
 			name:      "hdr/text-sub/sw-upload",
 			spec:      burnSpec{vaResident: false, w: "3840", h: "2160", hdr: true, algo: "hable", burnSub: true},
-			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=3840:h=2160:format=p010,tonemap_cuda=tonemap=hable:format=nv12[1];[1]hwdownload,format=nv12[2];[2]inlineass=render_height=1080[3]",
-			wantLabel: "[3]",
+			wantFltr:  "[0:0]hwupload[0];[0]scale_cuda=w=3840:h=2160:format=p010,tonemap_cuda=tonemap=hable:format=nv12[1];[1]inlineass=render_height=1080[2]",
+			wantLabel: "[2]",
 		},
 		{
 			name:      "text/animated-tier-down",
 			spec:      burnSpec{vaResident: true, w: "1920", h: "1080", burnSub: true, animatedTierDown: true},
-			wantFltr:  "[0:0]scale_cuda=w=1920:h=1080:format=nv12[0];[0]hwdownload,format=nv12[1];[1]inlineass=render_height=1080:animated_tier_down=1[2]",
-			wantLabel: "[2]",
+			wantFltr:  "[0:0]scale_cuda=w=1920:h=1080:format=nv12[0];[0]inlineass=render_height=1080:animated_tier_down=1[1]",
+			wantLabel: "[1]",
 		},
 	}
 	for _, c := range cases {

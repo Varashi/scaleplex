@@ -131,10 +131,10 @@ type dialect interface {
 	//
 	//   VAAPI: "" — the fork's vf_inlineass merged HW branch (patch 0115)
 	//          consumes a VAAPI surface directly; no download.
-	//   NVIDIA: "hwdownload,format=nv12" — vf_inlineass has no CUDA branch,
-	//          so the CUDA surface must come down to system nv12 first.
-	//          Matches Plex's own nvenc sub-burn chain; h264_nvenc then
-	//          ingests the sysmem nv12 directly (no re-upload).
+	//   NVIDIA: "" — the fork's vf_inlineass CUDA branch (patch 0126)
+	//          consumes a CUDA surface directly; the libass band is rendered
+	//          small on the CPU and alpha-blended onto the GPU frame, so the
+	//          full frame never leaves the GPU. h264_nvenc takes the result.
 	subBurnDownloadFilter() string
 }
 
