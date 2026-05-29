@@ -174,7 +174,6 @@ services:
   #     # The scaleplex docker-mod. Drops the shim into
   #     # /usr/lib/plexmediaserver/ on every container start.
   #     DOCKER_MODS: "ghcr.io/varashi/scaleplex_pms_dockermod:${IMAGE_TAG:-latest}"
-  #     LOCAL_RELAY_ENABLED: "1"
   #     LOCAL_RELAY_PORT: "32499"
   #     SCALEPLEX_ORCHESTRATOR_URL: "http://127.0.0.1:${ORCHESTRATOR_PORT:-3500}"
   #   devices:

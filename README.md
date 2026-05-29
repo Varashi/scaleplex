@@ -269,7 +269,6 @@ Three things added to the cluster:
    ```yaml
    env:
      DOCKER_MODS: ghcr.io/varashi/scaleplex_pms_dockermod:sha-<short>
-     LOCAL_RELAY_ENABLED: "1"
      LOCAL_RELAY_PORT: "32499"
      SCALEPLEX_ORCHESTRATOR_URL: http://<orchestrator-service>.<namespace>.svc:3500
    ```
