@@ -1,9 +1,6 @@
 package main
 
-import (
-	"os"
-	"testing"
-)
+import "testing"
 
 func TestSelectDialect(t *testing.T) {
 	// Explicit pins are deterministic regardless of the runner's hardware.
@@ -33,23 +30,34 @@ func TestSelectDialect(t *testing.T) {
 			}
 		})
 	}
-	// "auto"/unset probes real devices, so the expected backend is
-	// runner-dependent: /dev/nvidia0 → nvenc; else a DRM render node → vaapi;
-	// else (no GPU) → sw. Derive the expectation from the same probes
-	// selectDialect uses so this passes on any host (GPU-less CI → sw).
-	wantAuto := "sw"
-	if _, err := os.Stat("/dev/nvidia0"); err == nil {
-		wantAuto = "nvenc"
-	} else if hasRenderNode() {
-		wantAuto = "vaapi"
+	// "auto"/unset probes for an NVIDIA device first (/dev/nvidia0 on
+	// bare-metal, /dev/dxg on WSL2), then a DRM render node for VAAPI,
+	// else CPU. Override the device probes so the matrix is deterministic
+	// regardless of the runner's hardware.
+	origDev, origRender := deviceExists, hasRenderNode
+	t.Cleanup(func() { deviceExists, hasRenderNode = origDev, origRender })
+	autoCases := []struct {
+		name        string
+		present     map[string]bool
+		renderNode  bool
+		wantBackend string
+	}{
+		{"bare-metal /dev/nvidia0 → nvenc", map[string]bool{"/dev/nvidia0": true}, false, "nvenc"},
+		{"WSL2 /dev/dxg only → nvenc", map[string]bool{"/dev/dxg": true}, true, "nvenc"},
+		{"Intel render node → vaapi", nil, true, "vaapi"},
+		{"no GPU → sw", nil, false, "sw"},
 	}
-	for _, be := range []string{"", "auto"} {
-		t.Run("auto-probe WORKER_BACKEND="+be, func(t *testing.T) {
-			t.Setenv("WORKER_BACKEND", be)
-			if got := selectDialect().backendName(); got != wantAuto {
-				t.Fatalf("auto (WORKER_BACKEND=%q): got %q, want %q (device-probe derived)", be, got, wantAuto)
-			}
-		})
+	for _, tc := range autoCases {
+		for _, be := range []string{"", "auto"} {
+			t.Run(tc.name+" (WORKER_BACKEND="+be+")", func(t *testing.T) {
+				deviceExists = func(p string) bool { return tc.present[p] }
+				hasRenderNode = func() bool { return tc.renderNode }
+				t.Setenv("WORKER_BACKEND", be)
+				if got := selectDialect().backendName(); got != tc.wantBackend {
+					t.Fatalf("auto %s (WORKER_BACKEND=%q): got %q, want %q", tc.name, be, got, tc.wantBackend)
+				}
+			})
+		}
 	}
 }
 
