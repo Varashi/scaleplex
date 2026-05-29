@@ -65,6 +65,34 @@ func addWorker(t *testing.T, url string, active, max int, healthy bool) *worker 
 	return wk
 }
 
+// #93: /readyz must report Ready regardless of worker presence, so a push-only
+// fleet can bootstrap (a PUSH worker registers THROUGH the readiness-gated LB).
+func TestHandleReady_AlwaysReady_Issue93(t *testing.T) {
+	cases := []struct {
+		name    string
+		healthy *bool // nil = no workers
+	}{
+		{"zero workers", nil},
+		{"only unhealthy worker", boolp(false)},
+		{"healthy worker", boolp(true)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGlobals()
+			if tc.healthy != nil {
+				addWorker(t, "http://w1:3501", 0, 4, *tc.healthy)
+			}
+			rec := httptest.NewRecorder()
+			handleReady(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("got %d, want 200 (readiness must not gate on workers — #93 deadlock)", rec.Code)
+			}
+		})
+	}
+}
+
+func boolp(b bool) *bool { return &b }
+
 func TestPickOrder_LeastLoadedFirst(t *testing.T) {
 	resetGlobals()
 	a := addWorker(t, "http://a", 5, 0, true)  // unlimited, raw load 5
