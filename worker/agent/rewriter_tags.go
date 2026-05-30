@@ -94,6 +94,7 @@ const (
 	TagInjectCanThrottleURL             = "inject:-canthrottleurl(scaleplex-ffmpeg7-canThrottle)"
 	TagInjectInitHWDevice               = "inject:init_hw_device+filter_hw_device"
 	TagReplaceForeignInitHWDevice       = "replace:foreign-init_hw_device" // #85 — drop a foreign-backend -init_hw_device so it's re-injected for the worker dialect
+	TagStripVAAPIDriverParam            = "strip:init_hw_device:driver"    // #124 — strip Plex's hardcoded `,driver=iHD` from same-backend VAAPI init_hw_device; libva picks via LIBVA_DRIVER_NAME env (vendor-aware default from detectVAAPIDriver)
 	TagToSWStripHWDecode                = "to-sw:strip-hwdecode"           // #77 PR3 — swDialect stripped HW decode flags + device init
 	TagInjectSEIA53CC                   = "inject:sei+a53_cc"
 	TagLoglevelInfo                     = "loglevel:->info"
