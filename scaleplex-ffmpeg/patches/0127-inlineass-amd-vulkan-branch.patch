@@ -75,7 +75,7 @@ index 217211b..1c2f477 100644
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
 diff --git a/libavfilter/vf_inlineass.c b/libavfilter/vf_inlineass.c
-index eb41aa1..4f1d7ad 100644
+index eb41aa1..ed44d6c 100644
 --- a/libavfilter/vf_inlineass.c
 +++ b/libavfilter/vf_inlineass.c
 @@ -95,6 +95,40 @@
@@ -174,7 +174,7 @@ index eb41aa1..4f1d7ad 100644
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -1465,6 +1547,628 @@ fail:
+@@ -1465,6 +1547,640 @@ fail:
  }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -771,9 +771,21 @@ index eb41aa1..4f1d7ad 100644
 +     * + hw_frames_ctx, and attaches an internal HWMapDescriptor that
 +     * keeps vk_tgt alive for the lifetime of the mapped frame. The
 +     * downstream encoder sees a normal VAAPI frame. */
-+    out->format = AV_PIX_FMT_VAAPI;
-+    ret = av_hwframe_map(out, vk_tgt,
-+                         AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
++    /* av_hwframe_map() dispatch (hwcontext.c:807) needs an hwfc on dst to
++     * find the VAAPI map_to hook; without it the call falls through to
++     * the unconditional ENOSYS at hwcontext.c:866 even though
++     * vulkan_map_to_drm succeeds. Reuse the outlink's VAAPI pool ref
++     * (same device the input pool came from); vaapi_map_from_drm
++     * vaCreateSurfaces a fresh surface for data[3] and ignores the pool
++     * itself. MAP_DIRECT is dropped — only consulted by vaapi_map_frame
++     * (download), not the DRM-prime import. */
++    out->format        = AV_PIX_FMT_VAAPI;
++    out->hw_frames_ctx = av_buffer_ref(ff_filter_link(outlink)->hw_frames_ctx);
++    if (!out->hw_frames_ctx) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    ret = av_hwframe_map(out, vk_tgt, AV_HWFRAME_MAP_READ);
 +    if (ret < 0) {
 +        av_log(avctx, AV_LOG_ERROR,
 +               "inlineass(amd-vk): vulkan→vaapi map failed: %s\n",
@@ -803,7 +815,7 @@ index eb41aa1..4f1d7ad 100644
  /* ======================================================================== *
   *  init / uninit / format negotiation / link config (format-adaptive)      *
   * ======================================================================== */
-@@ -1620,6 +2324,26 @@ static av_cold void uninit(AVFilterContext *ctx)
+@@ -1620,6 +2336,26 @@ static av_cold void uninit(AVFilterContext *ctx)
      ass->cuda_hwctx = NULL;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -830,7 +842,7 @@ index eb41aa1..4f1d7ad 100644
      /* scaleplex: serialise libass teardown against the decoder thread's
       * append/replay and another instance's render. libass shares
       * process-global state (fontconfig/freetype) that is NOT reentrant;
-@@ -1671,8 +2395,20 @@ static int config_input(AVFilterLink *link)
+@@ -1671,8 +2407,20 @@ static int config_input(AVFilterLink *link)
      AVFilterContext *avctx  = link->dst;
      AssContext      *ass    = avctx->priv;
  
@@ -852,7 +864,7 @@ index eb41aa1..4f1d7ad 100644
  
  #if CONFIG_OVERLAY_CUDA_FILTER
      if (link->format == AV_PIX_FMT_CUDA)
-@@ -1802,6 +2538,12 @@ static int config_output(AVFilterLink *outlink)
+@@ -1802,6 +2550,12 @@ static int config_output(AVFilterLink *outlink)
      }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -865,7 +877,7 @@ index eb41aa1..4f1d7ad 100644
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -2345,8 +3087,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+@@ -2345,8 +3099,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
      long long time_ms;
      int err;
  
