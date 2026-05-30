@@ -34,6 +34,7 @@ package main
 import (
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -116,9 +117,11 @@ func hwAccelAllowed(inputEnv map[string]string) bool {
 // not an error — only transport/IO failures are errors (→ fail-closed +
 // retry). 5s timeout bounds the cold-path cost.
 func httpPassCheck(base, tok string) (bool, error) {
-	url := strings.TrimRight(base, "/") + "/?X-Plex-Token=" + tok
+	// QueryEscape defensively (Plex tokens are alphanumeric in practice, but
+	// unescaped reserved chars would corrupt the request).
+	reqURL := strings.TrimRight(base, "/") + "/?X-Plex-Token=" + url.QueryEscape(tok)
 	c := &http.Client{Timeout: 5 * time.Second}
-	resp, err := c.Get(url) //nolint:noctx // short fixed-timeout client
+	resp, err := c.Get(reqURL) //nolint:noctx // short fixed-timeout client
 	if err != nil {
 		return false, err
 	}

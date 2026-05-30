@@ -92,7 +92,12 @@ func TestPassActiveFromLocalAPI(t *testing.T) {
 
 	t.Run("network error (port closed) → empty", func(t *testing.T) {
 		writePrefs(t, `<Preferences PlexOnlineToken="srv-tok"/>`)
-		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", "1") // privileged port, dial will fail in test env
+		// Spin up a server and immediately Close → the listener's bound port
+		// is guaranteed connect-refused (deterministic across hosts; relying
+		// on a privileged port like 1 being closed flakes in some envs).
+		port, srv := passAPIServer(t, func(http.ResponseWriter, string) {})
+		srv.Close()
+		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", port)
 		if got := passActiveFromLocalAPI(); got != "" {
 			t.Errorf("got %q want empty", got)
 		}

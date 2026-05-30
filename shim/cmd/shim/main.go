@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -387,7 +388,9 @@ func passActiveFromLocalAPI() string {
 	}
 	port := envOr("SCALEPLEX_PMS_LOCAL_PORT", "32400")
 	c := &http.Client{Timeout: 2 * time.Second}
-	resp, err := c.Get("http://127.0.0.1:" + port + "/?X-Plex-Token=" + tok) //nolint:noctx // short fixed-timeout client
+	// QueryEscape defensively: PlexOnlineToken is alphanumeric in practice,
+	// but unescaped reserved chars (+ & =) would corrupt the request.
+	resp, err := c.Get("http://127.0.0.1:" + port + "/?X-Plex-Token=" + url.QueryEscape(tok)) //nolint:noctx // short fixed-timeout client
 	if err != nil {
 		return ""
 	}
