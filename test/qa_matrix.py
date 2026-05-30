@@ -38,18 +38,29 @@ WORKER_DS = os.environ.get("WORKER_DS", "plex-test-worker")
 WORKER_CONTAINER = os.environ.get("WORKER_CONTAINER", "app")
 MOVIE_SECTION = os.environ.get("SECTION", "1")
 
-# Worker control mode. "k8s" (default) drives the in-cluster Arc worker
-# DaemonSet (set env + rollout, kubectl logs). "docker" drives an external
-# compose worker over SSH (e.g. the NVIDIA worker on skw-d-frank) — recreate
-# the container to change FORCE_HW, read `docker logs`. For "docker" runs you
-# typically scale the Arc DS to 0 first so the orchestrator routes every
-# session to the external worker.
-WORKER_MODE = os.environ.get("WORKER_MODE", "k8s")
-if WORKER_MODE not in ("k8s", "docker"):
-    sys.exit(f"WORKER_MODE={WORKER_MODE!r} invalid; expected 'k8s' or 'docker'")
+# Worker control mode. Default "auto" combines:
+#   k8s sources — the in-cluster Arc worker DaemonSet (set env + rollout,
+#       kubectl logs). Active when worker_pods() returns pods.
+#   docker sources — an external compose/docker-run worker over SSH (e.g. the
+#       skw-d-frank NVIDIA worker, or a remote AMD test bench). Active when
+#       WORKER_SSH + WORKER_DOCKER_NAME envs are set; reads `docker logs`.
+# Both can be active simultaneously (hybrid fleet — k8s DS + external push
+# worker). worker_logs() combines logs from all active sources, so a matrix
+# session dispatched to an external push worker no longer NODISPATCH-misses
+# the spawn signal just because the harness was looking only at kubectl logs.
+# Explicit "k8s" or "docker" pins one channel (legacy behaviour; back-compat).
+# #125 item 1.
+WORKER_MODE = os.environ.get("WORKER_MODE", "auto")
+if WORKER_MODE not in ("auto", "k8s", "docker"):
+    sys.exit(f"WORKER_MODE={WORKER_MODE!r} invalid; expected 'auto', 'k8s', or 'docker'")
 WORKER_SSH = os.environ.get("WORKER_SSH", "")               # e.g. root@skw-d-frank.boeye.net
-WORKER_COMPOSE_DIR = os.environ.get("WORKER_COMPOSE_DIR", "/root/scaleplex-deploy")
+# Empty default so a plain `docker run` worker (no compose) doesn't accidentally
+# take the compose-recreate path in set_force_hw() and die in _ssh(check=True).
+# Set this when the external worker IS compose-managed.
+WORKER_COMPOSE_DIR = os.environ.get("WORKER_COMPOSE_DIR", "")
 WORKER_DOCKER_NAME = os.environ.get("WORKER_DOCKER_NAME", "scaleplex-deploy-worker-1")
+if WORKER_MODE == "docker" and not WORKER_SSH:
+    sys.exit("WORKER_MODE='docker' requires WORKER_SSH (e.g. root@host)")
 # Seconds to wait after a docker-worker recreate for the agent to boot +
 # PUSH-re-register with the orchestrator before driving sessions.
 WORKER_DOCKER_SETTLE = float(os.environ.get("WORKER_DOCKER_SETTLE", "18"))
@@ -137,40 +148,94 @@ def _ssh(cmd, timeout=200, check=False):
     return r
 
 
-def set_force_hw(val):
-    if WORKER_MODE == "docker":
-        # Rewrite the compose FORCE_HW env + recreate the container; the agent
-        # re-registers (PUSH) within a few seconds. Quoted value matches the
-        # `SCALEPLEX_FORCE_HW: "N"` compose form. check=True — a failed
-        # recreate invalidates the cells that follow, so fail fast.
-        _ssh("cd {d} && "
-             "sed -i 's/SCALEPLEX_FORCE_HW: .*/SCALEPLEX_FORCE_HW: \"{v}\"/' compose.yaml && "
-             "docker compose up -d".format(
-                 d=shlex.quote(WORKER_COMPOSE_DIR), v=int(val)),
-             check=True)
-        time.sleep(WORKER_DOCKER_SETTLE)
-        return
-    kubectl("set", "env", f"ds/{WORKER_DS}", f"SCALEPLEX_FORCE_HW={val}")
-    kubectl("rollout", "status", f"ds/{WORKER_DS}", "--timeout=180s")
-
-
 def worker_pods():
     r = kubectl("get", "pods", "-l", "app.kubernetes.io/controller=worker",
                 "-o", "name")
     return [p.split("/", 1)[1] for p in r.stdout.split() if p.strip()]
 
 
-def worker_logs(since):
-    """Combined worker log text for the given lookback window.
-    k8s: concat of each Arc pod's logs. docker: the external container's logs."""
+# Cache the per-mode availability (single check per matrix run).
+_k8s_available = None
+_docker_available = None
+
+
+def _use_k8s():
+    """True when k8s worker pods exist (or mode forces it)."""
+    global _k8s_available
     if WORKER_MODE == "docker":
-        # Tolerant (no check): a transient non-zero log read shouldn't abort
-        # the matrix; an empty result surfaces as a cell FAIL anyway.
-        return _ssh("docker logs {n} --since={s} 2>&1".format(
-            n=shlex.quote(WORKER_DOCKER_NAME), s=shlex.quote(since))).stdout
+        return False
+    if WORKER_MODE == "k8s":
+        return True
+    if _k8s_available is None:
+        try:
+            _k8s_available = bool(worker_pods())
+        except Exception as e:  # noqa: BLE001
+            # Don't memoize a probe failure (e.g. transient kubectl timeout) —
+            # next caller retries. Memoizing False would disable the k8s
+            # channel for the rest of the matrix on one flaky call.
+            print(f"  WARN: k8s worker probe failed: {e}; retrying on next use")
+            return False
+    return _k8s_available
+
+
+def _use_docker():
+    """True when an external docker worker is wired via env (or mode forces it)."""
+    global _docker_available
+    if WORKER_MODE == "k8s":
+        return False
+    if WORKER_MODE == "docker":
+        return True
+    if _docker_available is None:
+        _docker_available = bool(WORKER_SSH and WORKER_DOCKER_NAME)
+    return _docker_available
+
+
+def set_force_hw(val):
+    """Apply FORCE_HW to all available worker channels. k8s = DS env+rollout,
+    docker = compose recreate (no-op if no compose dir wired). When neither
+    applies, log + skip (operator must have set it on the worker externally).
+    #125 item 2."""
+    did = []
+    if _use_k8s():
+        kubectl("set", "env", f"ds/{WORKER_DS}", f"SCALEPLEX_FORCE_HW={val}")
+        kubectl("rollout", "status", f"ds/{WORKER_DS}", "--timeout=180s")
+        did.append("k8s-DS-rollout")
+    if _use_docker() and WORKER_COMPOSE_DIR:
+        # Rewrite the compose FORCE_HW env + recreate; agent re-PUSH-registers
+        # within a few seconds. check=True — a failed recreate invalidates the
+        # cells that follow.
+        _ssh("cd {d} && "
+             "sed -i 's/SCALEPLEX_FORCE_HW: .*/SCALEPLEX_FORCE_HW: \"{v}\"/' compose.yaml && "
+             "docker compose up -d".format(
+                 d=shlex.quote(WORKER_COMPOSE_DIR), v=int(val)),
+             check=True)
+        time.sleep(WORKER_DOCKER_SETTLE)
+        did.append("docker-compose-recreate")
+    if not did:
+        print(f"  WARN: set_force_hw({val}) — no k8s DS, no compose-wired docker worker; "
+              f"skipping (worker FORCE_HW must be set externally on plain docker run)")
+
+
+def worker_logs(since):
+    """Combined worker log text for the given lookback window, from ALL active
+    channels (k8s pods + ssh+docker for external worker, when applicable).
+    Hybrid fleets see both. #125 item 1."""
     out = []
-    for pod in worker_pods():
-        out.append(kubectl("logs", pod, "-c", WORKER_CONTAINER, f"--since={since}").stdout)
+    if _use_k8s():
+        for pod in worker_pods():
+            out.append(kubectl("logs", pod, "-c", WORKER_CONTAINER, f"--since={since}").stdout)
+    if _use_docker():
+        # Tolerant: transient ssh/docker hiccup shouldn't abort the matrix, but
+        # surface the failure — a silent empty stdout collapses into bogus
+        # NODISPATCH for sessions that DID land on the external worker.
+        r = _ssh(
+            f"docker logs {shlex.quote(WORKER_DOCKER_NAME)} --since={shlex.quote(since)} 2>&1"
+        )
+        if r.returncode == 0:
+            out.append(r.stdout)
+        else:
+            print(f"  WARN: docker log collection failed (rc={r.returncode}): "
+                  f"{r.stderr.strip() or r.stdout.strip()}")
     return "\n".join(out)
 
 
@@ -190,20 +255,28 @@ def _pod_by_prefix(prefix):
 def pms_logs(since):
     """plex-test PMS pod logs (the 'plex' container) — the Plex-side ground
     truth for SKIP/NODISPATCH cross-checks (decision + transcode-session spawn).
-    k8s only; empty in docker mode."""
-    if WORKER_MODE == "docker":
+    Returns kubectl output when reachable; empty otherwise (tolerant — PMS is
+    in k8s even in hybrid fleets with external workers, so don't skip on
+    WORKER_MODE alone)."""
+    if WORKER_MODE == "docker" and not _use_k8s():
         return ""
-    pod = _pod_by_prefix(PMS_POD_PREFIX)
-    return kubectl("logs", pod, "-c", "plex", f"--since={since}").stdout if pod else ""
+    try:
+        pod = _pod_by_prefix(PMS_POD_PREFIX)
+        return kubectl("logs", pod, "-c", "plex", f"--since={since}").stdout if pod else ""
+    except Exception:
+        return ""
 
 
 def orch_logs(since):
     """Orchestrator pod logs — did the PMS-side shim's /task reach the
     orchestrator + get dispatched? Used to localize a NODISPATCH."""
-    if WORKER_MODE == "docker":
+    if WORKER_MODE == "docker" and not _use_k8s():
         return ""
-    pod = _pod_by_prefix(ORCH_POD_PREFIX)
-    return kubectl("logs", pod, f"--since={since}").stdout if pod else ""
+    try:
+        pod = _pod_by_prefix(ORCH_POD_PREFIX)
+        return kubectl("logs", pod, f"--since={since}").stdout if pod else ""
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
