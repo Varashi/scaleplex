@@ -1960,8 +1960,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 	// leaves Plex's libx264+inlineass argv otherwise untouched) and the
 	// HW-reshape case (extractGraphFacts now captures scrubbed params)
 	// from the single call site.
+	inlineassPathsScrubbed := false
 	if scrubbed, did := scrubPlexInlineassFilesystemPathsInArgs(inputArgs); did {
 		inputArgs = scrubbed
+		inlineassPathsScrubbed = true
 		changes = append(changes, TagFilterInlineassScrubPlexFontPaths)
 	}
 
@@ -2083,9 +2085,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 		merged = append(merged, TagPrefixSkip+reason)
 		// Applied=true whenever we mutated argv (scrub, hint drops,
-		// EAE swap/prefix-drop, or framedrop-BSF drop), so the worker
-		// uses our rewritten copy instead of the input.
-		applied := len(scrub) > 0 || len(hintChanges) > 0 ||
+		// EAE swap/prefix-drop, framedrop-BSF drop, OR the top-of-
+		// Rewrite inlineass font-path scrub that ran on inputArgs
+		// before bail() was invoked — without that bit the caller
+		// would see Applied=false on a scrub-only bail and execute
+		// the unsanitized original argv, re-triggering the very
+		// libass fontconfig exit-145 the scrub exists to prevent).
+		applied := inlineassPathsScrubbed ||
+			len(scrub) > 0 || len(hintChanges) > 0 ||
 			len(eaeSwapped) > 0 || len(eaeDropped) > 0 ||
 			len(fdDropped) > 0
 		return RewriteResult{

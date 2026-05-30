@@ -1965,6 +1965,53 @@ func TestRewriter_ScrubsPlexInlineassFilesystemPaths(t *testing.T) {
 	}
 }
 
+// CodeRabbit finding (PR #138): on a bail path where the ONLY mutation
+// was the top-of-Rewrite inlineass scrub (no EAE swap, no framedrop BSF,
+// no input-hint drops, no -progressurl/-segment_list scrub), the
+// bail-local `applied` calc used to be false → caller would think no
+// rewrite happened and execute the ORIGINAL unsanitized argv, defeating
+// the scrub entirely. Regression test: minimal argv that bails
+// no-decoder (no -codec:0 before -i) but carries the PMS font paths in
+// -filter_complex must come back Applied=true AND with the scrub
+// applied to args.
+func TestRewriter_BailWithOnlyInlineassScrub_AppliedTrue(t *testing.T) {
+	args := []string{
+		"-i", "/tmp/in.mp4",
+		"-filter_complex", "[0:0]inlineass=font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:" +
+			"fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:" +
+			"font_size=54[1]",
+		"-f", "mp4",
+		"/tmp/out.mp4",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("Applied=false on scrub-only bail; caller would execute unsanitized argv. changes=%v args=%v", out.Changes, out.Args)
+	}
+	if !containsString(out.Changes, TagFilterInlineassScrubPlexFontPaths) {
+		t.Errorf("expected change tag %q in %v", TagFilterInlineassScrubPlexFontPaths, out.Changes)
+	}
+	// Confirm we actually bailed (not took the main path).
+	bailed := false
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "skip:") {
+			bailed = true
+			break
+		}
+	}
+	if !bailed {
+		t.Fatalf("expected a skip: bail tag in changes (this test repros the scrub-only-on-bail path); changes=%v", out.Changes)
+	}
+	// And the args returned to the caller no longer carry the PMS paths.
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] != "-filter_complex" {
+			continue
+		}
+		if strings.Contains(out.Args[i+1], "font_path=") || strings.Contains(out.Args[i+1], "/usr/lib/plexmediaserver/") {
+			t.Errorf("rewritten -filter_complex still carries PMS paths: %q", out.Args[i+1])
+		}
+	}
+}
+
 // HDR source + a plain SDR-target argv: scaleplex does NOT inject a
 // tonemap. A plain chain with no tonemap filter is exactly what Plex
 // emits when HW tone mapping is off — Plex then does no tonemapping
