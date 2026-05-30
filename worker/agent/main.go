@@ -167,7 +167,11 @@ func main() {
 	}
 
 	activeDialect = selectDialect()
-	log.Printf("worker backend: %s", activeDialect.backendName())
+	backendDetail := activeDialect.backendName()
+	if vd, ok := activeDialect.(vaapiDialect); ok && vd.vendor != "" {
+		backendDetail += " (vendor=" + vd.vendor + ")"
+	}
+	log.Printf("worker backend: %s", backendDetail)
 
 	// L1 Plex-Pass warning (scaleplex#78). SCALEPLEX_FORCE_HW=1 and the
 	// cross-backend reshape RE-ACCELERATE sessions onto HW that Plex would

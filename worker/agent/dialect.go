@@ -155,11 +155,25 @@ type dialect interface {
 	subBurnDownloadFilter() string
 }
 
-// vaapiDialect — Intel iHD / VAAPI. The historical default; tested
-// against the full ~200-entry argv corpus.
-type vaapiDialect struct{}
+// vaapiDialect — VAAPI backend, vendor-branched. Intel iHD is the historical
+// default (tested against the full ~200-entry argv corpus). AMD radeonsi
+// (RX 6800+) shares encode/decode/scale primitives but diverges on tonemap
+// (no tonemap_vaapi on radeonsi — libplacebo via Vulkan replaces it) and
+// overlay (no overlay_vaapi → sub-burn uses the vf_inlineass AMD-Vulkan
+// branch, fork patch 0127). Zero-value preserves Intel iHD behavior so
+// callers using `vaapiDialect{}` keep working. #123.
+type vaapiDialect struct {
+	// vendor: "" / "intel" → iHD (default), "amd" → radeonsi. Selected at
+	// startup by selectDialect() from probeVAAPIDriver(). The
+	// non-divergent methods (encode/decode/scale/hwaccel/initHWDevice/
+	// hwupload/hwdownload) are vendor-agnostic.
+	vendor string
+}
 
 func (vaapiDialect) backendName() string { return "vaapi" }
+
+// isAMD is the convenience predicate for vendor-branched methods + callers.
+func (d vaapiDialect) isAMD() bool { return d.vendor == "amd" }
 
 func (vaapiDialect) encoderMap() map[string]string {
 	// Identical content to the package-level encoderMap var (kept for
@@ -190,7 +204,23 @@ func (vaapiDialect) scaleFilter(w, h, pix string) string {
 	return "scale_vaapi=w=" + w + ":h=" + h + ":format=" + pix
 }
 
-func (vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+func (d vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+	if d.isAMD() {
+		// AMD radeonsi has no tonemap_vaapi (Intel-iHD-only); tonemap_opencl
+		// via VAAPI↔OpenCL derive is broken on mesa-opencl-icd (PR #134
+		// closed). The HDR→SDR pass is absorbed into vf_inlineass's
+		// AMD-Vulkan branch (fork patch 0127 v6) — same pl_render_image
+		// dispatch as the sub-burn, libplacebo handles tone-curve when
+		// pl_src.color is HDR + pl_tgt.color is bt709 SDR.
+		//
+		// composeBurn's AMD-HDR branch (composeBurnAMDHDR) never calls
+		// tonemapFilter — it goes straight to `inlineass[=tonemap_only=1]`.
+		// Returning empty here means: if any non-composeBurn caller asks
+		// for an HDR stage on AMD, the emitted filtergraph has a visible
+		// hole, which is the right failure mode (loud, immediate) for a
+		// path the AMD work hasn't covered yet.
+		return ""
+	}
 	// iHD fixed-curve BT.2390 EETF — no algo slot. Algo arg ignored.
 	return "tonemap_vaapi=transfer=bt709:format=" + pix
 }
@@ -266,7 +296,7 @@ var activeDialect dialect = vaapiDialect{}
 func selectDialect() dialect {
 	switch want := strings.ToLower(strings.TrimSpace(os.Getenv("WORKER_BACKEND"))); want {
 	case "vaapi":
-		return vaapiDialect{}
+		return pickVaapiDialect()
 	case "nvenc", "nvidia": // "nvidia" kept as an operator-facing alias
 		return nvencDialect{}
 	case "sw", "cpu", "software":
@@ -276,12 +306,28 @@ func selectDialect() dialect {
 			return nvencDialect{}
 		}
 		if hasRenderNode() {
-			return vaapiDialect{}
+			return pickVaapiDialect()
 		}
 		// No NVIDIA device and no DRM render node → no usable GPU → CPU.
 		return swDialect{}
 	default:
 		log.Printf("WORKER_BACKEND=%q unknown; falling back to vaapi", want)
-		return vaapiDialect{}
+		return pickVaapiDialect()
 	}
+}
+
+// probeVAAPIDriverForDialect indirection — production hits the sync.Once'd
+// detectVAAPIDriver; tests swap it (the Once + module-level cache make
+// detectVAAPIDriver itself awkward to inject directly).
+var probeVAAPIDriverForDialect = detectVAAPIDriver
+
+// pickVaapiDialect chooses the VAAPI vendor at startup from the libva driver
+// name probed off /sys/class/drm/renderD*/device/vendor (detectVAAPIDriver,
+// #124). `radeonsi` → AMD branch (fork patch 0127 vf_inlineass AMD-Vulkan
+// sub-burn + libplacebo tonemap), anything else → Intel iHD. #123.
+func pickVaapiDialect() dialect {
+	if probeVAAPIDriverForDialect() == "radeonsi" {
+		return vaapiDialect{vendor: "amd"}
+	}
+	return vaapiDialect{vendor: "intel"}
 }

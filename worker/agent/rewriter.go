@@ -11,6 +11,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strconv"
@@ -525,6 +526,18 @@ func resolveTonemapConfig() tonemapConfig {
 	}
 	if cfg.d.backendName() == "vaapi" {
 		cfg.useOpenCL = !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi")
+		// AMD radeonsi: neither backend is usable through the tm.stage()
+		// path — tonemap is absorbed into vf_inlineass's AMD-Vulkan branch
+		// (fork patch 0127 v6, composeBurnAMDHDR routes around tm.stage).
+		// Operators who explicitly opt in to SCALEPLEX_TONEMAP=vaapi on an
+		// AMD pod were probably copying Intel runbooks; log a WARN so the
+		// "useOpenCL=false but tonemap_vaapi isn't on this driver" mismatch
+		// surfaces in logs before they go hunting for a missing stage.
+		if vd, ok := cfg.d.(vaapiDialect); ok && vd.isAMD() &&
+			strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi") {
+			log.Printf("WARN: SCALEPLEX_TONEMAP=vaapi has no effect on radeonsi " +
+				"(no tonemap_vaapi); HDR→SDR runs through vf_inlineass libplacebo")
+		}
 	}
 	if a := strings.ToLower(os.Getenv("SCALEPLEX_TONEMAP_ALGO")); validTonemapAlgo(a) {
 		cfg.algo = a
@@ -627,6 +640,25 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 		// Software target: no HW surfaces — emit Plex's CPU filtergraph shape.
 		return tm.composeBurnSW(s)
 	}
+	// AMD radeonsi cross-cuts the HDR + sub-burn axes: there is no
+	// tonemap_vaapi (Intel-iHD-only) and the tonemap_opencl chain via
+	// VAAPI-OpenCL derive is broken on mesa-opencl-icd (PR #134 closed).
+	// vf_inlineass's AMD-Vulkan branch (fork patch 0127) runs the HDR→SDR
+	// tone-map inside its libplacebo pl_render_image dispatch — see the
+	// AMD-Vulkan v6 patch header. Routing on AMD therefore differs from
+	// Intel/NVIDIA:
+	//
+	//   HDR + sub-burn → scale_vaapi(...:format=p010) + inlineass(...)
+	//                    (no separate tonemap stage; the burn pass absorbs it)
+	//   HDR + no subs  → scale_vaapi(...:format=p010) + inlineass=tonemap_only=1
+	//                    (filter runs as a pure HDR→SDR pl_render_image pass)
+	//   SDR (any)      → identical to Intel iHD shape
+	//
+	// Intel iHD + NVIDIA paths fall through to the unchanged emitter below
+	// (the AMD branch is gated on `vd.isAMD()`).
+	if vd, ok := d.(vaapiDialect); ok && vd.isAMD() && s.hdr {
+		return composeBurnAMDHDR(d, s)
+	}
 	n := 0
 	next := func() string { l := strconv.Itoa(n); n++; return l }
 	var b strings.Builder
@@ -669,6 +701,60 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 		out = o
 	}
 	return b.String(), "[" + out + "]"
+}
+
+// composeBurnAMDHDR emits the AMD-radeonsi-specific HDR shape. The
+// vf_inlineass AMD-Vulkan branch (fork patch 0127 v7) absorbs the HDR→SDR
+// tonemap into its single pl_render_image dispatch — no separate tonemap
+// stage exists or is supported on radeonsi. When there's no sub-burn,
+// `tonemap_only=1` lets the filter run for tonemap alone (no libass
+// refresh, no -map_inlineass binding required). Always invoked with
+// s.hdr == true; caller (composeBurn) gates entry.
+//
+// hdr_to_sdr=1 is the explicit rewriter-driven tonemap intent (0127 v7,
+// issue #137). Honors scaleplex policy "never inject tonemap; Plex's argv
+// decides" — composeBurn only routes here when facts.hdr is true (Plex's
+// graph carried a tonemap stage), so emitting hdr_to_sdr=1 mirrors that
+// intent. HDR-passthrough sessions (Plex sent no tonemap stage → s.hdr
+// false → caller stays on the Intel-style composeBurn path) never get this
+// flag and the AMD-Vulkan branch leaves source HDR colorimetry intact.
+func composeBurnAMDHDR(d dialect, s burnSpec) (filter, newLabel string) {
+	n := 0
+	next := func() string { l := strconv.Itoa(n); n++; return l }
+	var b strings.Builder
+	src := "[0:0]"
+	if !s.vaResident {
+		u := next()
+		fmt.Fprintf(&b, "%s%s[%s];", src, d.hwUploadFilter(), u)
+		src = "[" + u + "]"
+	}
+	// Carry HDR through the scale; the inlineass filter applies the HDR→SDR
+	// pl_tgt.color = pl_color_space_bt709 override gated on the
+	// hdr_to_sdr=1 AVOption emitted below.
+	scaled := next()
+	fmt.Fprintf(&b, "%s%s[%s]", src, d.scaleFilter(s.w, s.h, "p010"), scaled)
+	o := next()
+	if s.burnSub {
+		params := s.subParams
+		if params != "" {
+			params += ":"
+		}
+		params += fmt.Sprintf("render_height=%d", subRenderHeightCap())
+		if s.animatedTierDown {
+			params += ":animated_tier_down=1"
+		}
+		// Explicit HDR→SDR intent — see composeBurnAMDHDR doc.
+		params += ":hdr_to_sdr=1"
+		// VAAPI dialect's subBurnDownloadFilter() returns "" — vf_inlineass
+		// AMD-Vulkan consumes the VAAPI surface directly.
+		fmt.Fprintf(&b, ";[%s]inlineass=%s[%s]", scaled, params, o)
+	} else {
+		// No-sub HDR session: tonemap_only=1 + hdr_to_sdr=1. render_height +
+		// animated_tier_down are libass-render knobs; meaningless when libass
+		// is bypassed, so omitted to keep the argv minimal.
+		fmt.Fprintf(&b, ";[%s]inlineass=tonemap_only=1:hdr_to_sdr=1[%s]", scaled, o)
+	}
+	return b.String(), "[" + o + "]"
 }
 
 // reBitmapSubBranch extracts the bitmap subtitle stream spec from Plex's

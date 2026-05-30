@@ -209,3 +209,61 @@ func TestNvidiaDialect_SharedMaps(t *testing.T) {
 		}
 	}
 }
+
+// PickVaapiDialect routes to AMD vendor when the libva probe says radeonsi,
+// else Intel. Vendor-agnostic VAAPI methods (encode/decode/scale/...) stay
+// shared. #123.
+func TestPickVaapiDialect_VendorRouting(t *testing.T) {
+	orig := probeVAAPIDriverForDialect
+	t.Cleanup(func() { probeVAAPIDriverForDialect = orig })
+
+	cases := []struct {
+		probe      string
+		wantVendor string
+	}{
+		{"radeonsi", "amd"},
+		{"iHD", "intel"},
+		{"nvidia", "intel"}, // VAAPI-over-NVIDIA is unusual; default to Intel-shape
+		{"", "intel"},       // probe failure → default Intel (matches detectVAAPIDriver's iHD fallback)
+		{"some-future-driver", "intel"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.probe, func(t *testing.T) {
+			probeVAAPIDriverForDialect = func() string { return tc.probe }
+			d := pickVaapiDialect()
+			vd, ok := d.(vaapiDialect)
+			if !ok {
+				t.Fatalf("pickVaapiDialect returned non-vaapiDialect: %T", d)
+			}
+			if vd.vendor != tc.wantVendor {
+				t.Errorf("probe=%q: vendor=%q, want %q", tc.probe, vd.vendor, tc.wantVendor)
+			}
+		})
+	}
+}
+
+// selectDialect's "auto" branch + a render node + radeonsi probe → AMD vendor
+// end-to-end from the operator-facing knob.
+func TestSelectDialect_AMDAutoRoute(t *testing.T) {
+	origRender, origProbe, origDev := hasRenderNode, probeVAAPIDriverForDialect, deviceExists
+	t.Cleanup(func() {
+		hasRenderNode, probeVAAPIDriverForDialect, deviceExists = origRender, origProbe, origDev
+	})
+
+	hasRenderNode = func() bool { return true }
+	probeVAAPIDriverForDialect = func() string { return "radeonsi" }
+	deviceExists = func(string) bool { return false } // no NVIDIA device
+
+	t.Setenv("WORKER_BACKEND", "auto")
+	d := selectDialect()
+	if d.backendName() != "vaapi" {
+		t.Fatalf("backendName: got %q, want vaapi", d.backendName())
+	}
+	vd, ok := d.(vaapiDialect)
+	if !ok {
+		t.Fatalf("got %T, want vaapiDialect", d)
+	}
+	if !vd.isAMD() {
+		t.Errorf("isAMD: got false, want true (vendor=%q)", vd.vendor)
+	}
+}
