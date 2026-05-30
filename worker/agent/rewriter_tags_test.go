@@ -426,6 +426,7 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagInjectInitHWDevice":               "inject:init_hw_device+filter_hw_device",
 		"TagInjectSEIA53CC":                   "inject:sei+a53_cc",
 		"TagReplaceForeignInitHWDevice":       "replace:foreign-init_hw_device",
+		"TagStripVAAPIDriverParam":            "strip:init_hw_device:driver",
 		"TagToSWStripHWDecode":                "to-sw:strip-hwdecode",
 		"TagLoglevelInfo":                     "loglevel:->info",
 		"TagMapLabelUpdate":                   "map-label-update",

@@ -1757,7 +1757,11 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		sessionDir = opts.SessionDir
 	}
 
-	vaapiDriver := envOr("HW_VAAPI_DRIVER", "iHD")
+	// Default the VAAPI driver to whatever the local GPU's PCI vendor maps to
+	// (Intel=iHD, AMD=radeonsi, ...) — #124. Operator can pin with
+	// HW_VAAPI_DRIVER. Falls back to "iHD" on unknown vendor / probe failure
+	// (back-compat for the historical Intel fleet).
+	vaapiDriver := envOr("HW_VAAPI_DRIVER", detectVAAPIDriver())
 	// Image-resident defaults: Ubuntu's intel-media-va-driver-non-free
 	// installs iHD_drv_video.so under /usr/lib/x86_64-linux-gnu/dri and
 	// libva auto-discovers it. HW_LIBVA_DRIVERS_PATH only needs to be
@@ -2194,6 +2198,20 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						}
 					}
 					changes = append(changes, TagReplaceForeignInitHWDevice)
+				}
+			}
+		}
+		// Strip Plex's hardcoded `,driver=iHD` from a same-backend VAAPI
+		// init_hw_device — its presence forces libva to load iHD regardless of
+		// LIBVA_DRIVER_NAME env, breaking AMD radeonsi (or any non-Intel) hosts.
+		// With it stripped, libva falls back to LIBVA_DRIVER_NAME (set by the
+		// rewriter at the spawn-env section below) — vendor-aware default from
+		// detectVAAPIDriver(). #124.
+		if !honorSW && activeDialect.backendName() == "vaapi" {
+			if ihd := indexOfArg(args, "-init_hw_device", 0); ihd >= 0 && ihd+1 < len(args) {
+				if stripped := stripVAAPIDriverParam(args[ihd+1]); stripped != args[ihd+1] {
+					args[ihd+1] = stripped
+					changes = append(changes, TagStripVAAPIDriverParam)
 				}
 			}
 		}
