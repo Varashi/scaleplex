@@ -54,8 +54,13 @@ WORKER_MODE = os.environ.get("WORKER_MODE", "auto")
 if WORKER_MODE not in ("auto", "k8s", "docker"):
     sys.exit(f"WORKER_MODE={WORKER_MODE!r} invalid; expected 'auto', 'k8s', or 'docker'")
 WORKER_SSH = os.environ.get("WORKER_SSH", "")               # e.g. root@skw-d-frank.boeye.net
-WORKER_COMPOSE_DIR = os.environ.get("WORKER_COMPOSE_DIR", "/root/scaleplex-deploy")
+# Empty default so a plain `docker run` worker (no compose) doesn't accidentally
+# take the compose-recreate path in set_force_hw() and die in _ssh(check=True).
+# Set this when the external worker IS compose-managed.
+WORKER_COMPOSE_DIR = os.environ.get("WORKER_COMPOSE_DIR", "")
 WORKER_DOCKER_NAME = os.environ.get("WORKER_DOCKER_NAME", "scaleplex-deploy-worker-1")
+if WORKER_MODE == "docker" and not WORKER_SSH:
+    sys.exit("WORKER_MODE='docker' requires WORKER_SSH (e.g. root@host)")
 # Seconds to wait after a docker-worker recreate for the agent to boot +
 # PUSH-re-register with the orchestrator before driving sessions.
 WORKER_DOCKER_SETTLE = float(os.environ.get("WORKER_DOCKER_SETTLE", "18"))
@@ -164,8 +169,12 @@ def _use_k8s():
     if _k8s_available is None:
         try:
             _k8s_available = bool(worker_pods())
-        except Exception:
-            _k8s_available = False
+        except Exception as e:  # noqa: BLE001
+            # Don't memoize a probe failure (e.g. transient kubectl timeout) —
+            # next caller retries. Memoizing False would disable the k8s
+            # channel for the rest of the matrix on one flaky call.
+            print(f"  WARN: k8s worker probe failed: {e}; retrying on next use")
+            return False
     return _k8s_available
 
 
@@ -216,9 +225,17 @@ def worker_logs(since):
         for pod in worker_pods():
             out.append(kubectl("logs", pod, "-c", WORKER_CONTAINER, f"--since={since}").stdout)
     if _use_docker():
-        # Tolerant: transient ssh/docker hiccup shouldn't abort the matrix.
-        out.append(_ssh("docker logs {n} --since={s} 2>&1".format(
-            n=shlex.quote(WORKER_DOCKER_NAME), s=shlex.quote(since))).stdout)
+        # Tolerant: transient ssh/docker hiccup shouldn't abort the matrix, but
+        # surface the failure — a silent empty stdout collapses into bogus
+        # NODISPATCH for sessions that DID land on the external worker.
+        r = _ssh(
+            f"docker logs {shlex.quote(WORKER_DOCKER_NAME)} --since={shlex.quote(since)} 2>&1"
+        )
+        if r.returncode == 0:
+            out.append(r.stdout)
+        else:
+            print(f"  WARN: docker log collection failed (rc={r.returncode}): "
+                  f"{r.stderr.strip() or r.stdout.strip()}")
     return "\n".join(out)
 
 
