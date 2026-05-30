@@ -75,10 +75,10 @@ index 217211b..1c2f477 100644
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
 diff --git a/libavfilter/vf_inlineass.c b/libavfilter/vf_inlineass.c
-index eb41aa1..18dcfcf 100644
+index eb41aa1..4f1d7ad 100644
 --- a/libavfilter/vf_inlineass.c
 +++ b/libavfilter/vf_inlineass.c
-@@ -95,6 +95,34 @@
+@@ -95,6 +95,40 @@
  #define INLINEASS_CUDA_BLOCK_Y 16
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -107,13 +107,19 @@ index eb41aa1..18dcfcf 100644
 +#include <libplacebo/renderer.h>
 +#include <libplacebo/utils/libav.h>
 +#include <libplacebo/vulkan.h>
++/* drm_fourcc.h defines DRM_FORMAT_MOD_LINEAR (== 0ULL), the only modifier
++ * we currently advertise to RADV via VkImageDrmFormatModifierListCreateInfoEXT.
++ * Linear is universally supported on radeonsi, dma-buf-exportable, and
++ * trivially importable into the downstream VAAPI surface — the simplest
++ * shape that avoids the v2 NULL-deref crash. See TODO(amd-vk-v3a:probe). */
++#include <drm_fourcc.h>
 +#include "libavutil/hwcontext_vulkan.h"
 +#endif /* CONFIG_LIBPLACEBO_FILTER */
 +
  /* Display-window lifecycle for a single subtitle cue. Decoupled from
   * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
   * can share a small, testable primitive with the text path. INT64_MIN
-@@ -239,6 +267,43 @@ typedef struct {
+@@ -239,6 +273,54 @@ typedef struct {
      CUtexObject          cuda_bmp_tex[4];         /**< Y/U/V/A over cuda_bmp_overlay */
      int                  cuda_bmp_surf_w, cuda_bmp_surf_h;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
@@ -152,12 +158,23 @@ index eb41aa1..18dcfcf 100644
 +    pl_tex           amd_bmp_tex;         /**< cached RGBA bitmap texture (PGS path) */
 +    int              amd_bmp_tex_w;
 +    int              amd_bmp_tex_h;
++    /* DRM-modifier list chained into AVVulkanFramesContext.create_pnext when
++     * tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT. MUST outlive both
++     * av_hwframe_ctx_init AND every subsequent vulkan_pool_alloc — hwcontext
++     * _vulkan reads create_pnext on each pool grow (hwcontext_vulkan.c:2577,
++     * 2599). Embedded on AssContext so lifetime == filter lifetime, no
++     * separate free needed (the filter framework frees priv after uninit).
++     * The struct's pDrmFormatModifiers points at the adjacent
++     * amd_vk_mod_list[] buffer; do NOT reorder or move these two fields
++     * apart without re-pointing pDrmFormatModifiers in inlineass_amd_vk_config. */
++    uint64_t                                   amd_vk_mod_list[1];
++    VkImageDrmFormatModifierListCreateInfoEXT  amd_vk_mod_list_info;
 +    int              amd_active;          /**< 1 = AMD-Vulkan branch owns this filter instance */
 +#endif /* CONFIG_LIBPLACEBO_FILTER */
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -1465,6 +1530,610 @@ fail:
+@@ -1465,6 +1547,628 @@ fail:
  }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -366,6 +383,24 @@ index eb41aa1..18dcfcf 100644
 +        /* SAMPLED + TRANSFER bits are added automatically by
 +         * hwcontext_vulkan (see header doc on `usage`). */
 +        vk_hwctx->usage  = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++
++        /* DRM_FORMAT_MODIFIER_EXT tiling requires a modifier list in pNext —
++         * hwcontext_vulkan.c forwards VkImageCreateInfo straight to
++         * vkCreateImage with create_pnext as the pNext chain, no
++         * auto-discovery. Without this RADV null-derefs at [r14+0x10]
++         * picking a modifier (v2 SIGSEGV). LINEAR is the safe minimum:
++         * universally supported, dma-buf-exportable, trivially importable
++         * back into VAAPI for the downstream encoder.
++         * TODO(amd-vk-v3a:probe): probe RADV's supported tiled modifiers
++         * via vkGetPhysicalDeviceFormatProperties2 +
++         * VkDrmFormatModifierPropertiesList2EXT for a perf bump (DCC, etc.). */
++        ass->amd_vk_mod_list[0]                       = DRM_FORMAT_MOD_LINEAR;
++        ass->amd_vk_mod_list_info.sType               = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
++        ass->amd_vk_mod_list_info.pNext               = NULL;
++        ass->amd_vk_mod_list_info.drmFormatModifierCount = 1;
++        ass->amd_vk_mod_list_info.pDrmFormatModifiers = ass->amd_vk_mod_list;
++        vk_hwctx->create_pnext = &ass->amd_vk_mod_list_info;
++
 +        vk_hwctx->tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 +
 +        ret = av_hwframe_ctx_init(ass->amd_vk_frames_ref);
@@ -768,7 +803,7 @@ index eb41aa1..18dcfcf 100644
  /* ======================================================================== *
   *  init / uninit / format negotiation / link config (format-adaptive)      *
   * ======================================================================== */
-@@ -1620,6 +2289,26 @@ static av_cold void uninit(AVFilterContext *ctx)
+@@ -1620,6 +2324,26 @@ static av_cold void uninit(AVFilterContext *ctx)
      ass->cuda_hwctx = NULL;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -795,7 +830,7 @@ index eb41aa1..18dcfcf 100644
      /* scaleplex: serialise libass teardown against the decoder thread's
       * append/replay and another instance's render. libass shares
       * process-global state (fontconfig/freetype) that is NOT reentrant;
-@@ -1671,8 +2360,20 @@ static int config_input(AVFilterLink *link)
+@@ -1671,8 +2395,20 @@ static int config_input(AVFilterLink *link)
      AVFilterContext *avctx  = link->dst;
      AssContext      *ass    = avctx->priv;
  
@@ -817,7 +852,7 @@ index eb41aa1..18dcfcf 100644
  
  #if CONFIG_OVERLAY_CUDA_FILTER
      if (link->format == AV_PIX_FMT_CUDA)
-@@ -1802,6 +2503,12 @@ static int config_output(AVFilterLink *outlink)
+@@ -1802,6 +2538,12 @@ static int config_output(AVFilterLink *outlink)
      }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -830,7 +865,7 @@ index eb41aa1..18dcfcf 100644
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -2345,8 +3052,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+@@ -2345,8 +3087,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
      long long time_ms;
      int err;
  
