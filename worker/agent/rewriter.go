@@ -11,6 +11,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strconv"
@@ -525,6 +526,13 @@ func resolveTonemapConfig() tonemapConfig {
 	}
 	if cfg.d.backendName() == "vaapi" {
 		cfg.useOpenCL = !strings.EqualFold(os.Getenv("SCALEPLEX_TONEMAP"), "vaapi")
+		// AMD radeonsi has no tonemap_vaapi — only tonemap_opencl works.
+		// Force-override SCALEPLEX_TONEMAP=vaapi (which would otherwise emit
+		// a filter that fails at init on AMD). #123.
+		if vd, ok := cfg.d.(vaapiDialect); ok && vd.isAMD() && !cfg.useOpenCL {
+			log.Printf("SCALEPLEX_TONEMAP=vaapi ignored on AMD vendor (radeonsi has no tonemap_vaapi); forcing opencl")
+			cfg.useOpenCL = true
+		}
 	}
 	if a := strings.ToLower(os.Getenv("SCALEPLEX_TONEMAP_ALGO")); validTonemapAlgo(a) {
 		cfg.algo = a

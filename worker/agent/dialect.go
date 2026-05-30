@@ -155,11 +155,26 @@ type dialect interface {
 	subBurnDownloadFilter() string
 }
 
-// vaapiDialect — Intel iHD / VAAPI. The historical default; tested
-// against the full ~200-entry argv corpus.
-type vaapiDialect struct{}
+// vaapiDialect — VAAPI backend, vendor-branched. Intel iHD is the historical
+// default (tested against the full ~200-entry argv corpus). AMD radeonsi
+// (RX 6800+) shares the encode/decode/scale primitives, but diverges on
+// tonemap (no tonemap_vaapi on radeonsi — must route through tonemap_opencl
+// via the existing hwmap chain) and overlay (no overlay_vaapi → sub-burn is
+// Phase 2 via libplacebo+overlay_vulkan). Zero-value preserves intel-iHD
+// behavior so existing callers (var activeDialect = vaapiDialect{}) keep
+// working without touching every reference. #123.
+type vaapiDialect struct {
+	// vendor: "" / "intel" → iHD (default), "amd" → radeonsi. Selected at
+	// startup by selectDialect() from probeVAAPIDriver(). The
+	// non-divergent methods (encode/decode/scale/hwaccel/initHWDevice/
+	// hwupload/hwdownload) are vendor-agnostic.
+	vendor string
+}
 
 func (vaapiDialect) backendName() string { return "vaapi" }
+
+// isAMD is the convenience predicate for the vendor-branched methods.
+func (d vaapiDialect) isAMD() bool { return d.vendor == "amd" }
 
 func (vaapiDialect) encoderMap() map[string]string {
 	// Identical content to the package-level encoderMap var (kept for
@@ -190,7 +205,14 @@ func (vaapiDialect) scaleFilter(w, h, pix string) string {
 	return "scale_vaapi=w=" + w + ":h=" + h + ":format=" + pix
 }
 
-func (vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+func (d vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+	if d.isAMD() {
+		// radeonsi has no tonemap_vaapi (Intel iHD-only). AMD always tone-maps
+		// via tonemap_opencl — resolveTonemapConfig forces useOpenCL=true on
+		// AMD so tm.stage emits the hwmap→opencl chain and never calls this.
+		// Empty sentinel = "do not emit a single-stage HW tonemap on AMD".
+		return ""
+	}
 	// iHD fixed-curve BT.2390 EETF — no algo slot. Algo arg ignored.
 	return "tonemap_vaapi=transfer=bt709:format=" + pix
 }
@@ -199,7 +221,9 @@ func (vaapiDialect) hwUploadFilter() string   { return "hwupload" }
 func (vaapiDialect) hwDownloadFilter() string { return "hwdownload" }
 
 // vf_inlineass consumes the VAAPI surface directly (fork patch 0115) — no
-// download needed before the burn stage.
+// download needed before the burn stage. (AMD: patch 0115's HW branch
+// calls overlay_vaapi internally and would fail on radeonsi; the Phase 2
+// Vulkan path replaces this.)
 func (vaapiDialect) subBurnDownloadFilter() string { return "" }
 
 // swDialect — pure-software (CPU) transcode, for no-GPU fleet members in a
@@ -266,7 +290,7 @@ var activeDialect dialect = vaapiDialect{}
 func selectDialect() dialect {
 	switch want := strings.ToLower(strings.TrimSpace(os.Getenv("WORKER_BACKEND"))); want {
 	case "vaapi":
-		return vaapiDialect{}
+		return pickVaapiDialect()
 	case "nvenc", "nvidia": // "nvidia" kept as an operator-facing alias
 		return nvencDialect{}
 	case "sw", "cpu", "software":
@@ -276,12 +300,28 @@ func selectDialect() dialect {
 			return nvencDialect{}
 		}
 		if hasRenderNode() {
-			return vaapiDialect{}
+			return pickVaapiDialect()
 		}
 		// No NVIDIA device and no DRM render node → no usable GPU → CPU.
 		return swDialect{}
 	default:
 		log.Printf("WORKER_BACKEND=%q unknown; falling back to vaapi", want)
-		return vaapiDialect{}
+		return pickVaapiDialect()
 	}
+}
+
+// probeVAAPIDriverForDialect indirection — production hits the sync.Once'd
+// detectVAAPIDriver; tests swap it (the Once + module-level cache make
+// detectVAAPIDriver itself awkward to inject directly).
+var probeVAAPIDriverForDialect = detectVAAPIDriver
+
+// pickVaapiDialect chooses the VAAPI vendor at startup from the libva driver
+// name probed off /sys/class/drm/renderD*/device/vendor (detectVAAPIDriver,
+// #124). `radeonsi` → AMD branch (tonemap_opencl only, Phase 2 sub-burn);
+// anything else → Intel iHD (the historical default). #123.
+func pickVaapiDialect() dialect {
+	if probeVAAPIDriverForDialect() == "radeonsi" {
+		return vaapiDialect{vendor: "amd"}
+	}
+	return vaapiDialect{vendor: "intel"}
 }

@@ -30,6 +30,28 @@ func TestResolveTonemapConfig(t *testing.T) {
 	}
 }
 
+// AMD radeonsi has no tonemap_vaapi — resolveTonemapConfig must force
+// useOpenCL=true on the AMD vendor branch even when the operator pinned
+// SCALEPLEX_TONEMAP=vaapi (otherwise tm.stage would emit a tonemap_vaapi
+// filter that fails to init on radeonsi). #123.
+func TestResolveTonemapConfig_AMDForcesOpenCL(t *testing.T) {
+	withDialect(t, vaapiDialect{vendor: "amd"})
+	// Default (no env set) — opencl by default everywhere; just sanity.
+	if c := resolveTonemapConfig(); !c.useOpenCL {
+		t.Errorf("AMD default: want opencl, got %+v", c)
+	}
+	// Operator pin to vaapi must be ignored on AMD.
+	t.Setenv("SCALEPLEX_TONEMAP", "vaapi")
+	if c := resolveTonemapConfig(); !c.useOpenCL {
+		t.Errorf("AMD + SCALEPLEX_TONEMAP=vaapi: must still force opencl (tonemap_vaapi absent on radeonsi), got %+v", c)
+	}
+	// Intel must still honor the env pin (regression check on the AMD branch).
+	withDialect(t, vaapiDialect{vendor: "intel"})
+	if c := resolveTonemapConfig(); c.useOpenCL {
+		t.Errorf("Intel + SCALEPLEX_TONEMAP=vaapi: want fixed-curve (useOpenCL=false), got %+v", c)
+	}
+}
+
 // When PMS sends its own OpenCL tonemap chain, scaleplex re-emits it in
 // canonical comma form, preserving Plex's chosen algorithm — it does not
 // discard or override it.

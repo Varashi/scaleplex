@@ -161,6 +161,9 @@ func TestDialect_TonemapFilter(t *testing.T) {
 	}{
 		{"vaapi ignores algo", vaapiDialect{}, "hable", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
 		{"vaapi empty algo same", vaapiDialect{}, "", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
+		{"vaapi intel explicit — same as zero-value", vaapiDialect{vendor: "intel"}, "hable", "nv12", "tonemap_vaapi=transfer=bt709:format=nv12"},
+		{"vaapi AMD — empty (radeonsi has no tonemap_vaapi)", vaapiDialect{vendor: "amd"}, "hable", "nv12", ""},
+		{"vaapi AMD p010 — also empty", vaapiDialect{vendor: "amd"}, "mobius", "p010", ""},
 		{"nvidia hable nv12 — corpus shape", nvencDialect{}, "hable", "nv12", "tonemap_cuda=tonemap=hable:format=nv12"},
 		{"nvidia bt2390 nv12", nvencDialect{}, "bt2390", "nv12", "tonemap_cuda=tonemap=bt2390:format=nv12"},
 	}
@@ -207,5 +210,63 @@ func TestNvidiaDialect_SharedMaps(t *testing.T) {
 		if _, ok := n.hwDecodeShortCodecs()[k]; !ok {
 			t.Errorf("hwDecodeShortCodecs[%q]: present on vaapi, missing on nvidia", k)
 		}
+	}
+}
+
+// PickVaapiDialect routes to AMD when the libva probe says radeonsi, else
+// Intel. Vendor-agnostic VAAPI methods (encode/decode/scale/...) stay shared
+// — only tonemap diverges (validated in TestDialect_TonemapFilter). #123.
+func TestPickVaapiDialect_VendorRouting(t *testing.T) {
+	orig := probeVAAPIDriverForDialect
+	t.Cleanup(func() { probeVAAPIDriverForDialect = orig })
+
+	cases := []struct {
+		probe      string
+		wantVendor string
+	}{
+		{"radeonsi", "amd"},
+		{"iHD", "intel"},
+		{"nvidia", "intel"},          // VAAPI-over-NVIDIA is unusual; default to Intel-shape (encode methods unchanged)
+		{"", "intel"},                // probe failure → default Intel (matches detectVAAPIDriver's iHD fallback)
+		{"some-future-driver", "intel"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.probe, func(t *testing.T) {
+			probeVAAPIDriverForDialect = func() string { return tc.probe }
+			d := pickVaapiDialect()
+			vd, ok := d.(vaapiDialect)
+			if !ok {
+				t.Fatalf("pickVaapiDialect returned non-vaapiDialect: %T", d)
+			}
+			if vd.vendor != tc.wantVendor {
+				t.Errorf("probe=%q: vendor=%q, want %q", tc.probe, vd.vendor, tc.wantVendor)
+			}
+		})
+	}
+}
+
+// selectDialect's "auto" branch + a render node + radeonsi probe → AMD vendor
+// (proves the vendor branch runs end-to-end from the operator-facing knob).
+func TestSelectDialect_AMDAutoRoute(t *testing.T) {
+	origRender, origProbe := hasRenderNode, probeVAAPIDriverForDialect
+	t.Cleanup(func() { hasRenderNode, probeVAAPIDriverForDialect = origRender, origProbe })
+
+	hasRenderNode = func() bool { return true }
+	probeVAAPIDriverForDialect = func() string { return "radeonsi" }
+	deviceExistsOrig := deviceExists
+	deviceExists = func(string) bool { return false } // no NVIDIA device
+	t.Cleanup(func() { deviceExists = deviceExistsOrig })
+
+	t.Setenv("WORKER_BACKEND", "auto")
+	d := selectDialect()
+	if d.backendName() != "vaapi" {
+		t.Fatalf("backendName: got %q, want vaapi", d.backendName())
+	}
+	vd, ok := d.(vaapiDialect)
+	if !ok {
+		t.Fatalf("got %T, want vaapiDialect", d)
+	}
+	if !vd.isAMD() {
+		t.Errorf("isAMD: got false, want true (vendor=%q)", vd.vendor)
 	}
 }
