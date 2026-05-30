@@ -450,6 +450,9 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 			seekOffsetSeconds = res.SeekOffsetSeconds
 			isMatroskaSegment = res.IsMatroskaSegment
 			metricRewriteApplied.WithLabelValues("applied").Inc()
+			// #113: VAAPI-canonical filter-tag substrings (inlineass-vaapi etc.) are
+			// rewritten to the target backend's names after a cross-backend reshape.
+			relabelCrossBackendTags(res.Changes)
 			log.Printf("session %s: rewriter applied: %s", req.SessionID, strings.Join(res.Changes, ","))
 		} else {
 			reason := "unknown"

@@ -1,5 +1,55 @@
 package main
 
+import "strings"
+
+// relabelCrossBackendTags rewrites VAAPI-canonical filter-tag substrings to the
+// target backend's names after a cross-backend reshape (#113). The Tag* / TagPrefix*
+// constants are VAAPI-canonical (e.g. `inlineass-vaapi`, `opencl-tonemap->vaapi`)
+// because VAAPI was the first backend implemented; a cross-backend retarget to
+// NVENC actually executes the CUDA branch (`inlineass(CUDA)`, `tonemap_cuda`), so
+// the emitted tags misrepresented the executed graph (320/320 nvenc PASS still
+// logged `inlineass-vaapi`). This post-processes res.Changes in place; only the
+// log + matrix consumers see tags so a string-level rewrite is safe.
+//
+// Mutates `tags` in place. No-op when there's no `cross-backend:*->X` marker or
+// the target backend is the canonical one (vaapi).
+func relabelCrossBackendTags(tags []string) {
+	target := ""
+	for _, t := range tags {
+		if strings.HasPrefix(t, "cross-backend:") {
+			if i := strings.LastIndex(t, "->"); i > 0 {
+				target = t[i+2:]
+			}
+			break
+		}
+	}
+	if target == "" || target == "vaapi" {
+		return
+	}
+	var rep [][2]string
+	switch target {
+	case "nvenc":
+		// Order matters: replace the longer/more-specific strings first so a
+		// later replacement doesn't accidentally rewrite a subspan.
+		rep = [][2]string{
+			{"bitmap-inlineass-vaapi", "bitmap-inlineass-cuda"},
+			{"opencl-tonemap->vaapi", "tonemap_cuda"},
+			{"tonemap_opencl-normalized", "tonemap_cuda-normalized"},
+			{"inlineass-vaapi", "inlineass-cuda"},
+		}
+	default:
+		return
+	}
+	for i, t := range tags {
+		for _, kv := range rep {
+			if strings.Contains(t, kv[0]) {
+				t = strings.ReplaceAll(t, kv[0], kv[1])
+			}
+		}
+		tags[i] = t
+	}
+}
+
 // Rewriter change-tag inventory — single source of truth for the strings the
 // rewriter emits via res.Changes (and the bail()/scrub() variants). Live
 // docs (docs/CLIENT_TEST_MATRIX.md, docs/REWRITER.md) and runtime tools
