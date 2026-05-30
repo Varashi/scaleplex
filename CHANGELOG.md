@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.2](https://github.com/Varashi/scaleplex/compare/v1.10.1...v1.10.2) (2026-05-30)
+
+
+### Fixes
+
+* **worker:** relabel rewriter tags after cross-backend reshape ([#113](https://github.com/Varashi/scaleplex/issues/113)) ([#119](https://github.com/Varashi/scaleplex/issues/119)) ([14b2757](https://github.com/Varashi/scaleplex/commit/14b2757bf05570ee636dd2a8e6bdbfb909876d8b))
+
 ## [1.10.1](https://github.com/Varashi/scaleplex/compare/v1.10.0...v1.10.1) (2026-05-29)
 
 
