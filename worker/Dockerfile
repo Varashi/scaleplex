@@ -40,6 +40,16 @@ LABEL org.opencontainers.image.licenses=MIT
 # userspace, same as jellyfin-ffmpeg). CUDA runtime libs come from the
 # base image; NVENC/NVDEC encoder libs (libnvidia-encode, libnvcuvid)
 # are bound in at runtime via nvidia-container-toolkit's CDI spec.
+#
+# AMD radeonsi support (#123): mesa-va-drivers ships radeonsi_drv_video.so
+# with the matching libva ABI under /usr/lib/x86_64-linux-gnu/dri/ so libva
+# auto-discovers it from the default search path (no LIBVA_DRIVERS_PATH
+# override). The scaleplex-ffmpeg deb bundles a (stale-ABI) copy under
+# /usr/lib/scaleplex-ffmpeg/lib/dri/ — left in place but not on the default
+# search path; the rewriter routes via the vendor-aware default driver
+# (#124). mesa-opencl-icd registers the rusticl/Clover platform that
+# `tonemap_opencl` needs on AMD (Intel keeps intel-opencl-icd; NVIDIA uses
+# the CUDA OpenCL ICD from the base image).
 COPY scaleplex-ffmpeg/dist/scaleplex-ffmpeg7_*.deb /tmp/
 RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|' \
       /etc/apt/sources.list.d/ubuntu.sources && \
@@ -48,6 +58,8 @@ RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|'
       /tmp/scaleplex-ffmpeg7_*.deb \
       intel-media-va-driver-non-free \
       intel-opencl-icd \
+      mesa-va-drivers \
+      mesa-opencl-icd \
       libva2 libva-drm2 \
       vainfo \
       fontconfig fonts-dejavu-core \
