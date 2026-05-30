@@ -1491,6 +1491,98 @@ func dropFramedropBSF(args []string) ([]string, []string) {
 	return args, dropped
 }
 
+// scrubPlexInlineassFilesystemPaths removes PMS-install-only AVOption
+// keys (`font_path`, `fontconfig_file`) from every `inlineass=` node in
+// a -filter_complex graph. PMS emits absolute paths that exist only on
+// the Plex Media Server install (`/usr/lib/plexmediaserver/Resources/
+// Fonts/NotoSans-Medium.otf`, `/usr/lib/plexmediaserver/Resources/
+// fonts.conf`); the worker image has neither file, so vf_inlineass +
+// libass fontconfig init fails and ffmpeg exits 145 on every force-burn
+// session. Without those keys, libass falls back to the worker's
+// FONTCONFIG_FILE env (/opt/scaleplex/fonts.conf) and the default font
+// name "DejaVu Sans" hardcoded in fork patch 0099 — visually similar
+// sans-serif coverage, no broken renders.
+//
+// Top-level `inlineass=` pairs are `:`-separated. `overrides=` is the
+// only value containing `,` and `=`; verified across the argv corpus
+// (2026-05-12) that no top-level `:` appears inside any inlineass key
+// value — same assumption as plexInlineassToForceStyle and the retired
+// stripPlexInlineassFilterArgs (deleted in d82374e; that one stripped
+// styling keys the fork couldn't parse pre-0119, but never touched the
+// filesystem-path keys, leaving the latent libass bug to surface once
+// uid:1000 made the fontconfig cache write unauthorized too).
+//
+// Idempotent. Returns the (possibly rewritten) graph + true if any pair
+// was stripped.
+func scrubPlexInlineassFilesystemPaths(filterStr string) (string, bool) {
+	if !strings.Contains(filterStr, "inlineass=") {
+		return filterStr, false
+	}
+	stripKeys := map[string]bool{
+		"font_path":       true,
+		"fontconfig_file": true,
+	}
+	var out strings.Builder
+	out.Grow(len(filterStr))
+	changed := false
+	i := 0
+	for {
+		j := strings.Index(filterStr[i:], "inlineass=")
+		if j < 0 {
+			out.WriteString(filterStr[i:])
+			break
+		}
+		j += i
+		out.WriteString(filterStr[i : j+len("inlineass=")])
+		k := j + len("inlineass=")
+		segEnd := len(filterStr)
+		if end := strings.IndexAny(filterStr[k:], "[;"); end >= 0 {
+			segEnd = k + end
+		}
+		segment := filterStr[k:segEnd]
+		pairs := strings.Split(segment, ":")
+		kept := pairs[:0]
+		for _, p := range pairs {
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) == 2 && stripKeys[kv[0]] {
+				changed = true
+				continue
+			}
+			kept = append(kept, p)
+		}
+		out.WriteString(strings.Join(kept, ":"))
+		i = segEnd
+	}
+	return out.String(), changed
+}
+
+// scrubPlexInlineassFilesystemPathsInArgs runs
+// scrubPlexInlineassFilesystemPaths over every `-filter_complex` value
+// in args. Returns the new slice and true if any value was scrubbed.
+// Safe on the input slice — only clones on first write so a no-op pass
+// returns the original.
+func scrubPlexInlineassFilesystemPathsInArgs(args []string) ([]string, bool) {
+	out := args
+	cloned := false
+	didAny := false
+	for i := 0; i+1 < len(out); i++ {
+		if out[i] != "-filter_complex" {
+			continue
+		}
+		newVal, did := scrubPlexInlineassFilesystemPaths(out[i+1])
+		if !did {
+			continue
+		}
+		if !cloned {
+			out = append([]string(nil), args...)
+			cloned = true
+		}
+		out[i+1] = newVal
+		didAny = true
+	}
+	return out, didAny
+}
+
 // rewriteManifestName rewrites `-manifest_name <url>` in-place: the
 // loopback URL (which workers can't reach) becomes the relay's base
 // URL, with X_PLEX_TOKEN appended. ffmpeg then PUTs the manifest body
@@ -1856,6 +1948,25 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 
 	changes := []string{}
 
+	// Scrub Plex's PMS-install-only AVOption keys (`font_path`,
+	// `fontconfig_file`) from every inlineass= filter node. PMS's argv
+	// embeds absolute paths under /usr/lib/plexmediaserver/Resources/...
+	// that don't exist on the worker image; libass fails fontconfig init
+	// and ffmpeg exits 145 on ALL force-burn sessions
+	// ([[project_scaleplex_sub_burn_prod_bug_2026_05_30]]). Runs before
+	// the bail closure is defined so both the bail path (which re-clones
+	// inputArgs) and the main reshape path see the cleaned graph — fixes
+	// the SW-passthrough case (rewriter applies skip:no-decoder bail but
+	// leaves Plex's libx264+inlineass argv otherwise untouched) and the
+	// HW-reshape case (extractGraphFacts now captures scrubbed params)
+	// from the single call site.
+	inlineassPathsScrubbed := false
+	if scrubbed, did := scrubPlexInlineassFilesystemPathsInArgs(inputArgs); did {
+		inputArgs = scrubbed
+		inlineassPathsScrubbed = true
+		changes = append(changes, TagFilterInlineassScrubPlexFontPaths)
+	}
+
 	// Tone-mapping backend (opencl vs vaapi) for the tonemap Plex's
 	// argv asked for. scaleplex never decides whether to tonemap.
 	tm := resolveTonemapConfig()
@@ -1974,9 +2085,14 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		}
 		merged = append(merged, TagPrefixSkip+reason)
 		// Applied=true whenever we mutated argv (scrub, hint drops,
-		// EAE swap/prefix-drop, or framedrop-BSF drop), so the worker
-		// uses our rewritten copy instead of the input.
-		applied := len(scrub) > 0 || len(hintChanges) > 0 ||
+		// EAE swap/prefix-drop, framedrop-BSF drop, OR the top-of-
+		// Rewrite inlineass font-path scrub that ran on inputArgs
+		// before bail() was invoked — without that bit the caller
+		// would see Applied=false on a scrub-only bail and execute
+		// the unsanitized original argv, re-triggering the very
+		// libass fontconfig exit-145 the scrub exists to prevent).
+		applied := inlineassPathsScrubbed ||
+			len(scrub) > 0 || len(hintChanges) > 0 ||
 			len(eaeSwapped) > 0 || len(eaeDropped) > 0 ||
 			len(fdDropped) > 0
 		return RewriteResult{

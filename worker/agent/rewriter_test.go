@@ -1753,6 +1753,265 @@ func TestPlexInlineassToForceStyle_Empty(t *testing.T) {
 	}
 }
 
+// scrubPlexInlineassFilesystemPaths must drop font_path + fontconfig_file
+// (PMS-install-only absolute paths the worker can't honor) and leave the
+// rest of Plex's inlineass node intact. The exact argv shape is taken
+// from a live force-burn session that hit the exit-145 fontconfig bug on
+// prod 2026-05-30/31 (worker exits 145 with "Cannot load config file
+// /usr/lib/plexmediaserver/Resources/fonts.conf"). Idempotent.
+func TestScrubPlexInlineassFilesystemPaths(t *testing.T) {
+	cases := []struct {
+		name           string
+		in             string
+		wantChanged    bool
+		wantContains   []string
+		wantNotContain []string
+	}{
+		{
+			name: "HW-reshape graph (live prod argv shape)",
+			in: "[0:#0x01]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1];[1]hwdownload,format=nv12[2];" +
+				"[2]inlineass=font_scale=1.000000:" +
+				"font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:" +
+				"fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:" +
+				"language=en:overrides=ScaledBorderAndShadow=yes,FontName=Noto Sans Medium," +
+				"Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000:" +
+				"outline=2.6:shadow=1.7:font_size=54[3];[3]hwupload[4]",
+			wantChanged: true,
+			wantContains: []string{
+				"hwupload[0]", "scale_vaapi=w=1920:h=1080",
+				"font_scale=1.000000", "language=en", "overrides=ScaledBorderAndShadow",
+				"FontName=Noto Sans Medium", "outline=2.6", "shadow=1.7", "font_size=54",
+			},
+			wantNotContain: []string{
+				"font_path=", "fontconfig_file=",
+				"/usr/lib/plexmediaserver/",
+			},
+		},
+		{
+			name: "SW-passthrough graph (libx264 path)",
+			in: "[0:#0x01]scale=w=1920:h=1080:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];" +
+				"[1]inlineass=font_scale=1.0:" +
+				"font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:" +
+				"fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:" +
+				"language=en:outline=2.6:shadow=1.7:font_size=54[2]",
+			wantChanged: true,
+			wantContains: []string{
+				"scale=w=1920", "font_scale=1.0", "language=en", "outline=2.6",
+			},
+			wantNotContain: []string{
+				"font_path=", "fontconfig_file=", "/usr/lib/plexmediaserver/",
+			},
+		},
+		{
+			name:           "no inlineass node — passthrough",
+			in:             "[0:0]hwupload[0];[0]scale_vaapi=w=1280:h=720:format=nv12[1];[1]hwupload[2]",
+			wantChanged:    false,
+			wantContains:   []string{"scale_vaapi=w=1280:h=720"},
+			wantNotContain: []string{"font_path=", "fontconfig_file="},
+		},
+		{
+			name:           "inlineass without the scrubbed keys — passthrough",
+			in:             "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1];[1]inlineass=font_size=54:outline=2:shadow=1[2];[2]hwupload[3]",
+			wantChanged:    false,
+			wantContains:   []string{"inlineass=font_size=54:outline=2:shadow=1"},
+			wantNotContain: []string{"font_path=", "fontconfig_file="},
+		},
+		{
+			name: "two inlineass nodes — both scrubbed",
+			in: "[0]inlineass=font_path=/a:font_size=12[1];" +
+				"[2]inlineass=fontconfig_file=/b:font_size=24[3]",
+			wantChanged: true,
+			wantContains: []string{
+				"inlineass=font_size=12", "inlineass=font_size=24",
+			},
+			wantNotContain: []string{
+				"font_path=", "fontconfig_file=", "/a", "/b",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := scrubPlexInlineassFilesystemPaths(tc.in)
+			if changed != tc.wantChanged {
+				t.Errorf("changed=%v, want %v\n  in:  %s\n  out: %s", changed, tc.wantChanged, tc.in, got)
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(got, want) {
+					t.Errorf("output missing %q\n  out: %s", want, got)
+				}
+			}
+			for _, bad := range tc.wantNotContain {
+				if strings.Contains(got, bad) {
+					t.Errorf("output should not contain %q\n  out: %s", bad, got)
+				}
+			}
+			// Idempotency.
+			got2, changed2 := scrubPlexInlineassFilesystemPaths(got)
+			if changed2 {
+				t.Errorf("second pass reports change (not idempotent)\n  out: %s", got2)
+			}
+			if got2 != got {
+				t.Errorf("second pass mutates output (not idempotent)\n  pass1: %s\n  pass2: %s", got, got2)
+			}
+		})
+	}
+}
+
+// scrubPlexInlineassFilesystemPathsInArgs only rewrites -filter_complex
+// values that need it; other args (including other -filter_complex
+// values without inlineass) pass through.
+func TestScrubPlexInlineassFilesystemPathsInArgs(t *testing.T) {
+	args := []string{
+		"-i", "/tmp/in.mp4",
+		"-filter_complex", "[0:0]scale=w=1280:h=720[1]", // no inlineass, untouched
+		"-filter_complex", "[0:0]inlineass=font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:font_size=54[1]",
+		"-f", "dash",
+	}
+	out, did := scrubPlexInlineassFilesystemPathsInArgs(args)
+	if !did {
+		t.Fatalf("expected scrub to fire")
+	}
+	if len(out) != len(args) || out[0] != "-i" || out[1] != "/tmp/in.mp4" ||
+		out[2] != "-filter_complex" || out[4] != "-filter_complex" ||
+		out[6] != "-f" || out[7] != "dash" {
+		t.Fatalf("arg structure mutated: %v", out)
+	}
+	if out[3] != "[0:0]scale=w=1280:h=720[1]" {
+		t.Errorf("first filter_complex (no inlineass) unexpectedly changed: %q", out[3])
+	}
+	if strings.Contains(out[5], "font_path=") || strings.Contains(out[5], "plexmediaserver") {
+		t.Errorf("second filter_complex still carries PMS paths: %q", out[5])
+	}
+	if !strings.Contains(out[5], "font_size=54") {
+		t.Errorf("second filter_complex lost legitimate font_size: %q", out[5])
+	}
+	// No-op pass returns the original slice (or equivalent).
+	out2, did2 := scrubPlexInlineassFilesystemPathsInArgs(out)
+	if did2 {
+		t.Errorf("idempotent pass reports change")
+	}
+	if len(out2) != len(out) {
+		t.Errorf("idempotent pass mutated arg count: %d -> %d", len(out), len(out2))
+	}
+}
+
+// End-to-end regression: a live HW-reshape force-burn argv (the shape
+// captured 2026-05-31 on prod that hit exit-145) must come out of
+// Rewrite without the two PMS-install-only inlineass keys, and the
+// scrub tag must land in res.Changes. Covers both SW-passthrough bail
+// paths (when the rewriter skips reshape) and HW-reshape paths (when
+// extractGraphFacts captures already-scrubbed params).
+func TestRewriter_ScrubsPlexInlineassFilesystemPaths(t *testing.T) {
+	// SW-passthrough shape: Plex Optimize MP4 (libx264) target with
+	// inlineass burn — the worker bails on no-decoder for this shape
+	// (Plex provides Optimize's bare codec hints, no -i decoder), so
+	// without the top-level scrub the filter graph used to pass through
+	// verbatim and ffmpeg would exit 145.
+	args := []string{
+		"-codec:#0x01", "hevc",
+		"-codec:#0x02", "aac",
+		"-i", "/media/in.mp4",
+		"-i", "/transcode/temp-0.srt",
+		"-start_at_zero", "-copyts",
+		"-fps_mode", "cfr",
+		"-y", "-nostats", "-loglevel", "quiet",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:#0x01]scale=w=1920:h=1080:force_divisible_by=4[0];[0]format=pix_fmts=yuv420p|nv12[1];" +
+			"[1]inlineass=font_scale=1.000000:" +
+			"font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:" +
+			"fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:" +
+			"language=en:overrides=ScaledBorderAndShadow=yes,FontName=Noto Sans Medium," +
+			"Bold=500,PrimaryColour=&H00FFFFFF,OutlineColour=&H00020713,BackColour=&HCC000000:" +
+			"outline=2.6:shadow=1.7:font_size=54[2]",
+		"-map", "[2]",
+		"-codec:0", "libx264",
+		"-crf:0", "16",
+		"-f", "dash",
+		"-map", "1:s:0", "-f", "null", "-codec", "ass", "nullfile",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("rewriter did not apply: %v", out.Changes)
+	}
+	if !containsString(out.Changes, TagFilterInlineassScrubPlexFontPaths) {
+		t.Errorf("expected change tag %q, got %v", TagFilterInlineassScrubPlexFontPaths, out.Changes)
+	}
+	fcIdx := -1
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] == "-filter_complex" && strings.Contains(out.Args[i+1], "inlineass=") {
+			fcIdx = i + 1
+			break
+		}
+	}
+	if fcIdx < 0 {
+		t.Fatalf("no -filter_complex with inlineass in output args: %v", out.Args)
+	}
+	fc := out.Args[fcIdx]
+	for _, bad := range []string{
+		"font_path=", "fontconfig_file=", "/usr/lib/plexmediaserver/",
+	} {
+		if strings.Contains(fc, bad) {
+			t.Errorf("rewritten filter_complex still contains %q\n  out: %s", bad, fc)
+		}
+	}
+	for _, want := range []string{
+		"inlineass=", "font_scale=1.000000", "language=en",
+		"outline=2.6", "shadow=1.7", "font_size=54",
+		"overrides=ScaledBorderAndShadow",
+	} {
+		if !strings.Contains(fc, want) {
+			t.Errorf("rewritten filter_complex missing %q\n  out: %s", want, fc)
+		}
+	}
+}
+
+// CodeRabbit finding (PR #138): on a bail path where the ONLY mutation
+// was the top-of-Rewrite inlineass scrub (no EAE swap, no framedrop BSF,
+// no input-hint drops, no -progressurl/-segment_list scrub), the
+// bail-local `applied` calc used to be false → caller would think no
+// rewrite happened and execute the ORIGINAL unsanitized argv, defeating
+// the scrub entirely. Regression test: minimal argv that bails
+// no-decoder (no -codec:0 before -i) but carries the PMS font paths in
+// -filter_complex must come back Applied=true AND with the scrub
+// applied to args.
+func TestRewriter_BailWithOnlyInlineassScrub_AppliedTrue(t *testing.T) {
+	args := []string{
+		"-i", "/tmp/in.mp4",
+		"-filter_complex", "[0:0]inlineass=font_path=/usr/lib/plexmediaserver/Resources/Fonts/NotoSans-Medium.otf:" +
+			"fontconfig_file=/usr/lib/plexmediaserver/Resources/fonts.conf:" +
+			"font_size=54[1]",
+		"-f", "mp4",
+		"/tmp/out.mp4",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("Applied=false on scrub-only bail; caller would execute unsanitized argv. changes=%v args=%v", out.Changes, out.Args)
+	}
+	if !containsString(out.Changes, TagFilterInlineassScrubPlexFontPaths) {
+		t.Errorf("expected change tag %q in %v", TagFilterInlineassScrubPlexFontPaths, out.Changes)
+	}
+	// Confirm we actually bailed (not took the main path).
+	bailed := false
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "skip:") {
+			bailed = true
+			break
+		}
+	}
+	if !bailed {
+		t.Fatalf("expected a skip: bail tag in changes (this test repros the scrub-only-on-bail path); changes=%v", out.Changes)
+	}
+	// And the args returned to the caller no longer carry the PMS paths.
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] != "-filter_complex" {
+			continue
+		}
+		if strings.Contains(out.Args[i+1], "font_path=") || strings.Contains(out.Args[i+1], "/usr/lib/plexmediaserver/") {
+			t.Errorf("rewritten -filter_complex still carries PMS paths: %q", out.Args[i+1])
+		}
+	}
+}
+
 // HDR source + a plain SDR-target argv: scaleplex does NOT inject a
 // tonemap. A plain chain with no tonemap filter is exactly what Plex
 // emits when HW tone mapping is off — Plex then does no tonemapping

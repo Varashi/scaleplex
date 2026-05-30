@@ -69,20 +69,21 @@ func relabelCrossBackendTags(tags []string) {
 // Full-literal tags — exact strings rewriter.go emits via
 // `append(changes, "<literal>")`.
 const (
-	TagAddMapInlineass               = "add:-map_inlineass"
-	TagBailSegmentListRewriteToRelay = "bail:segment_list:rewrite-to-relay"
-	TagCanThrottleDisabledByEnv      = "canthrottle:disabled-by-env"
-	TagDropEAEPrefixBail             = "drop:-eae_prefix(bail)"
-	TagDropInlineassDecodeSink       = "drop:inlineass-decode-sink"
-	TagDropNostats                   = "drop:-nostats"
-	TagDropProgressurlBail           = "drop:-progressurl(bail)"
-	TagEnvHOME                       = "env:HOME"
-	TagEnvLIBVA                      = "env:LIBVA"
-	TagFilterTonemapOpenCLNormalized = "filter:tonemap_opencl-normalized"
-	TagFilterTonemapOpenCLToVAAPI    = "filter:tonemap_opencl->tonemap_vaapi"
-	TagForceHWWouldHonorHWDecSWEnc   = "force-hw:would-honor-hwdec-swenc"
-	TagForceHWWouldHonorSW           = "force-hw:would-honor-sw"
-	TagPassGateDenied                = "pass-gate:denied-honor-sw" // #78 — no active Plex Pass → HW re-accel denied
+	TagAddMapInlineass                   = "add:-map_inlineass"
+	TagBailSegmentListRewriteToRelay     = "bail:segment_list:rewrite-to-relay"
+	TagCanThrottleDisabledByEnv          = "canthrottle:disabled-by-env"
+	TagDropEAEPrefixBail                 = "drop:-eae_prefix(bail)"
+	TagDropInlineassDecodeSink           = "drop:inlineass-decode-sink"
+	TagDropNostats                       = "drop:-nostats"
+	TagDropProgressurlBail               = "drop:-progressurl(bail)"
+	TagEnvHOME                           = "env:HOME"
+	TagEnvLIBVA                          = "env:LIBVA"
+	TagFilterInlineassScrubPlexFontPaths = "filter:inlineass:scrub-plex-font-paths"
+	TagFilterTonemapOpenCLNormalized     = "filter:tonemap_opencl-normalized"
+	TagFilterTonemapOpenCLToVAAPI        = "filter:tonemap_opencl->tonemap_vaapi"
+	TagForceHWWouldHonorHWDecSWEnc       = "force-hw:would-honor-hwdec-swenc"
+	TagForceHWWouldHonorSW               = "force-hw:would-honor-sw"
+	TagPassGateDenied                    = "pass-gate:denied-honor-sw" // #78 — no active Plex Pass → HW re-accel denied
 
 	TagHLSSegmentListRewriteToRelay     = "hls:segment_list:rewrite-to-relay"
 	TagHWDecodeFilterBitmapInlineassVA  = "hw-decode:filter:bitmap-inlineass-vaapi"
