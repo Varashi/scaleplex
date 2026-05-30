@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.11.0](https://github.com/Varashi/scaleplex/compare/v1.10.2...v1.11.0) (2026-05-30)
+
+
+### Features
+
+* **amd:** radeonsi vendor branch + GPU-resident sub-burn & HDR tonemap via libplacebo ([#123](https://github.com/Varashi/scaleplex/issues/123)) ([#135](https://github.com/Varashi/scaleplex/issues/135)) ([489527c](https://github.com/Varashi/scaleplex/commit/489527c27fdd0e9c3c04ab7229871eda650edc6a))
+* **worker/image:** add mesa-va-drivers + mesa-opencl-icd for AMD ([#123](https://github.com/Varashi/scaleplex/issues/123)) ([#131](https://github.com/Varashi/scaleplex/issues/131)) ([c4d67ea](https://github.com/Varashi/scaleplex/commit/c4d67eae3db502b115e36a42532bb702d48f3de6))
+
+
+### Fixes
+
+* **shim:** query local Plex API for Pass state + tests ([#126](https://github.com/Varashi/scaleplex/issues/126), [#127](https://github.com/Varashi/scaleplex/issues/127)) ([#133](https://github.com/Varashi/scaleplex/issues/133)) ([40fb784](https://github.com/Varashi/scaleplex/commit/40fb7849ebf477c09d6bed32176d1dd781058612))
+* **worker:** scrub Plex inlineass font_path/fontconfig_file in -filter_complex ([#138](https://github.com/Varashi/scaleplex/issues/138)) ([6a446c8](https://github.com/Varashi/scaleplex/commit/6a446c8237fa839274e4776d9c148a39840ec37d))
+* **worker:** vendor-aware VAAPI driver detection ([#124](https://github.com/Varashi/scaleplex/issues/124)) ([#130](https://github.com/Varashi/scaleplex/issues/130)) ([05a65de](https://github.com/Varashi/scaleplex/commit/05a65def3dda6304b1a1e375d7f108e5f86e5987))
+
 ## [1.10.2](https://github.com/Varashi/scaleplex/compare/v1.10.1...v1.10.2) (2026-05-30)
 
 
