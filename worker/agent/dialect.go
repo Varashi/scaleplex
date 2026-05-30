@@ -204,7 +204,23 @@ func (vaapiDialect) scaleFilter(w, h, pix string) string {
 	return "scale_vaapi=w=" + w + ":h=" + h + ":format=" + pix
 }
 
-func (vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+func (d vaapiDialect) tonemapFilter(_ /* algo */, pix string) string {
+	if d.isAMD() {
+		// AMD radeonsi has no tonemap_vaapi (Intel-iHD-only); tonemap_opencl
+		// via VAAPI↔OpenCL derive is broken on mesa-opencl-icd (PR #134
+		// closed). The HDR→SDR pass is absorbed into vf_inlineass's
+		// AMD-Vulkan branch (fork patch 0127 v6) — same pl_render_image
+		// dispatch as the sub-burn, libplacebo handles tone-curve when
+		// pl_src.color is HDR + pl_tgt.color is bt709 SDR.
+		//
+		// composeBurn's AMD-HDR branch (composeBurnAMDHDR) never calls
+		// tonemapFilter — it goes straight to `inlineass[=tonemap_only=1]`.
+		// Returning empty here means: if any non-composeBurn caller asks
+		// for an HDR stage on AMD, the emitted filtergraph has a visible
+		// hole, which is the right failure mode (loud, immediate) for a
+		// path the AMD work hasn't covered yet.
+		return ""
+	}
 	// iHD fixed-curve BT.2390 EETF — no algo slot. Algo arg ignored.
 	return "tonemap_vaapi=transfer=bt709:format=" + pix
 }

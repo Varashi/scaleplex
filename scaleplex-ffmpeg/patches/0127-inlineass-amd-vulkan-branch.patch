@@ -75,7 +75,7 @@ index 217211b..1c2f477 100644
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
 diff --git a/libavfilter/vf_inlineass.c b/libavfilter/vf_inlineass.c
-index eb41aa1..907072c 100644
+index eb41aa1..3aad0aa 100644
 --- a/libavfilter/vf_inlineass.c
 +++ b/libavfilter/vf_inlineass.c
 @@ -95,6 +95,40 @@
@@ -119,7 +119,22 @@ index eb41aa1..907072c 100644
  /* Display-window lifecycle for a single subtitle cue. Decoupled from
   * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
   * can share a small, testable primitive with the text path. INT64_MIN
-@@ -239,6 +273,54 @@ typedef struct {
+@@ -170,6 +204,14 @@ typedef struct {
+     char *filename;            /**< optional: render a sub FILE (ad-hoc validation) */
+     int   render_height;       /**< cap libass raster height; VPP upscales (0 = no cap) */
+     int   animated_tier_down;  /**< toggle: render animated cues one tier below render_height */
++    /* scaleplex (patch 0127 v6, issue #123): AMD-Vulkan-only — run filter for
++     * its HDR→SDR tonemap side-effect with no overlay. Rewriter sets this
++     * when an HDR session has no sub-burn but still needs tonemap, since
++     * AMD radeonsi has neither tonemap_vaapi nor a working tonemap_opencl
++     * via VAAPI-OpenCL derive (see PR #134). On non-AMD branches the flag
++     * is read but has no effect (other branches don't dispatch HDR→SDR
++     * through libplacebo). */
++    int   tonemap_only;
+     int   animated;            /**< an animated cue (\move/\t/\k/\fad) was seen */
+     int   anim_active;         /**< overlay is currently sized at the animated (lower) tier */
+     int   anim_ow, anim_oh;    /**< animated-tier overlay dims (precomputed) */
+@@ -239,6 +281,54 @@ typedef struct {
      CUtexObject          cuda_bmp_tex[4];         /**< Y/U/V/A over cuda_bmp_overlay */
      int                  cuda_bmp_surf_w, cuda_bmp_surf_h;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
@@ -174,7 +189,7 @@ index eb41aa1..907072c 100644
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -1465,6 +1547,647 @@ fail:
+@@ -1465,6 +1555,722 @@ fail:
  }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -368,13 +383,25 @@ index eb41aa1..907072c 100644
 +    {
 +        AVHWFramesContext     *vk_frames;
 +        AVVulkanFramesContext *vk_hwctx;
++        /* scaleplex (patch 0127 v6, issue #123): output sw_format is nv12
++         * (SDR 8-bit) when the input is HDR — libplacebo tonemaps in
++         * filter_frame_amd_vk (pl_tgt.color = pl_color_space_bt709 override
++         * when pl_color_transfer_is_hdr(pl_src.color.transfer)), so the
++         * downstream encoder gets a real SDR surface. For SDR sources the
++         * pool mirrors the input (nv12 → nv12), unchanged behavior. */
++        enum AVPixelFormat out_swfmt = in_frames->sw_format;
++        if (in_frames->sw_format == AV_PIX_FMT_P010 ||
++            in_frames->sw_format == AV_PIX_FMT_P012 ||
++            in_frames->sw_format == AV_PIX_FMT_P016) {
++            out_swfmt = AV_PIX_FMT_NV12;
++        }
 +
 +        ass->amd_vk_frames_ref = av_hwframe_ctx_alloc(ass->amd_vk_device_ref);
 +        if (!ass->amd_vk_frames_ref)
 +            return AVERROR(ENOMEM);
 +        vk_frames                    = (AVHWFramesContext *)ass->amd_vk_frames_ref->data;
 +        vk_frames->format            = AV_PIX_FMT_VULKAN;
-+        vk_frames->sw_format         = in_frames->sw_format;  /* NV12 / P010 — mirror VAAPI pool */
++        vk_frames->sw_format         = out_swfmt;
 +        vk_frames->width             = inlink->w;
 +        vk_frames->height            = inlink->h;
 +        vk_frames->initial_pool_size = 4; /* small ring: encoder retires 1-2 in flight */
@@ -412,9 +439,13 @@ index eb41aa1..907072c 100644
 +        }
 +    }
 +
-+    /* Output link: pass-through geometry, reuse the input frames pool (so
-+     * av_hwframe_get_buffer in filter_frame allocates from it without a
-+     * fresh pool — same shape, same encoder-friendly hw_frames_ctx). */
++    /* Output link: pass-through geometry. When the Vulkan intermediate pool's
++     * sw_format == input sw_format (SDR), reuse the input frames pool (zero
++     * new alloc, same encoder-friendly ctx — original v5 behavior). When HDR
++     * was tonemapped to SDR nv12 above, the input pool's sw_format
++     * (p010/p012/p016) no longer matches what vulkan_map_to_vaapi will
++     * export — allocate a fresh nv12 VAAPI pool on the same device
++     * (issue #123 v6). */
 +    il = ff_filter_link(inlink);
 +    ol = ff_filter_link(outlink);
 +    outlink->w                   = inlink->w;
@@ -423,9 +454,35 @@ index eb41aa1..907072c 100644
 +    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
 +    outlink->time_base           = inlink->time_base;
 +    ol->frame_rate               = il->frame_rate;
-+    ol->hw_frames_ctx            = av_buffer_ref(il->hw_frames_ctx);
-+    if (!ol->hw_frames_ctx)
-+        return AVERROR(ENOMEM);
++    {
++        AVHWFramesContext *vkf = (AVHWFramesContext *)ass->amd_vk_frames_ref->data;
++        if (vkf->sw_format == in_frames->sw_format) {
++            ol->hw_frames_ctx = av_buffer_ref(il->hw_frames_ctx);
++            if (!ol->hw_frames_ctx)
++                return AVERROR(ENOMEM);
++        } else {
++            AVHWFramesContext *out_frames;
++            ol->hw_frames_ctx = av_hwframe_ctx_alloc(in_frames->device_ref);
++            if (!ol->hw_frames_ctx)
++                return AVERROR(ENOMEM);
++            out_frames                    = (AVHWFramesContext *)ol->hw_frames_ctx->data;
++            out_frames->format            = AV_PIX_FMT_VAAPI;
++            out_frames->sw_format         = vkf->sw_format;   /* nv12 */
++            out_frames->width             = inlink->w;
++            out_frames->height            = inlink->h;
++            out_frames->initial_pool_size = 4;
++            ret = av_hwframe_ctx_init(ol->hw_frames_ctx);
++            if (ret < 0) {
++                av_log(avctx, AV_LOG_ERROR,
++                       "inlineass(amd-vk): SDR VAAPI frames-ctx init failed: %s\n",
++                       av_err2str(ret));
++                return ret;
++            }
++            av_log(avctx, AV_LOG_VERBOSE,
++                   "inlineass(amd-vk): tonemap target pool: VAAPI nv12 %dx%d (input was %s)\n",
++                   inlink->w, inlink->h, av_get_pix_fmt_name(in_frames->sw_format));
++        }
++    }
 +
 +    /* Render-res cap mirrors the VAAPI/CUDA branches: rasterise libass at a
 +     * capped height (ow x oh) and let pl_render_image upscale via the
@@ -556,13 +613,17 @@ index eb41aa1..907072c 100644
 +    time_ms = av_rescale_q(in->pts, inlink->time_base, ASS_TIME_BASE);
 +
 +    /* Refresh text + bitmap overlays. Text writes to ass->cpu (BGRA premult);
-+     * bitmap presentation lives in bmp_pending_buf (same premult BGRA). */
-+    ret = inlineass_amd_refresh_overlay(avctx, time_ms);
-+    if (ret < 0)
-+        goto fail;
-+    ret = refresh_bitmap(avctx, time_ms);   /* shared with VAAPI branch */
-+    if (ret < 0)
-+        goto fail;
++     * bitmap presentation lives in bmp_pending_buf (same premult BGRA).
++     * Skipped when tonemap_only — the filter is then a pure HDR→SDR
++     * pl_render_image pass with no overlay (issue #123 v6). */
++    if (!ass->tonemap_only) {
++        ret = inlineass_amd_refresh_overlay(avctx, time_ms);
++        if (ret < 0)
++            goto fail;
++        ret = refresh_bitmap(avctx, time_ms);   /* shared with VAAPI branch */
++        if (ret < 0)
++            goto fail;
++    }
 +
 +    /* Allocate the RENDER TARGET from the intermediate Vulkan pool (NOT
 +     * the VAAPI pool — see the inlineass_amd_vk_config comment block).
@@ -706,6 +767,35 @@ index eb41aa1..907072c 100644
 +    }
 +    tgt_mapped = 1;
 +
++    /* scaleplex (patch 0127 v6, issue #123): absorb HDR→SDR tonemap into the
++     * same pl_render_image dispatch. pl_map_avframe_ex populates pl_src.color
++     * from the AVFrame's color_trc/color_primaries/colorspace via libplacebo's
++     * pl_map_avframe → pl_color_space_from_avframe path; if the source is HDR
++     * (PQ / HLG / any pl_color_transfer_is_hdr trc) we override the TARGET
++     * color space to bt709 SDR so libplacebo's draw_overlays() internal
++     * pipeline runs the HDR→SDR EOTF + tone-mapping along with the overlay
++     * blend — one GPU dispatch, zero extra filters.
++     *
++     * Subs-with-HDR sessions get this transparently (no rewriter change for
++     * the overlay path itself). Subs-less HDR sessions enter here via the
++     * tonemap_only=1 opt — they're a pure tonemap pass with zero overlays
++     * attached below. SDR sources fall through to pl_tgt.color = pl_src.color
++     * (libplacebo's pl_map_avframe default), so non-HDR + non-AMD-Vulkan
++     * paths are unaffected.
++     *
++     * TODO(amd-vk-v6:hdr-metadata): libplacebo honors HDR10 MaxCLL/MaxFALL
++     * from pl_src.color.hdr for better tone-curve tuning. pl_map_avframe
++     * fills hdr from AVMasteringDisplayMetadata side-data when present; if
++     * Plex strips that side-data the tonemap falls back to default params.
++     * Live-validation gate to confirm side-data survival end-to-end. */
++    if (pl_color_transfer_is_hdr(pl_src.color.transfer)) {
++        pl_tgt.color = pl_color_space_bt709;
++        av_log(avctx, AV_LOG_VERBOSE,
++               "inlineass(amd-vk): HDR src (trc=%d) → SDR bt709 tgt (libplacebo tonemap)%s\n",
++               pl_src.color.transfer,
++               ass->tonemap_only ? " [tonemap_only]" : "");
++    }
++
 +    /* Attach overlays. A stream is text XOR bitmap (PGS preferred when both
 +     * active, mirroring the VAAPI/CUDA branches' precedence). Single full-tex
 +     * src part stretched onto the full dst frame (DST_FRAME coords) — same
@@ -822,7 +912,7 @@ index eb41aa1..907072c 100644
  /* ======================================================================== *
   *  init / uninit / format negotiation / link config (format-adaptive)      *
   * ======================================================================== */
-@@ -1620,6 +2343,26 @@ static av_cold void uninit(AVFilterContext *ctx)
+@@ -1620,6 +2426,26 @@ static av_cold void uninit(AVFilterContext *ctx)
      ass->cuda_hwctx = NULL;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -849,7 +939,7 @@ index eb41aa1..907072c 100644
      /* scaleplex: serialise libass teardown against the decoder thread's
       * append/replay and another instance's render. libass shares
       * process-global state (fontconfig/freetype) that is NOT reentrant;
-@@ -1671,8 +2414,20 @@ static int config_input(AVFilterLink *link)
+@@ -1671,8 +2497,20 @@ static int config_input(AVFilterLink *link)
      AVFilterContext *avctx  = link->dst;
      AssContext      *ass    = avctx->priv;
  
@@ -871,7 +961,7 @@ index eb41aa1..907072c 100644
  
  #if CONFIG_OVERLAY_CUDA_FILTER
      if (link->format == AV_PIX_FMT_CUDA)
-@@ -1802,6 +2557,12 @@ static int config_output(AVFilterLink *outlink)
+@@ -1802,6 +2640,12 @@ static int config_output(AVFilterLink *outlink)
      }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -884,7 +974,7 @@ index eb41aa1..907072c 100644
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -2345,8 +3106,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+@@ -2345,8 +3189,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
      long long time_ms;
      int err;
  
@@ -899,6 +989,20 @@ index eb41aa1..907072c 100644
  
  #if CONFIG_OVERLAY_CUDA_FILTER
      if (inlink->format == AV_PIX_FMT_CUDA)
+@@ -2639,6 +3488,13 @@ static const AVOption inlineass_options[] = {
+     {"filename",       "subtitle file to render (ASS/SSA); omit to feed via -map_inlineass (HW ad-hoc)", OFFSET(filename), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
+     {"render_height",  "HW path: cap libass raster height (0=full); VPP upscales", OFFSET(render_height), AV_OPT_TYPE_INT, {.i64 = 1080}, 0, 4320, FLAGS},
+     {"animated_tier_down", "HW path: render animated cues (\\move/\\t/\\k/\\fad) one resolution tier below render_height", OFFSET(animated_tier_down), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
++    /* scaleplex (patch 0127 v6, issue #123): AMD-Vulkan-only — run filter for
++     * its HDR→SDR tonemap side-effect with no overlay. The rewriter sets
++     * this on an AMD HDR session that has no sub-burn but still needs the
++     * HDR→SDR pass; the filter skips libass refresh + overlay attach and
++     * just runs the libplacebo pl_render_image with an SDR target color
++     * space. Inert on non-AMD branches. */
++    {"tonemap_only",   "AMD-Vulkan branch: run HDR→SDR tonemap with no overlay (no -map_inlineass binding needed)", OFFSET(tonemap_only), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
+     /* scaleplex: Plex user subtitle-appearance styling (parsed by libass) */
+     {"overrides",      "ASS style overrides ([Style.]Param=Value CSV; Plex appearance)", OFFSET(overrides), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
+     {"outline",        "outline (border) width override (0=unset)", OFFSET(outline), AV_OPT_TYPE_DOUBLE, {.dbl = 0.0}, 0.0, 100.0, FLAGS},
 diff --git a/libavfilter/vf_inlineass.h b/libavfilter/vf_inlineass.h
 index 799d6da..3bda54b 100644
 --- a/libavfilter/vf_inlineass.h
