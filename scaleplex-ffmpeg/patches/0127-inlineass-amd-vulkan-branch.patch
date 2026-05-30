@@ -146,7 +146,7 @@ index eb41aa1..0c4aa6a 100644
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -1465,6 +1525,526 @@ fail:
+@@ -1465,6 +1525,531 @@ fail:
  }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -204,14 +204,18 @@ index eb41aa1..0c4aa6a 100644
 + * already computes via detectVAAPIDriver. */
 +static int inlineass_amd_vendor_is_mesa(AVFilterContext *avctx, AVFilterLink *inlink)
 +{
++    /* ffmpeg 7 moved hw_frames_ctx off AVFilterLink onto the internal
++     * FilterLink (accessed via ff_filter_link). vf_libplacebo uses the
++     * same accessor (see its input_init / map_frame). */
++    FilterLink            *il = ff_filter_link(inlink);
 +    AVHWFramesContext     *frames;
 +    AVHWDeviceContext     *device;
 +    AVVAAPIDeviceContext  *vactx;
 +    const char            *vendor;
 +
-+    if (!inlink->hw_frames_ctx)
++    if (!il->hw_frames_ctx)
 +        return 0;
-+    frames = (AVHWFramesContext *)inlink->hw_frames_ctx->data;
++    frames = (AVHWFramesContext *)il->hw_frames_ctx->data;
 +    if (!frames || !frames->device_ref)
 +        return 0;
 +    device = (AVHWDeviceContext *)frames->device_ref->data;
@@ -241,11 +245,12 @@ index eb41aa1..0c4aa6a 100644
 +    FilterLink        *il, *ol;
 +    int ret;
 +
-+    if (!inlink->hw_frames_ctx) {
++    il = ff_filter_link(inlink);
++    if (!il->hw_frames_ctx) {
 +        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): no hw_frames_ctx on input\n");
 +        return AVERROR(EINVAL);
 +    }
-+    in_frames = (AVHWFramesContext *)inlink->hw_frames_ctx->data;
++    in_frames = (AVHWFramesContext *)il->hw_frames_ctx->data;
 +
 +    /* VAAPI → DRM → Vulkan derive chain. ffmpeg handles DMA-BUF export
 +     * + Vulkan import for us. */
