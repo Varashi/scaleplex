@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -61,9 +63,9 @@ func TestHWAccelAllowed(t *testing.T) {
 		}
 	})
 
-	// L2 (#78): the shim-supplied SCALEPLEX_PASS_ACTIVE is authoritative and
-	// skips the HTTP probe entirely.
-	t.Run("L2 PASS_ACTIVE=1 → allow without probe", func(t *testing.T) {
+	// L1 (#78, #126): the shim-supplied SCALEPLEX_PASS_ACTIVE is authoritative
+	// and skips the HTTP probe entirely.
+	t.Run("L1 PASS_ACTIVE=1 → allow without probe", func(t *testing.T) {
 		stubPass(t, func(_, _ string) (bool, error) {
 			t.Fatal("should not HTTP-probe when PASS_ACTIVE set")
 			return false, nil
@@ -74,7 +76,7 @@ func TestHWAccelAllowed(t *testing.T) {
 			t.Error("PASS_ACTIVE=1 should allow")
 		}
 	})
-	t.Run("L2 PASS_ACTIVE=0 → deny without probe", func(t *testing.T) {
+	t.Run("L1 PASS_ACTIVE=0 → deny without probe", func(t *testing.T) {
 		stubPass(t, func(_, _ string) (bool, error) {
 			t.Fatal("should not HTTP-probe when PASS_ACTIVE set")
 			return false, nil
@@ -85,7 +87,7 @@ func TestHWAccelAllowed(t *testing.T) {
 			t.Error("PASS_ACTIVE=0 should deny")
 		}
 	})
-	t.Run("L2 absent → falls back to HTTP probe", func(t *testing.T) {
+	t.Run("L1 absent → falls back to L3 HTTP probe", func(t *testing.T) {
 		probed := false
 		stubPass(t, func(_, _ string) (bool, error) { probed = true; return true, nil })
 		if !hwAccelAllowed(wiredEnv()) || !probed {
@@ -185,5 +187,109 @@ func TestRewriter_PassGate_SameBackendHWNotGated(t *testing.T) {
 	out := Rewrite(args, wiredEnv(), nil)
 	if containsString(out.Changes, TagPassGateDenied) {
 		t.Fatalf("same-backend HW passthrough must NOT consult the Pass gate: %v", out.Changes)
+	}
+}
+
+// L3 — worker HTTP probe. Exercises the real httpPassCheck (not the stub) end
+// to end against an httptest PMS, including non-200/parse/transport branches.
+// stubPass coverage above tests gate-level decisions; these pin the parser +
+// HTTP contract that the gate ultimately depends on.
+func TestHttpPassCheck(t *testing.T) {
+	t.Run("200 + active Pass → true", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("X-Plex-Token"); got != "tok" {
+				t.Errorf("token forwarded: got %q want tok", got)
+			}
+			_, _ = w.Write([]byte(`<MediaContainer myPlexSubscription="1" other="x"/>`))
+		}))
+		defer srv.Close()
+		ok, err := httpPassCheck(srv.URL, "tok")
+		if err != nil || !ok {
+			t.Errorf("want (true, nil), got (%v, %v)", ok, err)
+		}
+	})
+	t.Run("200 + no Pass → false", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`<MediaContainer myPlexSubscription="0"/>`))
+		}))
+		defer srv.Close()
+		ok, err := httpPassCheck(srv.URL, "tok")
+		if err != nil || ok {
+			t.Errorf("want (false, nil), got (%v, %v)", ok, err)
+		}
+	})
+	t.Run("200 + attr absent → false, no error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`<MediaContainer other="x"/>`))
+		}))
+		defer srv.Close()
+		ok, err := httpPassCheck(srv.URL, "tok")
+		if err != nil || ok {
+			t.Errorf("absent attr must be no-Pass not error; got (%v, %v)", ok, err)
+		}
+	})
+	t.Run("401 → false, no error (treated as no-Pass)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer srv.Close()
+		ok, err := httpPassCheck(srv.URL, "bad")
+		if err != nil || ok {
+			t.Errorf("401 must close without error; got (%v, %v)", ok, err)
+		}
+	})
+	t.Run("5xx → false, no error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		defer srv.Close()
+		ok, err := httpPassCheck(srv.URL, "tok")
+		if err != nil || ok {
+			t.Errorf("5xx must close without error; got (%v, %v)", ok, err)
+		}
+	})
+	t.Run("malformed body → false, no error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`<<<not-xml<<<`))
+		}))
+		defer srv.Close()
+		ok, err := httpPassCheck(srv.URL, "tok")
+		if err != nil || ok {
+			t.Errorf("malformed body must be no-Pass not error; got (%v, %v)", ok, err)
+		}
+	})
+	t.Run("connect refused → error → caller fail-closed", func(t *testing.T) {
+		// Server immediately closed → dial fails.
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		url := srv.URL
+		srv.Close()
+		ok, err := httpPassCheck(url, "tok")
+		if err == nil {
+			t.Errorf("transport failure must surface as error (caller fail-closes); got ok=%v", ok)
+		}
+	})
+}
+
+// Counterfactual logging contract (issue #127 surface bug): the
+// `force-hw:would-honor-sw` tag fires on **gate ALLOW + Plex emitted SW**
+// under FORCE_HW=1 — it quantifies the SW exposure that flipping FORCE_HW
+// off would honor. It is NOT a denial tag (a denial emits TagPassGateDenied).
+// Misreading allow-counterfactual as denial caused a recent misdiagnosis;
+// this test pins the contract: gate explicitly ALLOWS, tag fires.
+func TestRewriter_PassGate_AllowPlusPlexSW_FiresCounterfactual(t *testing.T) {
+	stubPass(t, func(_, _ string) (bool, error) { return true, nil }) // explicit allow
+	t.Setenv("SCALEPLEX_FORCE_HW", "1")
+	out := Rewrite(swArgsAV1H264, wiredEnv(), nil)
+	if containsString(out.Changes, TagPassGateDenied) {
+		t.Fatalf("gate allowed; must not tag as denied: %v", out.Changes)
+	}
+	if !containsString(out.Changes, TagForceHWWouldHonorSW) {
+		t.Fatalf("gate allow + Plex-SW + FORCE_HW=1 must emit %s: %v",
+			TagForceHWWouldHonorSW, out.Changes)
+	}
+	// And the session re-accelerates (not honored), which is the actual
+	// behavior the counterfactual is the observability shadow of.
+	if !containsString(out.Changes, "encode:libx264->h264_vaapi") {
+		t.Errorf("FORCE_HW=1 + Pass should reshape SW→HW: %v", out.Changes)
 	}
 }

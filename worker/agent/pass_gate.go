@@ -34,6 +34,7 @@ package main
 import (
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -64,12 +65,12 @@ const passCacheTTL = 5 * time.Minute
 // per PMS base (passCacheTTL) so it's one query per PMS per 5 min, not per
 // session. Query failures are NOT cached (next session retries).
 func hwAccelAllowed(inputEnv map[string]string) bool {
-	// L2 (#78): the shim runs inside the PMS container and reads the Plex-Pass
-	// state straight from Preferences.xml (myPlexSubscription), forwarding it as
-	// SCALEPLEX_PASS_ACTIVE per session. When present it's authoritative + fresh
-	// — trust it directly and skip the per-session HTTP probe (which can flake
-	// and fail-closed a legit Pass user into degraded SW). "1" → allow, anything
-	// else ("0") → deny. Absent → fall through to the L3 HTTP probe below.
+	// L1 (#78, #126): the shim runs inside the PMS container and asks the local
+	// Plex API for the live Pass state, forwarding it as SCALEPLEX_PASS_ACTIVE
+	// per session. When present it's authoritative + fresh — trust it directly
+	// and skip the per-session HTTP probe (which can flake and fail-closed a
+	// legit Pass user into degraded SW). "1" → allow, anything else ("0") →
+	// deny. Absent → fall through to the L3 HTTP probe below.
 	//
 	// Read from the PER-SESSION inputEnv ONLY (not envFrom, which also reads the
 	// worker process env): a static worker-level SCALEPLEX_PASS_ACTIVE would
@@ -116,9 +117,11 @@ func hwAccelAllowed(inputEnv map[string]string) bool {
 // not an error — only transport/IO failures are errors (→ fail-closed +
 // retry). 5s timeout bounds the cold-path cost.
 func httpPassCheck(base, tok string) (bool, error) {
-	url := strings.TrimRight(base, "/") + "/?X-Plex-Token=" + tok
+	// QueryEscape defensively (Plex tokens are alphanumeric in practice, but
+	// unescaped reserved chars would corrupt the request).
+	reqURL := strings.TrimRight(base, "/") + "/?X-Plex-Token=" + url.QueryEscape(tok)
 	c := &http.Client{Timeout: 5 * time.Second}
-	resp, err := c.Get(url) //nolint:noctx // short fixed-timeout client
+	resp, err := c.Get(reqURL) //nolint:noctx // short fixed-timeout client
 	if err != nil {
 		return false, err
 	}
