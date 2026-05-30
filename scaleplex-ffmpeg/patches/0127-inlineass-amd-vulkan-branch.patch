@@ -1,0 +1,764 @@
+scaleplex: vf_inlineass AMD-Vulkan branch — sub-burn via libplacebo pl_render_image (#123)
+
+AMD-Vulkan hardware branch for vf_inlineass, mirroring the Intel iHD
+VAAPI-VPP branch (patch 0115) and the NVIDIA CUDA branch (patch 0126) in
+purpose: GPU-resident text/ASS + bitmap (PGS/DVD/DVB) burn-in onto VAAPI
+surfaces, no per-frame hwdownload.
+
+Why a separate branch on AMD radeonsi:
+  - overlay_vaapi + tonemap_vaapi are Intel-iHD-only (radeonsi has no
+    VPP blend pipeline), so the existing patch-0115 path cannot run.
+  - overlay_vulkan on RADV crashes with VK_ERROR_DEVICE_LOST + amdgpu
+    GPU reset (driver bug, kernel-side).
+  - libplacebo's `inputs=2` (multi-input filter mode) hits the libplacebo
+    Vulkan assert `vk_tex_barrier: !tex_vk->held`.
+  Both fail at the driver/library plumbing level. The recipe-tuning
+  effort on Mesa 25.2.8 / RADV NAVI21 / RX 6800 explored 14 graph shapes;
+  none worked at production quality.
+
+What works: mpv vo_gpu_next's update_overlays() uses libplacebo's
+pl_render_image() + pl_overlay API directly. pl_render_image dispatches
+via libplacebo's own draw_overlays() — a different libplacebo code path
+than the broken inputs=2 front-door. mpv ships this on AMD RADV in
+production today. This patch ports that blueprint into vf_inlineass.
+
+Architecture:
+  - At config_input time on AV_PIX_FMT_VAAPI, vaQueryVendorString()
+    selects the branch: "Mesa" substring → AMD-Vulkan (this patch);
+    otherwise → existing VAAPI-VPP branch.
+  - inlineass_amd_vk_config() derives a Vulkan AVHWDeviceContext from
+    the input VAAPI device via the DRM intermediary (direct VAAPI→Vulkan
+    derive is broken on jellyfin-ffmpeg7 — the same recipe-tuning
+    finding that ruled out overlay_vulkan), then imports that device
+    into libplacebo. The pl_vulkan_import_params queue family + lock/
+    unlock bridging is cribbed verbatim from vf_libplacebo.c init_vulkan().
+  - Per-frame: libass renders the band into the shared `cpu` BGRA staging
+    (same buffer the VAAPI-VPP branch uses); uploaded to a cached
+    pl_tex; the source + a freshly-allocated output VAAPI surface (from
+    the input frames pool) are mapped as pl_frame via pl_map_avframe_ex
+    (libplacebo handles VAAPI→DMA-BUF→Vulkan transparently); the band is
+    attached as a pl_overlay; pl_render_image() blends + writes the
+    output surface. Output stays AV_PIX_FMT_VAAPI for the downstream
+    h264/hevc_vaapi encoder.
+  - Bitmap (PGS) reuses the existing bmp_pending_buf premultiplied BGRA
+    staging populated by avfilter_inlineass_replay_bitmap; uploaded to a
+    separate cached pl_tex.
+
+Gated on CONFIG_LIBPLACEBO_FILTER (the same guard vf_libplacebo uses).
+The scaleplex deps image is built with --enable-libplacebo --enable-vulkan
+since the 0094 lineage, so the guard is true for every shipped
+scaleplex-ffmpeg build. A libplacebo-less ffmpeg sees neither the
+includes nor the branch — the existing VAAPI-VPP / CUDA / SW paths are
+untouched.
+
+Tracks issue #123 (AMD RX 6800 radeonsi bring-up).
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -371,6 +371,12 @@ OBJS-$(CONFIG_INLINEASS_FILTER)              += vf_inlineass.o vaapi_vpp.o
+ # deduped in common.mak, so cuda/load_helper.o (also added by overlay_cuda)
+ # collapses to a single entry.
+ OBJS-$(CONFIG_OVERLAY_CUDA_FILTER)           += vf_inlineass_cuda.ptx.o cuda/load_helper.o
++# scaleplex (issue #123): inlineass AMD-Vulkan branch. The C code lives inline
++# in vf_inlineass.c under #if CONFIG_LIBPLACEBO_FILTER, so no extra .o is
++# needed here — but libavfilter.so picks up the libplacebo + Vulkan link deps
++# from vf_libplacebo.o (same CONFIG_LIBPLACEBO_FILTER guard, line below), so
++# our branch's `pl_*` + `vk*` symbol references resolve automatically when the
++# guard is on. Documented for the next reader; no objects to add.
+ OBJS-$(CONFIG_INFLATE_FILTER)                += vf_neighbor.o
+ OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
+ OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
+diff --git a/libavfilter/vf_inlineass.c b/libavfilter/vf_inlineass.c
+index eb41aa1..0c4aa6a 100644
+--- a/libavfilter/vf_inlineass.c
++++ b/libavfilter/vf_inlineass.c
+@@ -95,6 +95,34 @@
+ #define INLINEASS_CUDA_BLOCK_Y 16
+ #endif /* CONFIG_OVERLAY_CUDA_FILTER */
+ 
++/* scaleplex: AMD-Vulkan branch (issue #123, patch 0127) — GPU-resident
++ * subtitle burn-in on AMD radeonsi via libplacebo's pl_render_image() +
++ * pl_overlay API. AMD has no overlay_vaapi / tonemap_vaapi (Intel iHD-only)
++ * and overlay_vulkan / libplacebo `inputs=2` (multi-input filter mode) both
++ * fail at the driver/library plumbing level on RADV (VK_ERROR_DEVICE_LOST and
++ * `vk_tex_barrier: !tex_vk->held` respectively; recipe-tuning report mid-2026
++ * exhausted 14 shapes). The working blueprint is mpv `vo_gpu_next`'s
++ * update_overlays(), which uses libplacebo's draw_overlays() dispatch — a
++ * different libplacebo code path than the broken inputs=2 front-door, and
++ * proven on RADV in production today.
++ *
++ * Gated on CONFIG_LIBPLACEBO_FILTER: the same guard vf_libplacebo uses, on
++ * when libplacebo + Vulkan SDK are present at configure time. The scaleplex
++ * deps image is built with --enable-libplacebo --enable-vulkan since the 0094
++ * lineage, so the guard is true for every shipped scaleplex-ffmpeg build.
++ *
++ * Branch detection at config_input time: input pix fmt == AV_PIX_FMT_VAAPI
++ * AND vaQueryVendorString() reports a Mesa driver → AMD-Vulkan branch (this
++ * patch); otherwise the existing Intel iHD VAAPI-VPP branch (patch 0115)
++ * handles the surface. The libass call sites stay under inlineass_lock,
++ * shared with the SW / VAAPI / CUDA branches. */
++#if CONFIG_LIBPLACEBO_FILTER
++#include <libplacebo/renderer.h>
++#include <libplacebo/utils/libav.h>
++#include <libplacebo/vulkan.h>
++#include "libavutil/hwcontext_vulkan.h"
++#endif /* CONFIG_LIBPLACEBO_FILTER */
++
+ /* Display-window lifecycle for a single subtitle cue. Decoupled from
+  * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
+  * can share a small, testable primitive with the text path. INT64_MIN
+@@ -239,6 +267,38 @@ typedef struct {
+     CUtexObject          cuda_bmp_tex[4];         /**< Y/U/V/A over cuda_bmp_overlay */
+     int                  cuda_bmp_surf_w, cuda_bmp_surf_h;
+ #endif /* CONFIG_OVERLAY_CUDA_FILTER */
++
++#if CONFIG_LIBPLACEBO_FILTER
++    /* ---- HW (AMD-Vulkan) branch state (issue #123) --------------------- *
++     * Active when input is AV_PIX_FMT_VAAPI AND the VAAPI vendor probe
++     * reports a Mesa driver (radeonsi on AMD). vf_inlineass derives a
++     * Vulkan AVHWDeviceContext from the input's VAAPI device (via the DRM
++     * intermediary — direct VAAPI→Vulkan derive is broken on
++     * jellyfin-ffmpeg7; same recipe-tuning finding that ruled out
++     * overlay_vulkan), imports it into libplacebo, and per-frame:
++     *   1. renders the libass band (shared cpu/bmp_pending_buf staging) to
++     *      a cached pl_tex (BGRA, host-writable, sampleable);
++     *   2. maps the VAAPI input + a freshly-allocated VAAPI output (from
++     *      the input frames pool) via pl_map_avframe_ex (libplacebo
++     *      handles the VAAPI→DMA-BUF→Vulkan import transparently);
++     *   3. attaches the band as a pl_overlay on the source pl_frame;
++     *   4. pl_render_image() blends + writes to the output VAAPI surface.
++     * Output keeps AV_PIX_FMT_VAAPI so the downstream h264/hevc_vaapi
++     * encoder is happy. Bitmap (PGS/DVD/DVB) shares the existing
++     * bmp_pending_buf premultiplied-BGRA staging. */
++    AVBufferRef     *amd_vk_device_ref;   /**< derived AVHWDeviceContext (Vulkan) */
++    pl_log           amd_pl_log;
++    pl_vulkan        amd_pl_vk;           /**< libplacebo Vulkan ctx (imported from AVF) */
++    pl_renderer      amd_pl_rr;
++    pl_tex           amd_overlay_tex;     /**< cached RGBA band texture (text path); host-writable */
++    int              amd_overlay_w;       /**< current band dims for cache invalidation */
++    int              amd_overlay_h;
++    int              amd_have_overlay;    /**< 1 = amd_overlay_tex carries a visible band */
++    pl_tex           amd_bmp_tex;         /**< cached RGBA bitmap texture (PGS path) */
++    int              amd_bmp_tex_w;
++    int              amd_bmp_tex_h;
++    int              amd_active;          /**< 1 = AMD-Vulkan branch owns this filter instance */
++#endif /* CONFIG_LIBPLACEBO_FILTER */
+ } AssContext;
+ 
+ /* scaleplex: process-wide libass lock. libass is not reentrant across
+@@ -1465,6 +1525,526 @@ fail:
+ }
+ #endif /* CONFIG_OVERLAY_CUDA_FILTER */
+ 
++#if CONFIG_LIBPLACEBO_FILTER
++/* ======================================================================== *
++ *  HW (AMD-Vulkan) branch — sub-burn via libplacebo pl_render_image +      *
++ *  pl_overlay. Mirrors mpv vo_gpu_next update_overlays(). Active only when *
++ *  input is AV_PIX_FMT_VAAPI AND vendor probe matches "Mesa" (radeonsi).   *
++ *  Issue #123, patch 0127.                                                  *
++ * ======================================================================== */
++
++/* libplacebo log → ffmpeg log bridge (per-instance, avctx in log_priv). */
++static void inlineass_amd_pl_log_cb(void *log_priv, enum pl_log_level level,
++                                    const char *msg)
++{
++    AVFilterContext *avctx = log_priv;
++    int av_level = AV_LOG_VERBOSE;
++    switch (level) {
++    case PL_LOG_FATAL:
++    case PL_LOG_ERR:   av_level = AV_LOG_ERROR;   break;
++    case PL_LOG_WARN:  av_level = AV_LOG_WARNING; break;
++    case PL_LOG_INFO:  av_level = AV_LOG_INFO;    break;
++    case PL_LOG_DEBUG: av_level = AV_LOG_DEBUG;   break;
++    default:           av_level = AV_LOG_VERBOSE; break;
++    }
++    av_log(avctx, av_level, "libplacebo: %s\n", msg);
++}
++
++/* lock_queue / unlock_queue thunks bridging AVVulkanDeviceContext's per-queue
++ * lock callbacks to libplacebo's pl_vulkan_import_params signature. Cribbed
++ * verbatim from vf_libplacebo.c's lock_queue/unlock_queue + init_vulkan() —
++ * priv == AVHWDeviceContext*, hwctx->lock_queue takes (avhwctx, qf, idx). */
++static void inlineass_amd_lock_queue(void *priv, uint32_t qf, uint32_t qidx)
++{
++    AVHWDeviceContext *avhwctx = priv;
++    const AVVulkanDeviceContext *hwctx = avhwctx->hwctx;
++    hwctx->lock_queue(avhwctx, qf, qidx);
++}
++
++static void inlineass_amd_unlock_queue(void *priv, uint32_t qf, uint32_t qidx)
++{
++    AVHWDeviceContext *avhwctx = priv;
++    const AVVulkanDeviceContext *hwctx = avhwctx->hwctx;
++    hwctx->unlock_queue(avhwctx, qf, qidx);
++}
++
++/* Probe the input VAAPI device's vendor string. Returns 1 iff this filter
++ * should take the AMD-Vulkan branch (vendor contains "Mesa", i.e. radeonsi).
++ * Called once at config_input time; result cached on ass->amd_active.
++ *
++ * TODO(amd-vk-validate): Mesa-on-Intel (iris/crocus) would also match "Mesa"
++ * — all scaleplex Intel deployments use the iHD binary driver, but a
++ * Mesa-iris reporter would mis-route here. Defensive: ?cross-check
++ * vendor_id from sysfs DRM node, or accept the env-var override the worker
++ * already computes via detectVAAPIDriver. */
++static int inlineass_amd_vendor_is_mesa(AVFilterContext *avctx, AVFilterLink *inlink)
++{
++    AVHWFramesContext     *frames;
++    AVHWDeviceContext     *device;
++    AVVAAPIDeviceContext  *vactx;
++    const char            *vendor;
++
++    if (!inlink->hw_frames_ctx)
++        return 0;
++    frames = (AVHWFramesContext *)inlink->hw_frames_ctx->data;
++    if (!frames || !frames->device_ref)
++        return 0;
++    device = (AVHWDeviceContext *)frames->device_ref->data;
++    vactx  = device->hwctx;
++    vendor = vaQueryVendorString(vactx->display);
++    if (!vendor)
++        return 0;
++    av_log(avctx, AV_LOG_VERBOSE, "inlineass(amd-vk): VAAPI vendor = \"%s\"\n", vendor);
++    return strstr(vendor, "Mesa") != NULL;
++}
++
++/* config_output for the AMD-Vulkan branch. Called from config_output when
++ * ass->amd_active was latched in config_input. Derives a Vulkan
++ * AVHWDeviceContext from the input VAAPI device (via DRM intermediary —
++ * direct VAAPI→Vulkan derive is broken on jellyfin-ffmpeg7), imports it into
++ * libplacebo, creates the renderer, and sets the output link geometry +
++ * frames-ctx (we keep AV_PIX_FMT_VAAPI throughout and allocate output
++ * surfaces from the same input pool). */
++static int inlineass_amd_vk_config(AVFilterContext *avctx, AVFilterLink *inlink)
++{
++    AssContext        *ass     = avctx->priv;
++    AVFilterLink      *outlink = avctx->outputs[0];
++    AVHWFramesContext *in_frames;
++    AVBufferRef       *drm_ref = NULL;
++    AVHWDeviceContext *vk_device;
++    AVVulkanDeviceContext *vkctx;
++    FilterLink        *il, *ol;
++    int ret;
++
++    if (!inlink->hw_frames_ctx) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): no hw_frames_ctx on input\n");
++        return AVERROR(EINVAL);
++    }
++    in_frames = (AVHWFramesContext *)inlink->hw_frames_ctx->data;
++
++    /* VAAPI → DRM → Vulkan derive chain. ffmpeg handles DMA-BUF export
++     * + Vulkan import for us. */
++    ret = av_hwdevice_ctx_create_derived(&drm_ref, AV_HWDEVICE_TYPE_DRM,
++                                         in_frames->device_ref, 0);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR,
++               "inlineass(amd-vk): derive DRM device failed: %s\n", av_err2str(ret));
++        return ret;
++    }
++    ret = av_hwdevice_ctx_create_derived(&ass->amd_vk_device_ref,
++                                         AV_HWDEVICE_TYPE_VULKAN, drm_ref, 0);
++    av_buffer_unref(&drm_ref);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR,
++               "inlineass(amd-vk): derive Vulkan device failed: %s\n", av_err2str(ret));
++        return ret;
++    }
++
++    vk_device = (AVHWDeviceContext *)ass->amd_vk_device_ref->data;
++    vkctx     = vk_device->hwctx;
++
++    ass->amd_pl_log = pl_log_create(PL_API_VER, pl_log_params(
++        .log_cb    = inlineass_amd_pl_log_cb,
++        .log_priv  = avctx,
++        .log_level = PL_LOG_WARN,
++    ));
++    if (!ass->amd_pl_log) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_log_create failed\n");
++        return AVERROR(ENOMEM);
++    }
++
++    /* Import the AVF Vulkan device into libplacebo. Field+queue mapping
++     * cribbed verbatim from vf_libplacebo.c init_vulkan() (PL_API_VER>=278
++     * branch — guaranteed by CONFIG_LIBPLACEBO_FILTER gating).  */
++    ass->amd_pl_vk = pl_vulkan_import(ass->amd_pl_log, pl_vulkan_import_params(
++        .instance        = vkctx->inst,
++        .get_proc_addr   = vkctx->get_proc_addr,
++        .phys_device     = vkctx->phys_dev,
++        .device          = vkctx->act_dev,
++        .extensions      = vkctx->enabled_dev_extensions,
++        .num_extensions  = vkctx->nb_enabled_dev_extensions,
++        .features        = &vkctx->device_features,
++        .lock_queue      = inlineass_amd_lock_queue,
++        .unlock_queue    = inlineass_amd_unlock_queue,
++        .queue_ctx       = vk_device,
++        .queue_graphics  = {
++            .index = vkctx->queue_family_index,
++            .count = vkctx->nb_graphics_queues,
++        },
++        .queue_compute   = {
++            .index = vkctx->queue_family_comp_index,
++            .count = vkctx->nb_comp_queues,
++        },
++        .queue_transfer  = {
++            .index = vkctx->queue_family_tx_index,
++            .count = vkctx->nb_tx_queues,
++        },
++        .max_api_version = VK_API_VERSION_1_3,
++    ));
++    if (!ass->amd_pl_vk) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_vulkan_import failed\n");
++        return AVERROR(EIO);
++    }
++
++    ass->amd_pl_rr = pl_renderer_create(ass->amd_pl_log, ass->amd_pl_vk->gpu);
++    if (!ass->amd_pl_rr) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_renderer_create failed\n");
++        return AVERROR(ENOMEM);
++    }
++
++    /* Output link: pass-through geometry, reuse the input frames pool (so
++     * av_hwframe_get_buffer in filter_frame allocates from it without a
++     * fresh pool — same shape, same encoder-friendly hw_frames_ctx). */
++    il = ff_filter_link(inlink);
++    ol = ff_filter_link(outlink);
++    outlink->w                   = inlink->w;
++    outlink->h                   = inlink->h;
++    outlink->format              = AV_PIX_FMT_VAAPI;
++    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
++    outlink->time_base           = inlink->time_base;
++    ol->frame_rate               = il->frame_rate;
++    ol->hw_frames_ctx            = av_buffer_ref(il->hw_frames_ctx);
++    if (!ol->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++
++    /* Render-res cap mirrors the VAAPI/CUDA branches: rasterise libass at a
++     * capped height (ow x oh) and let pl_render_image upscale via the
++     * overlay's natural texture sampling. Folds in the SCALEPLEX_SUB_RENDER_HEIGHT
++     * knob via the existing render_height filter option. */
++    {
++        int in_w = inlink->w;
++        int in_h = inlink->h;
++        int rh   = ass->render_height;
++        int sw, sh;
++        compute_cap_dims(in_w, in_h, rh, &sw, &sh);
++        if (ass->animated_tier_down) {
++            int eff = (rh > 0 && rh < in_h) ? rh : in_h;
++            compute_cap_dims(in_w, in_h, tier_down(eff), &ass->anim_ow, &ass->anim_oh);
++        } else {
++            ass->anim_ow = sw;
++            ass->anim_oh = sh;
++        }
++        if (ass->animated && ass->animated_tier_down) {
++            ass->ow = ass->anim_ow;
++            ass->oh = ass->anim_oh;
++            ass->anim_active = 1;
++        } else {
++            ass->ow = sw;
++            ass->oh = sh;
++        }
++        av_log(avctx, AV_LOG_VERBOSE,
++               "inlineass(amd-vk): render %dx%d -> output %dx%d (render_height=%d, anim_tier=%dx%d%s)\n",
++               ass->ow, ass->oh, in_w, in_h, rh, ass->anim_ow, ass->anim_oh,
++               ass->anim_active ? " active" : "");
++    }
++
++    /* libass renderer geometry/fonts — identical to the VAAPI branch.
++     * cpu BGRA staging is shared with the VAAPI-VPP branch (render_ass_images
++     * writes premultiplied BGRA there); we upload it into pl_tex per cue
++     * change instead of av_hwframe_transfer_data on a VAAPI surface. */
++    pthread_mutex_lock(&inlineass_lock);
++    ass_set_frame_size(ass->renderer, ass->ow, ass->oh);
++    ass_set_pixel_aspect(ass->renderer, 1.0);
++    ass_set_font_scale(ass->renderer, ass->font_scale);
++    if (ass->storage_w > 0 && ass->storage_h > 0)
++        ass_set_storage_size(ass->renderer, ass->storage_w, ass->storage_h);
++    ass_set_fonts(ass->renderer, ass->font_path, "DejaVu Sans",
++                  ASS_FONTPROVIDER_AUTODETECT, ass->fc_file, 1);
++    pthread_mutex_unlock(&inlineass_lock);
++
++    /* Allocate the BGRA staging buffer (s->cpu) the libass text path writes
++     * into. We don't allocate a VAAPI overlay surface (the VAAPI-VPP branch
++     * does that); pl_tex_recreate manages the GPU texture lazily on first
++     * cue. */
++    ass->cpu = av_frame_alloc();
++    if (!ass->cpu)
++        return AVERROR(ENOMEM);
++    ass->cpu->format = AV_PIX_FMT_BGRA;
++    ass->cpu->width  = ass->ow;
++    ass->cpu->height = ass->oh;
++    ret = av_frame_get_buffer(ass->cpu, 0);
++    if (ret < 0)
++        return ret;
++    return 0;
++}
++
++/* Render the libass band into ass->cpu (premultiplied BGRA, shared with the
++ * VAAPI-VPP branch). Sets ass->have_overlay = 1 iff a visible cue exists.
++ * Reuses render_ass_images() + the inlineass_lock from patch 0115. */
++static int inlineass_amd_refresh_overlay(AVFilterContext *avctx, int64_t time_ms)
++{
++    AssContext *ass = avctx->priv;
++    int change = 0, clear = 0, do_render = 0;
++    ASS_Image *img;
++
++    pthread_mutex_lock(&inlineass_lock);
++    img = ass_render_frame(ass->renderer, ass->track, time_ms, &change);
++    if (change) {
++        if (!img) {
++            clear = 1;
++        } else {
++            memset(ass->cpu->data[0], 0,
++                   (size_t)ass->cpu->linesize[0] * ass->oh);
++            render_ass_images(ass->cpu->data[0], ass->cpu->linesize[0],
++                              ass->ow, ass->oh, img);
++            do_render = 1;
++        }
++    }
++    pthread_mutex_unlock(&inlineass_lock);
++
++    if (clear) {
++        ass->amd_have_overlay = 0;
++        return 0;
++    }
++    if (do_render) {
++        /* The actual pl_tex upload happens in filter_frame, where we hold the
++         * GPU context for the blend — keeps the lock scope minimal. The CPU
++         * data is staged here; mark it as "needs re-upload" by latching the
++         * have_overlay flag (we keep the BGRA buffer as the canonical copy). */
++        ass->amd_have_overlay = 1;
++        /* TODO(amd-vk-validate): we re-upload the whole band texture per cue
++         * change. mpv's update_overlays() uses an inflight queue so it can
++         * recycle the previous texture if the band size matches. For sub
++         * burn-in the cue change rate is ~1 Hz, so the simpler always-upload
++         * is fine; revisit if profiling shows GPU-upload churn. */
++    }
++    return 0;
++}
++
++/* Per-frame AMD-Vulkan composite: refresh the libass band → upload to the
++ * cached pl_tex (size-aware: recreate when band dims change) → map src/dst
++ * VAAPI AVFrames as pl_frame via pl_map_avframe_ex → attach the band as a
++ * pl_overlay on the source → pl_render_image() blends into the dst surface
++ * → forward dst. Mirrors mpv vo_gpu_next update_overlays() lifecycle. */
++static int filter_frame_amd_vk(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *avctx   = inlink->dst;
++    AVFilterLink    *outlink = avctx->outputs[0];
++    AssContext      *ass     = avctx->priv;
++    AVFrame         *out     = NULL;
++    pl_fmt           bgra_fmt;
++    struct pl_frame  pl_src = {0}, pl_tgt = {0};
++    struct pl_overlay_part part;
++    struct pl_overlay      ol_text, ol_bmp;
++    struct pl_overlay      overlays[2];
++    int                    num_overlays = 0;
++    int64_t                time_ms;
++    bool                   ok;
++    int                    ret, src_mapped = 0, tgt_mapped = 0;
++
++    time_ms = av_rescale_q(in->pts, inlink->time_base, ASS_TIME_BASE);
++
++    /* Refresh text + bitmap overlays. Text writes to ass->cpu (BGRA premult);
++     * bitmap presentation lives in bmp_pending_buf (same premult BGRA). */
++    ret = inlineass_amd_refresh_overlay(avctx, time_ms);
++    if (ret < 0)
++        goto fail;
++    ret = refresh_bitmap(avctx, time_ms);   /* shared with VAAPI branch */
++    if (ret < 0)
++        goto fail;
++
++    /* Allocate the output VAAPI surface from the input frames pool. We do
++     * NOT blend in place: even though pl_render_image could theoretically
++     * write to the source, the input AVFrame may still be referenced
++     * upstream (decoder pool sharing). Allocating a fresh surface keeps the
++     * pipeline safe. */
++    out = av_frame_alloc();
++    if (!out) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    out->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
++    if (!out->hw_frames_ctx) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    out->format = AV_PIX_FMT_VAAPI;
++    out->width  = in->width;
++    out->height = in->height;
++    ret = av_hwframe_get_buffer(out->hw_frames_ctx, out, 0);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR,
++               "inlineass(amd-vk): av_hwframe_get_buffer failed: %s\n", av_err2str(ret));
++        goto fail;
++    }
++    ret = av_frame_copy_props(out, in);
++    if (ret < 0)
++        goto fail;
++
++    bgra_fmt = pl_find_named_fmt(ass->amd_pl_vk->gpu, "bgra8");
++    if (!bgra_fmt) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): no bgra8 format\n");
++        ret = AVERROR(EIO);
++        goto fail;
++    }
++
++    /* (Re)create + upload the TEXT band texture on visible cue. pl_tex_recreate
++     * is a no-op if params match; otherwise it destroys the old tex first. */
++    if (ass->amd_have_overlay && ass->cpu) {
++        if (!pl_tex_recreate(ass->amd_pl_vk->gpu, &ass->amd_overlay_tex,
++            pl_tex_params(
++                .format        = bgra_fmt,
++                .w             = ass->cpu->width,
++                .h             = ass->cpu->height,
++                .host_writable = true,
++                .sampleable    = true,
++            ))) {
++            av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_tex_recreate(text) failed\n");
++            ret = AVERROR(EIO);
++            goto fail;
++        }
++        if (!pl_tex_upload(ass->amd_pl_vk->gpu, pl_tex_transfer_params(
++                .tex       = ass->amd_overlay_tex,
++                .row_pitch = ass->cpu->linesize[0],
++                .ptr       = ass->cpu->data[0],
++            ))) {
++            av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_tex_upload(text) failed\n");
++            ret = AVERROR(EIO);
++            goto fail;
++        }
++        ass->amd_overlay_w = ass->cpu->width;
++        ass->amd_overlay_h = ass->cpu->height;
++    }
++
++    /* (Re)create + upload the BITMAP texture on active bmp cue (PGS/DVD/DVB).
++     * Source is bmp_pending_buf (premultiplied BGRA, decoder-thread staged).
++     * Lock scope mirrors refresh_bitmap: read under inlineass_lock, upload
++     * outside. */
++    if (ass->bmp_clock.active && ass->bmp_pending_buf) {
++        uint8_t *bmp_copy = NULL;
++        int bmp_w = 0, bmp_h = 0, bmp_stride = 0;
++        pthread_mutex_lock(&inlineass_lock);
++        bmp_w      = ass->bmp_cw;
++        bmp_h      = ass->bmp_ch;
++        bmp_stride = ass->bmp_pending_stride;
++        if (bmp_w > 0 && bmp_h > 0 && bmp_stride > 0) {
++            bmp_copy = av_malloc((size_t)bmp_stride * bmp_h);
++            if (bmp_copy)
++                memcpy(bmp_copy, ass->bmp_pending_buf, (size_t)bmp_stride * bmp_h);
++        }
++        pthread_mutex_unlock(&inlineass_lock);
++
++        if (bmp_copy) {
++            if (!pl_tex_recreate(ass->amd_pl_vk->gpu, &ass->amd_bmp_tex,
++                pl_tex_params(
++                    .format        = bgra_fmt,
++                    .w             = bmp_w,
++                    .h             = bmp_h,
++                    .host_writable = true,
++                    .sampleable    = true,
++                ))) {
++                av_free(bmp_copy);
++                av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_tex_recreate(bmp) failed\n");
++                ret = AVERROR(EIO);
++                goto fail;
++            }
++            if (!pl_tex_upload(ass->amd_pl_vk->gpu, pl_tex_transfer_params(
++                    .tex       = ass->amd_bmp_tex,
++                    .row_pitch = bmp_stride,
++                    .ptr       = bmp_copy,
++                ))) {
++                av_free(bmp_copy);
++                av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_tex_upload(bmp) failed\n");
++                ret = AVERROR(EIO);
++                goto fail;
++            }
++            av_free(bmp_copy);
++            ass->amd_bmp_tex_w = bmp_w;
++            ass->amd_bmp_tex_h = bmp_h;
++        }
++    }
++
++    /* Map VAAPI input + output as pl_frame. libplacebo handles the
++     * VAAPI→DMA-BUF→Vulkan import path transparently (mpv-proven on RADV).
++     *
++     * TODO(amd-vk-validate): if pl_map_avframe_ex fails on a VAAPI input on
++     * this radeonsi/libplacebo combo, fall back to a manual
++     * vaExportSurfaceHandle + pl_vulkan_wrap (replicating libplacebo's own
++     * internal path). mpv works on AMD, so the path exists; ffmpeg's
++     * wrapper layer may have a gap. */
++    if (!pl_map_avframe_ex(ass->amd_pl_vk->gpu, &pl_src,
++                           pl_avframe_params(.frame = in))) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_map_avframe_ex(src) failed\n");
++        ret = AVERROR(EIO);
++        goto fail;
++    }
++    src_mapped = 1;
++    if (!pl_map_avframe_ex(ass->amd_pl_vk->gpu, &pl_tgt,
++                           pl_avframe_params(.frame = out))) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_map_avframe_ex(dst) failed\n");
++        ret = AVERROR(EIO);
++        goto fail;
++    }
++    tgt_mapped = 1;
++
++    /* Attach overlays. A stream is text XOR bitmap (PGS preferred when both
++     * active, mirroring the VAAPI/CUDA branches' precedence). Single overlay
++     * part covering the full band; dst rect == src rect (no extra scale,
++     * pl_render_image rescales overlay coords into the target). */
++    part = (struct pl_overlay_part) {
++        .src   = { 0, 0, 0, 0 },
++        .dst   = { 0, 0, 0, 0 },
++        .color = { 1.0f, 1.0f, 1.0f, 1.0f },
++    };
++
++    if (ass->bmp_clock.active && ass->amd_bmp_tex) {
++        part.src.x1 = ass->amd_bmp_tex_w;
++        part.src.y1 = ass->amd_bmp_tex_h;
++        part.dst.x1 = in->width;
++        part.dst.y1 = in->height;
++        ol_bmp = (struct pl_overlay) {
++            .tex       = ass->amd_bmp_tex,
++            .mode      = PL_OVERLAY_NORMAL,
++            .coords    = PL_OVERLAY_COORDS_DST_FRAME,
++            .repr      = { .alpha = PL_ALPHA_PREMULTIPLIED },
++            .color     = pl_color_space_srgb,
++            .parts     = &part,
++            .num_parts = 1,
++        };
++        overlays[num_overlays++] = ol_bmp;
++    } else if (ass->amd_have_overlay && ass->amd_overlay_tex) {
++        part.src.x1 = ass->amd_overlay_w;
++        part.src.y1 = ass->amd_overlay_h;
++        part.dst.x1 = in->width;
++        part.dst.y1 = in->height;
++        ol_text = (struct pl_overlay) {
++            .tex       = ass->amd_overlay_tex,
++            .mode      = PL_OVERLAY_NORMAL,
++            .coords    = PL_OVERLAY_COORDS_DST_FRAME,
++            .repr      = { .alpha = PL_ALPHA_PREMULTIPLIED },
++            .color     = pl_color_space_srgb,
++            .parts     = &part,
++            .num_parts = 1,
++        };
++        overlays[num_overlays++] = ol_text;
++    }
++    pl_src.overlays     = overlays;
++    pl_src.num_overlays = num_overlays;
++
++    /* The render call that dodges overlay_vulkan + libplacebo inputs=2
++     * (both broken on RADV). pl_render_image dispatches via libplacebo's
++     * own draw_overlays() — mpv's working path. */
++    ok = pl_render_image(ass->amd_pl_rr, &pl_src, &pl_tgt, &pl_render_default_params);
++    if (!ok) {
++        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_render_image failed\n");
++        ret = AVERROR(EIO);
++        goto fail;
++    }
++
++    pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_src);
++    pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_tgt);
++    av_frame_free(&in);
++    return ff_filter_frame(outlink, out);
++
++fail:
++    if (tgt_mapped) pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_tgt);
++    if (src_mapped) pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_src);
++    av_frame_free(&in);
++    av_frame_free(&out);
++    return ret;
++}
++#endif /* CONFIG_LIBPLACEBO_FILTER */
++
+ /* ======================================================================== *
+  *  init / uninit / format negotiation / link config (format-adaptive)      *
+  * ======================================================================== */
+@@ -1620,6 +2200,23 @@ static av_cold void uninit(AVFilterContext *ctx)
+     ass->cuda_hwctx = NULL;
+ #endif /* CONFIG_OVERLAY_CUDA_FILTER */
+ 
++#if CONFIG_LIBPLACEBO_FILTER
++    /* AMD-Vulkan branch teardown (NULL/no-op when not configured). Order:
++     * destroy textures + renderer + Vulkan ctx + log, then drop the AVF
++     * Vulkan device ref. Mirrors mpv vo_gpu_next uninit. */
++    if (ass->amd_pl_vk) {
++        if (ass->amd_overlay_tex)
++            pl_tex_destroy(ass->amd_pl_vk->gpu, &ass->amd_overlay_tex);
++        if (ass->amd_bmp_tex)
++            pl_tex_destroy(ass->amd_pl_vk->gpu, &ass->amd_bmp_tex);
++    }
++    if (ass->amd_pl_rr)  pl_renderer_destroy(&ass->amd_pl_rr);
++    if (ass->amd_pl_vk)  pl_vulkan_destroy(&ass->amd_pl_vk);
++    if (ass->amd_pl_log) pl_log_destroy(&ass->amd_pl_log);
++    av_buffer_unref(&ass->amd_vk_device_ref);
++    ass->amd_active = 0;
++#endif /* CONFIG_LIBPLACEBO_FILTER */
++
+     /* scaleplex: serialise libass teardown against the decoder thread's
+      * append/replay and another instance's render. libass shares
+      * process-global state (fontconfig/freetype) that is NOT reentrant;
+@@ -1671,8 +2268,20 @@ static int config_input(AVFilterLink *link)
+     AVFilterContext *avctx  = link->dst;
+     AssContext      *ass    = avctx->priv;
+ 
+-    if (link->format == AV_PIX_FMT_VAAPI)
++    if (link->format == AV_PIX_FMT_VAAPI) {
++#if CONFIG_LIBPLACEBO_FILTER
++        /* AMD radeonsi (Mesa) → AMD-Vulkan branch (patch 0127); Intel iHD
++         * → existing VAAPI-VPP branch (patch 0115). Latched here so
++         * config_output + filter_frame dispatch without re-probing. */
++        if (inlineass_amd_vendor_is_mesa(avctx, link)) {
++            ass->amd_active = 1;
++            /* No per-input setup needed; pl_vulkan_import + ass_set_frame_size
++             * happen in inlineass_amd_vk_config() from config_output. */
++            return 0;
++        }
++#endif
+         return ff_vaapi_vpp_config_input(link);
++    }
+ 
+ #if CONFIG_OVERLAY_CUDA_FILTER
+     if (link->format == AV_PIX_FMT_CUDA)
+@@ -1802,6 +2411,12 @@ static int config_output(AVFilterLink *outlink)
+     }
+ #endif /* CONFIG_OVERLAY_CUDA_FILTER */
+ 
++#if CONFIG_LIBPLACEBO_FILTER
++    /* AMD-Vulkan branch handles its own output link + libplacebo init. */
++    if (ass->amd_active)
++        return inlineass_amd_vk_config(avctx, inlink);
++#endif
++
+     /* HW (VAAPI) branch. */
+     outlink->time_base     = inlink->time_base;
+     vpp_ctx->output_width  = inlink->w;
+@@ -2345,8 +2960,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+     long long time_ms;
+     int err;
+ 
+-    if (inlink->format == AV_PIX_FMT_VAAPI)
++    if (inlink->format == AV_PIX_FMT_VAAPI) {
++#if CONFIG_LIBPLACEBO_FILTER
++        if (ass->amd_active)
++            return filter_frame_amd_vk(inlink, picref);
++#endif
+         return filter_frame_hw(inlink, picref);
++    }
+ 
+ #if CONFIG_OVERLAY_CUDA_FILTER
+     if (inlink->format == AV_PIX_FMT_CUDA)
+diff --git a/libavfilter/vf_inlineass.h b/libavfilter/vf_inlineass.h
+index 799d6da..3bda54b 100644
+--- a/libavfilter/vf_inlineass.h
++++ b/libavfilter/vf_inlineass.h
+@@ -38,7 +38,9 @@ void avfilter_inlineass_replay_chunk(AVFilterContext *link, AVCodecContext *dec_
+ /* scaleplex: feed a whole decoded BITMAP subtitle presentation (PGS/DVD/DVB)
+  * to the merged filter's HW (VAAPI) branch. Only the VAAPI branch can burn
+  * bitmap subs; the SW branch ignores this path. An empty presentation
+- * (num_rects == 0) is a clear. */
++ * (num_rects == 0) is a clear. The AMD-Vulkan branch (patch 0127) reuses the
++ * same staged BGRA presentation via libplacebo overlay upload — no extra
++ * decoder-side API surface. */
+ void avfilter_inlineass_replay_bitmap(AVFilterContext *link, AVCodecContext *dec_ctx,
+                                       AVSubtitle *sub);
+ void avfilter_inlineass_set_aspect_ratio(AVFilterContext *context, double dar);
