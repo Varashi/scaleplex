@@ -75,7 +75,7 @@ index 217211b..1c2f477 100644
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
 diff --git a/libavfilter/vf_inlineass.c b/libavfilter/vf_inlineass.c
-index eb41aa1..3aad0aa 100644
+index eb41aa1..ab6a38b 100644
 --- a/libavfilter/vf_inlineass.c
 +++ b/libavfilter/vf_inlineass.c
 @@ -95,6 +95,40 @@
@@ -119,7 +119,7 @@ index eb41aa1..3aad0aa 100644
  /* Display-window lifecycle for a single subtitle cue. Decoupled from
   * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
   * can share a small, testable primitive with the text path. INT64_MIN
-@@ -170,6 +204,14 @@ typedef struct {
+@@ -170,6 +204,24 @@ typedef struct {
      char *filename;            /**< optional: render a sub FILE (ad-hoc validation) */
      int   render_height;       /**< cap libass raster height; VPP upscales (0 = no cap) */
      int   animated_tier_down;  /**< toggle: render animated cues one tier below render_height */
@@ -131,10 +131,20 @@ index eb41aa1..3aad0aa 100644
 +     * is read but has no effect (other branches don't dispatch HDR→SDR
 +     * through libplacebo). */
 +    int   tonemap_only;
++    /* scaleplex (patch 0127 v7, issue #137): explicit rewriter-driven HDR→SDR
++     * intent. Scaleplex policy "never inject tonemap; Plex's argv decides"
++     * (project_scaleplex_tonemap_policy) — v6 auto-tonemapped any HDR source
++     * via pl_color_transfer_is_hdr(), incorrectly SDR-mapping HDR-passthrough
++     * sessions and paying the libplacebo tonemap cost on the passthrough
++     * path. v7 gates the pl_tgt.color = bt709 override AND the intermediate
++     * Vulkan pool's HDR→nv12 sw_format swap on this flag. Set by the rewriter
++     * only when facts.hdr (Plex's argv carries a tonemap stage) AND vendor=AMD.
++     * Inert on non-AMD branches. */
++    int   hdr_to_sdr;
      int   animated;            /**< an animated cue (\move/\t/\k/\fad) was seen */
      int   anim_active;         /**< overlay is currently sized at the animated (lower) tier */
      int   anim_ow, anim_oh;    /**< animated-tier overlay dims (precomputed) */
-@@ -239,6 +281,54 @@ typedef struct {
+@@ -239,6 +291,54 @@ typedef struct {
      CUtexObject          cuda_bmp_tex[4];         /**< Y/U/V/A over cuda_bmp_overlay */
      int                  cuda_bmp_surf_w, cuda_bmp_surf_h;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
@@ -189,7 +199,7 @@ index eb41aa1..3aad0aa 100644
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -1465,6 +1555,722 @@ fail:
+@@ -1465,6 +1565,733 @@ fail:
  }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -383,16 +393,19 @@ index eb41aa1..3aad0aa 100644
 +    {
 +        AVHWFramesContext     *vk_frames;
 +        AVVulkanFramesContext *vk_hwctx;
-+        /* scaleplex (patch 0127 v6, issue #123): output sw_format is nv12
-+         * (SDR 8-bit) when the input is HDR — libplacebo tonemaps in
-+         * filter_frame_amd_vk (pl_tgt.color = pl_color_space_bt709 override
-+         * when pl_color_transfer_is_hdr(pl_src.color.transfer)), so the
-+         * downstream encoder gets a real SDR surface. For SDR sources the
-+         * pool mirrors the input (nv12 → nv12), unchanged behavior. */
++        /* scaleplex (patch 0127 v7, issue #137): output sw_format is nv12
++         * (SDR 8-bit) ONLY when the rewriter signalled HDR→SDR intent via
++         * hdr_to_sdr=1 AND the input is HDR — libplacebo will tonemap in
++         * filter_frame_amd_vk (pl_tgt.color = pl_color_space_bt709 override,
++         * also gated on hdr_to_sdr). For HDR-passthrough (hdr_to_sdr=0 +
++         * HDR source) and any SDR source, the pool mirrors the input pool's
++         * sw_format — no format conversion, no extra Vulkan→VAAPI realloc
++         * (passthrough hits the input-pool-reuse branch below). */
 +        enum AVPixelFormat out_swfmt = in_frames->sw_format;
-+        if (in_frames->sw_format == AV_PIX_FMT_P010 ||
-+            in_frames->sw_format == AV_PIX_FMT_P012 ||
-+            in_frames->sw_format == AV_PIX_FMT_P016) {
++        if (ass->hdr_to_sdr &&
++            (in_frames->sw_format == AV_PIX_FMT_P010 ||
++             in_frames->sw_format == AV_PIX_FMT_P012 ||
++             in_frames->sw_format == AV_PIX_FMT_P016)) {
 +            out_swfmt = AV_PIX_FMT_NV12;
 +        }
 +
@@ -788,7 +801,15 @@ index eb41aa1..3aad0aa 100644
 +     * fills hdr from AVMasteringDisplayMetadata side-data when present; if
 +     * Plex strips that side-data the tonemap falls back to default params.
 +     * Live-validation gate to confirm side-data survival end-to-end. */
-+    if (pl_color_transfer_is_hdr(pl_src.color.transfer)) {
++    /* scaleplex (patch 0127 v7, issue #137): gate the HDR→SDR target-color
++     * override on ass->hdr_to_sdr — the rewriter's explicit intent. Scaleplex
++     * policy "never inject tonemap; Plex's argv decides"
++     * (project_scaleplex_tonemap_policy): HDR-passthrough sessions (HDR client
++     * + HDR output) must NOT be SDR-mapped, and must NOT pay the libplacebo
++     * tonemap dispatch cost. The pl_color_transfer_is_hdr() check is kept as
++     * a safety: don't override an already-SDR source even if the rewriter
++     * mis-sets the flag, but the rewriter's intent is the trigger. */
++    if (ass->hdr_to_sdr && pl_color_transfer_is_hdr(pl_src.color.transfer)) {
 +        pl_tgt.color = pl_color_space_bt709;
 +        av_log(avctx, AV_LOG_VERBOSE,
 +               "inlineass(amd-vk): HDR src (trc=%d) → SDR bt709 tgt (libplacebo tonemap)%s\n",
@@ -912,7 +933,7 @@ index eb41aa1..3aad0aa 100644
  /* ======================================================================== *
   *  init / uninit / format negotiation / link config (format-adaptive)      *
   * ======================================================================== */
-@@ -1620,6 +2426,26 @@ static av_cold void uninit(AVFilterContext *ctx)
+@@ -1620,6 +2447,26 @@ static av_cold void uninit(AVFilterContext *ctx)
      ass->cuda_hwctx = NULL;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -939,7 +960,7 @@ index eb41aa1..3aad0aa 100644
      /* scaleplex: serialise libass teardown against the decoder thread's
       * append/replay and another instance's render. libass shares
       * process-global state (fontconfig/freetype) that is NOT reentrant;
-@@ -1671,8 +2497,20 @@ static int config_input(AVFilterLink *link)
+@@ -1671,8 +2518,20 @@ static int config_input(AVFilterLink *link)
      AVFilterContext *avctx  = link->dst;
      AssContext      *ass    = avctx->priv;
  
@@ -961,7 +982,7 @@ index eb41aa1..3aad0aa 100644
  
  #if CONFIG_OVERLAY_CUDA_FILTER
      if (link->format == AV_PIX_FMT_CUDA)
-@@ -1802,6 +2640,12 @@ static int config_output(AVFilterLink *outlink)
+@@ -1802,6 +2661,12 @@ static int config_output(AVFilterLink *outlink)
      }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -974,7 +995,7 @@ index eb41aa1..3aad0aa 100644
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -2345,8 +3189,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+@@ -2345,8 +3210,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
      long long time_ms;
      int err;
  
@@ -989,7 +1010,7 @@ index eb41aa1..3aad0aa 100644
  
  #if CONFIG_OVERLAY_CUDA_FILTER
      if (inlink->format == AV_PIX_FMT_CUDA)
-@@ -2639,6 +3488,13 @@ static const AVOption inlineass_options[] = {
+@@ -2639,6 +3509,20 @@ static const AVOption inlineass_options[] = {
      {"filename",       "subtitle file to render (ASS/SSA); omit to feed via -map_inlineass (HW ad-hoc)", OFFSET(filename), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
      {"render_height",  "HW path: cap libass raster height (0=full); VPP upscales", OFFSET(render_height), AV_OPT_TYPE_INT, {.i64 = 1080}, 0, 4320, FLAGS},
      {"animated_tier_down", "HW path: render animated cues (\\move/\\t/\\k/\\fad) one resolution tier below render_height", OFFSET(animated_tier_down), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
@@ -1000,6 +1021,13 @@ index eb41aa1..3aad0aa 100644
 +     * just runs the libplacebo pl_render_image with an SDR target color
 +     * space. Inert on non-AMD branches. */
 +    {"tonemap_only",   "AMD-Vulkan branch: run HDR→SDR tonemap with no overlay (no -map_inlineass binding needed)", OFFSET(tonemap_only), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
++    /* scaleplex (patch 0127 v7, issue #137): explicit rewriter-driven HDR→SDR
++     * intent (AMD-Vulkan only). Set by the rewriter when Plex's filtergraph
++     * carried a tonemap stage. Without it, the AMD-Vulkan branch leaves the
++     * source HDR colorimetry intact (passthrough) and skips the libplacebo
++     * tonemap dispatch — honors "scaleplex never injects tonemap; Plex's
++     * argv decides". Inert on non-AMD branches. */
++    {"hdr_to_sdr",     "AMD-Vulkan branch: explicit HDR→SDR tonemap (rewriter sets when Plex's argv carried a tonemap stage; default off = passthrough)", OFFSET(hdr_to_sdr), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
      /* scaleplex: Plex user subtitle-appearance styling (parsed by libass) */
      {"overrides",      "ASS style overrides ([Style.]Param=Value CSV; Plex appearance)", OFFSET(overrides), AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN, CHAR_MAX, FLAGS},
      {"outline",        "outline (border) width override (0=unset)", OFFSET(outline), AV_OPT_TYPE_DOUBLE, {.dbl = 0.0}, 0.0, 100.0, FLAGS},
