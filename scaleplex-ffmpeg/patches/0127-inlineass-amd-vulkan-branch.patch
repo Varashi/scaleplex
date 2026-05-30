@@ -34,12 +34,17 @@ Architecture:
     unlock bridging is cribbed verbatim from vf_libplacebo.c init_vulkan().
   - Per-frame: libass renders the band into the shared `cpu` BGRA staging
     (same buffer the VAAPI-VPP branch uses); uploaded to a cached
-    pl_tex; the source + a freshly-allocated output VAAPI surface (from
-    the input frames pool) are mapped as pl_frame via pl_map_avframe_ex
-    (libplacebo handles VAAPI→DMA-BUF→Vulkan transparently); the band is
-    attached as a pl_overlay; pl_render_image() blends + writes the
-    output surface. Output stays AV_PIX_FMT_VAAPI for the downstream
-    h264/hevc_vaapi encoder.
+    pl_tex. The render target is allocated from an intermediate Vulkan
+    AVHWFramesContext (NV12, COLOR_ATTACHMENT_BIT, DRM_FORMAT_MODIFIER
+    tiling) — libplacebo's pl_map_avframe_ex on a VAAPI AVFrame hard-
+    codes sampleable-only via pl_map_avframe_drm, so the imported
+    pl_tex is NOT renderable; the Vulkan-pool path goes via
+    pl_map_avframe_vulkan which DOES pass vkfc->usage through. After
+    pl_render_image, av_hwframe_map produces the VAAPI AVFrame the
+    encoder consumes — zero GPU-side copy, dma-buf-shared backing.
+    Mirrors vf_libplacebo's own Vulkan-output dance with the Vulkan→
+    VAAPI map tail added (libavutil/hwcontext_vulkan.c
+    vulkan_map_to_vaapi is the proven shipping primitive).
   - Bitmap (PGS) reuses the existing bmp_pending_buf premultiplied BGRA
     staging populated by avfilter_inlineass_replay_bitmap; uploaded to a
     separate cached pl_tex.
@@ -53,6 +58,7 @@ untouched.
 
 Tracks issue #123 (AMD RX 6800 radeonsi bring-up).
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 217211b..1c2f477 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -371,6 +371,12 @@ OBJS-$(CONFIG_INLINEASS_FILTER)              += vf_inlineass.o vaapi_vpp.o
@@ -69,7 +75,7 @@ diff --git a/libavfilter/Makefile b/libavfilter/Makefile
  OBJS-$(CONFIG_INTERLACE_FILTER)              += vf_tinterlace.o
  OBJS-$(CONFIG_INTERLEAVE_FILTER)             += f_interleave.o
 diff --git a/libavfilter/vf_inlineass.c b/libavfilter/vf_inlineass.c
-index eb41aa1..0c4aa6a 100644
+index eb41aa1..18dcfcf 100644
 --- a/libavfilter/vf_inlineass.c
 +++ b/libavfilter/vf_inlineass.c
 @@ -95,6 +95,34 @@
@@ -107,7 +113,7 @@ index eb41aa1..0c4aa6a 100644
  /* Display-window lifecycle for a single subtitle cue. Decoupled from
   * libass so the bitmap path (PGS/DVD/DVB), which has no libass clock,
   * can share a small, testable primitive with the text path. INT64_MIN
-@@ -239,6 +267,38 @@ typedef struct {
+@@ -239,6 +267,43 @@ typedef struct {
      CUtexObject          cuda_bmp_tex[4];         /**< Y/U/V/A over cuda_bmp_overlay */
      int                  cuda_bmp_surf_w, cuda_bmp_surf_h;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
@@ -131,6 +137,11 @@ index eb41aa1..0c4aa6a 100644
 +     * encoder is happy. Bitmap (PGS/DVD/DVB) shares the existing
 +     * bmp_pending_buf premultiplied-BGRA staging. */
 +    AVBufferRef     *amd_vk_device_ref;   /**< derived AVHWDeviceContext (Vulkan) */
++    AVBufferRef     *amd_vk_frames_ref;   /**< intermediate Vulkan AVHWFramesContext
++                                               (sw_format = input swfmt, COLOR_ATTACHMENT
++                                               + DRM-modifier tiling — render target for
++                                               libplacebo; av_hwframe_map'd to VAAPI per
++                                               frame for the downstream encoder) */
 +    pl_log           amd_pl_log;
 +    pl_vulkan        amd_pl_vk;           /**< libplacebo Vulkan ctx (imported from AVF) */
 +    pl_renderer      amd_pl_rr;
@@ -146,7 +157,7 @@ index eb41aa1..0c4aa6a 100644
  } AssContext;
  
  /* scaleplex: process-wide libass lock. libass is not reentrant across
-@@ -1465,6 +1525,531 @@ fail:
+@@ -1465,6 +1530,610 @@ fail:
  }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -322,6 +333,50 @@ index eb41aa1..0c4aa6a 100644
 +        return AVERROR(ENOMEM);
 +    }
 +
++    /* Intermediate Vulkan AVHWFramesContext — the RENDER TARGET pool.
++     * libplacebo's pl_map_avframe_ex on a VAAPI input goes via
++     * pl_map_avframe_drm, which hard-codes the imported pl_tex as
++     * sampleable + blit_src only (never renderable) — VAAPI surfaces
++     * lack VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT on the Vulkan side and
++     * there's no AVVAAPIFramesContext knob to add it. Workaround
++     * (mirrors vf_libplacebo's Vulkan-output path): render into a
++     * Vulkan-native AVFrame allocated from THIS pool (vkfc->usage |=
++     * COLOR_ATTACHMENT_BIT → pl_map_avframe_vulkan passes the flag to
++     * pl_vulkan_wrap → the pl_tex IS renderable), then DMA-BUF
++     * map the Vulkan frame to a VAAPI AVFrame for the downstream
++     * encoder via vulkan_map_to_vaapi (zero GPU-side copy; the same
++     * dma-buf the Vulkan render wrote into becomes the VAAPI surface).
++     * DRM_FORMAT_MODIFIER_EXT tiling is required so the underlying
++     * VkImage is dma-buf exportable for that map step. */
++    {
++        AVHWFramesContext     *vk_frames;
++        AVVulkanFramesContext *vk_hwctx;
++
++        ass->amd_vk_frames_ref = av_hwframe_ctx_alloc(ass->amd_vk_device_ref);
++        if (!ass->amd_vk_frames_ref)
++            return AVERROR(ENOMEM);
++        vk_frames                    = (AVHWFramesContext *)ass->amd_vk_frames_ref->data;
++        vk_frames->format            = AV_PIX_FMT_VULKAN;
++        vk_frames->sw_format         = in_frames->sw_format;  /* NV12 / P010 — mirror VAAPI pool */
++        vk_frames->width             = inlink->w;
++        vk_frames->height            = inlink->h;
++        vk_frames->initial_pool_size = 4; /* small ring: encoder retires 1-2 in flight */
++
++        vk_hwctx = vk_frames->hwctx;
++        /* SAMPLED + TRANSFER bits are added automatically by
++         * hwcontext_vulkan (see header doc on `usage`). */
++        vk_hwctx->usage  = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++        vk_hwctx->tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++
++        ret = av_hwframe_ctx_init(ass->amd_vk_frames_ref);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "inlineass(amd-vk): Vulkan frames-ctx init failed: %s\n",
++                   av_err2str(ret));
++            return ret;
++        }
++    }
++
 +    /* Output link: pass-through geometry, reuse the input frames pool (so
 +     * av_hwframe_get_buffer in filter_frame allocates from it without a
 +     * fresh pool — same shape, same encoder-friendly hw_frames_ctx). */
@@ -452,6 +507,7 @@ index eb41aa1..0c4aa6a 100644
 +    AVFilterLink    *outlink = avctx->outputs[0];
 +    AssContext      *ass     = avctx->priv;
 +    AVFrame         *out     = NULL;
++    AVFrame         *vk_tgt  = NULL;
 +    pl_fmt           bgra_fmt;
 +    struct pl_frame  pl_src = {0}, pl_tgt = {0};
 +    struct pl_overlay_part part;
@@ -473,33 +529,41 @@ index eb41aa1..0c4aa6a 100644
 +    if (ret < 0)
 +        goto fail;
 +
-+    /* Allocate the output VAAPI surface from the input frames pool. We do
-+     * NOT blend in place: even though pl_render_image could theoretically
-+     * write to the source, the input AVFrame may still be referenced
-+     * upstream (decoder pool sharing). Allocating a fresh surface keeps the
-+     * pipeline safe. */
++    /* Allocate the RENDER TARGET from the intermediate Vulkan pool (NOT
++     * the VAAPI pool — see the inlineass_amd_vk_config comment block).
++     * The Vulkan frames-ctx was created with COLOR_ATTACHMENT_BIT, so the
++     * pl_tex libplacebo derives in pl_map_avframe_ex (via
++     * pl_map_avframe_vulkan, which passes vkfc->usage through to
++     * pl_vulkan_wrap) IS renderable — unlike the VAAPI→DRM→Vulkan import
++     * path which hard-codes sampleable only. After rendering we DMA-BUF
++     * map the Vulkan frame to a VAAPI AVFrame for the downstream
++     * encoder. */
++    vk_tgt = av_frame_alloc();
++    if (!vk_tgt) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    ret = av_hwframe_get_buffer(ass->amd_vk_frames_ref, vk_tgt, 0);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR,
++               "inlineass(amd-vk): av_hwframe_get_buffer(vulkan) failed: %s\n",
++               av_err2str(ret));
++        goto fail;
++    }
++    ret = av_frame_copy_props(vk_tgt, in);
++    if (ret < 0)
++        goto fail;
++    vk_tgt->width  = in->width;
++    vk_tgt->height = in->height;
++
++    /* Allocate the VAAPI AVFrame the downstream encoder will consume.
++     * Filled in below via av_hwframe_map; it carries the same DMA-BUF
++     * backing as vk_tgt — zero GPU-side copy. */
 +    out = av_frame_alloc();
 +    if (!out) {
 +        ret = AVERROR(ENOMEM);
 +        goto fail;
 +    }
-+    out->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
-+    if (!out->hw_frames_ctx) {
-+        ret = AVERROR(ENOMEM);
-+        goto fail;
-+    }
-+    out->format = AV_PIX_FMT_VAAPI;
-+    out->width  = in->width;
-+    out->height = in->height;
-+    ret = av_hwframe_get_buffer(out->hw_frames_ctx, out, 0);
-+    if (ret < 0) {
-+        av_log(avctx, AV_LOG_ERROR,
-+               "inlineass(amd-vk): av_hwframe_get_buffer failed: %s\n", av_err2str(ret));
-+        goto fail;
-+    }
-+    ret = av_frame_copy_props(out, in);
-+    if (ret < 0)
-+        goto fail;
 +
 +    bgra_fmt = pl_find_named_fmt(ass->amd_pl_vk->gpu, "bgra8");
 +    if (!bgra_fmt) {
@@ -600,7 +664,7 @@ index eb41aa1..0c4aa6a 100644
 +    }
 +    src_mapped = 1;
 +    if (!pl_map_avframe_ex(ass->amd_pl_vk->gpu, &pl_tgt,
-+                           pl_avframe_params(.frame = out))) {
++                           pl_avframe_params(.frame = vk_tgt))) {
 +        av_log(avctx, AV_LOG_ERROR, "inlineass(amd-vk): pl_map_avframe_ex(dst) failed\n");
 +        ret = AVERROR(EIO);
 +        goto fail;
@@ -662,13 +726,39 @@ index eb41aa1..0c4aa6a 100644
 +    }
 +
 +    pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_src);
++    src_mapped = 0;
 +    pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_tgt);
++    tgt_mapped = 0;
++
++    /* Vulkan → VAAPI map: produces a VAAPI AVFrame whose VASurface is a
++     * dma-buf import of the Vulkan VkImage memory we just rendered into.
++     * av_hwframe_map sets out->format = AV_PIX_FMT_VAAPI + width/height
++     * + hw_frames_ctx, and attaches an internal HWMapDescriptor that
++     * keeps vk_tgt alive for the lifetime of the mapped frame. The
++     * downstream encoder sees a normal VAAPI frame. */
++    out->format = AV_PIX_FMT_VAAPI;
++    ret = av_hwframe_map(out, vk_tgt,
++                         AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR,
++               "inlineass(amd-vk): vulkan→vaapi map failed: %s\n",
++               av_err2str(ret));
++        goto fail;
++    }
++    ret = av_frame_copy_props(out, in);
++    if (ret < 0)
++        goto fail;
++
++    /* vk_tgt's refcount is now held by `out` via the HWMapDescriptor;
++     * drop our own ref. */
++    av_frame_free(&vk_tgt);
 +    av_frame_free(&in);
 +    return ff_filter_frame(outlink, out);
 +
 +fail:
 +    if (tgt_mapped) pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_tgt);
 +    if (src_mapped) pl_unmap_avframe(ass->amd_pl_vk->gpu, &pl_src);
++    av_frame_free(&vk_tgt);
 +    av_frame_free(&in);
 +    av_frame_free(&out);
 +    return ret;
@@ -678,7 +768,7 @@ index eb41aa1..0c4aa6a 100644
  /* ======================================================================== *
   *  init / uninit / format negotiation / link config (format-adaptive)      *
   * ======================================================================== */
-@@ -1620,6 +2200,23 @@ static av_cold void uninit(AVFilterContext *ctx)
+@@ -1620,6 +2289,26 @@ static av_cold void uninit(AVFilterContext *ctx)
      ass->cuda_hwctx = NULL;
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -695,6 +785,9 @@ index eb41aa1..0c4aa6a 100644
 +    if (ass->amd_pl_rr)  pl_renderer_destroy(&ass->amd_pl_rr);
 +    if (ass->amd_pl_vk)  pl_vulkan_destroy(&ass->amd_pl_vk);
 +    if (ass->amd_pl_log) pl_log_destroy(&ass->amd_pl_log);
++    /* Drop intermediate frames-ctx BEFORE the device ref (frames-ctx
++     * holds an internal ref on the device). */
++    av_buffer_unref(&ass->amd_vk_frames_ref);
 +    av_buffer_unref(&ass->amd_vk_device_ref);
 +    ass->amd_active = 0;
 +#endif /* CONFIG_LIBPLACEBO_FILTER */
@@ -702,7 +795,7 @@ index eb41aa1..0c4aa6a 100644
      /* scaleplex: serialise libass teardown against the decoder thread's
       * append/replay and another instance's render. libass shares
       * process-global state (fontconfig/freetype) that is NOT reentrant;
-@@ -1671,8 +2268,20 @@ static int config_input(AVFilterLink *link)
+@@ -1671,8 +2360,20 @@ static int config_input(AVFilterLink *link)
      AVFilterContext *avctx  = link->dst;
      AssContext      *ass    = avctx->priv;
  
@@ -724,7 +817,7 @@ index eb41aa1..0c4aa6a 100644
  
  #if CONFIG_OVERLAY_CUDA_FILTER
      if (link->format == AV_PIX_FMT_CUDA)
-@@ -1802,6 +2411,12 @@ static int config_output(AVFilterLink *outlink)
+@@ -1802,6 +2503,12 @@ static int config_output(AVFilterLink *outlink)
      }
  #endif /* CONFIG_OVERLAY_CUDA_FILTER */
  
@@ -737,7 +830,7 @@ index eb41aa1..0c4aa6a 100644
      /* HW (VAAPI) branch. */
      outlink->time_base     = inlink->time_base;
      vpp_ctx->output_width  = inlink->w;
-@@ -2345,8 +2960,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+@@ -2345,8 +3052,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
      long long time_ms;
      int err;
  
