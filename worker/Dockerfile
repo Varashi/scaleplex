@@ -128,4 +128,13 @@ EXPOSE 3501
 # "Connection error" (live repro 2026-05-08: Plex Android, force-burn
 # subs + seek, 2 min wall clock no segments).
 RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v 2>&1 | tail -3
+
+# Default to the unprivileged uid 1000 (#68). Prod overrides this anyway
+# (k8s `runAsUser: 1000`, compose `user: "1000:100"`), so this is defense-in-
+# depth for external/ad-hoc invocations (`docker run ghcr.io/varashi/...`).
+# The agent binary carries cap_perfmon=ep via setcap so the i915 PMU reader
+# (Intel) still works for uid 1000; render2 (gid 568) + video group memberships
+# carry /dev/dri/renderD* access; nvidia-container-toolkit handles /dev/nvidia*
+# perms via CDI device specs.
+USER scaleplex
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/scaleplex-agent"]
