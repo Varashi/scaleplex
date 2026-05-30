@@ -346,36 +346,77 @@ func collectEnv() map[string]string {
 		}
 		out["SCALEPLEX_PMS_BASE_URL"] = "http://" + host + ":" + port
 	}
-	// L2 Plex-Pass gate (#78): the shim runs inside the PMS container, so it can
-	// read the account's Pass state straight from Preferences.xml
-	// (myPlexSubscription) and forward it as SCALEPLEX_PASS_ACTIVE. The worker
-	// trusts this over its own per-session HTTP probe (L3) — local, fresh, can't
-	// flake. Read fresh per spawn (one cheap file read), so a lapsed Pass is
-	// caught on the next session. Absent/unreadable → unset, worker falls back to
-	// the HTTP probe. An explicit env override (already copied above) wins.
+	// L1 Plex-Pass gate (#78, #126): the shim runs inside the PMS container,
+	// so it asks the local Plex API directly for the live Pass state and
+	// forwards it as SCALEPLEX_PASS_ACTIVE. The worker trusts this over its
+	// own per-session HTTP probe (L3) — same node, no inter-pod RTT/DNS/TLS,
+	// fresh per spawn so a lapsed Pass is caught on the next session.
+	// Failure/absent → unset, worker falls back to the L3 probe. Explicit env
+	// override (already copied above) wins. Pre-#126 read myPlexSubscription
+	// from Preferences.xml; modern Plex doesn't cache it there.
 	if _, has := out["SCALEPLEX_PASS_ACTIVE"]; !has {
-		if pa := passActiveFromPrefs(); pa != "" {
+		if pa := passActiveFromLocalAPI(); pa != "" {
 			out["SCALEPLEX_PASS_ACTIVE"] = pa
 		}
 	}
 	return out
 }
 
-var reMyPlexSubscription = regexp.MustCompile(`myPlexSubscription="(\d)"`)
+var (
+	reMyPlexSubscription = regexp.MustCompile(`myPlexSubscription="(\d)"`)
+	rePlexOnlineToken    = regexp.MustCompile(`PlexOnlineToken="([^"]+)"`)
+)
 
-// passActiveFromPrefs reads myPlexSubscription ("1"/"0") from the PMS
-// Preferences.xml (the in-container account-state cache). Returns "" when it
-// can't be determined (file missing/unreadable, attr absent) — the worker then
-// falls back to its own HTTP Pass probe. Path is SCALEPLEX_PMS_PREFS or the
-// standard LSIO/Plex location.
-func passActiveFromPrefs() string {
+// passActiveFromLocalAPI queries the local Plex API (127.0.0.1:32400) for the
+// live Pass state and returns "1"/"0"/"" ("" = couldn't determine; the worker
+// falls back to its own HTTP probe). Runs inside the PMS container, so the
+// hop is localhost — no DNS, no TLS, no inter-pod RTT, fresh on every spawn.
+//
+// Replaces the older Preferences.xml read (passActiveFromPrefs, #78), which
+// assumed Plex cached myPlexSubscription to Preferences. Modern Plex doesn't:
+// only PlexOnline* attrs are cached; myPlexSubscription is only emitted live
+// by the API root (#126). The token used here is the server's PlexOnlineToken
+// (still in Preferences.xml), not the per-session X-Plex-Token.
+//
+// Port override: SCALEPLEX_PMS_LOCAL_PORT (default 32400). Prefs path
+// override: SCALEPLEX_PMS_PREFS (default LSIO/Plex location).
+func passActiveFromLocalAPI() string {
+	tok := readLocalPlexToken()
+	if tok == "" {
+		return ""
+	}
+	port := envOr("SCALEPLEX_PMS_LOCAL_PORT", "32400")
+	c := &http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get("http://127.0.0.1:" + port + "/?X-Plex-Token=" + tok) //nolint:noctx // short fixed-timeout client
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return ""
+	}
+	m := reMyPlexSubscription.FindSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return string(m[1])
+}
+
+// readLocalPlexToken extracts PlexOnlineToken from Preferences.xml. It's the
+// server's own auth token (the one Plex itself uses against plex.tv) and is
+// the right credential for a localhost API hit. Returns "" when missing.
+func readLocalPlexToken() string {
 	path := envOr("SCALEPLEX_PMS_PREFS",
 		"/config/Library/Application Support/Plex Media Server/Preferences.xml")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	m := reMyPlexSubscription.FindSubmatch(b)
+	m := rePlexOnlineToken.FindSubmatch(b)
 	if m == nil {
 		return ""
 	}

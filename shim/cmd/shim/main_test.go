@@ -1,50 +1,135 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestPassActiveFromPrefs(t *testing.T) {
+// passAPIServer spins up a fake PMS local API on 127.0.0.1:<random>. handler
+// receives the X-Plex-Token query value so individual cases can assert it.
+// Returns the listening port (string) and the server (caller must Close).
+func passAPIServer(t *testing.T, handler func(w http.ResponseWriter, tok string)) (port string, srv *httptest.Server) {
+	t.Helper()
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler(w, r.URL.Query().Get("X-Plex-Token"))
+	}))
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse httptest URL: %v", err)
+	}
+	return u.Port(), srv
+}
+
+func writePrefs(t *testing.T, body string) (prefsPath string) {
+	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "Preferences.xml")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("SCALEPLEX_PMS_PREFS", p)
+	return p
+}
 
-	if err := os.WriteFile(p, []byte(`<?xml version="1.0"?><Preferences other="x" myPlexSubscription="1" z="y"/>`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got := passActiveFromPrefs(); got != "1" {
-		t.Errorf("active Pass: got %q want 1", got)
-	}
-	if err := os.WriteFile(p, []byte(`<Preferences myPlexSubscription="0"/>`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got := passActiveFromPrefs(); got != "0" {
-		t.Errorf("no Pass: got %q want 0", got)
-	}
-	// attr absent → "" (worker falls back to the HTTP probe)
-	if err := os.WriteFile(p, []byte(`<Preferences foo="bar"/>`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got := passActiveFromPrefs(); got != "" {
-		t.Errorf("absent attr: got %q want empty", got)
-	}
-	// missing file → ""
-	t.Setenv("SCALEPLEX_PMS_PREFS", filepath.Join(dir, "nope.xml"))
-	if got := passActiveFromPrefs(); got != "" {
-		t.Errorf("missing file: got %q want empty", got)
-	}
+// L1 — shim asks local Plex API for the live Pass state (#126).
+func TestPassActiveFromLocalAPI(t *testing.T) {
+	t.Run("active Pass → 1", func(t *testing.T) {
+		writePrefs(t, `<Preferences PlexOnlineToken="srv-tok-abc"/>`)
+		port, srv := passAPIServer(t, func(w http.ResponseWriter, tok string) {
+			if tok != "srv-tok-abc" {
+				t.Errorf("token forwarded to PMS: got %q want srv-tok-abc", tok)
+			}
+			fmt.Fprint(w, `<MediaContainer myPlexSubscription="1" other="x"/>`)
+		})
+		defer srv.Close()
+		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", port)
+		if got := passActiveFromLocalAPI(); got != "1" {
+			t.Errorf("got %q want 1", got)
+		}
+	})
+
+	t.Run("no Pass → 0", func(t *testing.T) {
+		writePrefs(t, `<Preferences PlexOnlineToken="srv-tok"/>`)
+		port, srv := passAPIServer(t, func(w http.ResponseWriter, _ string) {
+			fmt.Fprint(w, `<MediaContainer myPlexSubscription="0"/>`)
+		})
+		defer srv.Close()
+		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", port)
+		if got := passActiveFromLocalAPI(); got != "0" {
+			t.Errorf("got %q want 0", got)
+		}
+	})
+
+	t.Run("attr absent → empty (worker falls back to L3)", func(t *testing.T) {
+		writePrefs(t, `<Preferences PlexOnlineToken="srv-tok"/>`)
+		port, srv := passAPIServer(t, func(w http.ResponseWriter, _ string) {
+			fmt.Fprint(w, `<MediaContainer other="x"/>`)
+		})
+		defer srv.Close()
+		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", port)
+		if got := passActiveFromLocalAPI(); got != "" {
+			t.Errorf("got %q want empty", got)
+		}
+	})
+
+	t.Run("non-200 → empty", func(t *testing.T) {
+		writePrefs(t, `<Preferences PlexOnlineToken="srv-tok"/>`)
+		port, srv := passAPIServer(t, func(w http.ResponseWriter, _ string) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+		defer srv.Close()
+		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", port)
+		if got := passActiveFromLocalAPI(); got != "" {
+			t.Errorf("got %q want empty", got)
+		}
+	})
+
+	t.Run("network error (port closed) → empty", func(t *testing.T) {
+		writePrefs(t, `<Preferences PlexOnlineToken="srv-tok"/>`)
+		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", "1") // privileged port, dial will fail in test env
+		if got := passActiveFromLocalAPI(); got != "" {
+			t.Errorf("got %q want empty", got)
+		}
+	})
+
+	t.Run("missing PlexOnlineToken → empty (no probe attempted)", func(t *testing.T) {
+		writePrefs(t, `<Preferences foo="bar"/>`)
+		probed := false
+		port, srv := passAPIServer(t, func(w http.ResponseWriter, _ string) {
+			probed = true
+			fmt.Fprint(w, `<MediaContainer myPlexSubscription="1"/>`)
+		})
+		defer srv.Close()
+		t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", port)
+		if got := passActiveFromLocalAPI(); got != "" {
+			t.Errorf("got %q want empty", got)
+		}
+		if probed {
+			t.Error("must not hit API when token unavailable")
+		}
+	})
+
+	t.Run("missing Preferences.xml → empty", func(t *testing.T) {
+		t.Setenv("SCALEPLEX_PMS_PREFS", filepath.Join(t.TempDir(), "nope.xml"))
+		if got := passActiveFromLocalAPI(); got != "" {
+			t.Errorf("got %q want empty", got)
+		}
+	})
 }
 
 func TestCollectEnv_SetsPassActive(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "Preferences.xml")
-	if err := os.WriteFile(p, []byte(`<Preferences myPlexSubscription="1"/>`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SCALEPLEX_PMS_PREFS", p)
+	writePrefs(t, `<Preferences PlexOnlineToken="srv-tok"/>`)
+	port, srv := passAPIServer(t, func(w http.ResponseWriter, _ string) {
+		fmt.Fprint(w, `<MediaContainer myPlexSubscription="1"/>`)
+	})
+	defer srv.Close()
+	t.Setenv("SCALEPLEX_PMS_LOCAL_PORT", port)
 	if got := collectEnv()["SCALEPLEX_PASS_ACTIVE"]; got != "1" {
 		t.Errorf("collectEnv should forward PASS_ACTIVE=1, got %q", got)
 	}
