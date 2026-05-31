@@ -20,6 +20,10 @@ Verifier hardening (#141/#142):
   - NODISPATCH is a hard FAIL (not silent green): cells that never reached the
     worker went unvalidated. Reclassified by observed state (PMS_NO_TRANSCODE /
     ORCH_NOT_NOTIFIED / WORKER_NEVER_SPAWNED). Waive with --allow-nodispatch.
+    Hardened against phantom NODISPATCH: a pref-combo is pre-warmed (read back
+    until applied) before its first cell, and a no-spawn re-polls out to 2x
+    settle (slow av1->hevc inits) before being classified. A startup content
+    audit lists sub-burn shapes the library lacks, so a gap isn't a silent skip.
   - Sub-burn stderr cleanliness (#149): the worker surfaces libass/fontconfig
     stderr lines live as `subtitle-stderr: ...`; their presence fails the cell
     (catches image-level font/cache regressions that are often non-fatal).
@@ -153,6 +157,28 @@ def plex(path, params=None, headers=None, timeout=30):
 def set_prefs(prefs):
     code, _ = plex("/:/prefs", {k: v for k, v in prefs.items()})
     return code == 200
+
+
+def prefs_applied(prefs, tries=6):
+    """Pre-warm (#142): set_prefs PUTs the combo, but the transcoder re-reads
+    prefs lazily — the first cell of a combo could race PMS's re-eval and lose a
+    spawn. Poll /:/prefs and confirm the values landed before driving cells (so
+    we don't pay it as a phantom NODISPATCH). Returns False on timeout; caller
+    proceeds anyway (best-effort warm, not a gate).
+
+    Only the boolean (0/1) prefs are checked: those are the HW decode/encode/
+    tonemap toggles that gate the spawn warm-up and read back verbatim. Text
+    enums (e.g. TranscoderHEVCEncodingMode "hevc-sources" → PMS reports
+    "always") get normalized, so an exact match would spuriously never confirm."""
+    checkable = {k: v for k, v in prefs.items() if str(v) in ("0", "1")}
+    for _ in range(tries):
+        code, body = plex("/:/prefs")
+        if code == 200 and all(
+                re.search(rf'id="{re.escape(k)}"[^>]*\bvalue="{v}"', body)
+                for k, v in checkable.items()):
+            return True
+        time.sleep(1)
+    return False
 
 
 def kubectl(*args, timeout=200):
@@ -703,6 +729,14 @@ def drive_cell(case, proto, settle, soak):
         # skip; fall through and verify it like a transcode.
 
     if not spawned and not errs:
+        # Adaptive settle (#142): a slow av1->hevc HW init (12-15s, #118), or a
+        # cold first-cell after a worker roll, can cross the settle window.
+        # Before declaring a NODISPATCH, poll once more out to 2x settle — same
+        # session, NO new trigger (a 2nd trigger races a 2nd PMS session, the
+        # #118 footgun). Cheap when the cell really did dispatch slowly.
+        spawned, _, _, errs = _poll_logs(slug, started, settle * 2, want_seg=False)
+
+    if not spawned and not errs:
         # NODISPATCH should never happen for a real transcode — capture PMS +
         # orchestrator evidence to localize where the dispatch dropped, and
         # reclassify by observed state so the headline isn't one opaque bucket
@@ -843,6 +877,16 @@ def main():
         ps = c["protocols"] or protocols
         print(f"  - {c['label']}: {c['title']} (rk={c['rk']}) protos={ps}"
               f"{' [windows]' if c['client'] else ''}")
+    # Pre-flight content audit (#142): report sub-burn shapes the library has NO
+    # content for, so a missing shape reads as a content gap — not a silent
+    # omission, and not a later NODISPATCH on a cell that was never built.
+    covered = {c["label"] for c in cases}
+    sub_shapes = [f"{k}-burn-{s}" for k in ("text", "bitmap", "ass")
+                  for s in ("embedded", "external")]
+    missing = [s for s in sub_shapes if s not in covered]
+    if missing:
+        print(f"content audit: no library content for {len(missing)} sub-burn "
+              f"shape(s) (skipped, not failed): {', '.join(missing)}")
     print(f"default protocols: {protocols}\n")
 
     # Resolve fhw + server_combos honouring smart-mode defaults.
@@ -887,7 +931,8 @@ def main():
             if not set_prefs(combo):
                 print(f"  PREFS-FAIL {combo}")
                 continue
-            time.sleep(2)
+            if not prefs_applied(combo):
+                print(f"  WARN prefs not confirmed applied (proceeding): {combo}")
             plabel = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
                               for k, v in combo.items())
             for pname, phdrs, pmeta in client_axis:
