@@ -365,6 +365,34 @@ def find_sub_stream(rk):
     return out
 
 
+def _alnum(s):
+    """Lowercase, strip everything non-alphanumeric. Used to compare a worker
+    log line against a cell's correlation key separator-agnostically."""
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def source_corr_key(rk):
+    """Correlation key for matching worker logs to this cell. PMS derives the
+    transcode SessionID from the source FILENAME, not the Plex title, and the
+    two can diverge (a localized title vs the release filename — e.g. title
+    "40-45 De Musical" vs file "40-45, the Musical (2025)"). Slugging the title
+    then misses every worker log line → false NODISPATCH (#142).
+
+    Use an alphanumeric PREFIX of the file basename: alnum-only survives PMS's
+    separator normalization (hyphens kept, spaces/punct → _), and the short
+    prefix survives PMS truncating the SessionID. Empty on lookup failure (the
+    caller falls back to the title slug)."""
+    code, body = plex(f"/library/metadata/{rk}")
+    if code != 200:
+        return ""
+    m = re.search(r'<Part [^>]*\bfile="([^"]*)"', body)
+    if not m:
+        return ""
+    base = m.group(1).rsplit("/", 1)[-1]
+    base = re.sub(r"\.[A-Za-z0-9]+$", "", base)  # drop extension
+    return _alnum(base)[:16]
+
+
 def _filter_cases_for_profile(cases, meta):
     """Drop case variants the profile's harvested behaviour says never happen.
 
@@ -540,7 +568,7 @@ def _scan_logs(slug, since):
     tags = ""
     errors = []
     for line in worker_logs(since).splitlines():
-        if slug not in line:
+        if slug not in _alnum(line):
             continue
         if "spawned ffmpeg" in line:
             spawned = True
@@ -591,7 +619,10 @@ def drive_cell(case, proto, settle, soak):
     sid = str(uuid.uuid4())
     params = build_params(case["rk"], sid, proto, case["extra"])
     hdrs = {**(case["client"] or CLIENT_HEADERS), "X-Plex-Client-Identifier": f"qa-{sid[:8]}"}
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", case["title"]).strip("_")[:18]
+    # Correlate worker logs by the source FILENAME (alnum prefix), not the Plex
+    # title — PMS's SessionID is filename-derived and the two can diverge (#142).
+    # Fall back to the title slug if the file lookup fails.
+    slug = source_corr_key(case["rk"]) or _alnum(case["title"])[:16]
 
     vdec, dcode = transcode_decision(params, hdrs)
     if dcode == 400:
