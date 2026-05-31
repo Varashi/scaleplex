@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.1](https://github.com/Varashi/scaleplex/compare/v1.11.0...v1.11.1) (2026-05-31)
+
+
+### Fixes
+
+* **worker:** three latent bugs unmasked by [#138](https://github.com/Varashi/scaleplex/issues/138) — Ghosts S2E1 force-burn exit-145 ([#144](https://github.com/Varashi/scaleplex/issues/144)) ([ad1119b](https://github.com/Varashi/scaleplex/commit/ad1119b8611ac67255f43ea9e5f5438e8039ddaf))
+
 ## [1.11.0](https://github.com/Varashi/scaleplex/compare/v1.10.2...v1.11.0) (2026-05-30)
 
 
