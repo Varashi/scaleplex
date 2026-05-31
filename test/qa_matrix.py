@@ -166,11 +166,14 @@ def prefs_applied(prefs, tries=6):
     we don't pay it as a phantom NODISPATCH). Returns False on timeout; caller
     proceeds anyway (best-effort warm, not a gate).
 
-    Only the boolean (0/1) prefs are checked: those are the HW decode/encode/
-    tonemap toggles that gate the spawn warm-up and read back verbatim. Text
-    enums (e.g. TranscoderHEVCEncodingMode "hevc-sources" → PMS reports
-    "always") get normalized, so an exact match would spuriously never confirm."""
-    checkable = {k: v for k, v in prefs.items() if str(v) in ("0", "1")}
+    Only the HardwareAccelerated* bools are checked — they read back verbatim
+    and gate the spawn-relevant HW path. Skipped: the text enum
+    TranscoderHEVCEncodingMode (PMS normalizes "hevc-sources" → "always") and
+    TranscoderToneMapping (advanced pref PMS pins at 1 — won't accept 0 via the
+    API; the ToneMapping=0 axis is degenerate, tracked separately), both of
+    which would otherwise never confirm and spam warnings."""
+    checkable = {k: v for k, v in prefs.items()
+                 if k.startswith("HardwareAccelerated") and str(v) in ("0", "1")}
     for _ in range(tries):
         code, body = plex("/:/prefs")
         if code == 200 and all(
