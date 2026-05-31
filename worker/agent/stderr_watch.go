@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"log"
 	"regexp"
 	"strings"
@@ -47,13 +48,7 @@ func (s *stderrErrorWatch) Append(p []byte) {
 		s.buf = s.buf[len(s.buf)-64*1024:]
 	}
 	for {
-		idx := -1
-		for i, c := range s.buf {
-			if c == '\n' || c == '\r' {
-				idx = i
-				break
-			}
-		}
+		idx := bytes.IndexAny(s.buf, "\r\n")
 		if idx < 0 {
 			break
 		}
