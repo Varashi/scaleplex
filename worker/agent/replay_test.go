@@ -43,6 +43,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -58,6 +59,119 @@ type replayCapture struct {
 	Env             map[string]string `json:"env"`
 	SourcePath      string            `json:"source_path"`
 	HasMapInlineass bool              `json:"has_map_inlineass"`
+}
+
+// --- #147: bail classification --------------------------------------
+//
+// A "bail" is the rewriter declining to reshape, surfaced as a
+// "skip:<reason>" entry in Changes. It can carry Applied=true (a *soft*
+// bail: the rewriter scrubbed Plex flags / normalized stream-specs but
+// still gave up on the transcode reshape). Those soft bails previously
+// slipped through as PASS because replay only inspected !res.Applied —
+// the masking that let PR #144's :#0xNN class (hevc_vaapi/h264_vaapi +
+// inlineass=, bailing skip:no-decoder) ride the corpus as PASS for ~3
+// weeks. For a shape that MUST be reshaped — an inlineass= sub-burn
+// paired with a HW video encoder — a bail is always a regression.
+const (
+	shapeHWSubBurn     = "hw-subburn-transcode" // inlineass= + HW video encoder — MUST reshape
+	shapeOptimizeRemux = "optimize-remux"
+	shapeOther         = "other"
+)
+
+// allowedBailReasons lists the bail reasons that are a CORRECT outcome
+// per shape. "*" = any reason allowed (permissive — today's behavior).
+// An empty slice = no bail is acceptable; any skip:<reason> fails. Only
+// shapeHWSubBurn is strict for now; tightening the rest is #150.
+var allowedBailReasons = map[string][]string{
+	shapeHWSubBurn: {
+		// Deliberate defensive fallback (NOT the silent skip:no-decoder
+		// masking #144 fixed): the rewriter declines to reshape a HW-decode
+		// sub-burn filtergraph whose shape it doesn't model, and runs Plex's
+		// SW-inlineass graph instead — functional, just not the GPU-resident
+		// reshape. A known, explicit perf gap; modeling these graphs is a
+		// rewriter follow-up. Matched by prefix (the reason carries the full
+		// graph string).
+		TagPrefixBailHWDecodeSubUnmodeled,
+	},
+	shapeOptimizeRemux: {"*"},
+	shapeOther:         {"*"},
+}
+
+// bailAllowed reports whether reason is an acceptable bail for shape.
+// Allowlist entries ending in ":" are dynamic-reason prefixes (the bail
+// appends a variable suffix, e.g. the filtergraph) and match by prefix.
+func bailAllowed(shape, reason string) bool {
+	allowed, ok := allowedBailReasons[shape]
+	if !ok {
+		return true // unknown shape → don't fail
+	}
+	for _, a := range allowed {
+		switch {
+		case a == "*", a == reason:
+			return true
+		case strings.HasSuffix(a, ":") && strings.HasPrefix(reason, a):
+			return true
+		}
+	}
+	return false
+}
+
+// bailReasonOf returns the bail reason (without the "skip:" prefix) from
+// a rewriter result's changes, or "" if it didn't bail. Independent of
+// Applied — a soft bail carries Applied=true.
+func bailReasonOf(changes []string) string {
+	for _, ch := range changes {
+		if strings.HasPrefix(ch, TagPrefixSkip) {
+			return strings.TrimPrefix(ch, TagPrefixSkip)
+		}
+	}
+	return ""
+}
+
+// Matches a hardware video encoder token in any backend — the shape is
+// about what PMS *sent*, not the replay host's GPU, so cover all suffixes.
+var reHWVideoEncoder = regexp.MustCompile(`^(h264|hevc|av1|vp9|mpeg4|mpeg2video)_(vaapi|nvenc|qsv|cuda|amf|vulkan|videotoolbox|mf|v4l2m2m)$`)
+
+func hasHWVideoEncoder(argv []string) bool {
+	// Encoders are output-side. Scan only tokens after the LAST -i so a
+	// decoder-side HW token (e.g. `-codec:0 hevc_vaapi` before -i, or an
+	// NVDEC hint) can't misclassify the shape into shapeHWSubBurn and trip
+	// the must-reshape assertion. (CodeRabbit, PR #152.)
+	start := 0
+	for i, a := range argv {
+		if a == "-i" {
+			start = i + 1
+		}
+	}
+	for _, a := range argv[start:] {
+		if reHWVideoEncoder.MatchString(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInlineassFilter(argv []string) bool {
+	for _, a := range argv {
+		if strings.Contains(a, "inlineass=") {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyShape buckets a captured argv for bail-expectation purposes.
+// Only shapeHWSubBurn is strict; the rest stay permissive — this change
+// catches must-reshape regressions, not every legitimate bail.
+func classifyShape(argv []string) string {
+	switch {
+	case hasInlineassFilter(argv) && hasHWVideoEncoder(argv):
+		return shapeHWSubBurn
+	case isOptimizeRemux(argv):
+		return shapeOptimizeRemux
+	default:
+		return shapeOther
+	}
 }
 
 func TestReplayCorpus(t *testing.T) {
@@ -135,16 +249,27 @@ func TestReplayCorpus(t *testing.T) {
 			res := Rewrite(c.Argv, c.Env, &RewriteOpts{
 				SessionDir: filepath.Join("/tmp/replay", c.SessionID),
 			})
-			if !res.Applied {
-				skipReason := ""
-				for _, ch := range res.Changes {
-					if strings.HasPrefix(ch, "skip:") {
-						skipReason = ch
-						break
-					}
+			// #147: a bail (skip:<reason>) on a shape that MUST be reshaped is
+			// a regression even when Applied=true masked it as PASS. Check
+			// every bail regardless of Applied, and hard-fail the disallowed
+			// ones. Allowed bails fall through to the unchanged paths below.
+			if reason := bailReasonOf(res.Changes); reason != "" {
+				if shape := classifyShape(c.Argv); !bailAllowed(shape, reason) {
+					results = append(results, result{c.SessionID, c.CaptureSource, "FAIL bail",
+						fmt.Sprintf("shape=%s skip:%s — must reshape; fix rewriter or add an explicit allowedBailReasons entry", shape, reason)})
+					t.Errorf("rewriter bailed skip:%s on shape %q that must be reshaped — regression (#147)", reason, shape)
+					return
 				}
-				results = append(results, result{c.SessionID, c.CaptureSource, "FAIL bail", skipReason})
-				t.Logf("rewriter bailed: %s", skipReason)
+			}
+
+			if !res.Applied {
+				// Allowed hard bail (no scrub ran, rewriter declined). Record +
+				// stop — the bailed argv is ~Plex's original, not a rewriter
+				// product. (Allowed *soft* bails keep Applied=true and fall
+				// through to the ffmpeg run below, unchanged.)
+				reason := bailReasonOf(res.Changes)
+				results = append(results, result{c.SessionID, c.CaptureSource, "BAIL ok", "skip:" + reason})
+				t.Logf("expected bail: skip:%s", reason)
 				return
 			}
 
