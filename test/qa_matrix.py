@@ -619,7 +619,13 @@ def drive_cell(case, proto, settle, soak):
         orch = orch_logs("120s")
         pms_tx = bool(re.search(r"(?i)transcod", pms))
         orch_task = ("/task" in orch or sid[:8] in orch)
-        if not pms_tx:
+        if not pms and not orch:
+            # Both log sources empty — e.g. docker-only worker mode with no k8s
+            # access to plex-test-pms / -orchestrator. Don't assert
+            # PMS_NO_TRANSCODE off absent evidence; flag it as unattributable
+            # so the operator wires up log access. (CodeRabbit, #155.)
+            klass = "LOGS_UNAVAILABLE"
+        elif not pms_tx:
             klass = "PMS_NO_TRANSCODE"      # prefs flip didn't take / PMS chose copy
         elif not orch_task:
             klass = "ORCH_NOT_NOTIFIED"     # shim never POSTed /task to the orchestrator
