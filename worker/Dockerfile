@@ -149,7 +149,9 @@ EXPOSE 3501
 # `-loglevel quiet` argv it becomes the only visible stderr and
 # easily masks the real fatal (see 2026-05-31 Ghosts S2E1 diag where
 # the warning was misread as the proximate cause of exit-145).
-RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v 2>&1 | tail -3 && \
+RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v >/tmp/fc-cache.log 2>&1 && \
+    tail -3 /tmp/fc-cache.log && \
+    rm -f /tmp/fc-cache.log && \
     install -d -o 1000 -g 1000 -m 0755 /home/ubuntu/.cache /home/ubuntu/.cache/fontconfig && \
     chown -R 1000:1000 /home/ubuntu/.cache /var/cache/fontconfig
 

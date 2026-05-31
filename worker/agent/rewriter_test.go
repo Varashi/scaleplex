@@ -2153,15 +2153,23 @@ func TestRewriter_HWPassthrough_NormalizesStreamSpecsAndReshapes(t *testing.T) {
 // -manifest_name http://127.0.0.1:32400/...` that still falls through
 // to the bail (covers any unmodeled flag combo the main path can't
 // reshape) must have its manifest_name URL rewritten to relay before
-// the dash muxer tries to POST and ECONNREFUSEs → exit 145.
+// the dash muxer tries to POST and ECONNREFUSEs → exit 145. Carries
+// real `#0xNN` syntax so the normalize+bail interaction is exercised:
+// the normalizer fires at top-of-Rewrite, then the argv still trips
+// the no-input bail (no second `-i` source after `dropSidecarInput`
+// is hypothetical here — we just omit `-codec:0` so the main path
+// can't engage), and the bail's manifest_name rewrite runs on the
+// already-normalized argv.
 func TestRewriter_BailRewritesManifestNameToRelay(t *testing.T) {
 	args := []string{
-		// No `-codec:0` and no `-hwaccel:0` even after normalization —
-		// force the bail path to fire.
+		// PMS `#0xNN` shape. After normalization the rewriter still
+		// can't find a `-codec:0` peer for reshape (no encoder output
+		// declared) and bails — but the bail must already see the
+		// normalized argv so downstream tests would catch shape drift.
 		"-i", "src.mp4",
 		"-i", "temp-0.srt",
 		"-map_inlineass", "1:s:0",
-		"-filter_complex", "[0:0]format=nv12[a];[a]inlineass=font_size=54[b]",
+		"-filter_complex", "[0:#0x01]format=nv12[a];[a]inlineass=font_size=54[b]",
 		"-map", "[b]",
 		"-f", "dash",
 		"-manifest_name", "http://127.0.0.1:32400/video/:/transcode/session/abc/uuid/manifest?X-Plex-Http-Pipeline=infinite",
@@ -2173,6 +2181,12 @@ func TestRewriter_BailRewritesManifestNameToRelay(t *testing.T) {
 		"X_PLEX_TOKEN":           "tok-xyz",
 	}
 	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("Applied=false on bail with mutations; caller would execute unsanitized argv. changes=%v", out.Changes)
+	}
+	if !containsString(out.Changes, TagNormalizeStreamSpecsToOrdinal) {
+		t.Errorf("normalize tag missing — `#0x01` should have been folded to ordinal before bail; changes=%v", out.Changes)
+	}
 	if !containsString(out.Changes, TagBailManifestNameRewriteToRelay) {
 		t.Fatalf("expected %q in changes; got %v", TagBailManifestNameRewriteToRelay, out.Changes)
 	}
@@ -2188,6 +2202,14 @@ func TestRewriter_BailRewritesManifestNameToRelay(t *testing.T) {
 		}
 		if !strings.Contains(out.Args[i+1], "X-Plex-Token=tok-xyz") {
 			t.Errorf("manifest_name missing X-Plex-Token append: %q", out.Args[i+1])
+		}
+		// And the filter_complex must carry the normalized form too —
+		// proves the bail returned the post-normalize argv, not the
+		// raw input.
+		for j := 0; j+1 < len(out.Args); j++ {
+			if out.Args[j] == "-filter_complex" && strings.Contains(out.Args[j+1], ":#0x") {
+				t.Errorf("residual `:#0x` in filter_complex after bail: %q", out.Args[j+1])
+			}
 		}
 		return
 	}
