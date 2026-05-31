@@ -382,7 +382,7 @@ def _filter_cases_for_profile(cases, meta):
         lbl = c["label"]
         if lbl == "windows-segmkv" and pclass != "desktop_windows":
             continue
-        if (lbl.startswith("text-burn") or lbl.startswith("bitmap-burn")) and subs and "burn" not in subs:
+        if lbl.startswith(("text-burn", "bitmap-burn")) and subs and "burn" not in subs:
             continue
         if lbl.startswith("audio-mkv(") and dstream and "1" not in dstream:
             continue
