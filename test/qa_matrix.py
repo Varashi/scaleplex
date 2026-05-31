@@ -53,6 +53,10 @@ NS = os.environ.get("NS", "plex-test")
 WORKER_DS = os.environ.get("WORKER_DS", "plex-test-worker")
 WORKER_CONTAINER = os.environ.get("WORKER_CONTAINER", "app")
 MOVIE_SECTION = os.environ.get("SECTION", "1")
+# Section to mine for an embedded-ASS sub-burn cell (#149). Movies rarely carry
+# ASS; anime/Series do (styled + animated "Dialogue"/"Signs" tracks). Default
+# the Anime show library; "" disables the ASS cell.
+ASS_SECTION = os.environ.get("ASS_SECTION", "3")
 
 # Worker control mode. Default "auto" combines:
 #   k8s sources — the in-cluster Arc worker DaemonSet (set env + rollout,
@@ -338,7 +342,8 @@ def content_streams(rk):
     return aud, sub
 
 
-SUB_TEXT = {"srt", "subrip", "ass", "ssa", "webvtt", "mov_text"}
+SUB_TEXT = {"srt", "subrip", "webvtt", "mov_text"}
+SUB_ASS = {"ass", "ssa"}  # styled/animated — stresses libass far more than srt
 SUB_BITMAP = {"pgs", "pgssub", "vobsub", "dvd_subtitle", "dvdsub"}
 
 
@@ -361,7 +366,9 @@ def find_sub_stream(rk):
             continue
         c = mcodec.group(1).lower()
         source = "external" if 'key="/library/streams/' in tag else "embedded"
-        if c in SUB_TEXT:
+        if c in SUB_ASS:
+            out.setdefault(f"ass-{source}", mid.group(1))
+        elif c in SUB_TEXT:
             out.setdefault(f"text-{source}", mid.group(1))
         elif c in SUB_BITMAP:
             out.setdefault(f"bitmap-{source}", mid.group(1))
@@ -396,6 +403,26 @@ def source_corr_key(rk):
     return _alnum(base)[:16]
 
 
+def discover_ass_item(section, limit=60):
+    """Find one item in `section` carrying an embedded ASS subtitle. Returns
+    (rk, title, ass_stream_id) or None. Used to source the #149 ass-burn cell
+    from the anime/Series library (type=4 = episodes) where styled/animated ASS
+    actually lives."""
+    if not section:
+        return None
+    code, body = plex(f"/library/sections/{section}/all", {"type": 4, "limit": limit})
+    if code != 200:
+        return None
+    for m in re.finditer(r'<Video\b[^>]*\bratingKey="(\d+)"[^>]*?>', body):
+        rk = m.group(1)
+        tm = re.search(r'\b(?:grandparentTitle|title)="([^"]{1,40})"', m.group(0))
+        title = tm.group(1) if tm else f"rk{rk}"
+        subs = find_sub_stream(rk)
+        if "ass-embedded" in subs:
+            return rk, title, subs["ass-embedded"]
+    return None
+
+
 def _filter_cases_for_profile(cases, meta):
     """Drop case variants the profile's harvested behaviour says never happen.
 
@@ -413,7 +440,7 @@ def _filter_cases_for_profile(cases, meta):
         lbl = c["label"]
         if lbl == "windows-segmkv" and pclass != "desktop_windows":
             continue
-        if lbl.startswith(("text-burn", "bitmap-burn")) and subs and "burn" not in subs:
+        if lbl.startswith(("text-burn", "bitmap-burn", "ass-burn")) and subs and "burn" not in subs:
             continue
         if lbl.startswith("audio-mkv(") and dstream and "1" not in dstream:
             continue
@@ -483,6 +510,15 @@ def build_cases(content):
             cases.append(case(rk, title, f"{kind}-burn-{source}",
                               {"subtitleStreamID": subs[bucket], "subtitles": "burn"}))
             done.add(bucket)
+
+    # ASS sub-burn (#149): styled/animated ASS exercises libass far harder than
+    # SRT (positioning, \pos/\move/\t, font substitution). Movies rarely carry
+    # it, so source one embedded-ASS item from the anime/Series library.
+    ass = discover_ass_item(ASS_SECTION)
+    if ass:
+        arc, atitle, asid = ass
+        cases.append(case(arc, atitle, "ass-burn-embedded",
+                          {"subtitleStreamID": asid, "subtitles": "burn"}))
 
     # Muxer coverage beyond the protocol param (the HLS segment container +
     # Plex-Windows shapes the corpus showed are real):
