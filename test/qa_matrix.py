@@ -20,6 +20,10 @@ Verifier hardening (#141/#142):
   - NODISPATCH is a hard FAIL (not silent green): cells that never reached the
     worker went unvalidated. Reclassified by observed state (PMS_NO_TRANSCODE /
     ORCH_NOT_NOTIFIED / WORKER_NEVER_SPAWNED). Waive with --allow-nodispatch.
+    Hardened against phantom NODISPATCH: a pref-combo is pre-warmed (read back
+    until applied) before its first cell, and a no-spawn re-polls out to 2x
+    settle (slow av1->hevc inits) before being classified. A startup content
+    audit lists sub-burn shapes the library lacks, so a gap isn't a silent skip.
   - Sub-burn stderr cleanliness (#149): the worker surfaces libass/fontconfig
     stderr lines live as `subtitle-stderr: ...`; their presence fails the cell
     (catches image-level font/cache regressions that are often non-fatal).
@@ -153,6 +157,31 @@ def plex(path, params=None, headers=None, timeout=30):
 def set_prefs(prefs):
     code, _ = plex("/:/prefs", {k: v for k, v in prefs.items()})
     return code == 200
+
+
+def prefs_applied(prefs, tries=6):
+    """Pre-warm (#142): set_prefs PUTs the combo, but the transcoder re-reads
+    prefs lazily — the first cell of a combo could race PMS's re-eval and lose a
+    spawn. Poll /:/prefs and confirm the values landed before driving cells (so
+    we don't pay it as a phantom NODISPATCH). Returns False on timeout; caller
+    proceeds anyway (best-effort warm, not a gate).
+
+    Only the HardwareAccelerated* bools are checked — they read back verbatim
+    and gate the spawn-relevant HW path. Skipped: the text enum
+    TranscoderHEVCEncodingMode (PMS normalizes "hevc-sources" → "always") and
+    TranscoderToneMapping (advanced pref PMS pins at 1 — won't accept 0 via the
+    API; the ToneMapping=0 axis is degenerate, tracked separately), both of
+    which would otherwise never confirm and spam warnings."""
+    checkable = {k: v for k, v in prefs.items()
+                 if k.startswith("HardwareAccelerated") and str(v) in ("0", "1")}
+    for _ in range(tries):
+        code, body = plex("/:/prefs")
+        if code == 200 and all(
+                re.search(rf'id="{re.escape(k)}"[^>]*\bvalue="{v}"', body)
+                for k, v in checkable.items()):
+            return True
+        time.sleep(1)
+    return False
 
 
 def kubectl(*args, timeout=200):
@@ -688,7 +717,8 @@ def drive_cell(case, proto, settle, soak):
     # gives slow inits room to land in the kubectl-log stream.
     started = time.time()
     trigger_spawn(params, hdrs)
-    spawned, _, _, errs = _poll_logs(slug, started, settle, want_seg=False)
+    eff_settle = settle
+    spawned, _, _, errs = _poll_logs(slug, started, eff_settle, want_seg=False)
 
     if vdec != "transcode":
         if not (spawned or errs):
@@ -701,6 +731,17 @@ def drive_cell(case, proto, settle, soak):
                             if pms else None}, sid
         # else: decision read non-transcode but a worker DID run → not a real
         # skip; fall through and verify it like a transcode.
+
+    if not spawned and not errs:
+        # Adaptive settle (#142): a slow av1->hevc HW init (12-15s, #118), or a
+        # cold first-cell after a worker roll, can cross the settle window.
+        # Before declaring a NODISPATCH, poll once more out to 2x settle — same
+        # session, NO new trigger (a 2nd trigger races a 2nd PMS session, the
+        # #118 footgun). Cheap when the cell really did dispatch slowly. Carry
+        # the widened window into the first-segment poll below (else a rescued
+        # slow-spawn would instantly FAIL "no first-segment" — CodeRabbit #159).
+        eff_settle = settle * 2
+        spawned, _, _, errs = _poll_logs(slug, started, eff_settle, want_seg=False)
 
     if not spawned and not errs:
         # NODISPATCH should never happen for a real transcode — capture PMS +
@@ -728,7 +769,7 @@ def drive_cell(case, proto, settle, soak):
                               "pms_started_transcode": pms_tx,
                               "orch_got_task": orch_task}, sid
 
-    _, seg, tags, errors = _poll_logs(slug, started, settle, want_seg=True)
+    _, seg, tags, errors = _poll_logs(slug, started, eff_settle, want_seg=True)
     if errors:
         return "FAIL", {"errors": sorted(set(errors)), "tags": tags}, sid
     if not seg:
@@ -843,6 +884,20 @@ def main():
         ps = c["protocols"] or protocols
         print(f"  - {c['label']}: {c['title']} (rk={c['rk']}) protos={ps}"
               f"{' [windows]' if c['client'] else ''}")
+    # Pre-flight content audit (#142): report sub-burn shapes the library has NO
+    # content for, so a missing shape reads as a content gap — not a silent
+    # omission, and not a later NODISPATCH on a cell that was never built.
+    covered = {c["label"] for c in cases}
+    # Only audit shapes the harness actually PROBES for content: text/bitmap ×
+    # embedded/external (scanned across movie content) + ass-embedded (the anime
+    # scan). ass-external isn't probed (discover_ass_item is embedded-only), so
+    # don't claim "no content" for it. (CodeRabbit #159.)
+    probed_shapes = ["text-burn-embedded", "text-burn-external",
+                     "bitmap-burn-embedded", "bitmap-burn-external", "ass-burn-embedded"]
+    missing = [s for s in probed_shapes if s not in covered]
+    if missing:
+        print(f"content audit: no library content for {len(missing)} probed sub-burn "
+              f"shape(s) (skipped, not failed): {', '.join(missing)}")
     print(f"default protocols: {protocols}\n")
 
     # Resolve fhw + server_combos honouring smart-mode defaults.
@@ -887,7 +942,8 @@ def main():
             if not set_prefs(combo):
                 print(f"  PREFS-FAIL {combo}")
                 continue
-            time.sleep(2)
+            if not prefs_applied(combo):
+                print(f"  WARN prefs not confirmed applied (proceeding): {combo}")
             plabel = ",".join(f"{k.replace('HardwareAccelerated','HW').replace('Transcoder','')[:10]}={v}"
                               for k, v in combo.items())
             for pname, phdrs, pmeta in client_axis:
