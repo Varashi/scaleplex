@@ -717,7 +717,8 @@ def drive_cell(case, proto, settle, soak):
     # gives slow inits room to land in the kubectl-log stream.
     started = time.time()
     trigger_spawn(params, hdrs)
-    spawned, _, _, errs = _poll_logs(slug, started, settle, want_seg=False)
+    eff_settle = settle
+    spawned, _, _, errs = _poll_logs(slug, started, eff_settle, want_seg=False)
 
     if vdec != "transcode":
         if not (spawned or errs):
@@ -736,8 +737,11 @@ def drive_cell(case, proto, settle, soak):
         # cold first-cell after a worker roll, can cross the settle window.
         # Before declaring a NODISPATCH, poll once more out to 2x settle — same
         # session, NO new trigger (a 2nd trigger races a 2nd PMS session, the
-        # #118 footgun). Cheap when the cell really did dispatch slowly.
-        spawned, _, _, errs = _poll_logs(slug, started, settle * 2, want_seg=False)
+        # #118 footgun). Cheap when the cell really did dispatch slowly. Carry
+        # the widened window into the first-segment poll below (else a rescued
+        # slow-spawn would instantly FAIL "no first-segment" — CodeRabbit #159).
+        eff_settle = settle * 2
+        spawned, _, _, errs = _poll_logs(slug, started, eff_settle, want_seg=False)
 
     if not spawned and not errs:
         # NODISPATCH should never happen for a real transcode — capture PMS +
@@ -765,7 +769,7 @@ def drive_cell(case, proto, settle, soak):
                               "pms_started_transcode": pms_tx,
                               "orch_got_task": orch_task}, sid
 
-    _, seg, tags, errors = _poll_logs(slug, started, settle, want_seg=True)
+    _, seg, tags, errors = _poll_logs(slug, started, eff_settle, want_seg=True)
     if errors:
         return "FAIL", {"errors": sorted(set(errors)), "tags": tags}, sid
     if not seg:
@@ -884,11 +888,15 @@ def main():
     # content for, so a missing shape reads as a content gap — not a silent
     # omission, and not a later NODISPATCH on a cell that was never built.
     covered = {c["label"] for c in cases}
-    sub_shapes = [f"{k}-burn-{s}" for k in ("text", "bitmap", "ass")
-                  for s in ("embedded", "external")]
-    missing = [s for s in sub_shapes if s not in covered]
+    # Only audit shapes the harness actually PROBES for content: text/bitmap ×
+    # embedded/external (scanned across movie content) + ass-embedded (the anime
+    # scan). ass-external isn't probed (discover_ass_item is embedded-only), so
+    # don't claim "no content" for it. (CodeRabbit #159.)
+    probed_shapes = ["text-burn-embedded", "text-burn-external",
+                     "bitmap-burn-embedded", "bitmap-burn-external", "ass-burn-embedded"]
+    missing = [s for s in probed_shapes if s not in covered]
     if missing:
-        print(f"content audit: no library content for {len(missing)} sub-burn "
+        print(f"content audit: no library content for {len(missing)} probed sub-burn "
               f"shape(s) (skipped, not failed): {', '.join(missing)}")
     print(f"default protocols: {protocols}\n")
 
