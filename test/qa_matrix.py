@@ -343,19 +343,57 @@ SUB_BITMAP = {"pgs", "pgssub", "vobsub", "dvd_subtitle", "dvdsub"}
 
 
 def find_sub_stream(rk):
-    """Return {'text': id, 'bitmap': id} of the first matching subtitle stream
-    IDs on this item (for forcing sub-burn). Missing kinds are absent."""
+    """Return subtitle stream IDs bucketed by '<kind>-<source>' — kind is
+    text|bitmap, source is embedded|external. External (sidecar, e.g. a bazarr
+    .srt) streams carry key="/library/streams/.."; embedded (in-container) ones
+    don't. The two drive different PMS argv shapes — embedded `-map 0:s:N`
+    vs sidecar `-i temp.srt` + `-map_inlineass 1:s:0` — so the rewriter exercises
+    different paths (#141a). First match per bucket wins; missing buckets are
+    absent."""
     code, body = plex(f"/library/metadata/{rk}")
     out = {}
     if code != 200:
         return out
-    for sid, codec in re.findall(r"<Stream id=\"(\d+)\"[^>]*?streamType=\"3\"[^>]*?codec=\"([a-z0-9_]+)\"", body):
-        c = codec.lower()
-        if c in SUB_TEXT and "text" not in out:
-            out["text"] = sid
-        elif c in SUB_BITMAP and "bitmap" not in out:
-            out["bitmap"] = sid
+    for tag in re.findall(r"<Stream\b[^>]*streamType=\"3\"[^>]*>", body):
+        mid = re.search(r'\bid="(\d+)"', tag)
+        mcodec = re.search(r'\bcodec="([a-z0-9_]+)"', tag)
+        if not (mid and mcodec):
+            continue
+        c = mcodec.group(1).lower()
+        source = "external" if 'key="/library/streams/' in tag else "embedded"
+        if c in SUB_TEXT:
+            out.setdefault(f"text-{source}", mid.group(1))
+        elif c in SUB_BITMAP:
+            out.setdefault(f"bitmap-{source}", mid.group(1))
     return out
+
+
+def _alnum(s):
+    """Lowercase, strip everything non-alphanumeric. Used to compare a worker
+    log line against a cell's correlation key separator-agnostically."""
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def source_corr_key(rk):
+    """Correlation key for matching worker logs to this cell. PMS derives the
+    transcode SessionID from the source FILENAME, not the Plex title, and the
+    two can diverge (a localized title vs the release filename — e.g. title
+    "40-45 De Musical" vs file "40-45, the Musical (2025)"). Slugging the title
+    then misses every worker log line → false NODISPATCH (#142).
+
+    Use an alphanumeric PREFIX of the file basename: alnum-only survives PMS's
+    separator normalization (hyphens kept, spaces/punct → _), and the short
+    prefix survives PMS truncating the SessionID. Empty on lookup failure (the
+    caller falls back to the title slug)."""
+    code, body = plex(f"/library/metadata/{rk}")
+    if code != 200:
+        return ""
+    m = re.search(r'<Part [^>]*\bfile="([^"]*)"', body)
+    if not m:
+        return ""
+    base = m.group(1).rsplit("/", 1)[-1]
+    base = re.sub(r"\.[A-Za-z0-9]+$", "", base)  # drop extension
+    return _alnum(base)[:16]
 
 
 def _filter_cases_for_profile(cases, meta):
@@ -375,7 +413,7 @@ def _filter_cases_for_profile(cases, meta):
         lbl = c["label"]
         if lbl == "windows-segmkv" and pclass != "desktop_windows":
             continue
-        if lbl in ("text-burn", "bitmap-burn") and subs and "burn" not in subs:
+        if lbl.startswith(("text-burn", "bitmap-burn")) and subs and "burn" not in subs:
             continue
         if lbl.startswith("audio-mkv(") and dstream and "1" not in dstream:
             continue
@@ -427,20 +465,24 @@ def build_cases(content):
         cases.append(case(sdr1080[0], sdr1080[1], "sdr-nosub"))
     if hdr4k:
         cases.append(case(hdr4k[0], hdr4k[1], "hdr-nosub"))
-    # sub-burn: scan content for items carrying a text / bitmap sub stream.
-    text_done = bitmap_done = False
+    # sub-burn: scan content for items carrying text/bitmap subs, embedded AND
+    # external (sidecar). The embedded vs external rewriter paths differ —
+    # in-container `-map 0:s:N` + extractGraphFacts, vs sidecar `-i temp.srt` +
+    # `-map_inlineass 1:s:0` — so cover whichever buckets the library provides
+    # (#141a). One representative cell per bucket.
+    SUB_BUCKETS = ["text-embedded", "text-external", "bitmap-embedded", "bitmap-external"]
+    done = set()
     for rk, title, *_ in content:
-        if text_done and bitmap_done:
+        if len(done) == len(SUB_BUCKETS):
             break
         subs = find_sub_stream(rk)
-        if not text_done and "text" in subs:
-            cases.append(case(rk, title, "text-burn",
-                              {"subtitleStreamID": subs["text"], "subtitles": "burn"}))
-            text_done = True
-        if not bitmap_done and "bitmap" in subs:
-            cases.append(case(rk, title, "bitmap-burn",
-                              {"subtitleStreamID": subs["bitmap"], "subtitles": "burn"}))
-            bitmap_done = True
+        for bucket in SUB_BUCKETS:
+            if bucket in done or bucket not in subs:
+                continue
+            kind, source = bucket.split("-")
+            cases.append(case(rk, title, f"{kind}-burn-{source}",
+                              {"subtitleStreamID": subs[bucket], "subtitles": "burn"}))
+            done.add(bucket)
 
     # Muxer coverage beyond the protocol param (the HLS segment container +
     # Plex-Windows shapes the corpus showed are real):
@@ -529,7 +571,7 @@ def _scan_logs(slug, since):
     tags = ""
     errors = []
     for line in worker_logs(since).splitlines():
-        if slug not in line:
+        if slug not in _alnum(line):
             continue
         if "spawned ffmpeg" in line:
             spawned = True
@@ -588,7 +630,10 @@ def drive_cell(case, proto, settle, soak):
     sid = str(uuid.uuid4())
     params = build_params(case["rk"], sid, proto, case["extra"])
     hdrs = {**(case["client"] or CLIENT_HEADERS), "X-Plex-Client-Identifier": f"qa-{sid[:8]}"}
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", case["title"]).strip("_")[:18]
+    # Correlate worker logs by the source FILENAME (alnum prefix), not the Plex
+    # title — PMS's SessionID is filename-derived and the two can diverge (#142).
+    # Fall back to the title slug if the file lookup fails.
+    slug = source_corr_key(case["rk"]) or _alnum(case["title"])[:16]
 
     vdec, dcode = transcode_decision(params, hdrs)
     if dcode == 400:
