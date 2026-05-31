@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -2010,6 +2011,209 @@ func TestRewriter_BailWithOnlyInlineassScrub_AppliedTrue(t *testing.T) {
 			t.Errorf("rewritten -filter_complex still carries PMS paths: %q", out.Args[i+1])
 		}
 	}
+}
+
+// PMS stream-id-by-id specifier syntax (`:#0xNN`, hex) gets normalized
+// to ordinal form (`:0`, `:1`, ...) at top-of-Rewrite so downstream
+// detector + reshape stages (all keyed on literal `-hwaccel:0` /
+// `-codec:0`) actually engage instead of silently bailing
+// `skip:no-decoder`. Repro: Ghosts S2E1 force-burn 2026-05-31 — Plex
+// Versions / Optimized for TV argv carried `-codec:#0x01 hevc
+// -hwaccel:#0x01 vaapi ... -filter_complex "[0:#0x01]..."`.
+func TestNormalizePlexStreamSpecsToOrdinal(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		in          []string
+		wantOut     []string
+		wantChanged bool
+	}{
+		{
+			name: "HW-passthrough Ghosts shape — #0x01 video + #0x02 audio",
+			in: []string{
+				"-codec:#0x01", "hevc",
+				"-hwaccel:#0x01", "vaapi",
+				"-hwaccel_output_format:#0x01", "vaapi",
+				"-hwaccel_device:#0x01", "vaapi",
+				"-codec:#0x02", "aac",
+				"-i", "src.mp4",
+				"-filter_complex", "[0:#0x01]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1]",
+				"-codec:0", "hevc_vaapi",
+			},
+			wantOut: []string{
+				"-codec:0", "hevc",
+				"-hwaccel:0", "vaapi",
+				"-hwaccel_output_format:0", "vaapi",
+				"-hwaccel_device:0", "vaapi",
+				"-codec:1", "aac",
+				"-i", "src.mp4",
+				"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1]",
+				"-codec:0", "hevc_vaapi",
+			},
+			wantChanged: true,
+		},
+		{
+			name: "m2ts high-PID #0x1011 maps to ordinal 0",
+			in: []string{
+				"-codec:#0x1011", "hevc",
+				"-hwaccel:#0x1011", "vaapi",
+				"-i", "src.m2ts",
+			},
+			wantOut: []string{
+				"-codec:0", "hevc",
+				"-hwaccel:0", "vaapi",
+				"-i", "src.m2ts",
+			},
+			wantChanged: true,
+		},
+		{
+			name: "already-ordinal argv passes through unchanged",
+			in: []string{
+				"-codec:0", "hevc",
+				"-hwaccel:0", "vaapi",
+				"-i", "src.mp4",
+				"-filter_complex", "[0:0]hwupload[0]",
+				"-codec:0", "hevc_vaapi",
+			},
+			wantOut: []string{
+				"-codec:0", "hevc",
+				"-hwaccel:0", "vaapi",
+				"-i", "src.mp4",
+				"-filter_complex", "[0:0]hwupload[0]",
+				"-codec:0", "hevc_vaapi",
+			},
+			wantChanged: false,
+		},
+		{
+			name: "filter-complex only — no top-level flag carries #0xNN",
+			in: []string{
+				"-i", "src.mp4",
+				"-filter_complex", "[0:#0x01]format=nv12[a];[a]inlineass[b]",
+				"-map", "[b]",
+				"-f", "mp4", "out.mp4",
+			},
+			wantOut: []string{
+				"-i", "src.mp4",
+				"-filter_complex", "[0:0]format=nv12[a];[a]inlineass[b]",
+				"-map", "[b]",
+				"-f", "mp4", "out.mp4",
+			},
+			wantChanged: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, did := normalizePlexStreamSpecsToOrdinal(tc.in)
+			if did != tc.wantChanged {
+				t.Fatalf("changed=%v want=%v", did, tc.wantChanged)
+			}
+			if !reflect.DeepEqual(out, tc.wantOut) {
+				t.Errorf("output mismatch\n got: %v\nwant: %v", out, tc.wantOut)
+			}
+		})
+	}
+}
+
+// End-to-end: a `#0xNN`-style argv that previously hit `skip:no-decoder`
+// now engages the HW-passthrough reshape (no bail). Detector hits
+// `-hwaccel:0` after normalization.
+func TestRewriter_HWPassthrough_NormalizesStreamSpecsAndReshapes(t *testing.T) {
+	args := []string{
+		"-codec:#0x01", "hevc",
+		"-hwaccel:#0x01", "vaapi",
+		"-hwaccel_output_format:#0x01", "vaapi",
+		"-hwaccel_device:#0x01", "vaapi",
+		"-codec:#0x02", "aac",
+		"-i", "/media/src.mp4",
+		"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+		"-filter_complex", "[0:#0x01]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1]",
+		"-map", "[1]",
+		"-codec:0", "hevc_vaapi", "-qp:0", "15",
+		"-f", "dash", "out.mpd",
+	}
+	out := Rewrite(args, nil, nil)
+	if !out.Applied {
+		t.Fatalf("Applied=false; changes=%v", out.Changes)
+	}
+	if !containsString(out.Changes, TagNormalizeStreamSpecsToOrdinal) {
+		t.Errorf("expected %q in changes; got %v", TagNormalizeStreamSpecsToOrdinal, out.Changes)
+	}
+	for _, c := range out.Changes {
+		if strings.HasPrefix(c, "skip:no-decoder") {
+			t.Fatalf("rewriter still bailed no-decoder after normalization; changes=%v", out.Changes)
+		}
+	}
+	// The reshaped argv must NOT carry any residual `:#0x` specifiers.
+	for _, a := range out.Args {
+		if strings.Contains(a, ":#0x") {
+			t.Errorf("residual #0xNN specifier in output arg %q", a)
+		}
+	}
+}
+
+// Bail-mode safety net: a `#0xNN`-shape argv with `-f dash +
+// -manifest_name http://127.0.0.1:32400/...` that still falls through
+// to the bail (covers any unmodeled flag combo the main path can't
+// reshape) must have its manifest_name URL rewritten to relay before
+// the dash muxer tries to POST and ECONNREFUSEs → exit 145. Carries
+// real `#0xNN` syntax so the normalize+bail interaction is exercised:
+// the normalizer fires at top-of-Rewrite, then the argv still trips
+// the no-input bail (no second `-i` source after `dropSidecarInput`
+// is hypothetical here — we just omit `-codec:0` so the main path
+// can't engage), and the bail's manifest_name rewrite runs on the
+// already-normalized argv.
+func TestRewriter_BailRewritesManifestNameToRelay(t *testing.T) {
+	args := []string{
+		// PMS `#0xNN` shape. After normalization the rewriter still
+		// can't find a `-codec:0` peer for reshape (no encoder output
+		// declared) and bails — but the bail must already see the
+		// normalized argv so downstream tests would catch shape drift.
+		"-i", "src.mp4",
+		"-i", "temp-0.srt",
+		"-map_inlineass", "1:s:0",
+		"-filter_complex", "[0:#0x01]format=nv12[a];[a]inlineass=font_size=54[b]",
+		"-map", "[b]",
+		"-f", "dash",
+		"-manifest_name", "http://127.0.0.1:32400/video/:/transcode/session/abc/uuid/manifest?X-Plex-Http-Pipeline=infinite",
+		"-progressurl", "http://127.0.0.1:32400/video/:/transcode/session/abc/uuid/progress",
+		"out.mpd",
+	}
+	env := map[string]string{
+		"SCALEPLEX_PMS_BASE_URL": "http://relay.test:32499",
+		"X_PLEX_TOKEN":           "tok-xyz",
+	}
+	out := Rewrite(args, env, nil)
+	if !out.Applied {
+		t.Fatalf("Applied=false on bail with mutations; caller would execute unsanitized argv. changes=%v", out.Changes)
+	}
+	if !containsString(out.Changes, TagNormalizeStreamSpecsToOrdinal) {
+		t.Errorf("normalize tag missing — `#0x01` should have been folded to ordinal before bail; changes=%v", out.Changes)
+	}
+	if !containsString(out.Changes, TagBailManifestNameRewriteToRelay) {
+		t.Fatalf("expected %q in changes; got %v", TagBailManifestNameRewriteToRelay, out.Changes)
+	}
+	for i := 0; i+1 < len(out.Args); i++ {
+		if out.Args[i] != "-manifest_name" {
+			continue
+		}
+		if strings.HasPrefix(out.Args[i+1], "http://127.0.0.1:32400") {
+			t.Errorf("manifest_name still loopback after bail: %q", out.Args[i+1])
+		}
+		if !strings.Contains(out.Args[i+1], "relay.test:32499") {
+			t.Errorf("manifest_name not rewritten to SCALEPLEX_PMS_BASE_URL: %q", out.Args[i+1])
+		}
+		if !strings.Contains(out.Args[i+1], "X-Plex-Token=tok-xyz") {
+			t.Errorf("manifest_name missing X-Plex-Token append: %q", out.Args[i+1])
+		}
+		// And the filter_complex must carry the normalized form too —
+		// proves the bail returned the post-normalize argv, not the
+		// raw input.
+		for j := 0; j+1 < len(out.Args); j++ {
+			if out.Args[j] == "-filter_complex" && strings.Contains(out.Args[j+1], ":#0x") {
+				t.Errorf("residual `:#0x` in filter_complex after bail: %q", out.Args[j+1])
+			}
+		}
+		return
+	}
+	t.Errorf("-manifest_name flag missing from bail output args: %v", out.Args)
 }
 
 // HDR source + a plain SDR-target argv: scaleplex does NOT inject a
