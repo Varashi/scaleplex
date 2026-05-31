@@ -599,7 +599,16 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	// scraped on exit). The log forwarder used to fan out per-line
 	// POSTs to /progress/log here, but slammed PMS with 60+ concurrent
 	// HTTP connections; defaults to off until we throttle properly.
-	stderrPeek := stderrTail.Append
+	// Tap the stderr stream twice: the exit-time speed=Xx ring buffer (as
+	// before) AND a live libass/fontconfig error watch that log.Printf()s
+	// matching lines as they stream — so non-fatal sub-burn warnings show up in
+	// `kubectl logs` (not just the exit-time stderr_tail) for qa_matrix's
+	// cleanliness assertion (#149) and prod diag.
+	errWatch := newStderrErrorWatch(req.SessionID)
+	stderrPeek := func(p []byte) {
+		stderrTail.Append(p)
+		errWatch.Append(p)
+	}
 	go streamPrefixed(stderr, resp, "[stderr] ", streamDone, stderrPeek)
 
 	progressDone := make(chan struct{}, 1)

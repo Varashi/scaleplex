@@ -20,6 +20,9 @@ Verifier hardening (#141/#142):
   - NODISPATCH is a hard FAIL (not silent green): cells that never reached the
     worker went unvalidated. Reclassified by observed state (PMS_NO_TRANSCODE /
     ORCH_NOT_NOTIFIED / WORKER_NEVER_SPAWNED). Waive with --allow-nodispatch.
+  - Sub-burn stderr cleanliness (#149): the worker surfaces libass/fontconfig
+    stderr lines live as `subtitle-stderr: ...`; their presence fails the cell
+    (catches image-level font/cache regressions that are often non-fatal).
 
 Why API-driven: the server prefs change the argv *Plex* generates, so we must
 let Plex generate them. The request template was captured from a real client
@@ -535,6 +538,14 @@ def _scan_logs(slug, since):
         mt = TAG_RE.search(line)
         if mt:
             tags = mt.group(1)
+        # Sub-burn cleanliness (#149): the agent surfaces libass/fontconfig
+        # stderr lines live as `subtitle-stderr: <line>`. They only appear when
+        # a font cache is unwritable / a font is missing / fontconfig path is
+        # bad — image-level regressions that are often non-fatal (so they'd
+        # never reach stderr_tail). Their mere presence fails the cell.
+        if "subtitle-stderr:" in line:
+            errors.append("subtitle-stderr:" + line.split("subtitle-stderr:", 1)[1].strip()[:60])
+            continue
         head = line.split("stderr_tail=", 1)[0]  # skip the source stream dump
         m = ERR_RE.search(head)
         if m:
