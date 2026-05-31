@@ -133,7 +133,17 @@ func bailReasonOf(changes []string) string {
 var reHWVideoEncoder = regexp.MustCompile(`^(h264|hevc|av1|vp9|mpeg4|mpeg2video)_(vaapi|nvenc|qsv|cuda|amf|vulkan|videotoolbox|mf|v4l2m2m)$`)
 
 func hasHWVideoEncoder(argv []string) bool {
-	for _, a := range argv {
+	// Encoders are output-side. Scan only tokens after the LAST -i so a
+	// decoder-side HW token (e.g. `-codec:0 hevc_vaapi` before -i, or an
+	// NVDEC hint) can't misclassify the shape into shapeHWSubBurn and trip
+	// the must-reshape assertion. (CodeRabbit, PR #152.)
+	start := 0
+	for i, a := range argv {
+		if a == "-i" {
+			start = i + 1
+		}
+	}
+	for _, a := range argv[start:] {
 		if reHWVideoEncoder.MatchString(a) {
 			return true
 		}
