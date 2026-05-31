@@ -4,9 +4,22 @@
 Drives real Plex transcode sessions on a test PMS across the full server-pref
 matrix (HW decode/encode, HEVC mode, tonemapping) × scaleplex FORCE_HW ×
 representative content, then auto-verifies each on the worker side (spawned
-ffmpeg + first segment + no -38/218/234/bail). This catches transcoder errors
-and branch-shape regressions WITHOUT a human; quality / smoothness / visual
-correctness stay a Tier-3 human pass (see test/README-qa.md).
+ffmpeg + first segment + a post-segment SOAK with no fatal/non-zero exit).
+This catches transcoder errors and branch-shape regressions WITHOUT a human;
+quality / smoothness / visual correctness stay a Tier-3 human pass (see
+test/README-qa.md).
+
+Verifier hardening (#141/#142):
+  - Fatal-exit set widened beyond -38/218/234: now also exit 145 (libass /
+    fontconfig init family — the bug that escaped for ~3 weeks) and exit 8
+    (unknown decoder/encoder/BSF/filter), plus ANY non-zero `ffmpeg exit:`.
+  - Soak: 'first segment ready' is necessary but NOT sufficient — for DASH/HLS
+    the init segment lands before the first frame, so a first-frame fatal fires
+    ~1s later. After the segment we keep watching (--soak-seconds) and FAIL on a
+    late exit. A run is GREEN only if every cell survives the soak.
+  - NODISPATCH is a hard FAIL (not silent green): cells that never reached the
+    worker went unvalidated. Reclassified by observed state (PMS_NO_TRANSCODE /
+    ORCH_NOT_NOTIFIED / WORKER_NEVER_SPAWNED). Waive with --allow-nodispatch.
 
 Why API-driven: the server prefs change the argv *Plex* generates, so we must
 let Plex generate them. The request template was captured from a real client
@@ -500,8 +513,11 @@ def stop_session(sid):
 
 ERR_RE = re.compile(
     r"not supported by the device type|error code: -38|exit status 218|"
-    r"exit status 234|invalid source device name|Conversion failed|"
-    r"Error reinitializing|skip:[a-z-]+", re.I)
+    r"exit status 234|exit status 145|exit status 8|invalid source device name|"
+    r"Conversion failed|Error reinitializing|skip:[a-z-]+", re.I)
+# ANY non-zero ffmpeg exit is a fatal — the specific-code list above is for
+# pattern context, this is the catch-all (#141: exit 145 escaped the old set).
+EXIT_RE = re.compile(r"ffmpeg exit:\s*exit status ([1-9]\d*)", re.I)
 TAG_RE = re.compile(r"rewriter applied: ([^\"]+)")
 
 
@@ -523,6 +539,9 @@ def _scan_logs(slug, since):
         m = ERR_RE.search(head)
         if m:
             errors.append(m.group(0))
+        me = EXIT_RE.search(head)
+        if me:
+            errors.append(f"ffmpeg-exit-{me.group(1)}")
     return spawned, first_seg, tags, errors
 
 
@@ -543,13 +562,17 @@ def _poll_logs(slug, started_at, max_wait, want_seg):
     return spawned, first_seg, tags, errors
 
 
-def drive_cell(case, proto, settle):
+def drive_cell(case, proto, settle, soak):
     """Drive one cell to an AUTHORITATIVE verdict:
       SKIP       — PMS chose not to transcode (directplay/copy) → not a worker test
-      NODISPATCH — PMS decided transcode but no ffmpeg ever spawned (harness/
-                   orchestrator dispatch miss; retried) → not a worker correctness fail
-      PASS       — worker spawned + produced a first segment, no errors
-      FAIL       — worker spawned but errored, or produced no segment
+      NODISPATCH — PMS decided transcode but no ffmpeg ever spawned. Reclassified
+                   by observed state (PMS_NO_TRANSCODE / ORCH_NOT_NOTIFIED /
+                   WORKER_NEVER_SPAWNED) and counted as a hard FAIL by default (the
+                   cell went unvalidated) unless --allow-nodispatch (#142).
+      PASS       — worker spawned, produced a first segment, AND survived the soak
+                   window with no fatal / non-zero ffmpeg exit (#141).
+      FAIL       — worker spawned but errored (incl. a late soak-window exit), or
+                   produced no segment.
     Returns (status, info, sid)."""
     sid = str(uuid.uuid4())
     params = build_params(case["rk"], sid, proto, case["extra"])
@@ -589,19 +612,47 @@ def drive_cell(case, proto, settle):
 
     if not spawned and not errs:
         # NODISPATCH should never happen for a real transcode — capture PMS +
-        # orchestrator evidence to localize where the dispatch dropped.
+        # orchestrator evidence to localize where the dispatch dropped, and
+        # reclassify by observed state so the headline isn't one opaque bucket
+        # (#142). All three classes count as hard FAILs by default.
         pms = pms_logs("120s")
         orch = orch_logs("120s")
-        return "NODISPATCH", {"reason": f"decided-transcode, no worker spawn ({settle:.0f}s)",
-                              "pms_started_transcode": bool(re.search(r"(?i)transcod", pms)),
-                              "orch_got_task": ("/task" in orch or sid[:8] in orch)}, sid
+        pms_tx = bool(re.search(r"(?i)transcod", pms))
+        orch_task = ("/task" in orch or sid[:8] in orch)
+        if not pms_tx:
+            klass = "PMS_NO_TRANSCODE"      # prefs flip didn't take / PMS chose copy
+        elif not orch_task:
+            klass = "ORCH_NOT_NOTIFIED"     # shim never POSTed /task to the orchestrator
+        else:
+            klass = "WORKER_NEVER_SPAWNED"  # orch got the task, PMS transcoding, no worker spawn
+        return "NODISPATCH", {"class": klass,
+                              "reason": f"decided-transcode, no worker spawn ({settle:.0f}s)",
+                              "pms_started_transcode": pms_tx,
+                              "orch_got_task": orch_task}, sid
 
     _, seg, tags, errors = _poll_logs(slug, started, settle, want_seg=True)
     if errors:
         return "FAIL", {"errors": sorted(set(errors)), "tags": tags}, sid
-    if seg:
-        return "PASS", {"tags": tags}, sid
-    return "FAIL", {"reason": "spawned, no first-segment", "tags": tags}, sid
+    if not seg:
+        return "FAIL", {"reason": "spawned, no first-segment", "tags": tags}, sid
+
+    # Soak: 'first segment ready' is necessary but NOT sufficient. For DASH/HLS
+    # the init segment (moov) is written before the video pipeline processes a
+    # frame, so a first-frame fatal (libass/fontconfig exit 145, #141) fires
+    # ~1s AFTER the segment — the old verifier declared PASS and exited just
+    # before it. Keep watching for `soak` secs and FAIL on any fatal / non-zero
+    # ffmpeg exit in that window.
+    soak_deadline = time.time() + soak
+    while time.time() < soak_deadline:
+        time.sleep(2)
+        elapsed = int(time.time() - started) + 4
+        _, _, t2, soak_errs = _scan_logs(slug, f"{elapsed}s")
+        if t2:
+            tags = t2
+        if soak_errs:
+            return "FAIL", {"errors": sorted(set(soak_errs)), "tags": tags,
+                            "phase": "post-segment-soak"}, sid
+    return "PASS", {"tags": tags}, sid
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +676,14 @@ def main():
     ap.add_argument("--settle", type=float, default=20,
                     help="secs to wait per session for spawn / first segment (default 20; "
                          "av1->hevc HW transcodes need ~12-15s for first segment, #118)")
+    ap.add_argument("--soak-seconds", dest="soak", type=float, default=8,
+                    help="after 'first segment ready', keep watching this long for a LATE "
+                         "fatal/non-zero ffmpeg exit (libass/fontconfig exit 145 fires ~1s "
+                         "after the init segment, #141). 0 disables the soak.")
+    ap.add_argument("--allow-nodispatch", action="store_true",
+                    help="don't fail the run on NODISPATCH cells (cells that never reached the "
+                         "worker, so went unvalidated). Default: NODISPATCH is a hard fail "
+                         "so a partial run can't look green (#142).")
     ap.add_argument("--protocols", default="hls,dash", help="comma list, e.g. hls,dash")
     ap.add_argument("--client-profiles", default="",
                     help="iterate real captured client profiles as the client (outer axis), "
@@ -740,7 +799,7 @@ def main():
                     cc = c if phdrs is None else {**c, "client": phdrs}
                     for proto in protos_for(cc, pmeta):
                         label = (f"{pname+':' if pname else ''}{cc['label']}/{proto} | {plabel}")
-                        status, info, sid = drive_cell(cc, proto, args.settle)
+                        status, info, sid = drive_cell(cc, proto, args.settle, args.soak)
                         stop_session(sid)
                         results.append((fhw, label, status, info))
                         print(f"  [{status:10s}] FORCE_HW={fhw} {label} :: {info}")
@@ -749,21 +808,34 @@ def main():
     from collections import Counter
     tally = Counter(s for *_, s, _ in results)
     worker_cells = tally["PASS"] + tally["FAIL"]
+    nd = tally["NODISPATCH"]
     print(f"\n=== worker: {tally['PASS']}/{worker_cells} PASS "
-          f"| SKIP(no-transcode)={tally['SKIP']} | NODISPATCH={tally['NODISPATCH']} "
+          f"| SKIP(no-transcode)={tally['SKIP']} | NODISPATCH={nd} "
           f"| total cells={len(results)} ===")
     if tally["FAIL"]:
-        print("FAILURES (worker errored / no segment):")
+        print("FAILURES (worker errored / no segment / late soak-window exit):")
         for fhw, label, status, info in results:
             if status == "FAIL":
                 print(f"  FAIL FORCE_HW={fhw} {label} :: {info}")
-    if tally["NODISPATCH"]:
-        print("NODISPATCH (decided-transcode but never reached the worker — investigate dispatch):")
+    if nd:
+        # Count by reclassified subtype so the headline isn't one opaque bucket
+        # and each root cause is visible (#142).
+        nd_classes = Counter(info.get("class", "UNKNOWN")
+                             for *_, status, info in results if status == "NODISPATCH")
+        verdict = "WAIVED" if args.allow_nodispatch else "FAIL — unvalidated cells"
+        print(f"NODISPATCH [{verdict}] (cells that never reached the worker):")
+        for klass, n in nd_classes.most_common():
+            print(f"  {klass}: {n}")
         for fhw, label, status, info in results:
             if status == "NODISPATCH":
-                print(f"  NODISPATCH FORCE_HW={fhw} {label} :: {info}")
-    # Ironclad gate: any real worker FAIL is a hard fail.
-    sys.exit(1 if tally["FAIL"] else 0)
+                print(f"  NODISPATCH[{info.get('class','?')}] FORCE_HW={fhw} {label} :: {info}")
+    # Ironclad gate: any real worker FAIL is a hard fail. NODISPATCH cells went
+    # unvalidated, so they ALSO fail the run by default — a partial sweep must
+    # not read green (#142). --allow-nodispatch waives only the NODISPATCH gate.
+    if nd and not args.allow_nodispatch:
+        print(f"\n!! {nd} NODISPATCH cell(s) went unvalidated — failing the run "
+              f"(pass --allow-nodispatch to waive).")
+    sys.exit(1 if tally["FAIL"] or (nd and not args.allow_nodispatch) else 0)
 
 
 if __name__ == "__main__":
