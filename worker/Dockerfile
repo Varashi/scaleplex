@@ -62,7 +62,7 @@ RUN sed -i 's|^Components: main universe$|Components: main universe multiverse|'
       mesa-opencl-icd \
       libva2 libva-drm2 \
       vainfo \
-      fontconfig fonts-dejavu-core \
+      fontconfig fonts-dejavu-core fonts-noto-core \
       strace \
       tini && \
     rm /tmp/scaleplex-ffmpeg7_*.deb && \
@@ -139,7 +139,19 @@ EXPOSE 3501
 # never produced a segment, and Plex's HLS client timed out with
 # "Connection error" (live repro 2026-05-08: Plex Android, force-burn
 # subs + seek, 2 min wall clock no segments).
-RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v 2>&1 | tail -3
+#
+# Cache dirs get chown'd to uid:1000 immediately after — libass's
+# FcConfigParseAndLoad path still tries to write fallback cache
+# entries on demand (e.g. when a FontName= override in inlineass=
+# resolves to an unknown family and fontconfig has to synthesize a
+# match). Without write access, fontconfig prints "No writable cache
+# directories" to stderr — usually a benign warning, but with PMS's
+# `-loglevel quiet` argv it becomes the only visible stderr and
+# easily masks the real fatal (see 2026-05-31 Ghosts S2E1 diag where
+# the warning was misread as the proximate cause of exit-145).
+RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v 2>&1 | tail -3 && \
+    install -d -o 1000 -g 1000 -m 0755 /home/ubuntu/.cache /home/ubuntu/.cache/fontconfig && \
+    chown -R 1000:1000 /home/ubuntu/.cache /var/cache/fontconfig
 
 # Default to the unprivileged uid 1000 (#68). Prod overrides this anyway
 # (k8s `runAsUser: 1000`, compose `user: "1000:100"`), so this is defense-in-

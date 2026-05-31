@@ -1556,6 +1556,142 @@ func scrubPlexInlineassFilesystemPaths(filterStr string) (string, bool) {
 	return out.String(), changed
 }
 
+// normalizePlexStreamSpecsToOrdinal rewrites Plex's stream-id-by-id
+// stream-specifier syntax (`:#0xNN`, hex) into ffmpeg's ordinal form
+// (`:0`, `:1`, ...). PMS emits the `#0xNN` form for files where the
+// container's first video stream isn't at stream-index 0 — most
+// commonly the "Plex Versions / Optimized for TV" Optimize outputs
+// and high-PID m2ts/M2TS containers. Examples from the live argv
+// corpus:
+//
+//	-codec:#0x01 hevc            // → -codec:0 hevc
+//	-hwaccel:#0x01 vaapi         // → -hwaccel:0 vaapi
+//	-hwaccel_output_format:#0x01 vaapi
+//	-hwaccel_device:#0x01 vaapi
+//	-codec:#0x02 aac             // → -codec:1 aac
+//	-filter_complex "[0:#0x01]hwupload[0];..."  // → "[0:0]hwupload[0];..."
+//
+// Without normalization, the HW-decode passthrough detector at
+// rewriter.go:~2287 (`indexOfArg(args, "-hwaccel:0", 0)`) misses the
+// argv entirely → rewriter bails with `skip:no-decoder` → ffmpeg runs
+// the unmodified PMS argv → dash muxer POSTs `-manifest_name` to the
+// PMS loopback URL the worker pod can't reach → ECONNREFUSED → exit
+// 145. Live-confirmed prod regression 2026-05-31 on Ghosts S2E1
+// force-burn (Plex Versions/Optimized for TV path); ~95/3629 (2.6%)
+// of captured argv carry this shape, mostly mobile HLS sessions that
+// happen to clear the bail path's existing `-segment_list` URL
+// rewrite. Plex Web (dash) sessions need this normalization to engage
+// the main reshape path that already handles `-manifest_name`.
+//
+// Mapping rule: walk argv in order, collect each unique `#0xNN` ID
+// the first time it appears as a `:#0xNN` suffix on a flag, and
+// assign it the next ordinal (0, 1, 2, ...). Apply the same map to
+// `[<input>:#0xNN]` references inside `-filter_complex` values. PMS
+// emits stream-spec flags strictly in pre-input position (before the
+// first `-i`) and in container declaration order (video then audio),
+// so the resulting ordinals match what ffmpeg would assign by index.
+//
+// Idempotent: argv that already uses `:0`/`:1` ordinal form passes
+// through with no map entries built and no rewrites emitted.
+func normalizePlexStreamSpecsToOrdinal(args []string) ([]string, bool) {
+	// First pass — does any flag carry the `:#0x...` suffix? Cheap
+	// short-circuit so the common ordinal-form argv never allocates.
+	hasIdSpec := false
+	for _, a := range args {
+		if streamIDSpecRegex.MatchString(a) {
+			hasIdSpec = true
+			break
+		}
+		if a == "-filter_complex" {
+			continue
+		}
+	}
+	if !hasIdSpec {
+		// Also peek inside -filter_complex values — the filter graph
+		// can carry `[N:#0xMM]` even when no top-level flag does (rare
+		// in practice; safety net for future PMS argv shapes).
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-filter_complex" &&
+				strings.Contains(args[i+1], ":#0x") {
+				hasIdSpec = true
+				break
+			}
+		}
+	}
+	if !hasIdSpec {
+		return args, false
+	}
+
+	// Second pass — build the ID → ordinal map in first-occurrence
+	// order, scanning flag suffixes and then filter graph references.
+	idOrdinal := map[string]int{}
+	nextOrd := 0
+	assign := func(id string) {
+		if _, ok := idOrdinal[id]; ok {
+			return
+		}
+		idOrdinal[id] = nextOrd
+		nextOrd++
+	}
+	for _, a := range args {
+		for _, m := range streamIDSpecRegex.FindAllString(a, -1) {
+			assign(m[len(":#"):])
+		}
+	}
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-filter_complex" {
+			continue
+		}
+		for _, m := range filterStreamIDRefRegex.FindAllStringSubmatch(args[i+1], -1) {
+			assign(m[1])
+		}
+	}
+	if len(idOrdinal) == 0 {
+		return args, false
+	}
+
+	// Third pass — clone + rewrite. Replace `:#0xNN` flag suffixes
+	// and `[N:#0xNN]` filter refs with the resolved ordinal.
+	out := append([]string(nil), args...)
+	for i, a := range out {
+		if !strings.Contains(a, ":#0x") {
+			continue
+		}
+		out[i] = streamIDSpecRegex.ReplaceAllStringFunc(a, func(m string) string {
+			id := m[len(":#"):]
+			if ord, ok := idOrdinal[id]; ok {
+				return fmt.Sprintf(":%d", ord)
+			}
+			return m
+		})
+	}
+	for i := 0; i+1 < len(out); i++ {
+		if out[i] != "-filter_complex" {
+			continue
+		}
+		out[i+1] = filterStreamIDRefRegex.ReplaceAllStringFunc(out[i+1], func(m string) string {
+			sub := filterStreamIDRefRegex.FindStringSubmatch(m)
+			if len(sub) < 3 {
+				return m
+			}
+			input, id := sub[1], sub[2]
+			if ord, ok := idOrdinal[id]; ok {
+				return "[" + input + ":" + fmt.Sprintf("%d", ord) + "]"
+			}
+			return m
+		})
+	}
+	return out, true
+}
+
+var (
+	// `:#0xNN` suffix on a flag — e.g. `-codec:#0x01`, `-hwaccel:#0x1011`.
+	streamIDSpecRegex = regexp.MustCompile(`:#0x[0-9a-fA-F]+`)
+	// `[INPUT:#0xNN]` reference inside a filter graph — e.g.
+	// `[0:#0x01]hwupload[0]`. INPUT is the input index (numeric).
+	filterStreamIDRefRegex = regexp.MustCompile(`\[(\d+):#0x([0-9a-fA-F]+)\]`)
+)
+
 // scrubPlexInlineassFilesystemPathsInArgs runs
 // scrubPlexInlineassFilesystemPaths over every `-filter_complex` value
 // in args. Returns the new slice and true if any value was scrubbed.
@@ -1967,6 +2103,24 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		changes = append(changes, TagFilterInlineassScrubPlexFontPaths)
 	}
 
+	// Normalize Plex's stream-id-by-id specifier syntax (`:#0xNN`) to
+	// ordinal form (`:0`/`:1`/...). PMS emits the #0xNN form on files
+	// where the container's first video stream isn't at stream-index 0
+	// (Plex Versions / Optimized for TV outputs, high-PID m2ts). Without
+	// this normalization, the HW-decode passthrough detector + every
+	// other indexOfArg("-hwaccel:0",...)/("-codec:0",...) site misses
+	// the argv and the rewriter bails skip:no-decoder — see the helper
+	// doc for the full regression chain (live repro 2026-05-31 on Ghosts
+	// S2E1 force-burn, Plex Web dash + inlineass). Runs after the
+	// inlineass scrub so the scrub still triggers on the original
+	// argv shape, before any other phase inspects stream specs.
+	streamSpecsNormalized := false
+	if normalized, did := normalizePlexStreamSpecsToOrdinal(inputArgs); did {
+		inputArgs = normalized
+		streamSpecsNormalized = true
+		changes = append(changes, TagNormalizeStreamSpecsToOrdinal)
+	}
+
 	// Tone-mapping backend (opencl vs vaapi) for the tonemap Plex's
 	// argv asked for. scaleplex never decides whether to tonemap.
 	tm := resolveTonemapConfig()
@@ -2020,6 +2174,29 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 				args[i+1] = rewritten
 				bailChanges = append(bailChanges, TagBailSegmentListRewriteToRelay)
+			}
+		}
+		// `-manifest_name http://127.0.0.1:32400/...` — DASH equivalent
+		// of the segment_list block above. dashenc fork patch 0095 POSTs
+		// the .mpd body to that URL on each rewrite; loopback unreachable
+		// from the worker pod → ECONNREFUSED → ffmpeg exit 145 with a
+		// `-loglevel quiet` argv emitting no fatal to stderr (only
+		// fontconfig warnings if libass also opened). Live regression
+		// repro 2026-05-31 on Ghosts S2E1 force-burn before the
+		// stream-spec normalizer engaged → bail path stayed live for the
+		// dash class. Reuses the main-path helper so loopback rewrites
+		// stay identical between bail and full reshape.
+		if mnArgs, mnTags := rewriteManifestName(args, inputEnv); len(mnTags) > 0 {
+			args = mnArgs
+			for _, t := range mnTags {
+				switch t {
+				case "manifest_name:rewrite-to-relay":
+					bailChanges = append(bailChanges, TagBailManifestNameRewriteToRelay)
+				case "drop:-manifest_name(no-pms-base-or-non-loopback)":
+					bailChanges = append(bailChanges, TagBailManifestNameDrop)
+				default:
+					bailChanges = append(bailChanges, t+"(bail)")
+				}
 			}
 		}
 		return args, bailChanges
@@ -2091,7 +2268,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// would see Applied=false on a scrub-only bail and execute
 		// the unsanitized original argv, re-triggering the very
 		// libass fontconfig exit-145 the scrub exists to prevent).
-		applied := inlineassPathsScrubbed ||
+		applied := inlineassPathsScrubbed || streamSpecsNormalized ||
 			len(scrub) > 0 || len(hintChanges) > 0 ||
 			len(eaeSwapped) > 0 || len(eaeDropped) > 0 ||
 			len(fdDropped) > 0
