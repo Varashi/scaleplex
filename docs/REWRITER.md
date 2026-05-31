@@ -580,6 +580,55 @@ Time / Friends) hit the main rewriter's HW-decode-passthrough path
 because their argv shape includes `-hwaccel:0 vaapi` (the 2026-05-08
 commit `c93034d` accepts that shape directly).
 
+## Stream-spec normalization (`:#0xNN` → `:N`)
+
+PMS emits stream specifiers in **stream-id-by-id hex form** for some
+file classes — `-codec:#0x01 hevc -hwaccel:#0x01 vaapi ... -filter_complex
+"[0:#0x01]hwupload[0];..."` etc. Observed on:
+
+- "Plex Versions / Optimized for TV" Optimize outputs (Plex re-numbers
+  streams on Optimize encode).
+- High-PID m2ts / M2TS containers (e.g. `#0x1011`).
+- ~95 of 3629 captured argvs (~2.6 %) as of 2026-05-31.
+
+Stock ffmpeg accepts `:#0xNN` syntax natively. The rewriter doesn't —
+every detector site (`indexOfArg(args, "-hwaccel:0", 0)`,
+`"-codec:0"`, `"-hwaccel_output_format:0"`, etc.) is keyed on the
+literal `:N` ordinal form. Without normalization, `:#0xNN`-shape
+argvs silently bail `skip:no-decoder`, fall through to the bail
+path, and (until v1.11.1) the dash muxer POSTed `-manifest_name` to
+the worker pod's loopback → ECONNREFUSED → exit-145. Live regression
+hit prod 2026-05-31 on a Ghosts S2E1 Plex Web force-burn.
+
+`normalizePlexStreamSpecsToOrdinal` runs at top-of-`Rewrite` (after
+the inlineass scrub, before the bail closure). It collects each unique
+`#0xNN` ID in first-seen order across the argv (flag suffixes + filter
+graph refs) and maps them to ordinal `0, 1, 2, ...`. Single rewrite
+pass: flag suffix `:#0xNN` → `:N`, filter graph `[INPUT:#0xNN]` →
+`[INPUT:N]`. Idempotent: ordinal-form argvs short-circuit with no
+allocation, no map entries, no changes.
+
+Mapping assumption: PMS always emits stream-spec flags strictly in
+pre-input position before any other `:N` ordinal usage, and in
+container declaration order (video first, audio next). Holds across
+every `:#0xNN` corpus entry as of 2026-05-31.
+
+**Label:** `normalize:stream-specs:#0xNN->ordinal` on the changes list.
+
+**Tests:** `TestNormalizePlexStreamSpecsToOrdinal` (4 cases — Ghosts
+shape, m2ts high-PID, ordinal-form passthrough, filter-only),
+`TestRewriter_HWPassthrough_NormalizesStreamSpecsAndReshapes` (end-to-
+end: `#0xNN` no longer bails, reshape engages),
+`TestRewriter_BailRewritesManifestNameToRelay` (normalize+bail
+interaction).
+
+**Architectural followup:** GH #145 — lift this into a polymorphic
+stream-spec matcher in the rewriter (so the detector accepts `#0xNN`
+natively without upfront rewrite) or absorb into scaleplex-ffmpeg
+fork alongside the rest of the rewriter→fork migration. The current
+normalize is a workaround for the rewriter's narrow literal matching,
+not a real argv-parse gap.
+
 ## Bail-path scrubs
 
 When the main rewriter bails, the original argv is returned with one
@@ -594,6 +643,12 @@ unrecognised flag with empty stderr (loglevel quiet hides the error).
 - rewrites a loopback `-segment_list` URL to the relay (same shape as
   the full rewriter's `rewriteSegmentList`) — observed on LG webOS
   sidecar-SRT side-channel argvs that hit the bail path.
+- rewrites a loopback `-manifest_name` URL to the relay (DASH
+  equivalent of the `-segment_list` block above; reuses the main-path
+  `rewriteManifestName` helper). dashenc fork patch 0095 POSTs the
+  `.mpd` body on each rewrite; without this the worker pod hits
+  ECONNREFUSED → exit-145 on every dash-class bail. Added in v1.11.1
+  after the live Ghosts force-burn regression (#144).
 
 `-loglevel_plex` and `-strict_ts:N` are *not* scrubbed — fork patches
 0098/0107 make stock ffmpeg accept them. `-xioerror` has never been
