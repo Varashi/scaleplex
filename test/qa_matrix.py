@@ -17,6 +17,13 @@ Verifier hardening (#141/#142):
     the init segment lands before the first frame, so a first-frame fatal fires
     ~1s later. After the segment we keep watching (--soak-seconds) and FAIL on a
     late exit. A run is GREEN only if every cell survives the soak.
+  - Liveness / process-check (#141b): at soak end the session must still be a
+    real, running transcode — it must have encoded >=1 frame ('first progress
+    block') and NOT have terminated (ANY exit code, incl. a clean 0 — a premature
+    exit-0 after the init segment is exactly what the non-zero-only soak missed).
+    (A 'segments still produced' count isn't log-observable: per-segment events
+    go to the PMS response stream and progress PUTs aren't logged in this
+    harness, so 'first progress block' is the liveness signal we can see.)
   - NODISPATCH is a hard FAIL (not silent green): cells that never reached the
     worker went unvalidated. Reclassified by observed state (PMS_NO_TRANSCODE /
     ORCH_NOT_NOTIFIED / WORKER_NEVER_SPAWNED). Waive with --allow-nodispatch.
@@ -636,6 +643,9 @@ ERR_RE = re.compile(
 # pattern context, this is the catch-all (#141: exit 145 escaped the old set).
 EXIT_RE = re.compile(r"ffmpeg exit:\s*exit status ([1-9]\d*)", re.I)
 TAG_RE = re.compile(r"rewriter applied: ([^\"]+)")
+# Liveness signals (#141b). ANY ffmpeg exit (incl. a clean status-0) — EXIT_RE
+# above is non-zero only, so a premature clean exit slips its net.
+EXIT_ANY_RE = re.compile(r"ffmpeg exit:\s*(.+)")
 
 
 def _scan_logs(slug, since):
@@ -687,6 +697,39 @@ def _poll_logs(slug, started_at, max_wait, want_seg):
     return spawned, first_seg, tags, errors
 
 
+def _scan_liveness(slug, since):
+    """Post-first-segment liveness from worker logs (#141b). 'first segment
+    ready' is necessary but not sufficient: a session can write the init
+    segment and then stall (no frame ever encoded) or exit cleanly after one
+    segment — both pass the non-zero-exit soak. Returns (progressed, exited):
+
+      progressed — saw 'first progress block' (ffmpeg encoded >=1 frame past the
+                   init moov; distinguishes a real transcode from an init-only
+                   stall).
+      exited     — the 'ffmpeg exit: <detail>' text if the session terminated
+                   (ANY code, incl. a clean 0), else None. For 4K streaming
+                   content a termination inside the settle+soak window is
+                   premature regardless of code.
+
+    (A 'segments still produced' count was prototyped but dropped: per-segment
+    events ['segment-ready:'] go to the PMS response stream and the periodic
+    progress PUTs aren't emitted to the worker log in this harness — neither is
+    log-observable, so any '--min-progress'-style bar would read 0 for every
+    healthy cell. 'first progress block' is the log-observable liveness signal.)
+    """
+    progressed = False
+    exited = None
+    for line in worker_logs(since).splitlines():
+        if slug not in _alnum(line):
+            continue
+        if "first progress block" in line:
+            progressed = True
+        m = EXIT_ANY_RE.search(line)
+        if m:
+            exited = m.group(1).split("stderr_tail=", 1)[0].strip()[:80]
+    return progressed, exited
+
+
 def drive_cell(case, proto, settle, soak):
     """Drive one cell to an AUTHORITATIVE verdict:
       SKIP       — PMS chose not to transcode (directplay/copy) → not a worker test
@@ -694,10 +737,14 @@ def drive_cell(case, proto, settle, soak):
                    by observed state (PMS_NO_TRANSCODE / ORCH_NOT_NOTIFIED /
                    WORKER_NEVER_SPAWNED) and counted as a hard FAIL by default (the
                    cell went unvalidated) unless --allow-nodispatch (#142).
-      PASS       — worker spawned, produced a first segment, AND survived the soak
-                   window with no fatal / non-zero ffmpeg exit (#141).
+      PASS       — worker spawned, produced a first segment, survived the soak
+                   window with no fatal / non-zero ffmpeg exit (#141), AND passed
+                   the liveness gate (#141b): encoded >=1 frame ('first progress
+                   block') and was still running at soak end (no premature exit
+                   of ANY code; >= --min-progress heartbeats if set).
       FAIL       — worker spawned but errored (incl. a late soak-window exit), or
-                   produced no segment.
+                   produced no segment, or stalled / exited prematurely after the
+                   init segment (liveness).
     Returns (status, info, sid)."""
     sid = str(uuid.uuid4())
     params = build_params(case["rk"], sid, proto, case["extra"])
@@ -798,6 +845,23 @@ def drive_cell(case, proto, settle, soak):
         if soak_errs:
             return "FAIL", {"errors": sorted(set(soak_errs)), "tags": tags,
                             "phase": "post-segment-soak"}, sid
+
+    # Liveness / process-check (#141b). Only when soaking — the soak window is
+    # what gives the progress signals time to appear; --soak-seconds 0 keeps the
+    # old first-segment-only bar (escape hatch). Catches two classes the
+    # non-zero-exit soak misses: (1) a clean exit-0 after the init segment
+    # (premature termination), and (2) an init-segment-only stall that never
+    # encodes a frame.
+    if soak > 0:
+        window = f"{int(time.time() - started) + 4}s"
+        progressed, exited = _scan_liveness(slug, window)
+        if exited is not None:
+            return "FAIL", {"reason": f"ffmpeg exited during soak (premature): {exited}",
+                            "tags": tags, "phase": "liveness"}, sid
+        if not progressed:
+            return "FAIL", {"reason": "init segment only — no 'first progress block' "
+                            "(ffmpeg never encoded a frame / stalled)",
+                            "tags": tags, "phase": "liveness"}, sid
     return "PASS", {"tags": tags}, sid
 
 
@@ -825,7 +889,8 @@ def main():
     ap.add_argument("--soak-seconds", dest="soak", type=float, default=8,
                     help="after 'first segment ready', keep watching this long for a LATE "
                          "fatal/non-zero ffmpeg exit (libass/fontconfig exit 145 fires ~1s "
-                         "after the init segment, #141). 0 disables the soak.")
+                         "after the init segment, #141) AND run the liveness gate (#141b: "
+                         "encoded a frame + still alive at soak end). 0 disables both.")
     ap.add_argument("--allow-nodispatch", action="store_true",
                     help="don't fail the run on NODISPATCH cells (cells that never reached the "
                          "worker, so went unvalidated). Default: NODISPATCH is a hard fail "
