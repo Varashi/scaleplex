@@ -131,18 +131,22 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 				first = false
 				log.Printf("session %s: first progress block out_time_us=%s total_size=%s speed=%s base_url=%s", rc.SessionID, block["out_time_us"], block["total_size"], block["speed"], rc.URL)
 			}
-			putProgressTick(ctx, httpClient, rc, block)
-			ticks++
 			// Throttled liveness heartbeat. A SUCCESSFUL progress PUT is
 			// otherwise silent (doPlexPUT logs only 4xx/5xx + transport
 			// errors), so an observer — the qa_matrix verifier (#141b) or a
 			// human tailing logs — can't distinguish a session that's
 			// alive-and-advancing from one that wrote the init segment then
-			// hung mid-stream. Emit a capped (~5s) heartbeat carrying
-			// out_time_us so the encode is seen to ADVANCE, not just spawn.
-			if now := time.Now(); now.Sub(lastBeat) >= 5*time.Second {
-				lastBeat = now
-				log.Printf("session %s: progress heartbeat ticks=%d out_time_us=%s speed=%s", rc.SessionID, ticks, block["out_time_us"], block["speed"])
+			// hung mid-stream. Gate on PUT success so the heartbeat means
+			// "encode advancing AND PMS accepting the write", not ffmpeg
+			// parse alone — a session whose PUTs persistently fail emits no
+			// heartbeat (and its failures are logged separately). out_time_us
+			// lets the watcher confirm the encode is ADVANCING, not just spawned.
+			if putProgressTick(ctx, httpClient, rc, block) {
+				ticks++
+				if now := time.Now(); now.Sub(lastBeat) >= 5*time.Second {
+					lastBeat = now
+					log.Printf("session %s: progress heartbeat ticks=%d out_time_us=%s speed=%s", rc.SessionID, ticks, block["out_time_us"], block["speed"])
+				}
 			}
 			// Surface live encode speed for monitoring. Updates even
 			// while canThrottle is asserted (the throttle slows ffmpeg
@@ -168,7 +172,7 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 //	size     = total_size (bytes; ffmpeg may emit "N/A" → -1)
 //	remaining= (duration - out_time) / speed
 //	speed    = ffmpeg "<x>" minus the trailing "x"
-func putProgressTick(ctx context.Context, c *http.Client, rc reportContext, blk map[string]string) {
+func putProgressTick(ctx context.Context, c *http.Client, rc reportContext, blk map[string]string) bool {
 	outUs, _ := strconv.ParseInt(blk["out_time_us"], 10, 64)
 	outS := float64(outUs) / 1e6
 
@@ -229,7 +233,7 @@ func putProgressTick(ctx context.Context, c *http.Client, rc reportContext, blk 
 	}
 
 	fullURL := joinQuery(rc.URL, q)
-	doPlexPUT(ctx, c, rc, "progress", fullURL)
+	return doPlexPUT(ctx, c, rc, "progress", fullURL)
 }
 
 // sendPrelude fires the one-time PUTs Plex Transcoder sends at startup:
@@ -363,13 +367,17 @@ func joinQueryWithSuffix(rawURL, pathSuffix string, extra url.Values) string {
 	return u.String()
 }
 
-func doPlexPUT(ctx context.Context, c *http.Client, rc reportContext, kind, fullURL string) {
+// doPlexPUT returns true only when PMS accepted the write (2xx). Transport
+// errors and 4xx/5xx return false so callers (the progress heartbeat) can
+// distinguish "encode advancing AND PMS reachable" from a session whose PUTs
+// are silently failing.
+func doPlexPUT(ctx context.Context, c *http.Client, rc reportContext, kind, fullURL string) bool {
 	pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(pctx, http.MethodPut, fullURL, http.NoBody)
 	if err != nil {
 		metricProgressPUT.WithLabelValues(kind, "err").Inc()
-		return
+		return false
 	}
 	// Plex Transcoder sends Range: bytes=0-, no body. Mimic that so PMS
 	// path matching matches Plex Transcoder's wire frame exactly.
@@ -387,7 +395,7 @@ func doPlexPUT(ctx context.Context, c *http.Client, rc reportContext, kind, full
 		if rc.Throttle != nil {
 			rc.Throttle.set(false)
 		}
-		return
+		return false
 	}
 	// Read up to 4KB of the body so the throttle signal can be parsed
 	// (`canThrottle` substring per fftools/ffmpeg.c). 4KB matches Plex
@@ -402,11 +410,12 @@ func doPlexPUT(ctx context.Context, c *http.Client, rc reportContext, kind, full
 		if rc.Throttle != nil {
 			rc.Throttle.set(false)
 		}
-		return
+		return false
 	}
 	if rc.Throttle != nil && kind == "progress" {
 		rc.Throttle.set(bytes.Contains(body, []byte("canThrottle")))
 	}
+	return true
 }
 
 func httpClass(code int) string {
