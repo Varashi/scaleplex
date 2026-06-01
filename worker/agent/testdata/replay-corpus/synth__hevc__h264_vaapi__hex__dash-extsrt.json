@@ -21,7 +21,7 @@
     "-probesize",
     "20000000",
     "-i",
-    "/media/scaleplex-test-clips/hevc__main10__2160p__10bit__hdr__eac3-5.1__srt-sidecar.mkv",
+    "/media/scaleplex-test-clips/av1__main10__2160p__10bit__hdr10__eac3-5.1__sub-srt.mkv",
     "-ss",
     "2844",
     "-analyzeduration",
@@ -110,7 +110,7 @@
     "nullfile"
   ],
   "env": {},
-  "source_path": "/media/scaleplex-test-clips/hevc__main10__2160p__10bit__hdr__eac3-5.1__srt-sidecar.mkv",
+  "source_path": "/media/scaleplex-test-clips/av1__main10__2160p__10bit__hdr10__eac3-5.1__sub-srt.mkv",
   "has_map_inlineass": true,
   "synthesized": true
 }
