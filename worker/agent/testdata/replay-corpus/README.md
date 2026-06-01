@@ -42,6 +42,13 @@ Tests that run against this fixture:
   PGS bitmap subs, so this test cleanly skips on the fixture (no
   candidates). Real bitmap coverage runs against the live
   `~/scaleplex-corpus/` per-tag (see `docs/RELEASE_GATE.md` T2).
+- `TestReplayCorpus_DashMuxer` (#148) — **in-pod only** (real ffmpeg +
+  VAAPI; skips when `REPLAY_NO_FFMPEG` is set, so the PR-CI lane skips
+  it). Runs the real `-f dash` muxer against a fake-PMS `httptest`
+  server and asserts the manifest PUT lands + ffmpeg exits 0. On this
+  fixture the 4 `synth__av1__*__dash-extsrt` cells run (their source is
+  the `av1__…` synth clip); the `hevc` cells auto-skip on ffprobe codec
+  mismatch. See `docs/RELEASE_GATE.md` T2 Step 4.
 
 ## Refreshing
 

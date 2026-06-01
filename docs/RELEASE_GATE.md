@@ -94,6 +94,26 @@ kubectl -n plex-test exec "$POD" -- /tmp/replay.test \
   plex-test PMS (real-prod captures reference paths that may not exist
   on the test PMS)
 
+**Step 4 — in-pod dash-muxer e2e (`TestReplayCorpus_DashMuxer`, #148):**
+
+Runs the *real* `-f dash` muxer against a fake-PMS `httptest` server and
+asserts ffmpeg PUT the manifest to the rewritten `-manifest_name` URL +
+exited 0 — the muxer-side network path `TestReplayCorpus` can't reach
+(it strips `-manifest_name`). Catches PR #144's Bug B class (loopback
+manifest URL → ECONNREFUSED → exit-145). Same built binary:
+
+```bash
+kubectl -n plex-test exec "$POD" -- /tmp/replay.test \
+  -test.v -test.run TestReplayCorpus_DashMuxer -test.timeout 20m
+```
+
+**Required:**
+- Each run cell: `manifest PUT(s) to fake-PMS, ffmpeg exit 0`
+- `ran == 0` (whole test SKIP) only acceptable when the corpus has no
+  dash-shape cell with a present source (e.g. fixture-only on a host
+  without the synth clips); against `~/scaleplex-corpus` in-pod it must
+  run ≥1 cell. Knobs: `REPLAY_DASH_MAX` (default 6), `REPLAY_TIMEOUT`.
+
 **Cost:** ~20 minutes local, ~45 minutes in-pod (depends on corpus size).
 
 ## T3 — API-driven matrix (`test/qa_matrix.py`)
