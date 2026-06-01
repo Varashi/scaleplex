@@ -48,8 +48,8 @@ a full transcode). Recognised `X-Plex-*` headers load a base profile.
 
 | verdict | meaning |
 |---|---|
-| **PASS** | worker spawned, produced a first segment, **and survived the soak** with no fatal / non-zero `ffmpeg exit:` |
-| **FAIL** | spawned but errored (incl. a *late* soak-window exit), or produced no segment |
+| **PASS** | worker spawned, produced a first segment, **survived the soak** with no fatal / non-zero `ffmpeg exit:`, **and passed the liveness gate** (encoded a frame, `out_time_us` advanced, still running at soak end) |
+| **FAIL** | spawned but errored (incl. a *late* soak-window exit), produced no segment, or failed liveness (init-only stall / mid-stream freeze / premature exit) |
 | **NODISPATCH** | PMS decided transcode but no ffmpeg spawned — the cell went **unvalidated**. A hard FAIL by default |
 | **SKIP** | PMS chose direct-play/copy (no transcode to verify), or a client-profile 400 |
 
@@ -60,6 +60,25 @@ pipeline processes a frame, so a first-frame fatal — e.g. a libass/fontconfig
 **exit 145** — fires ~1 s *after* `first segment ready`. The verifier therefore
 keeps watching for `--soak-seconds` (default 8) after the segment and FAILs on
 any late fatal. A run is GREEN only if every cell survives its soak.
+
+### The liveness gate (#141b)
+
+Surviving the soak with no error still isn't enough — three stall classes pass
+a pure error/exit check:
+
+1. **init-only stall** — wrote the moov, never encoded a frame (no `first
+   progress block`).
+2. **mid-stream freeze** — encoded one frame then hung; `out_time_us` stops
+   climbing. Made observable by the throttled `progress heartbeat` line
+   (#166), which carries `out_time_us` on every successful progress PUT. The
+   gate FAILs when ≥2 samples don't advance; a single sample (short soak /
+   heavy throttle) is inconclusive and tolerated.
+3. **premature exit** — terminates inside the soak window, *including a clean
+   exit 0* (the non-zero-only soak misses it).
+
+`--min-progress N` raises a strict bar: require ≥N heartbeats (≈one per 5 s of
+advancing encode) within the soak or FAIL. Pair with a longer `--soak-seconds`.
+`--soak-seconds 0` disables soak + liveness entirely (first-segment-only).
 
 ### Fatal-exit set
 
@@ -111,7 +130,8 @@ content for, so a gap reads as a content gap — not a silent skip.
 | `ASS_SECTION` | `3` | section to mine for an embedded-ASS cell (`""` disables) |
 | `WORKER_MODE` | `auto` | `k8s` / `docker` / `auto` (combines both; external push workers over SSH) |
 | `--settle` | `20` | secs to wait per session for spawn / first segment |
-| `--soak-seconds` | `8` | post-segment watch for a late fatal (`0` disables) |
+| `--soak-seconds` | `8` | post-segment watch for a late fatal + liveness gate (`0` disables both) |
+| `--min-progress` | `0` | strict liveness: require ≥N `progress heartbeat` lines in the soak (`0` = advance-only) |
 | `--allow-nodispatch` | off | don't fail the run on NODISPATCH cells |
 | `--quick` | off | small slice, `FORCE_HW=1` only |
 
