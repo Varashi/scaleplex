@@ -10,6 +10,16 @@ against synthetic test clips under `/media/scaleplex-test-clips/` —
 **no PII, no real user titles or paths.** Each capture file name
 encodes its shape: `<codec>__<profile>__<resolution>__<depth>__<color>__<rk-prefix>-<rk-id>-<hash>.json`.
 
+Plus 8 `synth__*.json` **`hw-subburn-transcode`** cells (`inlineass=`
+sub-burn + `*_vaapi` encoder) emitted by
+[`cmd/corpus-synthesize`](../../../cmd/corpus-synthesize). That class is
+absent from the organic corpus (Frank rarely force-burns; the `:#0xNN` +
+dash + inlineass combo that broke in #144 never got captured — #150), so
+without synthesis the #147 must-reshape bail assertion has no fixture to
+fire against (#153). Each carries `"capture_source": "synthesized"` +
+`"synthesized": true`. Regenerate with
+`go run ./cmd/corpus-synthesize -out-dir worker/agent/testdata/replay-corpus`.
+
 ## Used by
 
 `worker/agent/replay_test.go` and siblings (build-tag `replay`).
