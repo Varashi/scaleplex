@@ -114,6 +114,8 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 	httpClient := &http.Client{Timeout: 4 * time.Second}
 	block := map[string]string{}
 	first := true
+	var ticks int
+	var lastBeat time.Time
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
@@ -130,6 +132,18 @@ func runProgressReporter(ctx context.Context, r io.Reader, rc reportContext) {
 				log.Printf("session %s: first progress block out_time_us=%s total_size=%s speed=%s base_url=%s", rc.SessionID, block["out_time_us"], block["total_size"], block["speed"], rc.URL)
 			}
 			putProgressTick(ctx, httpClient, rc, block)
+			ticks++
+			// Throttled liveness heartbeat. A SUCCESSFUL progress PUT is
+			// otherwise silent (doPlexPUT logs only 4xx/5xx + transport
+			// errors), so an observer — the qa_matrix verifier (#141b) or a
+			// human tailing logs — can't distinguish a session that's
+			// alive-and-advancing from one that wrote the init segment then
+			// hung mid-stream. Emit a capped (~5s) heartbeat carrying
+			// out_time_us so the encode is seen to ADVANCE, not just spawn.
+			if now := time.Now(); now.Sub(lastBeat) >= 5*time.Second {
+				lastBeat = now
+				log.Printf("session %s: progress heartbeat ticks=%d out_time_us=%s speed=%s", rc.SessionID, ticks, block["out_time_us"], block["speed"])
+			}
 			// Surface live encode speed for monitoring. Updates even
 			// while canThrottle is asserted (the throttle slows ffmpeg
 			// via usleep but the -progress stream keeps flowing), so
