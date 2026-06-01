@@ -130,11 +130,19 @@ except FileNotFoundError:
     CLIENT_PROFILES = {}
 
 # Server-pref axes (the "every combination" backbone). Keys are PMS prefs.
+#
+# TranscoderToneMapping is deliberately NOT an axis (#160): it's an
+# advanced="1" pref PMS pins at value="1" — an explicit
+# `?TranscoderToneMapping=0` is silently ignored, so iterating [1, 0] ran
+# both as 1 and every ToneMapping=0 combo just duplicated its
+# ToneMapping=1 sibling (2 of 4 --quick combos wasted). Dropping it halves
+# the cartesian (2^3=8) with zero coverage loss — the HDR-tonemap path is
+# still exercised by the HDR content cells, which run under the pinned
+# ToneMapping=1. SMART_BASELINE_COMBO + the prod-restore still pin it to 1.
 SERVER_AXES = {
     "HardwareAcceleratedCodecs": [1, 0],     # HW decode
     "HardwareAcceleratedEncoders": [1, 0],   # HW encode
     "TranscoderHEVCEncodingMode": ["hevc-sources", "never"],  # HEVC out
-    "TranscoderToneMapping": [1, 0],         # HDR tonemap
 }
 
 # ---------------------------------------------------------------------------
@@ -168,10 +176,9 @@ def prefs_applied(prefs, tries=6):
 
     Only the HardwareAccelerated* bools are checked — they read back verbatim
     and gate the spawn-relevant HW path. Skipped: the text enum
-    TranscoderHEVCEncodingMode (PMS normalizes "hevc-sources" → "always") and
-    TranscoderToneMapping (advanced pref PMS pins at 1 — won't accept 0 via the
-    API; the ToneMapping=0 axis is degenerate, tracked separately), both of
-    which would otherwise never confirm and spam warnings."""
+    TranscoderHEVCEncodingMode (PMS normalizes "hevc-sources" → "always"),
+    which would otherwise never confirm and spam warnings. (TranscoderToneMapping
+    is no longer iterated — #160 dropped it as a degenerate axis.)"""
     checkable = {k: v for k, v in prefs.items()
                  if k.startswith("HardwareAccelerated") and str(v) in ("0", "1")}
     for _ in range(tries):
@@ -490,7 +497,7 @@ def _profile_proto(meta, default_protos):
 
 # Smart-mode prod-baseline server combo (the de-facto prod prefs). When
 # --client-profiles is active and smart-mode on, this single combo replaces the
-# 16-combo cartesian — profile axis is orthogonal to server-pref axis. #116.
+# 8-combo cartesian — profile axis is orthogonal to server-pref axis. #116.
 SMART_BASELINE_COMBO = {
     "HardwareAcceleratedCodecs": 1,
     "HardwareAcceleratedEncoders": 1,
