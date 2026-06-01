@@ -33,6 +33,7 @@ package main
 
 import (
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,6 +46,21 @@ import (
 // passCheck queries PMS for the account's Plex Pass status. Injectable for
 // tests; production uses httpPassCheck.
 var passCheck = httpPassCheck
+
+// passGateDebug, when SCALEPLEX_PASS_GATE_DEBUG is set (non-empty), makes the
+// gate log every decision — which branch (L1 forwarded flag / not-wired /
+// cache / L3 probe), the PMS base, the probe HTTP status, the parsed
+// subscription value, and the final allow/deny. The token is NEVER logged.
+// Added for #125 item 3: a `force-hw:would-honor-sw` denial on an external
+// worker was un-diagnosable because the gate was silent about WHY. Read once
+// at startup (process env, not per-session).
+var passGateDebug = os.Getenv("SCALEPLEX_PASS_GATE_DEBUG") != ""
+
+func pgDebugf(format string, args ...any) {
+	if passGateDebug {
+		log.Printf("pass-gate: "+format, args...)
+	}
+}
 
 var reMyPlexSubscription = regexp.MustCompile(`myPlexSubscription="(\d)"`)
 
@@ -76,12 +92,14 @@ func hwAccelAllowed(inputEnv map[string]string) bool {
 	// worker process env): a static worker-level SCALEPLEX_PASS_ACTIVE would
 	// defeat the per-spawn freshness contract + could mis-gate every session.
 	if v, ok := inputEnv["SCALEPLEX_PASS_ACTIVE"]; ok && v != "" {
+		pgDebugf("L1 forwarded SCALEPLEX_PASS_ACTIVE=%q → %s", v, allowDeny(v == "1"))
 		return v == "1"
 	}
 
 	base := envFrom(inputEnv, "SCALEPLEX_PMS_BASE_URL")
 	tok := envFrom(inputEnv, "X_PLEX_TOKEN")
 	if base == "" || tok == "" {
+		pgDebugf("not wired (base=%q tok-present=%v) → allow (inert)", base, tok != "")
 		// Gate not wired: no PMS base/token means the worker isn't connected
 		// to a real PMS via the scaleplex shim (which always sets both for the
 		// progress reporter). Treat as "enforcement not configured" → allow.
@@ -98,18 +116,28 @@ func hwAccelAllowed(inputEnv map[string]string) bool {
 	passCacheMu.Lock()
 	if e, ok := passCache[key]; ok && time.Since(e.at) < passCacheTTL {
 		passCacheMu.Unlock()
+		pgDebugf("L3 cache hit base=%s active=%v → %s", base, e.active, allowDeny(e.active))
 		return e.active
 	}
 	passCacheMu.Unlock()
 
 	active, err := passCheck(base, tok)
 	if err != nil {
+		pgDebugf("L3 probe base=%s err=%v → deny (fail-closed)", base, err)
 		return false // fail-closed; don't cache (retry next session)
 	}
 	passCacheMu.Lock()
 	passCache[key] = passCacheEntry{active: active, at: time.Now()}
 	passCacheMu.Unlock()
+	pgDebugf("L3 probe base=%s active=%v → %s", base, active, allowDeny(active))
 	return active
+}
+
+func allowDeny(b bool) string {
+	if b {
+		return "allow"
+	}
+	return "deny"
 }
 
 // httpPassCheck GETs the PMS root (which carries the myPlexSubscription attr)
@@ -127,6 +155,7 @@ func httpPassCheck(base, tok string) (bool, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		pgDebugf("probe http=%d (non-200, e.g. 401 bad token) → no-Pass", resp.StatusCode)
 		return false, nil // e.g. 401 bad token → no-Pass (closed)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
@@ -135,8 +164,10 @@ func httpPassCheck(base, tok string) (bool, error) {
 	}
 	m := reMyPlexSubscription.FindSubmatch(body)
 	if m == nil {
+		pgDebugf("probe http=200 but myPlexSubscription attr ABSENT (server token? non-account context?) → no-Pass")
 		return false, nil // attr absent → treat as no-Pass
 	}
+	pgDebugf("probe http=200 myPlexSubscription=%q", string(m[1]))
 	return string(m[1]) == "1", nil
 }
 
