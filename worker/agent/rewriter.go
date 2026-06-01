@@ -243,6 +243,80 @@ func indexOfArg(args []string, key string, from int) int {
 	return -1
 }
 
+// streamIDOrdinalMap builds the `#0xNN`-id → ordinal map PMS's stream-by-id
+// argv implies: each distinct hex id, in first-occurrence order across the argv
+// (a flag suffix like `-codec:#0x01` or a filtergraph ref `[0:#0x01]`), maps to
+// the next ordinal (0, 1, 2, …). This mirrors ffmpeg's by-index assignment for
+// PMS's video-then-audio declaration order, so `#0x01` (the first id) resolves
+// to ordinal 0 (the video stream). Empty when the argv carries no `:#0x` spec
+// (the ordinal-form common case — no allocation). Replaces the upfront
+// normalizePlexStreamSpecsToOrdinal rewrite (#145): the rewriter now resolves
+// stream specs at match time and leaves PMS's argv pristine (ffmpeg accepts the
+// `#0xNN` form natively).
+func streamIDOrdinalMap(args []string) map[string]int {
+	var m map[string]int
+	next := 0
+	for _, a := range args {
+		for _, s := range streamIDSpecRegex.FindAllString(a, -1) {
+			id := s[len(":#"):] // ":#0x01" → "0x01"
+			if m == nil {
+				m = map[string]int{}
+			}
+			if _, ok := m[id]; !ok {
+				m[id] = next
+				next++
+			}
+		}
+	}
+	return m
+}
+
+// streamSpecSelectsOrdinal reports whether a stream-specifier (the text after
+// `-flag:`) selects video ordinal `ord`. Handles the three forms PMS emits:
+//
+//	"0"      ordinal index directly
+//	"#0xNN"  stream-by-id hex — resolved via idMap (streamIDOrdinalMap)
+//	"v:0"    type+index — video stream `index` (V = attached-pic excluded; we
+//	         only match v/V, since the rewriter keys exclusively on video)
+func streamSpecSelectsOrdinal(spec string, ord int, idMap map[string]int) bool {
+	if n, err := strconv.Atoi(spec); err == nil {
+		return n == ord
+	}
+	if strings.HasPrefix(spec, "#0x") {
+		o, ok := idMap[spec[len("#"):]] // "#0x01" → "0x01", matching idMap keys
+		return ok && o == ord
+	}
+	if t, idx, found := strings.Cut(spec, ":"); found && (t == "v" || t == "V") {
+		if n, err := strconv.Atoi(idx); err == nil {
+			return n == ord
+		}
+	}
+	return false
+}
+
+// streamSpecIndex is indexOfArg for a stream-specified flag: it finds the index
+// of `-<flagBase>:<spec>` (from `start`) whose specifier selects video ordinal
+// `ord`, accepting the ordinal (`:0`), hex-by-id (`:#0xNN`), and type+index
+// (`:v:0`) forms alike. The drop-in replacement for the old
+// `indexOfArg(args, "-flagBase:0", start)` ordinal-only matching that tripped on
+// PMS's `#0xNN` argv (#144 regression chain; #145 fix). flagBase carries no
+// trailing colon — `"-hwaccel"` won't false-match `-hwaccel_output_format:` (the
+// required `:` separator rules out the `_`-suffixed siblings).
+func streamSpecIndex(args []string, flagBase string, ord, start int) int {
+	idMap := streamIDOrdinalMap(args)
+	prefix := flagBase + ":"
+	for i := start; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, prefix) {
+			continue
+		}
+		if streamSpecSelectsOrdinal(a[len(prefix):], ord, idMap) {
+			return i
+		}
+	}
+	return -1
+}
+
 func escapeFilterPath(p string) string {
 	p = strings.ReplaceAll(p, `\`, `\\`)
 	p = strings.ReplaceAll(p, `:`, `\:`)
@@ -783,6 +857,26 @@ var reBitmapSubBranch = regexp.MustCompile(`\[(0:[0-9]+)\]scale=[0-9]+:[0-9]+,hw
 // live-validated (no PGS NVENC capture in the corpus); see scaleplex#66.
 var reBitmapMainScale = regexp.MustCompile(`\[0:0\]hwupload\[\d+\];\[\d+\]scale_(?:vaapi|cuda)=w=([0-9]+):h=([0-9]+)`)
 
+// reVideoInput0 matches a filtergraph's leading video input label in EITHER
+// form: ordinal `[0:0]` or PMS's stream-by-id `[0:#0xNN]` (#145, pristine argv —
+// no upfront normalize pass). The hex id resolves to the same stream (PMS
+// declares video first), so the reshape composers' `[0:0]` output stays the
+// correct canonical rewrite.
+var reVideoInput0 = regexp.MustCompile(`^\[0:(?:0|#0x[0-9a-fA-F]+)\]`)
+
+// graphLeadsWithVideoInput0 reports whether `graph` opens with the video input
+// label (`[0:0]` or `[0:#0xNN]`) immediately followed by `suffix`. The
+// stream-spec-agnostic replacement for `strings.HasPrefix(graph, "[0:0]"+suffix)`
+// at the reshape entry points, so a `#0xNN`-shaped graph still engages the
+// reshape instead of bailing to Plex's SW-inlineass path.
+func graphLeadsWithVideoInput0(graph, suffix string) bool {
+	loc := reVideoInput0.FindStringIndex(graph)
+	if loc == nil {
+		return false
+	}
+	return strings.HasPrefix(graph[loc[1]:], suffix)
+}
+
 // reTonemapOpenCLAlgo extracts Plex's tonemap algorithm from an (already
 // substituteOpenCLTonemap-normalized) tonemap_opencl node.
 var reTonemapOpenCLAlgo = regexp.MustCompile(`tonemap_opencl=tonemap=([A-Za-z0-9]+)`)
@@ -1006,7 +1100,7 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 	// unchanged rather than getting a wrong leading hwupload from
 	// composeBurn(vaResident=false). Matches the old reFilter* `^\[0:0\]scale=`
 	// anchor.
-	if !strings.HasPrefix(filterStr, "[0:0]scale=w=") {
+	if !graphLeadsWithVideoInput0(filterStr, "scale=w=") {
 		return nil
 	}
 	facts := extractGraphFacts(filterStr, subSrc)
@@ -1221,7 +1315,7 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 	if activeDialect.backendName() != "vaapi" {
 		return args, nil
 	}
-	if indexOfArg(args, "-hwaccel:0", 0) < 0 {
+	if streamSpecIndex(args, "-hwaccel", 0, 0) < 0 {
 		return args, nil
 	}
 	// Locate a filter_complex carrying tonemap_opencl.
@@ -1272,8 +1366,8 @@ func gpuResidentOpenCLTonemap(args []string) ([]string, []string) {
 	}
 
 	// 2: force VA-resident decode so [0:0] is a VA surface.
-	if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 &&
-		indexOfArg(args, "-hwaccel_output_format:0", 0) < 0 {
+	if hwIdx := streamSpecIndex(args, "-hwaccel", 0, 0); hwIdx >= 0 &&
+		streamSpecIndex(args, "-hwaccel_output_format", 0, 0) < 0 {
 		args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", "vaapi")
 		changes = append(changes, TagTonemapOCLForceOutputFormatVA)
 	}
@@ -1598,141 +1692,12 @@ func scrubPlexInlineassFilesystemPaths(filterStr string) (string, bool) {
 	return out.String(), changed
 }
 
-// normalizePlexStreamSpecsToOrdinal rewrites Plex's stream-id-by-id
-// stream-specifier syntax (`:#0xNN`, hex) into ffmpeg's ordinal form
-// (`:0`, `:1`, ...). PMS emits the `#0xNN` form for files where the
-// container's first video stream isn't at stream-index 0 — most
-// commonly the "Plex Versions / Optimized for TV" Optimize outputs
-// and high-PID m2ts/M2TS containers. Examples from the live argv
-// corpus:
-//
-//	-codec:#0x01 hevc            // → -codec:0 hevc
-//	-hwaccel:#0x01 vaapi         // → -hwaccel:0 vaapi
-//	-hwaccel_output_format:#0x01 vaapi
-//	-hwaccel_device:#0x01 vaapi
-//	-codec:#0x02 aac             // → -codec:1 aac
-//	-filter_complex "[0:#0x01]hwupload[0];..."  // → "[0:0]hwupload[0];..."
-//
-// Without normalization, the HW-decode passthrough detector at
-// rewriter.go:~2287 (`indexOfArg(args, "-hwaccel:0", 0)`) misses the
-// argv entirely → rewriter bails with `skip:no-decoder` → ffmpeg runs
-// the unmodified PMS argv → dash muxer POSTs `-manifest_name` to the
-// PMS loopback URL the worker pod can't reach → ECONNREFUSED → exit
-// 145. Live-confirmed prod regression 2026-05-31 on Ghosts S2E1
-// force-burn (Plex Versions/Optimized for TV path); ~95/3629 (2.6%)
-// of captured argv carry this shape, mostly mobile HLS sessions that
-// happen to clear the bail path's existing `-segment_list` URL
-// rewrite. Plex Web (dash) sessions need this normalization to engage
-// the main reshape path that already handles `-manifest_name`.
-//
-// Mapping rule: walk argv in order, collect each unique `#0xNN` ID
-// the first time it appears as a `:#0xNN` suffix on a flag, and
-// assign it the next ordinal (0, 1, 2, ...). Apply the same map to
-// `[<input>:#0xNN]` references inside `-filter_complex` values. PMS
-// emits stream-spec flags strictly in pre-input position (before the
-// first `-i`) and in container declaration order (video then audio),
-// so the resulting ordinals match what ffmpeg would assign by index.
-//
-// Idempotent: argv that already uses `:0`/`:1` ordinal form passes
-// through with no map entries built and no rewrites emitted.
-func normalizePlexStreamSpecsToOrdinal(args []string) ([]string, bool) {
-	// First pass — does any flag carry the `:#0x...` suffix? Cheap
-	// short-circuit so the common ordinal-form argv never allocates.
-	hasIdSpec := false
-	for _, a := range args {
-		if streamIDSpecRegex.MatchString(a) {
-			hasIdSpec = true
-			break
-		}
-		if a == "-filter_complex" {
-			continue
-		}
-	}
-	if !hasIdSpec {
-		// Also peek inside -filter_complex values — the filter graph
-		// can carry `[N:#0xMM]` even when no top-level flag does (rare
-		// in practice; safety net for future PMS argv shapes).
-		for i := 0; i+1 < len(args); i++ {
-			if args[i] == "-filter_complex" &&
-				strings.Contains(args[i+1], ":#0x") {
-				hasIdSpec = true
-				break
-			}
-		}
-	}
-	if !hasIdSpec {
-		return args, false
-	}
-
-	// Second pass — build the ID → ordinal map in first-occurrence
-	// order, scanning flag suffixes and then filter graph references.
-	idOrdinal := map[string]int{}
-	nextOrd := 0
-	assign := func(id string) {
-		if _, ok := idOrdinal[id]; ok {
-			return
-		}
-		idOrdinal[id] = nextOrd
-		nextOrd++
-	}
-	for _, a := range args {
-		for _, m := range streamIDSpecRegex.FindAllString(a, -1) {
-			assign(m[len(":#"):])
-		}
-	}
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] != "-filter_complex" {
-			continue
-		}
-		for _, m := range filterStreamIDRefRegex.FindAllStringSubmatch(args[i+1], -1) {
-			assign(m[1])
-		}
-	}
-	if len(idOrdinal) == 0 {
-		return args, false
-	}
-
-	// Third pass — clone + rewrite. Replace `:#0xNN` flag suffixes
-	// and `[N:#0xNN]` filter refs with the resolved ordinal.
-	out := append([]string(nil), args...)
-	for i, a := range out {
-		if !strings.Contains(a, ":#0x") {
-			continue
-		}
-		out[i] = streamIDSpecRegex.ReplaceAllStringFunc(a, func(m string) string {
-			id := m[len(":#"):]
-			if ord, ok := idOrdinal[id]; ok {
-				return fmt.Sprintf(":%d", ord)
-			}
-			return m
-		})
-	}
-	for i := 0; i+1 < len(out); i++ {
-		if out[i] != "-filter_complex" {
-			continue
-		}
-		out[i+1] = filterStreamIDRefRegex.ReplaceAllStringFunc(out[i+1], func(m string) string {
-			sub := filterStreamIDRefRegex.FindStringSubmatch(m)
-			if len(sub) < 3 {
-				return m
-			}
-			input, id := sub[1], sub[2]
-			if ord, ok := idOrdinal[id]; ok {
-				return "[" + input + ":" + fmt.Sprintf("%d", ord) + "]"
-			}
-			return m
-		})
-	}
-	return out, true
-}
-
-var (
-	// `:#0xNN` suffix on a flag — e.g. `-codec:#0x01`, `-hwaccel:#0x1011`.
-	streamIDSpecRegex = regexp.MustCompile(`:#0x[0-9a-fA-F]+`)
-	// `[INPUT:#0xNN]` reference inside a filter graph — e.g.
-	// `[0:#0x01]hwupload[0]`. INPUT is the input index (numeric).
-	filterStreamIDRefRegex = regexp.MustCompile(`\[(\d+):#0x([0-9a-fA-F]+)\]`)
-)
+// streamIDSpecRegex matches a `:#0xNN` stream-by-id suffix wherever it appears
+// — a flag (`-codec:#0x01`) or inside a `-filter_complex` value
+// (`[0:#0x01]hwupload`). streamIDOrdinalMap scans it to resolve ids to ordinals
+// at match time (#145); the rewriter no longer rewrites these to ordinal form,
+// so PMS's argv reaches ffmpeg (which accepts the `#0xNN` form) unchanged.
+var streamIDSpecRegex = regexp.MustCompile(`:#0x[0-9a-fA-F]+`)
 
 // scrubPlexInlineassFilesystemPathsInArgs runs
 // scrubPlexInlineassFilesystemPaths over every `-filter_complex` value
@@ -2090,17 +2055,17 @@ func isOptimizeRemux(args []string) bool {
 	if iIdx < 0 {
 		return false
 	}
-	dIdx := indexOfArg(args, "-codec:0", 0)
+	dIdx := streamSpecIndex(args, "-codec", 0, 0)
 	if dIdx < 0 || dIdx >= iIdx || dIdx+1 >= len(args) {
 		return false
 	}
 	if _, ok := activeDialect.hwDecodeShortCodecs()[args[dIdx+1]]; !ok {
 		return false
 	}
-	if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
+	if streamSpecIndex(args, "-hwaccel", 0, 0) >= 0 {
 		return false
 	}
-	encIdx := indexOfArg(args, "-codec:0", iIdx+1)
+	encIdx := streamSpecIndex(args, "-codec", 0, iIdx+1)
 	if encIdx < 0 || encIdx+1 >= len(args) || args[encIdx+1] != "copy" {
 		return false
 	}
@@ -2145,23 +2110,16 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		changes = append(changes, TagFilterInlineassScrubPlexFontPaths)
 	}
 
-	// Normalize Plex's stream-id-by-id specifier syntax (`:#0xNN`) to
-	// ordinal form (`:0`/`:1`/...). PMS emits the #0xNN form on files
-	// where the container's first video stream isn't at stream-index 0
-	// (Plex Versions / Optimized for TV outputs, high-PID m2ts). Without
-	// this normalization, the HW-decode passthrough detector + every
-	// other indexOfArg("-hwaccel:0",...)/("-codec:0",...) site misses
-	// the argv and the rewriter bails skip:no-decoder — see the helper
-	// doc for the full regression chain (live repro 2026-05-31 on Ghosts
-	// S2E1 force-burn, Plex Web dash + inlineass). Runs after the
-	// inlineass scrub so the scrub still triggers on the original
-	// argv shape, before any other phase inspects stream specs.
-	streamSpecsNormalized := false
-	if normalized, did := normalizePlexStreamSpecsToOrdinal(inputArgs); did {
-		inputArgs = normalized
-		streamSpecsNormalized = true
-		changes = append(changes, TagNormalizeStreamSpecsToOrdinal)
-	}
+	// Plex's stream-id-by-id specifier syntax (`-codec:#0xNN`, `[0:#0xNN]`),
+	// emitted on files where the container's first video stream isn't at index 0
+	// (Plex Versions / Optimized for TV outputs, high-PID m2ts), is no longer
+	// rewritten to ordinal form. Every `-flag:0` detector is now a streamSpecIndex
+	// call that resolves `#0xNN` → ordinal at match time (streamIDOrdinalMap), so
+	// PMS's argv reaches ffmpeg (which accepts the `#0xNN` form natively) pristine.
+	// This replaces the upfront normalizePlexStreamSpecsToOrdinal pass (#145); the
+	// regression it guarded against (HW-decode detector misses `-hwaccel:#0x01` →
+	// bail skip:no-decoder → exit 145 on dash, live repro 2026-05-31 Ghosts S2E1)
+	// is now prevented by the polymorphic matchers themselves.
 
 	// Tone-mapping backend (opencl vs vaapi) for the tonemap Plex's
 	// argv asked for. scaleplex never decides whether to tonemap.
@@ -2310,7 +2268,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// would see Applied=false on a scrub-only bail and execute
 		// the unsanitized original argv, re-triggering the very
 		// libass fontconfig exit-145 the scrub exists to prevent).
-		applied := inlineassPathsScrubbed || streamSpecsNormalized ||
+		applied := inlineassPathsScrubbed ||
 			len(scrub) > 0 || len(hintChanges) > 0 ||
 			len(eaeSwapped) > 0 || len(eaeDropped) > 0 ||
 			len(fdDropped) > 0
@@ -2477,7 +2435,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		//   hwaccel flags, scale_vaapi filter chain, h264_vaapi / hevc_vaapi
 		//   encoder with -qp:0 directly. We pass that through and only do
 		//   the Plex-quirk strips (phases 9-24).
-		decCodecIdx := indexOfArg(args, "-codec:0", 0)
+		decCodecIdx := streamSpecIndex(args, "-codec", 0, 0)
 		if decCodecIdx < 0 || decCodecIdx >= inputIdx {
 			return bail(TagBailReasonNoDecoder)
 		}
@@ -2500,10 +2458,10 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// keep honor-SW so reshapeToSoftware's output is kept as-is.
 		forceHW := forceHWEnv && hwReaccelOK && activeDialect.backendName() != "sw"
 		plexSWEncoder := false
-		if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
+		if peer := streamSpecIndex(args, "-codec", 0, inputIdx+1); peer > 0 && peer+1 < len(args) {
 			_, plexSWEncoder = activeDialect.encoderMap()[args[peer+1]]
 		}
-		noHwaccel := indexOfArg(args, "-hwaccel:0", 0) < 0
+		noHwaccel := streamSpecIndex(args, "-hwaccel", 0, 0) < 0
 		honorSW := plexSWEncoder && noHwaccel && !forceHW
 		honorHybrid := plexSWEncoder && !noHwaccel && !forceHW
 
@@ -2525,7 +2483,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// Honoring Plex's SW pipeline: leave the decoder as PMS emitted it
 			// (no VAAPI swap, no -hwaccel inject). isHWDecode stays false.
 		} else if _, isShort := activeDialect.hwDecodeShortCodecs()[swDecoder]; isShort {
-			if indexOfArg(args, "-hwaccel:0", 0) >= 0 {
+			if streamSpecIndex(args, "-hwaccel", 0, 0) >= 0 {
 				isHWDecode = true
 				changes = append(changes, TagPrefixDecodeHWPassthrough+swDecoder)
 			} else {
@@ -2536,7 +2494,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// codec name in the decoder slot. If the encoder is already
 				// HW-shaped (e.g. h264_vaapi), the argv is malformed in a way
 				// we can't safely reshape; bail rather than guess.
-				if peer := indexOfArg(args, "-codec:0", inputIdx+1); peer > 0 && peer+1 < len(args) {
+				if peer := streamSpecIndex(args, "-codec", 0, inputIdx+1); peer > 0 && peer+1 < len(args) {
 					if _, isSW := activeDialect.encoderMap()[args[peer+1]]; !isSW {
 						return bail(TagPrefixBailUnknownDecoder + swDecoder)
 					}
@@ -2661,7 +2619,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		// Locate output -codec:0 (after -i) up-front; both SW and HW paths
 		// reference it for later phases (CRF→QP, preset→cl, sei inject).
 		newInputIdx := indexOfArg(args, "-i", 0)
-		encCodecIdx := indexOfArg(args, "-codec:0", newInputIdx+1)
+		encCodecIdx := streamSpecIndex(args, "-codec", 0, newInputIdx+1)
 		if encCodecIdx < 0 {
 			return bail(TagBailReasonNoEncoder)
 		}
@@ -2718,7 +2676,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// 3. Video -filter_complex rewrite
 			vfIdx := -1
 			for i := 0; i < len(args); i++ {
-				if args[i] == "-filter_complex" && i+1 < len(args) && strings.HasPrefix(args[i+1], "[0:0]") {
+				if args[i] == "-filter_complex" && i+1 < len(args) && reVideoInput0.MatchString(args[i+1]) {
 					vfIdx = i + 1
 					break
 				}
@@ -2806,7 +2764,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			// Re-locate encCodecIdx because the splices above may have
 			// shifted indices.
 			newInputIdx = indexOfArg(args, "-i", 0)
-			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+			encCodecIdx = streamSpecIndex(args, "-codec", 0, newInputIdx+1)
 			if encCodecIdx < 0 {
 				return bail(TagBailReasonNoEncoder)
 			}
@@ -2879,7 +2837,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					for i := 0; i < len(args); i++ {
 						if args[i] == "-filter_complex" && i+1 < len(args) &&
 							strings.Contains(args[i+1], "inlineass=") &&
-							strings.HasPrefix(args[i+1], "[0:0]") {
+							reVideoInput0.MatchString(args[i+1]) {
 							vfIdx = i + 1
 							break
 						}
@@ -2926,9 +2884,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					// HW-tagged frame). Force -hwaccel_output_format:0 to the
 					// backend's surface format defensively (parity with the
 					// HW-decode-bitmap branch).
-					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
+					if ofIdx := streamSpecIndex(args, "-hwaccel_output_format", 0, 0); ofIdx >= 0 {
 						args[ofIdx+1] = activeDialect.hwaccelOutputFormat()
-					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
+					} else if hwIdx := streamSpecIndex(args, "-hwaccel", 0, 0); hwIdx >= 0 {
 						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat())
 						vfIdx = indexOfArg(args, "-filter_complex", 0) + 1
 					}
@@ -2961,7 +2919,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						changes = append(changes, TagHWDecodeMapLabelUpdate)
 					}
 					newInputIdx = indexOfArg(args, "-i", 0)
-					encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+					encCodecIdx = streamSpecIndex(args, "-codec", 0, newInputIdx+1)
 				case "bitmap":
 					return bail(TagBailReasonHWDecodeSubBitmapUnsupported)
 				}
@@ -2995,7 +2953,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 				// VA-resident only when Plex's argv actually HW-decodes; otherwise
 				// composeBurn prepends the hwupload itself.
-				vaResident := indexOfArg(args, "-hwaccel:0", 0) >= 0
+				vaResident := streamSpecIndex(args, "-hwaccel", 0, 0) >= 0
 				newFilter, newLabel := tm.composeBurn(burnSpec{
 					vaResident: vaResident, w: w, h: h, hdr: hdr, algo: algo,
 					burnSub: true,
@@ -3005,9 +2963,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// sysmem) so the no-hwupload composer is valid + the round-trip is
 				// gone. Idempotent with gpuResidentOpenCLTonemap's own force.
 				if vaResident {
-					if ofIdx := indexOfArg(args, "-hwaccel_output_format:0", 0); ofIdx >= 0 {
+					if ofIdx := streamSpecIndex(args, "-hwaccel_output_format", 0, 0); ofIdx >= 0 {
 						args[ofIdx+1] = activeDialect.hwaccelOutputFormat()
-					} else if hwIdx := indexOfArg(args, "-hwaccel:0", 0); hwIdx >= 0 {
+					} else if hwIdx := streamSpecIndex(args, "-hwaccel", 0, 0); hwIdx >= 0 {
 						args = spliceArgs(args, hwIdx+2, "-hwaccel_output_format:0", activeDialect.hwaccelOutputFormat())
 					}
 				}
@@ -3024,7 +2982,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				}
 				// The splices shifted indices; relocate the encoder.
 				newInputIdx = indexOfArg(args, "-i", 0)
-				encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+				encCodecIdx = streamSpecIndex(args, "-codec", 0, newInputIdx+1)
 				break
 			}
 		}
@@ -3039,7 +2997,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			args, oclChanges = gpuResidentOpenCLTonemap(args)
 			changes = append(changes, oclChanges...)
 			newInputIdx = indexOfArg(args, "-i", 0)
-			encCodecIdx = indexOfArg(args, "-codec:0", newInputIdx+1)
+			encCodecIdx = streamSpecIndex(args, "-codec", 0, newInputIdx+1)
 		}
 
 		// 6. -crf:0 is left untouched. The scaleplex-ffmpeg fork's VAAPI
@@ -3084,8 +3042,8 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 		//
 		// Skipped when honoring a SW session: the encoder stays libx264, where
 		// a53_cc isn't default-injected, so PMS's own omission already matches.
-		if !honorSW && !honorHybrid && indexOfArg(args, "-sei:0", 0) < 0 {
-			if fkfIdx := indexOfArg(args, "-force_key_frames:0", encCodecIdx+1); fkfIdx >= 0 {
+		if !honorSW && !honorHybrid && streamSpecIndex(args, "-sei", 0, 0) < 0 {
+			if fkfIdx := streamSpecIndex(args, "-force_key_frames", 0, encCodecIdx+1); fkfIdx >= 0 {
 				args = spliceArgs(args, fkfIdx, "-sei:0", "-a53_cc")
 				changes = append(changes, TagInjectSEIA53CC)
 			}
