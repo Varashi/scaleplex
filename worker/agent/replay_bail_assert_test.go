@@ -64,11 +64,11 @@ func TestBailAllowed(t *testing.T) {
 		{shapeHWSubBurn, "no-decoder", false},
 		{shapeHWSubBurn, "no-encoder", false},
 		{shapeHWSubBurn, "no-input", false},
-		// Seeded explicit exception — the rewriter's deliberate defensive
-		// fallback for graphs it doesn't model (prefix match: the reason
-		// appends the full filtergraph).
-		{shapeHWSubBurn, TagPrefixBailHWDecodeSubUnmodeled + "[0:0]hwupload[0];...", true},
-		{shapeHWSubBurn, "hw-decode-sub:unmodeled-graph:", true},
+		// The unmodeled-graph bail is NO LONGER an accepted exception (#154):
+		// the seeked select=gte+inlineass graph that seeded it is now modeled,
+		// so an unmodeled bail for this shape is a regression like any other.
+		{shapeHWSubBurn, TagPrefixBailHWDecodeSubUnmodeled + "[0:0]hwupload[0];...", false},
+		{shapeHWSubBurn, "hw-decode-sub:unmodeled-graph:", false},
 		// Permissive shapes keep today's behavior.
 		{shapeOther, "no-decoder", true},
 		{shapeOptimizeRemux, "no-encoder", true},

@@ -83,16 +83,14 @@ const (
 // An empty slice = no bail is acceptable; any skip:<reason> fails. Only
 // shapeHWSubBurn is strict for now; tightening the rest is #150.
 var allowedBailReasons = map[string][]string{
-	shapeHWSubBurn: {
-		// Deliberate defensive fallback (NOT the silent skip:no-decoder
-		// masking #144 fixed): the rewriter declines to reshape a HW-decode
-		// sub-burn filtergraph whose shape it doesn't model, and runs Plex's
-		// SW-inlineass graph instead — functional, just not the GPU-resident
-		// reshape. A known, explicit perf gap; modeling these graphs is a
-		// rewriter follow-up. Matched by prefix (the reason carries the full
-		// graph string).
-		TagPrefixBailHWDecodeSubUnmodeled,
-	},
+	// shapeHWSubBurn is fully strict: NO bail is acceptable — every HW-decode
+	// sub-burn transcode MUST reshape to the GPU-resident inlineass branch. The
+	// lone corpus exception (the seeked `scale_vaapi + select=gte + inlineass`
+	// 320x180 rendition, #154) is now modeled — select is a recognized node and
+	// the composers re-emit the seek gate (appendSelectStage) — so the
+	// `hw-decode-sub:unmodeled-graph:` seed is gone. An empty slice means any
+	// skip:<reason> for this shape fails the assertion.
+	shapeHWSubBurn:     {},
 	shapeOptimizeRemux: {"*"},
 	shapeOther:         {"*"},
 }

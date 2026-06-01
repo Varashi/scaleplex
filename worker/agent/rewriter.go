@@ -703,6 +703,21 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 	return b.String(), "[" + out + "]"
 }
 
+// appendSelectStage re-emits Plex's seek-offset `select=` node at the tail of a
+// recomposed graph. composeBurn* drop frame-gating (they only model the
+// scale/tonemap/burn axes), so a seeked session's `select=gte(t\,SEEK)` would be
+// lost — resetting playback to t=0 — without this. select is a zero-copy
+// metadata gate, valid on the VAAPI/CUDA/CPU surface the composer left at `label`
+// alike, so it goes last (mirrors Plex, which runs it just before its final
+// hwupload). No-op when expr is "".
+func appendSelectStage(filter, label, expr string) (string, string) {
+	if expr == "" {
+		return filter, label
+	}
+	const out = "vsel"
+	return fmt.Sprintf("%s;%sselect=%s[%s]", filter, label, expr, out), "[" + out + "]"
+}
+
 // composeBurnAMDHDR emits the AMD-radeonsi-specific HDR shape. The
 // vf_inlineass AMD-Vulkan branch (fork patch 0127 v7) absorbs the HDR→SDR
 // tonemap into its single pl_render_image dispatch — no separate tonemap
@@ -806,10 +821,11 @@ type graphFacts struct {
 	w, h      string
 	hdr       bool   // a tonemap stage is present
 	algo      string // honored tonemap algo ("" = none / fixed-curve)
-	subKind   string // "", "text", "bitmap"
-	subParams string // inlineass params (text)
-	subSpec   string // sub stream spec (bitmap overlay)
-	ok        bool   // recognized AND every node is modeled (safe to recompose)
+	subKind    string // "", "text", "bitmap"
+	subParams  string // inlineass params (text)
+	subSpec    string // sub stream spec (bitmap overlay)
+	selectExpr string // seek-offset `select=` expr (e.g. `gte(t\,203.99)`), "" = none
+	ok         bool   // recognized AND every node is modeled (safe to recompose)
 }
 
 var (
@@ -834,6 +850,14 @@ var (
 	// algo string in either shape.
 	reGraphTonemapCUDA = regexp.MustCompile(`tonemap_cuda=(?:tonemap=)?([A-Za-z0-9]+)`)
 	reGraphInlineass   = regexp.MustCompile(`inlineass=([^\[]*)`)
+	// reGraphSelect: a standalone `select=<expr>` filter node — Plex's
+	// seek-offset frame gate on a seeked session (e.g.
+	// `[3]select=gte(t\,203.995661)[4]`). Anchored on a node boundary (`;`/`]`)
+	// so a `select=` substring inside another node's args can't match, and the
+	// expr is captured up to the output label `[`, preserving the escaped comma
+	// (`\,`) verbatim — that escaping must survive into the recomposed graph or
+	// ffmpeg reparses it as a filterchain separator.
+	reGraphSelect = regexp.MustCompile(`[;\]]select=([^\[]+)\[`)
 	// reGraphFilterName: a filtergraph node name — an identifier preceded by a
 	// chain boundary (start, ';', ',', ']') possibly followed by whitespace,
 	// and followed by '=', '[', ',', ';' or end. Arg values (after '=' or ':')
@@ -855,6 +879,11 @@ var modeledFilterNodes = map[string]bool{
 	"tonemap_opencl": true, "tonemap_vaapi": true, "tonemap_cuda": true,
 	"zscale":    true,
 	"inlineass": true, "overlay_vaapi": true, "overlay_cuda": true,
+	// select: Plex's seek-offset frame gate (`select=gte(t\,SEEK)`) on a
+	// seeked session. A zero-copy metadata gate (no pixel access), so it's
+	// valid on any surface incl. VAAPI; extractGraphFacts lifts the expr and
+	// the composers re-emit it at the chain tail (see appendSelectStage).
+	"select": true,
 }
 
 // graphNodesModeled reports whether every filter node in the graph is in
@@ -876,6 +905,18 @@ func graphNodesModeled(graph string) bool {
 // w/h, tonemap algo, and the text inlineass params.
 func extractGraphFacts(graph string, subSrc *subtitleSource) graphFacts {
 	var f graphFacts
+	// Seek-offset `select=` node (a seeked session). Lift the expr up front so
+	// both the bitmap and text return paths carry it. If a `select=` node is
+	// present but we can't cleanly extract its expr (an unobserved shape), bail
+	// (ok stays false) rather than recompose a graph that silently drops the
+	// seek gate — the seek would reset to t=0.
+	if strings.Contains(graph, "select=") {
+		m := reGraphSelect.FindStringSubmatch(graph)
+		if m == nil {
+			return f
+		}
+		f.selectExpr = m[1]
+	}
 	// Bitmap sub2video→overlay_vaapi burn (with/without an intervening
 	// tonemap) — already a fact extractor.
 	if spec, w, h, algo, hdr, ok := detectBitmapOverlayBurn(graph); ok {
@@ -993,6 +1034,7 @@ func rewriteVideoFilter(filterStr, mediaPath string, subSrc *subtitleSource, sou
 		subParams:        facts.subParams,
 		animatedTierDown: animated,
 	})
+	f, newLabel = appendSelectStage(f, newLabel, facts.selectExpr)
 	return &filterRewrite{
 		Filter:   f,
 		OldLabel: oldLabel,
@@ -2901,6 +2943,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						subParams:        facts.subParams,
 						animatedTierDown: animated,
 					})
+					newFilter, newLabel = appendSelectStage(newFilter, newLabel, facts.selectExpr)
 					args[vfIdx] = newFilter
 					retargetMapLabel(args, oldLabel, newLabel)
 					if facts.hdr {

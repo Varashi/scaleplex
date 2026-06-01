@@ -271,6 +271,7 @@ func reshapeForeignHWArgv(args []string, tm tonemapConfig) ([]string, []string) 
 				burnSub:    facts.subKind == "text",
 				subParams:  facts.subParams,
 			})
+			newFilter, newLabel = appendSelectStage(newFilter, newLabel, facts.selectExpr)
 			args[vfIdx] = newFilter
 			retargetMapLabel(args, oldLabel, newLabel)
 		}

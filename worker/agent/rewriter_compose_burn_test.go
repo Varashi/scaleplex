@@ -1,6 +1,73 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// TestSeekSelectModeling covers #154: a seeked HW-decode sub-burn graph carries
+// a standalone `select=gte(t\,SEEK)` frame gate after inlineass. Before the fix
+// `select` was an unmodeled node → extractGraphFacts bailed (ok=false) → the
+// rewriter fell back to Plex's SW-inlineass round-trip instead of the
+// GPU-resident reshape. Now select is modeled, its expr lifted (escaped comma
+// preserved), and the composers re-emit it at the chain tail.
+func TestSeekSelectModeling(t *testing.T) {
+	t.Setenv("SCALEPLEX_SUB_RENDER_HEIGHT", "1080")
+	// The real Shes_Out_of_My_League 320x180 dash rendition shape (inlineass
+	// params trimmed; the select node + escaped comma are the point).
+	graph := `[0:0]hwupload[0];[0]scale_vaapi=w=320:h=180:format=nv12[1];` +
+		`[1]hwdownload,format=nv12[2];[2]inlineass=font_size=54:language=en[3];` +
+		`[3]select=gte(t\,203.995661)[4];[4]hwupload[5]`
+
+	t.Run("extractGraphFacts-lifts-select", func(t *testing.T) {
+		f := extractGraphFacts(graph, &subtitleSource{Kind: "text"})
+		if !f.ok {
+			t.Fatal("ok=false: select node still treated as unmodeled (the #154 bail)")
+		}
+		if f.subKind != "text" || f.w != "320" || f.h != "180" {
+			t.Fatalf("facts: subKind=%q w=%q h=%q", f.subKind, f.w, f.h)
+		}
+		if f.selectExpr != `gte(t\,203.995661)` {
+			t.Fatalf("selectExpr=%q — want the escaped-comma expr verbatim", f.selectExpr)
+		}
+	})
+
+	t.Run("reshape-re-emits-select-at-tail", func(t *testing.T) {
+		f := extractGraphFacts(graph, &subtitleSource{Kind: "text"})
+		va := tonemapConfig{}
+		fltr, label := va.composeBurn(burnSpec{
+			vaResident: true, w: f.w, h: f.h, burnSub: true, subParams: f.subParams,
+		})
+		fltr, label = appendSelectStage(fltr, label, f.selectExpr)
+		if !strings.HasSuffix(fltr, `select=gte(t\,203.995661)[vsel]`) {
+			t.Fatalf("select not appended at tail:\n%s", fltr)
+		}
+		if label != "[vsel]" {
+			t.Fatalf("label=%q want [vsel] (the -map target must follow select)", label)
+		}
+		// The GPU-resident reshape must NOT carry Plex's hwdownload/hwupload
+		// round-trip — that's the whole point of modeling it.
+		if strings.Contains(fltr, "hwdownload") {
+			t.Fatalf("reshape still round-trips through sysmem:\n%s", fltr)
+		}
+	})
+
+	t.Run("unparseable-select-bails-safe", func(t *testing.T) {
+		// A select node with no output label (unobserved shape): extraction must
+		// fail closed (ok=false) rather than drop the seek gate and reset to t=0.
+		bad := `[2]inlineass=x[3];[3]select=gte(t\,5)`
+		if f := extractGraphFacts(bad, &subtitleSource{Kind: "text"}); f.ok {
+			t.Fatal("ok=true on an unextractable select — would silently drop the seek")
+		}
+	})
+
+	t.Run("appendSelectStage-noop-when-empty", func(t *testing.T) {
+		fltr, label := appendSelectStage("[0:0]scale_vaapi=w=320:h=180:format=nv12[0]", "[0]", "")
+		if fltr != "[0:0]scale_vaapi=w=320:h=180:format=nv12[0]" || label != "[0]" {
+			t.Fatalf("non-noop on empty expr: %s %s", fltr, label)
+		}
+	})
+}
 
 // composeBurn is the orthogonal-stage composer: one builder emits every
 // {SDR,HDR}×{none,text,bitmap}×{any res}×{VA-resident,SW} shape. These tests
