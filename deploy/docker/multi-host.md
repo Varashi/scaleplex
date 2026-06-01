@@ -108,6 +108,48 @@ Notes:
 - `-p 3501:3501` exposes the worker port so the orchestrator can
   call it. Skip if Host A and Host B share a Docker swarm network.
 - Same `/transcode` + `/media` paths as PMS uses on Host A.
+- **`--group-add` gids are host-specific.** `44`/`568` are the video +
+  LSIO-render gids of the reference image/host; on YOUR host run
+  `stat -c '%g' /dev/dri/renderD*` (VAAPI) and use those numeric gids.
+  Pass them **numerically** — `--group-add render` fails (`unable to
+  find group render`): the image's render group is named `render2`
+  (gid 568), not `render`.
+- **`--cap-add PERFMON`** lets the worker read the GPU PMU for load
+  telemetry. The agent binary is `setcap cap_perfmon=ep`; on some
+  runtimes a missing cap surfaces as a `tini: exec … Operation not
+  permitted` boot loop, so include it if the container won't start.
+
+### NVIDIA variant (incl. WSL)
+
+For an NVIDIA worker, drop the `--device /dev/dri/...` bind and use the
+nvidia runtime instead. `WORKER_BACKEND=auto` probes `/dev/nvidia0` and
+picks the NVENC dialect (pin with `WORKER_BACKEND=nvenc` if you prefer).
+
+```bash
+docker run -d --name scaleplex-worker --restart unless-stopped \
+  --gpus all \
+  -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=video,compute,utility \
+  --user 1000:100 --group-add 44 --group-add 568 --cap-add PERFMON \
+  -v /srv/media:/media:ro -v /srv/transcode:/transcode \
+  -p 3501:3501 \
+  -e SCALEPLEX_ORCHESTRATOR_URL=http://host-a.lan:3500 \
+  -e SCALEPLEX_WORKER_HOST=host-b.lan \
+  -e WORKER_BACKEND=nvenc -e SCALEPLEX_FORCE_HW=1 \
+  -v /usr/lib/wsl/lib/libnvidia-encode.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-encode.so.1:ro \
+  -v /usr/lib/wsl/lib/libnvcuvid.so.1:/usr/lib/x86_64-linux-gnu/libnvcuvid.so.1:ro \
+  -v /usr/lib/wsl/lib/libnvidia-opticalflow.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-opticalflow.so.1:ro \
+  ghcr.io/varashi/scaleplex_worker:latest
+```
+
+The three `/usr/lib/wsl/lib/*.so.1` binds are **WSL2-only**: the
+nvidia-container-toolkit 1.19 CDI spec omits the NVENC/NVDEC user libs
+(`libnvidia-encode` / `libnvcuvid` / `libnvidia-opticalflow`), so encode
+and decode fail to open without them. **Drop those three lines on
+bare-metal Linux** — the toolkit injects them there.
+
+Confirm `worker backend: nvenc` + `gpu engines discovered` in
+`docker logs scaleplex-worker`, then that it shows `"backend":"nvenc"`,
+`"healthy":true` in `/workers` on Host A (the orchestrator dialed it back).
 
 Check the worker showed up:
 
