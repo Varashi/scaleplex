@@ -79,7 +79,6 @@ const (
 	TagEnvHOME                           = "env:HOME"
 	TagEnvLIBVA                          = "env:LIBVA"
 	TagFilterInlineassScrubPlexFontPaths = "filter:inlineass:scrub-plex-font-paths"
-	TagNormalizeStreamSpecsToOrdinal     = "normalize:stream-specs:#0xNN->ordinal"
 	TagBailManifestNameRewriteToRelay    = "bail:manifest_name:rewrite-to-relay"
 	TagBailManifestNameDrop              = "bail:manifest_name:drop(no-pms-base-or-non-loopback)"
 	TagFilterTonemapOpenCLNormalized     = "filter:tonemap_opencl-normalized"

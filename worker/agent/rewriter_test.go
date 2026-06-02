@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -2013,109 +2012,11 @@ func TestRewriter_BailWithOnlyInlineassScrub_AppliedTrue(t *testing.T) {
 	}
 }
 
-// PMS stream-id-by-id specifier syntax (`:#0xNN`, hex) gets normalized
-// to ordinal form (`:0`, `:1`, ...) at top-of-Rewrite so downstream
-// detector + reshape stages (all keyed on literal `-hwaccel:0` /
-// `-codec:0`) actually engage instead of silently bailing
-// `skip:no-decoder`. Repro: Ghosts S2E1 force-burn 2026-05-31 — Plex
-// Versions / Optimized for TV argv carried `-codec:#0x01 hevc
-// -hwaccel:#0x01 vaapi ... -filter_complex "[0:#0x01]..."`.
-func TestNormalizePlexStreamSpecsToOrdinal(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		in          []string
-		wantOut     []string
-		wantChanged bool
-	}{
-		{
-			name: "HW-passthrough Ghosts shape — #0x01 video + #0x02 audio",
-			in: []string{
-				"-codec:#0x01", "hevc",
-				"-hwaccel:#0x01", "vaapi",
-				"-hwaccel_output_format:#0x01", "vaapi",
-				"-hwaccel_device:#0x01", "vaapi",
-				"-codec:#0x02", "aac",
-				"-i", "src.mp4",
-				"-filter_complex", "[0:#0x01]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1]",
-				"-codec:0", "hevc_vaapi",
-			},
-			wantOut: []string{
-				"-codec:0", "hevc",
-				"-hwaccel:0", "vaapi",
-				"-hwaccel_output_format:0", "vaapi",
-				"-hwaccel_device:0", "vaapi",
-				"-codec:1", "aac",
-				"-i", "src.mp4",
-				"-filter_complex", "[0:0]hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1]",
-				"-codec:0", "hevc_vaapi",
-			},
-			wantChanged: true,
-		},
-		{
-			name: "m2ts high-PID #0x1011 maps to ordinal 0",
-			in: []string{
-				"-codec:#0x1011", "hevc",
-				"-hwaccel:#0x1011", "vaapi",
-				"-i", "src.m2ts",
-			},
-			wantOut: []string{
-				"-codec:0", "hevc",
-				"-hwaccel:0", "vaapi",
-				"-i", "src.m2ts",
-			},
-			wantChanged: true,
-		},
-		{
-			name: "already-ordinal argv passes through unchanged",
-			in: []string{
-				"-codec:0", "hevc",
-				"-hwaccel:0", "vaapi",
-				"-i", "src.mp4",
-				"-filter_complex", "[0:0]hwupload[0]",
-				"-codec:0", "hevc_vaapi",
-			},
-			wantOut: []string{
-				"-codec:0", "hevc",
-				"-hwaccel:0", "vaapi",
-				"-i", "src.mp4",
-				"-filter_complex", "[0:0]hwupload[0]",
-				"-codec:0", "hevc_vaapi",
-			},
-			wantChanged: false,
-		},
-		{
-			name: "filter-complex only — no top-level flag carries #0xNN",
-			in: []string{
-				"-i", "src.mp4",
-				"-filter_complex", "[0:#0x01]format=nv12[a];[a]inlineass[b]",
-				"-map", "[b]",
-				"-f", "mp4", "out.mp4",
-			},
-			wantOut: []string{
-				"-i", "src.mp4",
-				"-filter_complex", "[0:0]format=nv12[a];[a]inlineass[b]",
-				"-map", "[b]",
-				"-f", "mp4", "out.mp4",
-			},
-			wantChanged: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			out, did := normalizePlexStreamSpecsToOrdinal(tc.in)
-			if did != tc.wantChanged {
-				t.Fatalf("changed=%v want=%v", did, tc.wantChanged)
-			}
-			if !reflect.DeepEqual(out, tc.wantOut) {
-				t.Errorf("output mismatch\n got: %v\nwant: %v", out, tc.wantOut)
-			}
-		})
-	}
-}
-
-// End-to-end: a `#0xNN`-style argv that previously hit `skip:no-decoder`
-// now engages the HW-passthrough reshape (no bail). Detector hits
-// `-hwaccel:0` after normalization.
-func TestRewriter_HWPassthrough_NormalizesStreamSpecsAndReshapes(t *testing.T) {
+// End-to-end (#145): a `#0xNN`-style argv engages the HW-passthrough reshape
+// (no `skip:no-decoder` bail) via the polymorphic streamSpecIndex matchers —
+// with NO upfront normalize pass. The `#0xNN` flag specs stay PRISTINE in the
+// output (ffmpeg accepts them); only the encoder validation + scrubs run.
+func TestRewriter_HWPassthrough_HexStreamSpecsReshapePristine(t *testing.T) {
 	args := []string{
 		"-codec:#0x01", "hevc",
 		"-hwaccel:#0x01", "vaapi",
@@ -2133,19 +2034,74 @@ func TestRewriter_HWPassthrough_NormalizesStreamSpecsAndReshapes(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("Applied=false; changes=%v", out.Changes)
 	}
-	if !containsString(out.Changes, TagNormalizeStreamSpecsToOrdinal) {
-		t.Errorf("expected %q in changes; got %v", TagNormalizeStreamSpecsToOrdinal, out.Changes)
-	}
 	for _, c := range out.Changes {
 		if strings.HasPrefix(c, "skip:no-decoder") {
-			t.Fatalf("rewriter still bailed no-decoder after normalization; changes=%v", out.Changes)
+			t.Fatalf("rewriter bailed no-decoder — polymorphic matcher missed the #0xNN flag; changes=%v", out.Changes)
 		}
 	}
-	// The reshaped argv must NOT carry any residual `:#0x` specifiers.
-	for _, a := range out.Args {
-		if strings.Contains(a, ":#0x") {
-			t.Errorf("residual #0xNN specifier in output arg %q", a)
+	// HW-decode passthrough must engage: encoder validated, decode tagged.
+	if !containsString(out.Changes, "decode:hw-passthrough:hevc") {
+		t.Errorf("expected HW-decode passthrough tag; got %v", out.Changes)
+	}
+	// Option-1 invariant: the `#0xNN` specs PMS sent are preserved verbatim
+	// (no normalize rewrite), exactly once each — no dup or stale ordinal twin.
+	if n := countArg(out.Args, "-codec:#0x01"); n != 1 {
+		t.Errorf("-codec:#0x01 count = %d, want 1 (pristine, no rewrite/dup); args=%v", n, out.Args)
+	}
+	if n := countArg(out.Args, "-hwaccel:#0x01"); n != 1 {
+		t.Errorf("-hwaccel:#0x01 count = %d, want 1 (pristine, no rewrite/dup); args=%v", n, out.Args)
+	}
+}
+
+func countArg(args []string, s string) int {
+	n := 0
+	for _, a := range args {
+		if a == s {
+			n++
 		}
+	}
+	return n
+}
+
+// End-to-end coverage of the OTHER two stream-spec forms the polymorphic matcher
+// handles (#145): ordinal `:0` and type+index `:v:0`. Both must drive the same
+// HW-decode passthrough as the hex form, through the full Rewrite — not just the
+// streamSpecIndex unit. The decode-only `-hwaccel` flag is the pristine canary
+// (the `-codec:0` encoder shares the decoder's spelling in ordinal form, so it
+// can't be the canary there).
+func TestRewriter_HWPassthrough_OrdinalAndTypeIndexForms(t *testing.T) {
+	for _, c := range []struct{ name, dspec, finput, canary string }{
+		{"ordinal", "0", "[0:0]", "-hwaccel:0"},
+		{"type-index", "v:0", "[0:0]", "-hwaccel:v:0"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			args := []string{
+				"-codec:" + c.dspec, "hevc",
+				"-hwaccel:" + c.dspec, "vaapi",
+				"-hwaccel_output_format:" + c.dspec, "vaapi",
+				"-i", "/media/src.mp4",
+				"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+				"-filter_complex", c.finput + "hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1]",
+				"-map", "[1]",
+				"-codec:0", "hevc_vaapi", "-qp:0", "15",
+				"-f", "dash", "out.mpd",
+			}
+			out := Rewrite(args, nil, nil)
+			if !out.Applied {
+				t.Fatalf("Applied=false; changes=%v", out.Changes)
+			}
+			for _, ch := range out.Changes {
+				if strings.HasPrefix(ch, "skip:no-decoder") {
+					t.Fatalf("bailed no-decoder — matcher missed the %q form; changes=%v", c.dspec, out.Changes)
+				}
+			}
+			if !containsString(out.Changes, "decode:hw-passthrough:hevc") {
+				t.Errorf("HW-decode passthrough not engaged for %q; got %v", c.dspec, out.Changes)
+			}
+			if n := countArg(out.Args, c.canary); n != 1 {
+				t.Errorf("canary %q count = %d, want 1 (pristine); args=%v", c.canary, n, out.Args)
+			}
+		})
 	}
 }
 
@@ -2154,18 +2110,14 @@ func TestRewriter_HWPassthrough_NormalizesStreamSpecsAndReshapes(t *testing.T) {
 // to the bail (covers any unmodeled flag combo the main path can't
 // reshape) must have its manifest_name URL rewritten to relay before
 // the dash muxer tries to POST and ECONNREFUSEs → exit 145. Carries
-// real `#0xNN` syntax so the normalize+bail interaction is exercised:
-// the normalizer fires at top-of-Rewrite, then the argv still trips
-// the no-input bail (no second `-i` source after `dropSidecarInput`
-// is hypothetical here — we just omit `-codec:0` so the main path
-// can't engage), and the bail's manifest_name rewrite runs on the
-// already-normalized argv.
+// real `#0xNN` syntax (pristine, #145): the manifest_name bail rewrite
+// is stream-spec-agnostic, so it must fire regardless of the `#0x01`
+// form the argv still carries.
 func TestRewriter_BailRewritesManifestNameToRelay(t *testing.T) {
 	args := []string{
-		// PMS `#0xNN` shape. After normalization the rewriter still
-		// can't find a `-codec:0` peer for reshape (no encoder output
-		// declared) and bails — but the bail must already see the
-		// normalized argv so downstream tests would catch shape drift.
+		// PMS `#0xNN` shape with no `-codec:0` encoder output → the main
+		// reshape path can't engage and the rewriter bails; the bail's
+		// manifest_name rewrite must still run (on the pristine argv).
 		"-i", "src.mp4",
 		"-i", "temp-0.srt",
 		"-map_inlineass", "1:s:0",
@@ -2184,9 +2136,6 @@ func TestRewriter_BailRewritesManifestNameToRelay(t *testing.T) {
 	if !out.Applied {
 		t.Fatalf("Applied=false on bail with mutations; caller would execute unsanitized argv. changes=%v", out.Changes)
 	}
-	if !containsString(out.Changes, TagNormalizeStreamSpecsToOrdinal) {
-		t.Errorf("normalize tag missing — `#0x01` should have been folded to ordinal before bail; changes=%v", out.Changes)
-	}
 	if !containsString(out.Changes, TagBailManifestNameRewriteToRelay) {
 		t.Fatalf("expected %q in changes; got %v", TagBailManifestNameRewriteToRelay, out.Changes)
 	}
@@ -2203,12 +2152,12 @@ func TestRewriter_BailRewritesManifestNameToRelay(t *testing.T) {
 		if !strings.Contains(out.Args[i+1], "X-Plex-Token=tok-xyz") {
 			t.Errorf("manifest_name missing X-Plex-Token append: %q", out.Args[i+1])
 		}
-		// And the filter_complex must carry the normalized form too —
-		// proves the bail returned the post-normalize argv, not the
-		// raw input.
+		// Pristine (#145): the bail must NOT rewrite stream specs — the
+		// `[0:#0x01]` filter ref PMS sent is preserved (ffmpeg accepts it),
+		// while the orthogonal manifest_name rewrite still fired above.
 		for j := 0; j+1 < len(out.Args); j++ {
-			if out.Args[j] == "-filter_complex" && strings.Contains(out.Args[j+1], ":#0x") {
-				t.Errorf("residual `:#0x` in filter_complex after bail: %q", out.Args[j+1])
+			if out.Args[j] == "-filter_complex" && !strings.Contains(out.Args[j+1], "[0:#0x01]") {
+				t.Errorf("filter_complex `#0x01` ref not preserved pristine: %q", out.Args[j+1])
 			}
 		}
 		return
