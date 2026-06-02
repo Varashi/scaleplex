@@ -183,6 +183,7 @@ func reshapeToSoftware(args []string, tm tonemapConfig) ([]string, []string) {
 				subKind:   facts.subKind,
 				subSpec:   facts.subSpec,
 			})
+			nf, nl = appendSelectStage(nf, nl, facts.selectExpr)
 			args[vfIdx] = nf
 			retargetMapLabel(args, oldLabel, nl)
 			changes = append(changes, TagPrefixToSWFilter+composeMode(facts))
