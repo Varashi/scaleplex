@@ -855,7 +855,10 @@ var reBitmapSubBranch = regexp.MustCompile(`\[(0:[0-9]+)\]scale=[0-9]+:[0-9]+,hw
 // backends for parity with reGraphScaleWH — NVIDIA PGS-burn graphs use
 // scale_cuda. NOTE: the NVIDIA bitmap-overlay path is not yet
 // live-validated (no PGS NVENC capture in the corpus); see scaleplex#66.
-var reBitmapMainScale = regexp.MustCompile(`\[0:0\]hwupload\[\d+\];\[\d+\]scale_(?:vaapi|cuda)=w=([0-9]+):h=([0-9]+)`)
+// `[0:0]` OR PMS's stream-by-id `[0:#0xNN]` leading video input (#145) — both
+// resolve to the video stream, so the bitmap-overlay / OpenCL-tonemap detectors
+// accept either form for a pristine (un-normalized) argv.
+var reBitmapMainScale = regexp.MustCompile(`\[0:(?:0|#0x[0-9a-fA-F]+)\]hwupload\[\d+\];\[\d+\]scale_(?:vaapi|cuda)=w=([0-9]+):h=([0-9]+)`)
 
 // reVideoInput0 matches a filtergraph's leading video input label in EITHER
 // form: ordinal `[0:0]` or PMS's stream-by-id `[0:#0xNN]` (#145, pristine argv —
@@ -1271,9 +1274,10 @@ func substituteOpenCLTonemap(args []string, tm tonemapConfig) ([]string, bool) {
 	return args, false
 }
 
-// reLeadHwuploadOCL drops a leading `[0:0]hwupload[N];[N]` so scale_vaapi
-// reads the VA decode surface directly (see gpuResidentOpenCLTonemap).
-var reLeadHwuploadOCL = regexp.MustCompile(`^\[0:0\]hwupload\[\d+\];\[\d+\]`)
+// reLeadHwuploadOCL drops a leading `[0:0]hwupload[N];[N]` (or PMS's
+// stream-by-id `[0:#0xNN]` form, #145) so scale_vaapi reads the VA decode
+// surface directly (see gpuResidentOpenCLTonemap).
+var reLeadHwuploadOCL = regexp.MustCompile(`^\[0:(?:0|#0x[0-9a-fA-F]+)\]hwupload\[\d+\];\[\d+\]`)
 
 // reRevmapBeforeDownloadOCL collapses the `hwmap=vaapi:reverse=1[X];[X]hwdownload`
 // round-trip (opencl→va→sysmem) into a direct opencl→sysmem hwdownload.

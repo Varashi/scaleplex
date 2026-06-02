@@ -2044,9 +2044,64 @@ func TestRewriter_HWPassthrough_HexStreamSpecsReshapePristine(t *testing.T) {
 		t.Errorf("expected HW-decode passthrough tag; got %v", out.Changes)
 	}
 	// Option-1 invariant: the `#0xNN` specs PMS sent are preserved verbatim
-	// (no normalize rewrite). The decoder hint `-codec:#0x01` is the canary.
-	if !containsString(out.Args, "-codec:#0x01") || !containsString(out.Args, "-hwaccel:#0x01") {
-		t.Errorf("expected pristine #0xNN flag specs in output; got %v", out.Args)
+	// (no normalize rewrite), exactly once each — no dup or stale ordinal twin.
+	if n := countArg(out.Args, "-codec:#0x01"); n != 1 {
+		t.Errorf("-codec:#0x01 count = %d, want 1 (pristine, no rewrite/dup); args=%v", n, out.Args)
+	}
+	if n := countArg(out.Args, "-hwaccel:#0x01"); n != 1 {
+		t.Errorf("-hwaccel:#0x01 count = %d, want 1 (pristine, no rewrite/dup); args=%v", n, out.Args)
+	}
+}
+
+func countArg(args []string, s string) int {
+	n := 0
+	for _, a := range args {
+		if a == s {
+			n++
+		}
+	}
+	return n
+}
+
+// End-to-end coverage of the OTHER two stream-spec forms the polymorphic matcher
+// handles (#145): ordinal `:0` and type+index `:v:0`. Both must drive the same
+// HW-decode passthrough as the hex form, through the full Rewrite — not just the
+// streamSpecIndex unit. The decode-only `-hwaccel` flag is the pristine canary
+// (the `-codec:0` encoder shares the decoder's spelling in ordinal form, so it
+// can't be the canary there).
+func TestRewriter_HWPassthrough_OrdinalAndTypeIndexForms(t *testing.T) {
+	for _, c := range []struct{ name, dspec, finput, canary string }{
+		{"ordinal", "0", "[0:0]", "-hwaccel:0"},
+		{"type-index", "v:0", "[0:0]", "-hwaccel:v:0"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			args := []string{
+				"-codec:" + c.dspec, "hevc",
+				"-hwaccel:" + c.dspec, "vaapi",
+				"-hwaccel_output_format:" + c.dspec, "vaapi",
+				"-i", "/media/src.mp4",
+				"-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128,driver=iHD",
+				"-filter_complex", c.finput + "hwupload[0];[0]scale_vaapi=w=1920:h=1080:format=nv12[1]",
+				"-map", "[1]",
+				"-codec:0", "hevc_vaapi", "-qp:0", "15",
+				"-f", "dash", "out.mpd",
+			}
+			out := Rewrite(args, nil, nil)
+			if !out.Applied {
+				t.Fatalf("Applied=false; changes=%v", out.Changes)
+			}
+			for _, ch := range out.Changes {
+				if strings.HasPrefix(ch, "skip:no-decoder") {
+					t.Fatalf("bailed no-decoder — matcher missed the %q form; changes=%v", c.dspec, out.Changes)
+				}
+			}
+			if !containsString(out.Changes, "decode:hw-passthrough:hevc") {
+				t.Errorf("HW-decode passthrough not engaged for %q; got %v", c.dspec, out.Changes)
+			}
+			if n := countArg(out.Args, c.canary); n != 1 {
+				t.Errorf("canary %q count = %d, want 1 (pristine); args=%v", c.canary, n, out.Args)
+			}
+		})
 	}
 }
 

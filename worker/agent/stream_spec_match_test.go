@@ -26,9 +26,13 @@ func TestStreamSpecIndex(t *testing.T) {
 	if i := streamSpecIndex(args, "-codec", 0, in+1); i != 8 {
 		t.Errorf("encoder -codec:0 after -i: got idx %d, want 8", i)
 	}
-	// Audio (#0x02 → ordinal 1) must NOT match a request for video ordinal 0.
-	if i := streamSpecIndex(args, "-codec", 0, 0); args[i] == "-codec:#0x02" {
-		t.Error("video ordinal 0 wrongly matched the audio #0x02 codec")
+	// Audio (#0x02 → ordinal 1) resolves to its own slot…
+	if i := streamSpecIndex(args, "-codec", 1, 0); i != 4 {
+		t.Errorf("audio #0x02 → ordinal 1: got idx %d, want 4", i)
+	}
+	// …and a video-ordinal-0 query is the #0x01 decoder at idx 0, never audio.
+	if i := streamSpecIndex(args, "-codec", 0, 0); i != 0 {
+		t.Errorf("video ordinal 0 must be the #0x01 decoder at idx 0; got %d", i)
 	}
 	// flagBase must not bleed across the `:` boundary into a sibling flag.
 	hov := []string{"-hwaccel_output_format:#0x01", "vaapi", "-hwaccel:#0x01", "vaapi"}
@@ -88,8 +92,8 @@ func TestHexFilterGraphReshapeEntry(t *testing.T) {
 	if !reVideoInput0.MatchString("[0:0]scale=w=1920:h=1080[0]") {
 		t.Error("ordinal input label [0:0] regressed")
 	}
-	if reVideoInput0.MatchString("[0:5]scale=...") && !graphLeadsWithVideoInput0("[0:5]x", "") {
-		// [0:5] is a non-zero stream — must NOT read as video input 0.
+	// A non-zero ordinal stream must NOT read as video input 0.
+	if reVideoInput0.MatchString("[0:5]scale=w=1:h=1") {
 		t.Error("[0:5] wrongly matched video input 0")
 	}
 	if !graphLeadsWithVideoInput0("[0:#0x11]scale_vaapi=w=1:h=1[0]", "scale_vaapi=") {
