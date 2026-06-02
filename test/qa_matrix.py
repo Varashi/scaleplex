@@ -713,39 +713,55 @@ def _scan_liveness(slug, since):
       progressed — saw >=1 out_time_us sample ('first progress block' or a
                    'progress heartbeat', #166): ffmpeg encoded past the init
                    moov. Distinguishes a real transcode from an init-only stall.
-      advanced   — True  if >=2 out_time_us samples AND the last exceeds the
-                            first (the encode is moving, not frozen);
-                   False if >=2 samples that did NOT climb — a mid-stream stall,
-                            the class #166's heartbeat was added to expose;
-                   None  if <2 samples (a short soak / heavy throttle can't
-                            prove a stall, so the caller must not FAIL on it).
+      advanced   — True  if out_time_us moved forward at all (max > min across
+                            the block + heartbeat samples);
+                   False if two CONSECUTIVE heartbeats (>=5s apart, #166's
+                            throttle) report the same out_time_us — the encode
+                            is frozen mid-stream — or >=2 heartbeats never moved;
+                   None  if there isn't enough signal to tell (the caller must
+                            not FAIL on it).
       beats      — count of 'progress heartbeat' lines (#166), for --min-progress.
       exited     — the 'ffmpeg exit: <detail>' text if the session terminated
                    (ANY code, incl. a clean 0), else None. For 4K streaming
                    content a termination inside the settle+soak window is
                    premature regardless of code.
 
-    (out_time_us is log-observable on every progress PUT via #166's throttled
-    heartbeat — superseding the earlier note that progress signals never reached
-    the worker log, which is why a 'segments produced' stall bar was once dropped.)
+    Note the worker logs the 'first progress block' AND the first 'progress
+    heartbeat' with the SAME out_time_us (both fire on the first progress tick —
+    the heartbeat's lastBeat starts zero). So a healthy just-started session
+    yields [X, X]; a naive last-two / first-vs-last compare would FAIL it. The
+    stall signal is therefore keyed on consecutive HEARTBEATS (always >=5s apart
+    by the throttle), where equal out_time means a real freeze — not on the
+    block/first-heartbeat duplicate.
     """
-    samples = []
-    beats = 0
+    first_out = None       # out_time_us from 'first progress block'
+    beat_outs = []         # out_time_us from each 'progress heartbeat', in order
     exited = None
     for line in worker_logs(since).splitlines():
         if slug not in _alnum(line):
             continue
-        if "progress heartbeat" in line:
-            beats += 1
-        if "first progress block" in line or "progress heartbeat" in line:
+        if "first progress block" in line:
             mo = OUT_TIME_RE.search(line)
             if mo:
-                samples.append(int(mo.group(1)))
+                first_out = int(mo.group(1))
+        elif "progress heartbeat" in line:
+            mo = OUT_TIME_RE.search(line)
+            if mo:
+                beat_outs.append(int(mo.group(1)))
         m = EXIT_ANY_RE.search(line)
         if m:
             exited = m.group(1).split("stderr_tail=", 1)[0].strip()[:80]
-    progressed = bool(samples)
-    advanced = (samples[-1] > samples[0]) if len(samples) >= 2 else None
+    all_outs = ([first_out] if first_out is not None else []) + beat_outs
+    progressed = bool(all_outs)
+    beats = len(beat_outs)
+    if len(beat_outs) >= 2 and beat_outs[-1] == beat_outs[-2]:
+        advanced = False                              # consecutive frozen heartbeats → stall
+    elif all_outs and max(all_outs) > min(all_outs):
+        advanced = True                               # out_time moved forward
+    elif len(beat_outs) >= 2:
+        advanced = False                              # >=2 heartbeats, never advanced
+    else:
+        advanced = None                               # too little signal (incl. the block/first-beat duplicate)
     return progressed, advanced, beats, exited
 
 
@@ -883,9 +899,10 @@ def drive_cell(case, proto, settle, soak, min_progress=0):
                             "(ffmpeg never encoded a frame / stalled)",
                             "tags": tags, "phase": "liveness"}, sid
         if advanced is False:
-            # >=2 out_time_us samples that did not climb: encoded a frame then
-            # froze mid-stream (#166). advanced is None on <2 samples — a short
-            # soak / heavy throttle can't prove a stall, so don't FAIL there.
+            # Consecutive heartbeats (>=5s apart) with a frozen out_time_us:
+            # encoded a frame then hung mid-stream (#166). advanced is None when
+            # there's too little signal (e.g. the block/first-heartbeat duplicate
+            # tick) — can't prove a stall, so don't FAIL there.
             return "FAIL", {"reason": "mid-stream stall — out_time_us frozen across the "
                             "soak (encoded a frame then hung; #166 heartbeat did not advance)",
                             "tags": tags, "phase": "liveness"}, sid

@@ -42,16 +42,44 @@ def test_healthy_advancing():
 
 
 def test_mid_stream_stall_frozen_out_time():
-    """Encoded one frame, heartbeat fired but out_time_us never climbed: the
-    #166 mid-stream stall. advanced must be False so drive_cell FAILs it."""
+    """Two CONSECUTIVE heartbeats (>=5s apart) with the same out_time_us: the
+    encode froze mid-stream. advanced must be False so drive_cell FAILs it."""
     logs = "\n".join([
         _line("first progress block out_time_us=500000 total_size=1 speed=0x base_url=x"),
         _line("progress heartbeat ticks=3 out_time_us=500000 speed=0x"),
+        _line("progress heartbeat ticks=6 out_time_us=500000 speed=0x"),
     ])
     progressed, advanced, beats, exited = _scan(logs)
     assert progressed is True
     assert advanced is False
+    assert beats == 2
+
+
+def test_block_and_first_heartbeat_same_tick_inconclusive():
+    """The worker logs the first progress block AND the first heartbeat with the
+    SAME out_time_us (both fire on tick 1). A healthy just-started session must
+    NOT be FAILed as a stall — advanced is None (inconclusive), not False."""
+    logs = "\n".join([
+        _line("first progress block out_time_us=500000 total_size=1 speed=2x base_url=x"),
+        _line("progress heartbeat ticks=1 out_time_us=500000 speed=2x"),
+    ])
+    progressed, advanced, beats, exited = _scan(logs)
+    assert progressed is True
+    assert advanced is None
     assert beats == 1
+
+
+def test_advanced_then_frozen_is_stall():
+    """a,b,b — advanced once (a→b) then two heartbeats stuck at b: a late stall.
+    The consecutive-frozen-heartbeats rule must catch it (advanced False)."""
+    logs = "\n".join([
+        _line("first progress block out_time_us=500000 total_size=1 speed=1x base_url=x"),
+        _line("progress heartbeat ticks=4 out_time_us=5500000 speed=1x"),
+        _line("progress heartbeat ticks=7 out_time_us=5500000 speed=0x"),
+    ])
+    progressed, advanced, beats, exited = _scan(logs)
+    assert advanced is False
+    assert beats == 2
 
 
 def test_init_only_no_frame():
