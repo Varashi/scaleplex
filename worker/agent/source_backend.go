@@ -86,7 +86,7 @@ func detectSourceBackend(args []string) sourceBackend {
 	hasVAAPI, hasNVENC := false, false
 
 	// 1. -hwaccel:0 value (decode side).
-	if i := indexOfArg(args, "-hwaccel:0", 0); i >= 0 && i+1 < len(args) {
+	if i := streamSpecIndex(args, "-hwaccel", 0, 0); i >= 0 && i+1 < len(args) {
 		switch args[i+1] {
 		case "vaapi":
 			hasVAAPI = true
@@ -97,7 +97,7 @@ func detectSourceBackend(args []string) sourceBackend {
 
 	// 2. Output encoder (after -i). Foreign HW encoder names are decisive.
 	if in := indexOfArg(args, "-i", 0); in >= 0 {
-		if e := indexOfArg(args, "-codec:0", in+1); e >= 0 && e+1 < len(args) {
+		if e := streamSpecIndex(args, "-codec", 0, in+1); e >= 0 && e+1 < len(args) {
 			enc := args[e+1]
 			if strings.HasSuffix(enc, "_vaapi") {
 				hasVAAPI = true
@@ -179,7 +179,7 @@ func hasVideoEncoder(args []string) bool {
 	if in < 0 {
 		return false
 	}
-	e := indexOfArg(args, "-codec:0", in+1)
+	e := streamSpecIndex(args, "-codec", 0, in+1)
 	if e < 0 || e+1 >= len(args) {
 		return false
 	}
@@ -279,7 +279,7 @@ func reshapeForeignHWArgv(args []string, tm tonemapConfig) ([]string, []string) 
 
 	// 3. Encoder → worker's HW encoder.
 	if in := indexOfArg(args, "-i", 0); in >= 0 {
-		if e := indexOfArg(args, "-codec:0", in+1); e >= 0 && e+1 < len(args) {
+		if e := streamSpecIndex(args, "-codec", 0, in+1); e >= 0 && e+1 < len(args) {
 			if codec, isHW := hwEncoderCodec[args[e+1]]; isHW {
 				if lib, ok := codecCanonicalSWEncoder[codec]; ok {
 					if hwEnc, ok := d.encoderMap()[lib]; ok {

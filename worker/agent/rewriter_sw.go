@@ -131,10 +131,24 @@ func reshapeToSoftware(args []string, tm tonemapConfig) ([]string, []string) {
 	// already SW would otherwise produce no change tag, the strip would be
 	// discarded, and the HW-decode flags would survive onto a no-GPU worker.
 	stripped := false
-	for _, flag := range []string{
-		"-hwaccel:0", "-hwaccel_output_format:0", "-hwaccel_device:0",
-		"-init_hw_device", "-filter_hw_device",
-	} {
+	// Stream-specified HW-decode flags (`:0` / `:#0xNN` / `:v:0`) — match the
+	// video-stream spec in ANY form (#145). PMS emits `-hwaccel:#0xNN` on
+	// high-PID containers; an exact "-hwaccel:0" match would miss it, leave the
+	// hwaccel flags on the SW argv, and the honor-source path downstream would
+	// then see noHwaccel=false and bail unknown-decoder instead of keeping the
+	// SW reshape.
+	for _, base := range []string{"-hwaccel", "-hwaccel_output_format", "-hwaccel_device"} {
+		for {
+			i := streamSpecIndex(args, base, 0, 0)
+			if i < 0 || i+1 >= len(args) {
+				break
+			}
+			args = removeArgs(args, i, 2)
+			stripped = true
+		}
+	}
+	// Device-init flags carry no stream specifier — exact name.
+	for _, flag := range []string{"-init_hw_device", "-filter_hw_device"} {
 		for {
 			i := indexOfArg(args, flag, 0)
 			if i < 0 || i+1 >= len(args) {
@@ -154,7 +168,7 @@ func reshapeToSoftware(args []string, tm tonemapConfig) ([]string, []string) {
 	// SW decoder shape (the rewriter's decoder phase + the drop-in goal). An
 	// already-SW decoder lib (Plex emitted SW) is left untouched. The decoder
 	// slot is the first `-codec:0`, before `-i`.
-	if dc := indexOfArg(args, "-codec:0", 0); dc >= 0 && dc+1 < len(args) {
+	if dc := streamSpecIndex(args, "-codec", 0, 0); dc >= 0 && dc+1 < len(args) {
 		if in := indexOfArg(args, "-i", 0); in < 0 || dc < in {
 			if sw, ok := swDecoderForShort[args[dc+1]]; ok {
 				changes = append(changes, TagPrefixToSWDecode+args[dc+1]+"->"+sw)
@@ -192,7 +206,7 @@ func reshapeToSoftware(args []string, tm tonemapConfig) ([]string, []string) {
 
 	// 3. Encoder → SW (h264_vaapi/h264_nvenc → libx264, hevc_* → libx265).
 	if in := indexOfArg(args, "-i", 0); in >= 0 {
-		if e := indexOfArg(args, "-codec:0", in+1); e >= 0 && e+1 < len(args) {
+		if e := streamSpecIndex(args, "-codec", 0, in+1); e >= 0 && e+1 < len(args) {
 			if codec, isHW := hwEncoderCodec[args[e+1]]; isHW {
 				if lib, ok := codecCanonicalSWEncoder[codec]; ok {
 					changes = append(changes, TagPrefixToSWEncode+args[e+1]+"->"+lib)

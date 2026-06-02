@@ -61,7 +61,7 @@ func TestReplayCorpus_OrthogonalEmitParity(t *testing.T) {
 		considered++
 
 		// Unified emit from the extracted facts.
-		vaResident := indexOfArg(c.Argv, "-hwaccel:0", 0) >= 0
+		vaResident := streamSpecIndex(c.Argv, "-hwaccel", 0, 0) >= 0 // #145: match hex (`:#0xNN`) specs too, as Rewrite now does
 		uniGraph, _ := tm.composeBurn(burnSpec{
 			vaResident: vaResident, w: facts.w, h: facts.h, hdr: facts.hdr, algo: facts.algo,
 			burnSub: facts.subKind != "", subParams: facts.subParams,
