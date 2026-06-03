@@ -128,10 +128,18 @@ EXPOSE 3501
 # Pre-populate the system fontconfig cache against the slim config.
 # Runs as root so /var/cache/fontconfig is writeable; uid 1000 has
 # read access at runtime, so the spawned ffmpeg/libass picks up the
-# cache without any HOME tricks. Avoids the per-user .cache/fontconfig
-# layer that broke under BuildKit cache refreshes (fc-cache fell back
-# to writing per-dir caches into /usr/share/fonts/truetype/dejavu and
-# failed there).
+# cache without any HOME tricks.
+#
+# The leading `rm -rf` is load-bearing: the fontconfig apt postinst already
+# populated /var/cache/fontconfig in a LOWER image layer, and a later
+# fc-cache cannot rewrite those existing cache files through overlayfs in a
+# layered builder (BuildKit / buildah). It falls back to writing per-dir
+# caches into the read-only /usr/share/fonts/truetype/* dirs, those writes
+# fail, and fc-cache exits 2 — which broke the worker image build after
+# v1.11.1 (root-caused 2026-06-03 by reproducing the layered build locally).
+# Clearing the stale caches + creating the user cachedir up front lets
+# fc-cache write everything fresh in this layer. On failure the captured log
+# is dumped so a future regression is visible (the old `>log && tail` hid it).
 #
 # Without a populated cache libass's `subtitles=` filter triggers a
 # fontselect on the first subtitle frame; on the original system-wide
@@ -149,10 +157,11 @@ EXPOSE 3501
 # `-loglevel quiet` argv it becomes the only visible stderr and
 # easily masks the real fatal (see 2026-05-31 Ghosts S2E1 diag where
 # the warning was misread as the proximate cause of exit-145).
-RUN FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v >/tmp/fc-cache.log 2>&1 && \
+RUN rm -rf /var/cache/fontconfig/* /home/ubuntu/.cache/fontconfig && \
+    install -d -o 1000 -g 1000 -m 0755 /home/ubuntu/.cache /home/ubuntu/.cache/fontconfig && \
+    { FONTCONFIG_FILE=/opt/scaleplex/fonts.conf fc-cache -f -v >/tmp/fc-cache.log 2>&1 || { cat /tmp/fc-cache.log; exit 1; }; } && \
     tail -3 /tmp/fc-cache.log && \
     rm -f /tmp/fc-cache.log && \
-    install -d -o 1000 -g 1000 -m 0755 /home/ubuntu/.cache /home/ubuntu/.cache/fontconfig && \
     chown -R 1000:1000 /home/ubuntu/.cache /var/cache/fontconfig
 
 # Default to the unprivileged uid 1000 (#68). Prod overrides this anyway
