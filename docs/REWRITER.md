@@ -580,7 +580,7 @@ Time / Friends) hit the main rewriter's HW-decode-passthrough path
 because their argv shape includes `-hwaccel:0 vaapi` (the 2026-05-08
 commit `c93034d` accepts that shape directly).
 
-## Stream-spec normalization (`:#0xNN` → `:N`)
+## Stream-spec matching (`:N` / `:#0xNN` / `:v:N`)
 
 PMS emits stream specifiers in **stream-id-by-id hex form** for some
 file classes — `-codec:#0x01 hevc -hwaccel:#0x01 vaapi ... -filter_complex
@@ -589,45 +589,56 @@ file classes — `-codec:#0x01 hevc -hwaccel:#0x01 vaapi ... -filter_complex
 - "Plex Versions / Optimized for TV" Optimize outputs (Plex re-numbers
   streams on Optimize encode).
 - High-PID m2ts / M2TS containers (e.g. `#0x1011`).
-- ~95 of 3629 captured argvs (~2.6 %) as of 2026-05-31.
+- ~95 of 3629 captured argvs (~2.6 %).
 
-Stock ffmpeg accepts `:#0xNN` syntax natively. The rewriter doesn't —
-every detector site (`indexOfArg(args, "-hwaccel:0", 0)`,
-`"-codec:0"`, `"-hwaccel_output_format:0"`, etc.) is keyed on the
-literal `:N` ordinal form. Without normalization, `:#0xNN`-shape
-argvs silently bail `skip:no-decoder`, fall through to the bail
-path, and (until v1.11.1) the dash muxer POSTed `-manifest_name` to
-the worker pod's loopback → ECONNREFUSED → exit-145. Live regression
-hit prod 2026-05-31 on a Ghosts S2E1 Plex Web force-burn.
+Stock ffmpeg accepts `:#0xNN` natively. The rewriter resolves it at
+**match time** rather than rewriting the argv (since v1.12.0, #145):
+every `-flag:0` detector goes through `streamSpecIndex(args, flagBase,
+ord, start)`, which matches the ordinal (`:0`), stream-by-id (`:#0xNN`),
+and type+index (`:v:0`) forms alike. `#0xNN` ids resolve to ordinals via
+`streamIDOrdinalMap` (first-seen order across the argv = ffmpeg's
+by-index assignment for PMS's video-then-audio declaration order). The
+two graph-reshape entry points + the SW-reshape anchor accept a
+`[0:#0xNN]` leading video input label too (`reVideoInput0` /
+`graphLeadsWithVideoInput0`). **PMS's argv reaches ffmpeg pristine** —
+no upfront rewrite, better for debug/logging.
 
-`normalizePlexStreamSpecsToOrdinal` runs at top-of-`Rewrite` (after
-the inlineass scrub, before the bail closure). It collects each unique
-`#0xNN` ID in first-seen order across the argv (flag suffixes + filter
-graph refs) and maps them to ordinal `0, 1, 2, ...`. Single rewrite
-pass: flag suffix `:#0xNN` → `:N`, filter graph `[INPUT:#0xNN]` →
-`[INPUT:N]`. Idempotent: ordinal-form argvs short-circuit with no
-allocation, no map entries, no changes.
+This replaced the earlier `normalizePlexStreamSpecsToOrdinal` upfront
+pass (a workaround for the rewriter's then-narrow literal `:0` matching).
+That workaround existed because, without it, `:#0xNN`-shape argvs
+silently bailed `skip:no-decoder` → the dash muxer POSTed `-manifest_name`
+to the worker pod's loopback → ECONNREFUSED → exit-145 (live regression
+2026-05-31, Ghosts S2E1 Plex Web force-burn). The polymorphic matchers
+prevent that bail directly.
 
-Mapping assumption: PMS always emits stream-spec flags strictly in
-pre-input position before any other `:N` ordinal usage, and in
-container declaration order (video first, audio next). Holds across
-every `:#0xNN` corpus entry as of 2026-05-31.
+**Tests:** `TestStreamSpecIndex` / `TestStreamSpecSelectsOrdinal` /
+`TestStreamIDOrdinalMap` (the matcher across all three forms + the
+audio-not-video and flag-boundary guards), `TestHexFilterGraphReshapeEntry`
+(hex `[0:#0xNN]` graph reshapes), `TestRewriter_HWPassthrough_HexStreamSpecsReshapePristine`
++ `TestRewriter_HWPassthrough_OrdinalAndTypeIndexForms` (end-to-end through
+`Rewrite` for all three forms; `#0xNN` stays pristine in the output),
+`TestRewriter_BailRewritesManifestNameToRelay` (bail-path manifest rewrite
+on a pristine hex argv). Equivalence-validated: all 95 `:#0x` corpus entries
+produce byte-identical decision tags before/after the refactor.
 
-**Label:** `normalize:stream-specs:#0xNN->ordinal` on the changes list.
+## Seek-offset `select=` modeling
 
-**Tests:** `TestNormalizePlexStreamSpecsToOrdinal` (4 cases — Ghosts
-shape, m2ts high-PID, ordinal-form passthrough, filter-only),
-`TestRewriter_HWPassthrough_NormalizesStreamSpecsAndReshapes` (end-to-
-end: `#0xNN` no longer bails, reshape engages),
-`TestRewriter_BailRewritesManifestNameToRelay` (normalize+bail
-interaction).
-
-**Architectural followup:** GH #145 — lift this into a polymorphic
-stream-spec matcher in the rewriter (so the detector accepts `#0xNN`
-natively without upfront rewrite) or absorb into scaleplex-ffmpeg
-fork alongside the rest of the rewriter→fork migration. The current
-normalize is a workaround for the rewriter's narrow literal matching,
-not a real argv-parse gap.
+A seeked HW-decode sub-burn session can carry a standalone
+`select=gte(t\,SEEK)` frame-gate node after `inlineass` — Plex's
+fine-grained seek trim after the coarse input `-ss`/`-copyts`
+(e.g. the 320×180 dash rendition resume in the corpus). `select` is
+a recognized graph node (`modeledFilterNodes`); `extractGraphFacts`
+lifts its expr (escaped comma preserved verbatim — else ffmpeg reparses
+it as a filterchain separator) and the composers re-emit it at the chain
+tail via `appendSelectStage` (a zero-copy metadata gate, valid on the
+VAAPI/CUDA/CPU surface alike). A `select=` node whose expr can't be
+cleanly extracted fails closed (`ok=false`) rather than recompose a
+graph that silently drops the seek (which would reset playback to t=0).
+Before v1.12.0 (#154) the `select` node was unmodeled → the session
+bailed `hw-decode-sub:unmodeled-graph:` and ran Plex's SW-inlineass
+round-trip instead of the GPU-resident reshape (a perf gap, not a
+correctness bug). `shapeHWSubBurn` is now a fully strict replay shape
+(no bail accepted). **Tests:** `TestSeekSelectModeling`.
 
 ## Bail-path scrubs
 
