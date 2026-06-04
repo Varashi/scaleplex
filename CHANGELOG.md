@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.12.0](https://github.com/Varashi/scaleplex/compare/v1.11.1...v1.12.0) (2026-06-04)
+
+
+### Features
+
+* **rewriter:** model the seeked select=gte HW sub-burn graph ([#154](https://github.com/Varashi/scaleplex/issues/154)) ([#172](https://github.com/Varashi/scaleplex/issues/172)) ([4c5d949](https://github.com/Varashi/scaleplex/commit/4c5d949ec121766a84d40444b966ee6a2a6bb589))
+* **worker:** log a throttled progress heartbeat ([#141](https://github.com/Varashi/scaleplex/issues/141)b enabler) ([#166](https://github.com/Varashi/scaleplex/issues/166)) ([db43da4](https://github.com/Varashi/scaleplex/commit/db43da4acbff714dc3fd43c616973f8832f90ddd))
+* **worker:** SCALEPLEX_PASS_GATE_DEBUG verbose L3 logging ([#125](https://github.com/Varashi/scaleplex/issues/125) item 3) ([#169](https://github.com/Varashi/scaleplex/issues/169)) ([a0ffe8b](https://github.com/Varashi/scaleplex/commit/a0ffe8b4abba97ee4fcb32372851586888777954))
+
+
+### Fixes
+
+* **worker/image:** clear stale fontconfig cache before fc-cache (unbreak build) ([#175](https://github.com/Varashi/scaleplex/issues/175)) ([dffce8f](https://github.com/Varashi/scaleplex/commit/dffce8f68f0eca6783de0a69e7e7f951a4197d56))
+
+
+### Refactor
+
+* **rewriter:** polymorphic stream-spec matching, drop normalizer ([#145](https://github.com/Varashi/scaleplex/issues/145)) ([#173](https://github.com/Varashi/scaleplex/issues/173)) ([fff35f3](https://github.com/Varashi/scaleplex/commit/fff35f386b692a80d8177f42d4e2450308436078))
+
 ## [1.11.1](https://github.com/Varashi/scaleplex/compare/v1.11.0...v1.11.1) (2026-05-31)
 
 
