@@ -5,31 +5,31 @@
 //
 // First (and currently only) rule — Plex for Apple TV 8.45:
 //
-//   The "Enhanced Player" forces HLS transcodes into container=mkv via
-//     add-transcode-target(...protocol=hls&container=mkv&replace=true)
-//   The tvOS player demuxes a COPY / Direct-Stream of mkv-in-HLS fine
-//   (Dennis watches whole Optimize-version episodes that way), but
-//   rejects an *encoder-produced* (re-encode) mkv-in-HLS stream →
-//   infinite buffer. Confirmed byte-level: copy and re-encode produce
-//   byte-identical Matroska container framing; only the payload differs,
-//   so this is a client demuxer bug, fixed client-side in ATV 2025.31.x.
-//   See forums.plex.tv/t/.../933250 and Varashi/scaleplex#122.
+//	The "Enhanced Player" forces HLS transcodes into container=mkv via
+//	  add-transcode-target(...protocol=hls&container=mkv&replace=true)
+//	The tvOS player demuxes a COPY / Direct-Stream of mkv-in-HLS fine
+//	(Dennis watches whole Optimize-version episodes that way), but
+//	rejects an *encoder-produced* (re-encode) mkv-in-HLS stream →
+//	infinite buffer. Confirmed byte-level: copy and re-encode produce
+//	byte-identical Matroska container framing; only the payload differs,
+//	so this is a client demuxer bug, fixed client-side in ATV 2025.31.x.
+//	See forums.plex.tv/t/.../933250 and Varashi/scaleplex#122.
 //
 // The fix must change PMS's container DECISION — the worker can't, because
 // PMS builds the served .m3u8 from its own decision (rewriter.go:3157).
 // And it must NOT disturb the working copy path. So clientfix is
 // content-aware:
 //
-//   1. Forward the client's decision request to PMS UNCHANGED (mkv).
-//   2. If PMS decided the video stream = COPY (Direct Stream) → return it
-//      verbatim. The mkv copy plays; nothing changes.
-//   3. If PMS decided the video stream = TRANSCODE (re-encode, the broken
-//      case) → re-issue the SAME request with container=mkv→mp4 in the
-//      profile-extra. PMS caches the fMP4 decision under this session, and
-//      the client's later start.m3u8 (which never carries a profile-extra)
-//      replays it → 4K-HEVC fMP4, which tvOS plays. Validated byte-level:
-//      container=mp4 + the real ATV profile yields `ftyp`/fMP4 segments;
-//      the session-keyed re-issue overwrites the cached decision cleanly.
+//  1. Forward the client's decision request to PMS UNCHANGED (mkv).
+//  2. If PMS decided the video stream = COPY (Direct Stream) → return it
+//     verbatim. The mkv copy plays; nothing changes.
+//  3. If PMS decided the video stream = TRANSCODE (re-encode, the broken
+//     case) → re-issue the SAME request with container=mkv→mp4 in the
+//     profile-extra. PMS caches the fMP4 decision under this session, and
+//     the client's later start.m3u8 (which never carries a profile-extra)
+//     replays it → 4K-HEVC fMP4, which tvOS plays. Validated byte-level:
+//     container=mp4 + the real ATV profile yields `ftyp`/fMP4 segments;
+//     the session-keyed re-issue overwrites the cached decision cleanly.
 //
 // Fail-open: any parse/re-issue error returns PMS's original response
 // (status quo). The gateway routes ONLY the matched client's decision
@@ -50,6 +50,9 @@ import (
 	"time"
 )
 
+// main wires up the proxy from env (CLIENTFIX_LISTEN_ADDR,
+// CLIENTFIX_PMS_UPSTREAM, CLIENTFIX_UPSTREAM_TIMEOUT) and serves until
+// killed. /healthz is an unconditional 200 for k8s probes.
 func main() {
 	listen := envOr("CLIENTFIX_LISTEN_ADDR", ":8080")
 	upstreamRaw := os.Getenv("CLIENTFIX_PMS_UPSTREAM")
@@ -85,11 +88,16 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
+// proxy reverse-proxies requests to a single PMS upstream, applying the
+// per-client decision fix where it matches.
 type proxy struct {
 	upstream *url.URL
 	client   *http.Client
 }
 
+// handle implements the content-aware two-pass: forward unchanged, and
+// only re-issue with the container rewritten when the matched client got
+// a re-encode decision. Everything else is a transparent passthrough.
 func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
@@ -155,6 +163,8 @@ func (p *proxy) forward(method, path, rawQuery string, hdr http.Header, host str
 	return resp, b, nil
 }
 
+// writeResponse copies an upstream response (status, headers, body) to the
+// client, dropping Content-Length so the writer recomputes it.
 func writeResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
 	for k, vs := range resp.Header {
 		if strings.EqualFold(k, "Content-Length") {
@@ -168,6 +178,7 @@ func writeResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
 	_, _ = w.Write(body)
 }
 
+// isDecision reports whether the path is PMS's transcode decision endpoint.
 func isDecision(path string) bool {
 	return strings.Contains(path, "/transcode/universal/decision")
 }
@@ -244,6 +255,7 @@ func rewriteRawQuery(q string) string {
 	return q
 }
 
+// envOr returns env var k, or def if unset/empty.
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -251,6 +263,7 @@ func envOr(k, def string) string {
 	return def
 }
 
+// envDur parses env var k as a Go duration, or returns def.
 func envDur(k string, def time.Duration) time.Duration {
 	if v := os.Getenv(k); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
