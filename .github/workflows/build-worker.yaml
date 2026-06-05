@@ -27,10 +27,10 @@ jobs:
   go-build-test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: "1.23"
+          go-version: "1.26.1"
           cache-dependency-path: worker/agent/go.sum
       - name: vet
         working-directory: worker/agent
@@ -64,7 +64,7 @@ jobs:
       packages: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: fetch scaleplex-ffmpeg deb
         # The worker Dockerfile expects scaleplex-ffmpeg/dist/*.deb at
         # build context root. Pull the latest successful build-ffmpeg
@@ -98,22 +98,22 @@ jobs:
             ./scaleplex-ffmpeg/build.sh
           fi
           ls -lh scaleplex-ffmpeg/dist/
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/varashi/scaleplex_worker
           tags: |
             type=sha,prefix=sha-,format=short
             type=ref,event=branch
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: worker/Dockerfile

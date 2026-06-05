@@ -26,7 +26,7 @@ jobs:
   config-lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: docker compose config (validate YAML + interpolation)
         working-directory: deploy/docker
         run: |
@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: config-lint
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: build orchestrator image from this PR
         # Smoke must run against this PR's code, not whatever `latest`
         # on GHCR happens to be — otherwise new endpoints / behaviour
