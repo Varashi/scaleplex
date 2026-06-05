@@ -1,0 +1,66 @@
+name: build-clientfix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clientfix/**"
+      - ".github/workflows/build-clientfix.yaml"
+  pull_request:
+    paths:
+      - "clientfix/**"
+      - ".github/workflows/build-clientfix.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  go-build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.1"
+      - name: vet
+        working-directory: clientfix
+        run: go vet ./...
+      - name: test
+        working-directory: clientfix
+        run: go test -cover ./...
+      - name: build
+        working-directory: clientfix
+        run: go build ./...
+
+  image:
+    needs: go-build-test
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/varashi/scaleplex_clientfix
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: clientfix/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

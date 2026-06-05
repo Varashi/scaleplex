@@ -3,6 +3,7 @@ go 1.26.1
 use (
 	./cmd/argv-extract
 	./cmd/corpus-synthesize
+	./clientfix
 	./cmd/optimize-corpus-gen
 	./orchestrator
 	./shim
