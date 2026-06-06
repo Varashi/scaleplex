@@ -66,7 +66,7 @@ func TestRewriteContainer(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Plex-Client-Profile-Extra",
 		"add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mkv&videoCodec=h264,hevc&replace=true)+add-transcode-target-settings(CopyMatroskaAttachments=true)")
-	out := rewriteContainer(h)
+	out := rewriteContainer(h, "mp4")
 	got := out.Get("X-Plex-Client-Profile-Extra")
 	if !strings.Contains(got, "container=mp4") || strings.Contains(got, "container=mkv") {
 		t.Fatalf("container not flipped: %s", got)
