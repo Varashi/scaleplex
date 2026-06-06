@@ -7,6 +7,37 @@ See also: [`TEST_MATRIX.md`](TEST_MATRIX.md) for cells flagged
 `[KNOWN: <slug>]` — those cross-reference back here so a known-broken
 shape isn't re-validated each release.
 
+## Plex for Apple TV 8.45 · transcoded HEVC crashes the app — client bug, worked around
+
+ATV 8.45 (tvOS 26.5/26.6) cannot play a **transcoded HEVC** stream. Its
+"Enhanced Player" forces HLS transcodes into `container=mkv` (via an
+`add-transcode-target(... replace=true)` in `X-Plex-Client-Profile-Extra`),
+and the tvOS demuxer rejects a *re-encoded* mkv-in-HLS (copy plays fine — see
+the original #122 finding). But the bug is deeper than the container.
+
+Full matrix, real devices, av1 sources (SDR *and* DoVi — not HDR-specific):
+
+| output | result |
+|---|---|
+| hevc 4K — mkv / mp4 / mpegts | ❌ fail |
+| hevc 4K — fMP4 via a clean custom `tvOS.xml` (profile-extra fully stripped) | ❌ **crashes the app** (0 segments fetched, crash at decoder/init) |
+| h264 1080p — mpegts (stock `tvOS.xml`) | ✅ plays |
+
+So it is neither the container nor the Enhanced-Player extra — the client
+crashes setting up *any* transcoded-HEVC session.
+
+**Workaround (shipped):** [`clientfix`](CLIENTFIX.md) `CLIENTFIX_DECISION_MODE=strip`
+removes the profile-extra on the 8.45 transcode decision → PMS falls back to
+the stock tvOS profile → **h264 1080p** (5.1 audio copy, 20 Mbps). Strictly
+better than the total failure; the 1080p cap is the client's, not ours. 4K is
+only reachable by copy/Direct-Play of a device-decodable (non-av1) source.
+
+**Path to a real fix:** a Plex-for-ATV client update (the #122 mkv bug was
+fixed in a later ATV build) and/or the client crash log (tvOS Analytics Data /
+Xcode device logs / Plex Sentry) filed with Plex. Worker SW→HW av1 decode
+(scaleplex#185) cuts fleet load but does **not** unlock 4K here. Status as of
+2026-06-06: awaiting Dennis's client crash log.
+
 ## Burned PGS cue stayed on screen until next cue — RESOLVED in v1.6.1
 
 Was: `vf_inlineass::refresh_bitmap` recomputed `have_bmp` every frame from the
