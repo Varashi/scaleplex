@@ -395,6 +395,31 @@ SUB_TEXT = {"srt", "subrip", "webvtt", "mov_text"}
 SUB_ASS = {"ass", "ssa"}  # styled/animated — stresses libass far more than srt
 SUB_BITMAP = {"pgs", "pgssub", "vobsub", "dvd_subtitle", "dvdsub"}
 
+# --- Main10 guard (#189/#193) -------------------------------------------------
+# #189 added ensureHEVCMain10: on a 10-bit (p010) HW HEVC encode the rewriter
+# injects `-profile:N main10` (tag `encode:hevc:profile=main10`). Without it VAAPI
+# emits HEVC Range-Extensions (Rext), which Apple VideoToolbox cannot decode →
+# ATV crash. The broad matrix cells encode 8-bit hevc (av1->hevc, or HDR->SDR
+# tonemapped) = profile=main, so they never carry a 10-bit HW hevc encode and
+# the verifier (spawn/seg/SOAK/liveness) PASSes even on a Rext stream. This guard
+# cell drives a true 10-bit HDR10 HEVC transcode and FAILS if the main10 pin is
+# absent (a #189 regression would ship Rext again).
+#
+# rk of the corpus 10-bit HDR10 HEVC-Main10 source on plex-test
+# (hevc__main10__2160p__10bit__hdr10). Override via env if the corpus moves.
+MAIN10_SOURCE_RK = os.environ.get("MAIN10_SOURCE_RK", "326685")
+# Client profile (from client_profiles.json) that is HDR + HEVC-passthrough
+# capable — on a 10-bit HDR source it yields decision videoCodec=hevc at 10-bit
+# (so PMS asks for a hevc encode, not a downconvert to h264/8-bit). The ATV-8.45
+# profile is exactly the device the main10 pin protects.
+MAIN10_CLIENT_PROFILE = os.environ.get("MAIN10_CLIENT_PROFILE", "plex_for_apple_tv_tvos_14_1")
+# The tag ensureHEVCMain10 emits inside the comma-joined rewriter tag list.
+MAIN10_TAG = "encode:hevc:profile=main10"
+# Marker that the encode is a HW (VAAPI) hevc encode — the ONLY path the Main10
+# pin applies to. If the cell falls to a SW hevc encode (e.g. FORCE_HW=0 +
+# HW-encode off), the Rext class doesn't arise, so don't assert main10 there.
+HW_HEVC_ENCODE_RE = re.compile(r"encode:(?:hw-passthrough:)?hevc_vaapi")
+
 
 def find_sub_stream(rk):
     """Return subtitle stream IDs bucketed by '<kind>-<source>' — kind is
@@ -528,9 +553,13 @@ def build_cases(content):
     def first(pred):
         return next((c for c in content if pred(c)), None)
 
-    def case(rk, title, label, extra=None, client=None, protocols=None):
+    def case(rk, title, label, extra=None, client=None, protocols=None,
+             require_main10=False):
         return {"rk": rk, "title": title, "label": label,
-                "extra": extra or {}, "client": client, "protocols": protocols}
+                "extra": extra or {}, "client": client, "protocols": protocols,
+                # When True, drive_cell asserts a 10-bit HW hevc encode carries
+                # the main10 pin tag (the #189/#193 Rext guard).
+                "require_main10": require_main10}
 
     cases = []
     sdr1080 = first(lambda c: c[3] in ("1080", "720") and c[4] == "sdr")
@@ -589,6 +618,22 @@ def build_cases(content):
     if win_item:
         cases.append(case(win_item[0], win_item[1], "windows-segmkv",
                           client=WINDOWS_HEADERS, protocols=["hls"]))
+
+    # Main10 guard cell (#189/#193): a true 10-bit HDR10 HEVC source driven with
+    # an HDR/HEVC-passthrough client (ATV-8.45) so PMS decides videoCodec=hevc at
+    # 10-bit. drive_cell then FAILS unless the rewriter tags carry the main10 pin
+    # (`encode:hevc:profile=main10`) — catching a regression that would re-emit
+    # Apple-undecodable HEVC Rext. Uses the dedicated corpus clip (rk
+    # MAIN10_SOURCE_RK), independent of the discovered movie content above; hls
+    # only (the ATV transcode protocol). Skipped if the ATV profile isn't loaded.
+    atv = CLIENT_PROFILES.get(MAIN10_CLIENT_PROFILE)
+    if atv and atv.get("headers"):
+        cases.append(case(MAIN10_SOURCE_RK, "main10-hdr10-2160p", "main10-hevc-guard",
+                          client=atv["headers"], protocols=["hls"],
+                          require_main10=True))
+    else:
+        print(f"  WARN: client profile {MAIN10_CLIENT_PROFILE!r} not in "
+              f"client_profiles.json — skipping the Main10 guard cell (#189)")
     return cases
 
 
@@ -770,6 +815,44 @@ def _scan_liveness(slug, since):
     return progressed, advanced, beats, exited
 
 
+def _ffprobe_newest_segment(sid):
+    """Best-effort: locate the newest video segment this session produced on a
+    k8s worker and ffprobe its v:0 codec_name/profile/pix_fmt. Returns a dict
+    (codec_name/profile/pix_fmt) or None when no probe-able segment is found.
+
+    Corroborates the Main10 tag assertion with the real bitstream profile
+    ('Main 10' vs Rext). STRICTLY best-effort — many deployments stream the
+    encode straight to the relay (PUT) and keep nothing on disk, so a None here
+    is normal and must NOT flip the verdict (the rewriter tag is the gate). Only
+    used by the require_main10 cell. k8s only; skipped under docker-only mode."""
+    if not _use_k8s():
+        return None
+    for pod in worker_pods():
+        # Find a recent (<2 min) HLS/DASH segment, newest first. Output may not be
+        # persisted (pipe/relay) — then this yields nothing and we return None.
+        find = ("find / -xdev \\( -name '*.ts' -o -name '*.m4s' -o -name '*.mp4' "
+                "-o -name '*.mkv' \\) -mmin -2 -printf '%T@ %p\\n' 2>/dev/null "
+                "| sort -rn | head -1 | cut -d' ' -f2-")
+        r = kubectl("exec", pod, "-c", WORKER_CONTAINER, "--", "sh", "-c", find,
+                    timeout=30)
+        seg = r.stdout.strip().splitlines()
+        if not seg or not seg[0]:
+            continue
+        path = seg[0]
+        pr = kubectl("exec", pod, "-c", WORKER_CONTAINER, "--", "ffprobe",
+                     "-v", "error", "-select_streams", "v:0", "-show_entries",
+                     "stream=codec_name,profile,pix_fmt", "-of",
+                     "default=noprint_wrappers=1", path, timeout=30)
+        out = {}
+        for ln in pr.stdout.splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                out[k.strip()] = v.strip()
+        if out:
+            return out
+    return None
+
+
 def drive_cell(case, proto, settle, soak, min_progress=0):
     """Drive one cell to an AUTHORITATIVE verdict:
       SKIP       — PMS chose not to transcode (directplay/copy) → not a worker test
@@ -915,6 +998,41 @@ def drive_cell(case, proto, settle, soak, min_progress=0):
             return "FAIL", {"reason": f"liveness below bar — {beats} progress heartbeat(s) "
                             f"< --min-progress {min_progress}", "tags": tags,
                             "phase": "liveness"}, sid
+
+    # Main10 guard (#189/#193). For the dedicated 10-bit HDR10 HEVC guard cell:
+    # if the encode is a HW (VAAPI) hevc encode it MUST carry the main10 pin tag,
+    # else VAAPI emits HEVC Rext (Apple-undecodable) → ATV crash. The cell is
+    # otherwise healthy at this point (spawned, segmented, soaked, live), so the
+    # ONLY thing left to fail it is a missing pin — i.e. a #189 regression. We
+    # gate on a HW hevc encode tag: if the cell fell to a SW hevc encode (no
+    # FORCE_HW + HW-encode off), the Rext class doesn't arise, so skip the assert
+    # (a NO-OP, not a pass that hides the gap — see info note).
+    if case.get("require_main10"):
+        hw_hevc = bool(HW_HEVC_ENCODE_RE.search(tags or ""))
+        if hw_hevc and MAIN10_TAG not in (tags or ""):
+            # 10-bit HW hevc encode WITHOUT the main10 pin → the exact #189
+            # regression (would ship Rext). Hard FAIL — this is the guard's point.
+            return "FAIL", {"reason": f"10-bit HW hevc encode missing {MAIN10_TAG!r} "
+                            "(would emit Apple-undecodable HEVC Rext — #189/#193 regression)",
+                            "tags": tags, "phase": "main10-guard"}, sid
+        info = {"tags": tags, "main10_pin": MAIN10_TAG in (tags or ""),
+                "hw_hevc_encode": hw_hevc}
+        if not hw_hevc:
+            info["note"] = ("no HW hevc encode tag (SW hevc / non-hevc path) — "
+                            "main10 assertion N/A this cell run")
+        # Optional corroboration: ffprobe the newest produced segment for this
+        # session and require profile 'Main 10' (best-effort; ffprobe/seg-locate
+        # failures don't flip the verdict — the tag assertion above is the gate).
+        prof = _ffprobe_newest_segment(sid)
+        if prof:
+            info["seg_profile"] = prof
+            if hw_hevc and prof.get("profile") and "main 10" not in prof["profile"].lower():
+                return "FAIL", {"reason": f"produced segment ffprobes as profile "
+                                f"{prof.get('profile')!r} (expected 'Main 10' — HEVC Rext, "
+                                "#189/#193 regression)", "tags": tags,
+                                "seg_profile": prof, "phase": "main10-guard"}, sid
+        return "PASS", info, sid
+
     return "PASS", {"tags": tags}, sid
 
 
