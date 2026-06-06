@@ -64,9 +64,13 @@ func main() {
 	timeout := envDur("CLIENTFIX_UPSTREAM_TIMEOUT", 30*time.Second)
 	// Decision mode for the matched ATV-8.45 re-encode:
 	//   "strip" (default) — remove X-Plex-Client-Profile-Extra entirely so
-	//     PMS falls back to the base tvOS profile (h264 1080p). Use when the
-	//     Enhanced Player's hevc/4K/mkv target is unplayable (av1 sources).
-	//   "mp4" — only flip container=mkv->mp4, keeping hevc/4K (legacy #122).
+	//     PMS falls back to the base tvOS profile (h264 1080p). Known-good
+	//     for av1 sources whose Enhanced Player hevc/4K/mkv target is unplayable.
+	//   anything else is a target CONTAINER — keep the client's hevc/4K/HDR
+	//     caps and only swap the Enhanced Player's mkv target to that value:
+	//       "mp4"    — mkv->mp4   (legacy #122; failed on real ATV 8.45)
+	//       "mpegts" — mkv->mpegts (custom-profile ceiling test: does ATV
+	//                  play hevc/4K in TS, restoring full quality?)
 	mode := envOr("CLIENTFIX_DECISION_MODE", "strip")
 
 	// Streaming transparent passthrough for everything that isn't the
@@ -142,10 +146,12 @@ func (p *proxy) handleDecision(w http.ResponseWriter, r *http.Request) {
 	if videoIsTranscode(b1) {
 		var hdr2 http.Header
 		var q2, action string
-		if p.mode == "mp4" {
-			hdr2, q2, action = rewriteContainer(r.Header), rewriteRawQuery(r.URL.RawQuery), "rewrote container mkv→mp4"
-		} else {
+		if p.mode == "strip" {
 			hdr2, q2, action = stripProfileExtraHeader(r.Header), stripProfileExtraQuery(r.URL.RawQuery), "stripped Client-Profile-Extra → base profile"
+		} else {
+			// container-rewrite mode: p.mode is the target container — keep
+			// the client's hevc/4K/HDR caps, swap only the mkv target.
+			hdr2, q2, action = rewriteContainer(r.Header, p.mode), rewriteRawQuery(r.URL.RawQuery, p.mode), "rewrote container mkv→"+p.mode
 		}
 		resp2, b2, err := p.forward(r.Method, r.URL.Path, q2, hdr2, r.Host, body)
 		if err == nil {
@@ -259,13 +265,14 @@ func videoIsTranscode(xmlBody []byte) bool {
 	return false
 }
 
-// rewriteContainer returns a copy of the headers with container=mkv→mp4 in
-// X-Plex-Client-Profile-Extra. The Apple-TV profile carries exactly one
-// such token (the protocol=hls video add-transcode-target).
-func rewriteContainer(h http.Header) http.Header {
+// rewriteContainer returns a copy of the headers with container=mkv swapped
+// to the target container in X-Plex-Client-Profile-Extra, keeping the rest
+// of the profile (hevc/4K/HDR caps). The Apple-TV profile carries exactly
+// one such token (the protocol=hls video add-transcode-target).
+func rewriteContainer(h http.Header, target string) http.Header {
 	out := h.Clone()
 	if pe := out.Get("X-Plex-Client-Profile-Extra"); pe != "" {
-		out.Set("X-Plex-Client-Profile-Extra", strings.ReplaceAll(pe, "container=mkv", "container=mp4"))
+		out.Set("X-Plex-Client-Profile-Extra", strings.ReplaceAll(pe, "container=mkv", "container="+target))
 	}
 	return out
 }
@@ -294,10 +301,10 @@ func stripProfileExtraQuery(q string) string {
 
 // rewriteRawQuery applies the same container rewrite to the query string,
 // in case a client carries it there rather than as a header.
-func rewriteRawQuery(q string) string {
-	q = strings.ReplaceAll(q, "container=mkv", "container=mp4")
-	q = strings.ReplaceAll(q, "container%3Dmkv", "container%3Dmp4")
-	q = strings.ReplaceAll(q, "container%3dmkv", "container%3dmp4")
+func rewriteRawQuery(q, target string) string {
+	q = strings.ReplaceAll(q, "container=mkv", "container="+target)
+	q = strings.ReplaceAll(q, "container%3Dmkv", "container%3D"+target)
+	q = strings.ReplaceAll(q, "container%3dmkv", "container%3d"+target)
 	return q
 }
 
