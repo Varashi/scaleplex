@@ -20,7 +20,12 @@ func TestEnsureHEVCMain10(t *testing.T) {
 		wantTag   bool
 		wantAfter string // token expected immediately after the encoder, if injected
 	}{
-		{"10bit-hevc-injects", base10, true, "main10"},
+		{"10bit-hevc-vaapi-injects", base10, true, "main10"},
+		{"10bit-hevc-nvenc-injects", []string{
+			"-codec:0", "av1", "-hwaccel:0", "cuda", "-i", "in.mkv",
+			"-filter_complex", "[0:0]scale_cuda=w=3840:h=2160:format=p010[1]",
+			"-codec:0", "hevc_nvenc", "-qp:0", "15",
+		}, true, "main10"},
 		{"8bit-hevc-untouched", []string{
 			"-codec:0", "av1", "-i", "in.mkv",
 			"-filter_complex", "scale_vaapi=w=1920:h=1080:format=nv12",
@@ -50,10 +55,10 @@ func TestEnsureHEVCMain10(t *testing.T) {
 				t.Fatalf("tag=%v want %v (changes=%v)", tagged, c.wantTag, changes)
 			}
 			if c.wantTag {
-				// -profile:0 main10 must sit right after the encoder token
+				// -profile:0 main10 must sit right after the HW hevc encoder
 				enc := -1
 				for i, a := range got {
-					if a == "hevc_vaapi" {
+					if a == "hevc_vaapi" || a == "hevc_nvenc" {
 						enc = i
 					}
 				}
