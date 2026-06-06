@@ -69,17 +69,19 @@ container or the extra. Full matrix on real devices (tvOS 26.5/26.6, Plex
 | output | result |
 |---|---|
 | hevc 4K — mkv / mp4 / mpegts (extra kept, container swapped) | ❌ fail |
-| hevc 4K — fMP4 via a clean custom `tvOS.xml` (extra fully stripped) | ❌ **crashes the app** |
+| hevc 4K — fMP4 via a clean custom `tvOS.xml` (extra fully stripped) | ❌ crashes the app |
 | h264 1080p — mpegts (`strip` → stock `tvOS.xml`) | ✅ plays |
 
-**Conclusion:** ATV 8.45 cannot play a *transcoded* HEVC stream at all
-(reproduced across SDR and DoVi sources, so not HDR-specific). The shipped
-answer is `CLIENTFIX_DECISION_MODE=strip` → **h264 1080p** (5.1 audio copy,
-20 Mbps). 4K on this client is only reachable via copy/Direct-Play of a
-device-decodable source — see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). It is a
-Plex-for-ATV client bug; a future client build may fix it (the #122 mkv bug
-was fixed client-side in a later ATV release), at which point clientfix can be
-removed.
+**Root cause (#189):** not a client limit. The client's mpv/ffmpeg player logs
+`hevc (Rext), ... unspecified pixel format` + a malformed fMP4 `stsd` — the
+worker emits HEVC **Range-Extensions** instead of **Main10**, which Apple
+VideoToolbox can't decode → crash. ATV 8.45 *can* play HEVC Main10, so 4K is
+recoverable by fixing the `hevc_vaapi` encode/mux (force `-profile:v main10`).
+
+**Interim shipped answer:** `CLIENTFIX_DECISION_MODE=strip` → **h264 1080p**
+(5.1 audio copy, 20 Mbps) — see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). Once #189
+lands, a custom tvOS hevc-4K-fMP4 profile + strip restores full 4K and clientfix
+can be retired for this client.
 
 ### Custom PMS profiles (for the record)
 
