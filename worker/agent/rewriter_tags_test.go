@@ -454,6 +454,7 @@ func TestTagValues_Stable(t *testing.T) {
 		"TagPrefixDrop":                        "drop:",
 		"TagPrefixEncode":                      "encode:",
 		"TagPrefixEncodeHWPassthrough":         "encode:hw-passthrough:",
+		"TagEncodeHEVCMain10":                  "encode:hevc:profile=main10",
 		"TagPrefixEnvStrip":                    "env:strip:",
 		"TagPrefixFilter":                      "filter:",
 		"TagPrefixForceHWReshapeHybrid":        "force-hw:reshape-hybrid:",
