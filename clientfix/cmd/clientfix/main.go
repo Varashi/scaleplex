@@ -1,41 +1,37 @@
-// scaleplex-clientfix — a tiny content-aware reverse proxy that sits in
-// front of PMS's transcode DECISION endpoint to work around per-client
-// Plex bugs that live entirely in the client's
-// X-Plex-Client-Profile-Extra negotiation.
+// scaleplex-clientfix — a transparent reverse proxy that fronts PMS and
+// fixes per-client Plex bugs living in the client's
+// X-Plex-Client-Profile-Extra negotiation. It STREAMS everything
+// transparently to PMS, and only special-cases the transcode DECISION
+// request for matched clients.
+//
+// It must front ALL of PMS:32400 (not just a gateway route) because most
+// remote clients connect via Plex's plex.direct hashed-IP URL straight to
+// the WAN port-forward → PMS, bypassing any HTTP gateway. So the LB /
+// port-forward points here, and clientfix forwards to PMS.
 //
 // First (and currently only) rule — Plex for Apple TV 8.45:
 //
 //	The "Enhanced Player" forces HLS transcodes into container=mkv via
 //	  add-transcode-target(...protocol=hls&container=mkv&replace=true)
-//	The tvOS player demuxes a COPY / Direct-Stream of mkv-in-HLS fine
-//	(Dennis watches whole Optimize-version episodes that way), but
-//	rejects an *encoder-produced* (re-encode) mkv-in-HLS stream →
-//	infinite buffer. Confirmed byte-level: copy and re-encode produce
-//	byte-identical Matroska container framing; only the payload differs,
-//	so this is a client demuxer bug, fixed client-side in ATV 2025.31.x.
-//	See forums.plex.tv/t/.../933250 and Varashi/scaleplex#122.
+//	The tvOS player demuxes a COPY / Direct-Stream of mkv-in-HLS fine, but
+//	rejects an *encoder-produced* (re-encode) one → infinite buffer.
+//	Confirmed byte-level: copy and re-encode produce byte-identical
+//	Matroska framing; only the payload differs — a client demuxer bug,
+//	fixed client-side in ATV 2025.31.x. See scaleplex#122.
 //
-// The fix must change PMS's container DECISION — the worker can't, because
-// PMS builds the served .m3u8 from its own decision (rewriter.go:3157).
-// And it must NOT disturb the working copy path. So clientfix is
-// content-aware:
+// The fix must change PMS's container DECISION (the worker can't — PMS
+// builds the served .m3u8 from its own decision), without disturbing the
+// working copy path. So for the matched 8.45 decision request clientfix:
 //
-//  1. Forward the client's decision request to PMS UNCHANGED (mkv).
-//  2. If PMS decided the video stream = COPY (Direct Stream) → return it
-//     verbatim. The mkv copy plays; nothing changes.
-//  3. If PMS decided the video stream = TRANSCODE (re-encode, the broken
-//     case) → re-issue the SAME request with container=mkv→mp4 in the
-//     profile-extra. PMS caches the fMP4 decision under this session, and
-//     the client's later start.m3u8 (which never carries a profile-extra)
-//     replays it → 4K-HEVC fMP4, which tvOS plays. Validated byte-level:
-//     container=mp4 + the real ATV profile yields `ftyp`/fMP4 segments;
-//     the session-keyed re-issue overwrites the cached decision cleanly.
+//  1. Forwards it to PMS UNCHANGED (mkv).
+//  2. video=COPY (Direct Stream) → returns it verbatim (mkv copy plays).
+//  3. video=TRANSCODE (re-encode) → re-issues with container=mkv→mp4. PMS
+//     caches the fMP4 decision under the session GUID; the later
+//     start.m3u8 (no profile-extra) replays it → 4K-HEVC fMP4, tvOS-OK.
 //
-// Fail-open: any parse/re-issue error returns PMS's original response
-// (status quo). The gateway routes ONLY the matched client's decision
-// request here (Exact match on X-Plex-Product + X-Plex-Version); every
-// other request, client, and the whole streaming hot path go straight to
-// PMS and never touch this proxy.
+// Fail-open: parse/re-issue errors return PMS's original response. Every
+// other request — every other client, every other path, all media
+// streaming — is a transparent streaming passthrough.
 package main
 
 import (
@@ -44,20 +40,21 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 )
 
-// main wires up the proxy from env (CLIENTFIX_LISTEN_ADDR,
+// main wires the proxy from env (CLIENTFIX_LISTEN_ADDR,
 // CLIENTFIX_PMS_UPSTREAM, CLIENTFIX_UPSTREAM_TIMEOUT) and serves until
 // killed. /healthz is an unconditional 200 for k8s probes.
 func main() {
 	listen := envOr("CLIENTFIX_LISTEN_ADDR", ":8080")
 	upstreamRaw := os.Getenv("CLIENTFIX_PMS_UPSTREAM")
 	if upstreamRaw == "" {
-		log.Fatal("CLIENTFIX_PMS_UPSTREAM required (e.g. http://plex-test-pms.plex-test.svc:32400)")
+		log.Fatal("CLIENTFIX_PMS_UPSTREAM required (e.g. http://plex.plex.svc:32400)")
 	}
 	upstream, err := url.Parse(upstreamRaw)
 	if err != nil {
@@ -65,12 +62,25 @@ func main() {
 	}
 	timeout := envDur("CLIENTFIX_UPSTREAM_TIMEOUT", 30*time.Second)
 
+	// Streaming transparent passthrough for everything that isn't the
+	// matched decision request. FlushInterval -1 flushes immediately so
+	// Plex's eventsource/notification streams aren't buffered; preserves
+	// the client Host so PMS builds URLs exactly as for a direct hit.
+	rp := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = upstream.Scheme
+			req.URL.Host = upstream.Host
+		},
+		FlushInterval: -1,
+		ErrorLog:      log.Default(),
+	}
+
 	p := &proxy{
 		upstream: upstream,
+		rp:       rp,
+		// Used only for the small, buffered decision two-pass.
 		client: &http.Client{
-			Timeout: timeout,
-			// We terminate + re-issue ourselves; never auto-follow Plex
-			// redirects (would lose headers / the rewrite).
+			Timeout:       timeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
@@ -84,58 +94,61 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("scaleplex-clientfix listening on %s → PMS %s", listen, upstream)
+	log.Printf("scaleplex-clientfix fronting PMS %s, listening on %s", upstream, listen)
 	log.Fatal(srv.ListenAndServe())
 }
 
-// proxy reverse-proxies requests to a single PMS upstream, applying the
-// per-client decision fix where it matches.
+// proxy fronts a single PMS upstream: a streaming reverse proxy for all
+// traffic, plus a buffered two-pass on the matched decision request.
 type proxy struct {
 	upstream *url.URL
+	rp       *httputil.ReverseProxy
 	client   *http.Client
 }
 
-// handle implements the content-aware two-pass: forward unchanged, and
-// only re-issue with the container rewritten when the matched client got
-// a re-encode decision. Everything else is a transparent passthrough.
+// handle routes the matched Apple-TV-8.45 decision request through the
+// content-aware two-pass; everything else streams straight to PMS.
 func (p *proxy) handle(w http.ResponseWriter, r *http.Request) {
+	if isDecision(r.URL.Path) && appleTV845(r.Header) {
+		p.handleDecision(w, r)
+		return
+	}
+	p.rp.ServeHTTP(w, r)
+}
+
+// handleDecision buffers the (small) decision exchange: forward unchanged,
+// and only re-issue with the container rewritten when PMS decided a
+// re-encode. Copy decisions and any error pass the original through.
+func (p *proxy) handleDecision(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 
-	// Pass 1: forward the request to PMS exactly as the client sent it.
 	resp1, b1, err := p.forward(r.Method, r.URL.Path, r.URL.RawQuery, r.Header, r.Host, body)
 	if err != nil {
-		// PMS unreachable — nothing works regardless; surface 502.
 		log.Printf("upstream error on %s: %v", r.URL.Path, err)
 		http.Error(w, "scaleplex-clientfix: upstream error", http.StatusBadGateway)
 		return
 	}
 
-	// Only the Apple-TV-8.45 decision request is a candidate for the fix.
-	// (The gateway already scopes routing here; this predicate keeps
-	// clientfix correct + safe on its own if anything else reaches it.)
-	if isDecision(r.URL.Path) && appleTV845(r.Header) && videoIsTranscode(b1) {
+	if videoIsTranscode(b1) {
 		hdr2 := rewriteContainer(r.Header)
 		q2 := rewriteRawQuery(r.URL.RawQuery)
 		resp2, b2, err := p.forward(r.Method, r.URL.Path, q2, hdr2, r.Host, body)
 		if err == nil {
-			log.Printf("ATV-8.45 re-encode → rewrote container mkv→mp4 (%s, %d→%d B)", r.URL.Path, len(b1), len(b2))
+			log.Printf("ATV-8.45 re-encode → rewrote container mkv→mp4 (%d→%d B)", len(b1), len(b2))
 			writeResponse(w, resp2, b2)
 			return
 		}
 		log.Printf("ATV-8.45 re-issue failed, passing original through: %v", err)
-		// fail-open ↓
-	} else if isDecision(r.URL.Path) && appleTV845(r.Header) {
-		log.Printf("ATV-8.45 decision = copy/direct-stream → passthrough (%s)", r.URL.Path)
+	} else {
+		log.Printf("ATV-8.45 decision = copy/direct-stream → passthrough")
 	}
-
 	writeResponse(w, resp1, b1)
 }
 
-// forward sends one request to PMS and returns the (already-drained)
-// response. Accept-Encoding is stripped so PMS replies uncompressed,
-// making the decision XML trivial to parse; the original client Host is
-// preserved so PMS sees an identical request to a direct call.
+// forward sends one buffered request to PMS and returns the drained
+// response. Accept-Encoding is stripped so PMS replies uncompressed (easy
+// to parse); the client Host is preserved.
 func (p *proxy) forward(method, path, rawQuery string, hdr http.Header, host string, body []byte) (*http.Response, []byte, error) {
 	u := *p.upstream
 	u.Path = path
@@ -168,7 +181,7 @@ func (p *proxy) forward(method, path, rawQuery string, hdr http.Header, host str
 func writeResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
 	for k, vs := range resp.Header {
 		if strings.EqualFold(k, "Content-Length") {
-			continue // recomputed by the writer
+			continue
 		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -183,18 +196,17 @@ func isDecision(path string) bool {
 	return strings.Contains(path, "/transcode/universal/decision")
 }
 
-// appleTV845 is the rule's client matcher. Keep it here (not only at the
-// gateway) so the proxy is self-contained + safe if mis-routed.
+// appleTV845 is the rule's client matcher. Kept here (not only at the
+// network layer) so the proxy is self-contained + safe.
 func appleTV845(h http.Header) bool {
 	return h.Get("X-Plex-Product") == "Plex for Apple TV" &&
 		strings.HasPrefix(h.Get("X-Plex-Version"), "8.45")
 }
 
-// videoIsTranscode reports whether PMS's MDE decision re-encodes the
-// video (decision="transcode" on the selected video stream) vs copies it
-// (Direct Stream remux, decision="copy"). Only re-encodes hit the ATV
-// bug; copies play fine and must be left alone. Parse failure → false
-// (fail-open: leave the request untouched).
+// videoIsTranscode reports whether PMS's MDE decision re-encodes the video
+// (decision="transcode" on the selected video stream) vs copies it (Direct
+// Stream remux, decision="copy"). Only re-encodes hit the ATV bug. Parse
+// failure → false (fail-open: leave the request untouched).
 func videoIsTranscode(xmlBody []byte) bool {
 	var mc struct {
 		Videos []struct {
@@ -233,10 +245,9 @@ func videoIsTranscode(xmlBody []byte) bool {
 	return false
 }
 
-// rewriteContainer returns a copy of the headers with container=mkv→mp4
-// in X-Plex-Client-Profile-Extra. The Apple-TV profile carries exactly
-// one such token (the protocol=hls video add-transcode-target); other
-// occurrences don't appear in this client's profile.
+// rewriteContainer returns a copy of the headers with container=mkv→mp4 in
+// X-Plex-Client-Profile-Extra. The Apple-TV profile carries exactly one
+// such token (the protocol=hls video add-transcode-target).
 func rewriteContainer(h http.Header) http.Header {
 	out := h.Clone()
 	if pe := out.Get("X-Plex-Client-Profile-Extra"); pe != "" {
@@ -246,8 +257,7 @@ func rewriteContainer(h http.Header) http.Header {
 }
 
 // rewriteRawQuery applies the same container rewrite to the query string,
-// in case a client carries the profile-extra (or container) as a query
-// param rather than a header. URL-encoded form is `container%3Dmkv`.
+// in case a client carries it there rather than as a header.
 func rewriteRawQuery(q string) string {
 	q = strings.ReplaceAll(q, "container=mkv", "container=mp4")
 	q = strings.ReplaceAll(q, "container%3Dmkv", "container%3Dmp4")
