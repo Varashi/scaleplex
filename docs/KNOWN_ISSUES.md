@@ -23,20 +23,29 @@ Full matrix, real devices, av1 sources (SDR *and* DoVi — not HDR-specific):
 | hevc 4K — fMP4 via a clean custom `tvOS.xml` (profile-extra fully stripped) | ❌ **crashes the app** (0 segments fetched, crash at decoder/init) |
 | h264 1080p — mpegts (stock `tvOS.xml`) | ✅ plays |
 
-So it is neither the container nor the Enhanced-Player extra — the client
-crashes setting up *any* transcoded-HEVC session.
+**Root cause (client mpv logs, #189) — it's our encode, not a client limit.**
+Plex-for-AppleTV uses an mpv/ffmpeg player (hwdec=videotoolbox). On every 4K
+HEVC attempt:
 
-**Workaround (shipped):** [`clientfix`](CLIENTFIX.md) `CLIENTFIX_DECISION_MODE=strip`
-removes the profile-extra on the 8.45 transcode decision → PMS falls back to
-the stock tvOS profile → **h264 1080p** (5.1 audio copy, 20 Mbps). Strictly
-better than the total failure; the 1080p cap is the client's, not ours. 4K is
-only reachable by copy/Direct-Play of a device-decodable (non-av1) source.
+```
+[ffmpeg/demuxer] error: mov,mp4: invalid size 0 in stsd / error reading header
+[ffmpeg/demuxer] warn:  hls: ... (Video: hevc (Rext), none, 3840x2160): unspecified pixel format
+→ app crash ~4s later
+```
 
-**Path to a real fix:** a Plex-for-ATV client update (the #122 mkv bug was
-fixed in a later ATV build) and/or the client crash log (tvOS Analytics Data /
-Xcode device logs / Plex Sentry) filed with Plex. Worker SW→HW av1 decode
-(scaleplex#185) cuts fleet load but does **not** unlock 4K here. Status as of
-2026-06-06: awaiting Dennis's client crash log.
+The worker emits **HEVC Range-Extensions (Rext) with unspecified pixel format**
+plus a **malformed fMP4 `hvcC`/`stsd` (size 0)**. A 4:2:0 10-bit source must be
+**Main10**; Apple VideoToolbox decodes only Main/Main10, so the Rext stream is
+undecodable → mpv hwdec crashes. ATV 8.45 **can** play HEVC Main10 — so 4K is
+achievable once the encode/mux is fixed (force `hevc_vaapi -profile:v main10`
++ a complete `hvcC`). Tracked in **#189**.
+
+**Interim workaround (shipped):** [`clientfix`](CLIENTFIX.md)
+`CLIENTFIX_DECISION_MODE=strip` removes the profile-extra on the 8.45 transcode
+decision → PMS falls back to the stock tvOS profile → **h264 1080p** (5.1 audio
+copy, 20 Mbps). Once #189 lands, a custom tvOS hevc-4K-fMP4 profile + strip
+restores full 4K and this workaround can be retired. (Worker SW→HW av1 decode,
+#185, is a separate fleet-load item.)
 
 ## Burned PGS cue stayed on screen until next cue — RESOLVED in v1.6.1
 
