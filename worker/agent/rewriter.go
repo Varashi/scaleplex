@@ -1420,6 +1420,50 @@ func removeArgs(s []string, at, n int) []string {
 	return out
 }
 
+// ensureHEVCMain10 pins `-profile:N main10` on a 10-bit hevc_vaapi encode.
+// Plex's argv never sets a HEVC profile, and VAAPI's hevc encoder defaults
+// to HEVC Range-Extensions (Rext) for p010 input — a profile/pixfmt Apple
+// VideoToolbox (Plex-for-Apple-TV's mpv hwdec) cannot decode, so the client
+// crashes on 4K HDR with `hevc (Rext), unspecified pixel format`. Forcing
+// main10 yields a stream tvOS plays. Only 10-bit hevc_vaapi is touched:
+// 8-bit (nv12 → encoder default `main`) and h264 are left alone, and an
+// existing `-profile` (Plex or a prior pass) is never overwritten.
+// See scaleplex#189.
+func ensureHEVCMain10(args, changes []string) ([]string, []string) {
+	inputIdx := indexOfArg(args, "-i", 0)
+	if inputIdx < 0 {
+		return args, changes
+	}
+	enc := streamSpecIndex(args, "-codec", 0, inputIdx+1) // encoder slot (after -i)
+	if enc < 0 || enc+1 >= len(args) || args[enc+1] != "hevc_vaapi" {
+		return args, changes
+	}
+	if !tenBitOutput(args) {
+		return args, changes
+	}
+	// "-codec:0" → "-profile:0"; keep the same stream-spec suffix.
+	profileFlag := "-profile" + strings.TrimPrefix(args[enc], "-codec")
+	if indexOfArg(args, profileFlag, 0) >= 0 || indexOfArg(args, "-profile:v", 0) >= 0 {
+		return args, changes // already set — don't override
+	}
+	args = spliceArgs(args, enc+2, profileFlag, "main10")
+	changes = append(changes, TagEncodeHEVCMain10)
+	return args, changes
+}
+
+// tenBitOutput reports whether the VAAPI filter chain targets 10-bit. The
+// reshaped/HW-decode graphs declare `format=p010` for 10-bit (and `nv12`
+// for 8-bit), so a p010 token anywhere in the args means the encoder is fed
+// 10-bit and needs the main10 profile.
+func tenBitOutput(args []string) bool {
+	for _, a := range args {
+		if strings.Contains(a, "p010") {
+			return true
+		}
+	}
+	return false
+}
+
 // stripInlineassDecodeSink removes Plex's subtitle decode-sink output —
 // the trailing `-map <spec> -f null -codec ass|dvdsub nullfile` (7 tokens).
 // Plex emits it only to force the subtitle stream to decode so its private
@@ -2779,6 +2823,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 			args[encCodecIdx+1] = hwEncoder
 			changes = append(changes, TagPrefixEncode+swEncoder+"->"+hwEncoder)
+			args, changes = ensureHEVCMain10(args, changes)
 		} else if honorHybrid {
 			// HW decode + SW encode (per-axis honor, docs/HW_PROFILE.md). PMS
 			// emitted `-hwaccel:0 vaapi` decode + a libx264/libx265 encode (its
@@ -2809,6 +2854,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				return bail(TagPrefixBailUnexpectedEncoder + swEncoder)
 			}
 			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
+			args, changes = ensureHEVCMain10(args, changes)
 
 			// HDR-source already detected + emitted at the session level
 			// (hoisted above the branch split); `sourceIsHDR` flows through

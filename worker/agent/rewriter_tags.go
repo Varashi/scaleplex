@@ -129,6 +129,7 @@ const (
 	TagPrefixDrop                        = "drop:"                                                // <arg> or <arg>(bail)
 	TagPrefixEncode                      = "encode:"                                              // <swEncoder>-><hwEncoder>
 	TagPrefixEncodeHWPassthrough         = "encode:hw-passthrough:"                               // <swEncoder>
+	TagEncodeHEVCMain10                  = "encode:hevc:profile=main10"                           // pin Main10 on 10-bit hevc_vaapi (scaleplex#189)
 	TagPrefixEnvStrip                    = "env:strip:"                                           // <env-var-name>
 	TagPrefixFilter                      = "filter:"                                              // <mode>  (composeMode → bitmap-inlineass-vaapi | text-inlineass-vaapi | hdr-tonemap-vaapi | plain)
 	TagPrefixForceHWReshapeHybrid        = "force-hw:reshape-hybrid:"                             // <swDecoder>
