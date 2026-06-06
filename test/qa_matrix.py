@@ -150,7 +150,10 @@ except FileNotFoundError:
 SERVER_AXES = {
     "HardwareAcceleratedCodecs": [1, 0],     # HW decode
     "HardwareAcceleratedEncoders": [1, 0],   # HW encode
-    "TranscoderHEVCEncodingMode": ["hevc-sources", "never"],  # HEVC out
+    "TranscoderHEVCEncodingMode": ["always", "never"],  # HEVC out: "always"
+    # forces HEVC even from the av1 corpus (HEVC-capable client profiles), so the
+    # matrix actually exercises the hevc_vaapi encode + the Main10 pin (#189/#193);
+    # "hevc-sources" was useless here (preserve-HEVC-only → av1 always fell to h264).
 }
 
 # ---------------------------------------------------------------------------
@@ -182,13 +185,15 @@ def prefs_applied(prefs, tries=6):
     we don't pay it as a phantom NODISPATCH). Returns False on timeout; caller
     proceeds anyway (best-effort warm, not a gate).
 
-    Only the HardwareAccelerated* bools are checked — they read back verbatim
-    and gate the spawn-relevant HW path. Skipped: the text enum
-    TranscoderHEVCEncodingMode (PMS normalizes "hevc-sources" → "always"),
-    which would otherwise never confirm and spam warnings. (TranscoderToneMapping
+    Checked: the HardwareAccelerated* bools AND TranscoderHEVCEncodingMode —
+    all read back verbatim now ("always"/"never" are PMS-canonical, unlike the
+    old "hevc-sources" which normalized to "always" and never confirmed).
+    Confirming the HEVC mode matters: the "always" cells must have it applied or
+    they'd silently fall to h264 and skip the hevc/Main10 path. (TranscoderToneMapping
     is no longer iterated — #160 dropped it as a degenerate axis.)"""
     checkable = {k: v for k, v in prefs.items()
-                 if k.startswith("HardwareAccelerated") and str(v) in ("0", "1")}
+                 if (k.startswith("HardwareAccelerated") and str(v) in ("0", "1"))
+                 or k == "TranscoderHEVCEncodingMode"}
     for _ in range(tries):
         code, body = plex("/:/prefs")
         if code == 200 and all(
