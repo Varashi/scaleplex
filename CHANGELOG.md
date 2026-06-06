@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.13.0](https://github.com/Varashi/scaleplex/compare/v1.12.0...v1.13.0) (2026-06-06)
+
+
+### Features
+
+* **clientfix:** base-profile strip mode for ATV-8.45 (default) ([#186](https://github.com/Varashi/scaleplex/issues/186)) ([8e620a4](https://github.com/Varashi/scaleplex/commit/8e620a407a8feac96cd0ec05ed2356da59537e7d))
+* **clientfix:** content-aware decision proxy for per-client Plex bugs ([#179](https://github.com/Varashi/scaleplex/issues/179)) ([199af77](https://github.com/Varashi/scaleplex/commit/199af77bc24147ce1e66970f96ef3c0c106727eb))
+* **clientfix:** parametrize container-rewrite (add mpegts mode) ([#187](https://github.com/Varashi/scaleplex/issues/187)) ([7fe2b83](https://github.com/Varashi/scaleplex/commit/7fe2b836f720dae9b7ff6678a01ec438a806b62c))
+* **clientfix:** stream-front PMS (catch plex.direct, not just gateway) ([#182](https://github.com/Varashi/scaleplex/issues/182)) ([d9d73f6](https://github.com/Varashi/scaleplex/commit/d9d73f60b12c13c6bbe194077870538fd5342176))
+* **dockermod:** bundle clientfix as an in-pod s6 longrun ([#183](https://github.com/Varashi/scaleplex/issues/183)) ([ccccc30](https://github.com/Varashi/scaleplex/commit/ccccc30ef868e3bde6052b27a32255f8cd40ca16))
+
+
+### Fixes
+
+* **rewriter:** HEVC Main10 pin for all HW backends, not just VAAPI ([#189](https://github.com/Varashi/scaleplex/issues/189)) ([#192](https://github.com/Varashi/scaleplex/issues/192)) ([308cfe2](https://github.com/Varashi/scaleplex/commit/308cfe2c64126b03053f3797bd5efb9198d8e605))
+* **rewriter:** pin HEVC Main10 profile on 10-bit hevc_vaapi ([#189](https://github.com/Varashi/scaleplex/issues/189)) ([#191](https://github.com/Varashi/scaleplex/issues/191)) ([5d8cf64](https://github.com/Varashi/scaleplex/commit/5d8cf64c12227ad2ccc6317f0b8047c4f4b29d32))
+
 ## [1.12.0](https://github.com/Varashi/scaleplex/compare/v1.11.1...v1.12.0) (2026-06-04)
 
 
