@@ -43,6 +43,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -61,6 +62,12 @@ func main() {
 		log.Fatalf("invalid CLIENTFIX_PMS_UPSTREAM %q: %v", upstreamRaw, err)
 	}
 	timeout := envDur("CLIENTFIX_UPSTREAM_TIMEOUT", 30*time.Second)
+	// Decision mode for the matched ATV-8.45 re-encode:
+	//   "strip" (default) — remove X-Plex-Client-Profile-Extra entirely so
+	//     PMS falls back to the base tvOS profile (h264 1080p). Use when the
+	//     Enhanced Player's hevc/4K/mkv target is unplayable (av1 sources).
+	//   "mp4" — only flip container=mkv->mp4, keeping hevc/4K (legacy #122).
+	mode := envOr("CLIENTFIX_DECISION_MODE", "strip")
 
 	// Streaming transparent passthrough for everything that isn't the
 	// matched decision request. FlushInterval -1 flushes immediately so
@@ -78,6 +85,7 @@ func main() {
 	p := &proxy{
 		upstream: upstream,
 		rp:       rp,
+		mode:     mode,
 		// Used only for the small, buffered decision two-pass.
 		client: &http.Client{
 			Timeout:       timeout,
@@ -94,7 +102,7 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("scaleplex-clientfix fronting PMS %s, listening on %s", upstream, listen)
+	log.Printf("scaleplex-clientfix fronting PMS %s, listening on %s (decision mode=%s)", upstream, listen, mode)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -104,6 +112,7 @@ type proxy struct {
 	upstream *url.URL
 	rp       *httputil.ReverseProxy
 	client   *http.Client
+	mode     string // "strip" (default) | "mp4"
 }
 
 // handle routes the matched Apple-TV-8.45 decision request through the
@@ -131,11 +140,16 @@ func (p *proxy) handleDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if videoIsTranscode(b1) {
-		hdr2 := rewriteContainer(r.Header)
-		q2 := rewriteRawQuery(r.URL.RawQuery)
+		var hdr2 http.Header
+		var q2, action string
+		if p.mode == "mp4" {
+			hdr2, q2, action = rewriteContainer(r.Header), rewriteRawQuery(r.URL.RawQuery), "rewrote container mkv→mp4"
+		} else {
+			hdr2, q2, action = stripProfileExtraHeader(r.Header), stripProfileExtraQuery(r.URL.RawQuery), "stripped Client-Profile-Extra → base profile"
+		}
 		resp2, b2, err := p.forward(r.Method, r.URL.Path, q2, hdr2, r.Host, body)
 		if err == nil {
-			log.Printf("ATV-8.45 re-encode → rewrote container mkv→mp4 (%d→%d B)", len(b1), len(b2))
+			log.Printf("ATV-8.45 re-encode → %s (%d→%d B)", action, len(b1), len(b2))
 			writeResponse(w, resp2, b2)
 			return
 		}
@@ -254,6 +268,28 @@ func rewriteContainer(h http.Header) http.Header {
 		out.Set("X-Plex-Client-Profile-Extra", strings.ReplaceAll(pe, "container=mkv", "container=mp4"))
 	}
 	return out
+}
+
+// stripProfileExtraHeader returns a copy of the headers with the
+// X-Plex-Client-Profile-Extra header removed, so PMS falls back to the
+// client's base device profile (tvOS.xml → h264 1080p) instead of the 8.45
+// Enhanced Player's hevc/4K/mkv add-transcode-target.
+func stripProfileExtraHeader(h http.Header) http.Header {
+	out := h.Clone()
+	out.Del("X-Plex-Client-Profile-Extra")
+	return out
+}
+
+// profileExtraQueryRe matches the X-Plex-Client-Profile-Extra query param.
+// Its value is URL-encoded, so it never contains a raw '&'.
+var profileExtraQueryRe = regexp.MustCompile(`(^|&)X-Plex-Client-Profile-Extra=[^&]*`)
+
+// stripProfileExtraQuery removes the X-Plex-Client-Profile-Extra param from
+// the raw query, leaving every other param byte-identical. Plex carries the
+// profile-extra in the query as well as the header — a gateway filter can
+// only touch the header, which is why the strip must live in this L7 proxy.
+func stripProfileExtraQuery(q string) string {
+	return strings.TrimPrefix(profileExtraQueryRe.ReplaceAllString(q, ""), "&")
 }
 
 // rewriteRawQuery applies the same container rewrite to the query string,
