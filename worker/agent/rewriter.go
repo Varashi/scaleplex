@@ -1420,22 +1420,24 @@ func removeArgs(s []string, at, n int) []string {
 	return out
 }
 
-// ensureHEVCMain10 pins `-profile:N main10` on a 10-bit hevc_vaapi encode.
-// Plex's argv never sets a HEVC profile, and VAAPI's hevc encoder defaults
-// to HEVC Range-Extensions (Rext) for p010 input — a profile/pixfmt Apple
-// VideoToolbox (Plex-for-Apple-TV's mpv hwdec) cannot decode, so the client
-// crashes on 4K HDR with `hevc (Rext), unspecified pixel format`. Forcing
-// main10 yields a stream tvOS plays. Only 10-bit hevc_vaapi is touched:
-// 8-bit (nv12 → encoder default `main`) and h264 are left alone, and an
-// existing `-profile` (Plex or a prior pass) is never overwritten.
-// See scaleplex#189.
+// ensureHEVCMain10 pins `-profile:N main10` on a 10-bit HW HEVC encode.
+// Plex's argv never sets a HEVC profile, and a HW HEVC encoder fed p010 may
+// default to HEVC Range-Extensions (Rext) rather than Main10 (confirmed on
+// VAAPI/iHD) — a profile/pixfmt Apple VideoToolbox (Plex-for-Apple-TV's mpv
+// hwdec) cannot decode, so the client crashes on 4K HDR with `hevc (Rext),
+// unspecified pixel format`. Forcing main10 yields a stream tvOS plays.
+// Backend-agnostic: matches any HW hevc encoder via hwEncoderCodec —
+// hevc_vaapi (Intel iHD + AMD radeonsi) and hevc_nvenc (NVIDIA); `-profile
+// main10` is valid for both. Only 10-bit (p010) is touched: 8-bit (nv12 →
+// encoder default `main`) and h264 are left alone, and an existing
+// `-profile` (Plex or a prior pass) is never overwritten. See scaleplex#189.
 func ensureHEVCMain10(args, changes []string) ([]string, []string) {
 	inputIdx := indexOfArg(args, "-i", 0)
 	if inputIdx < 0 {
 		return args, changes
 	}
 	enc := streamSpecIndex(args, "-codec", 0, inputIdx+1) // encoder slot (after -i)
-	if enc < 0 || enc+1 >= len(args) || args[enc+1] != "hevc_vaapi" {
+	if enc < 0 || enc+1 >= len(args) || hwEncoderCodec[args[enc+1]] != "hevc" {
 		return args, changes
 	}
 	if !tenBitOutput(args) {
@@ -1451,10 +1453,10 @@ func ensureHEVCMain10(args, changes []string) ([]string, []string) {
 	return args, changes
 }
 
-// tenBitOutput reports whether the VAAPI filter chain targets 10-bit. The
-// reshaped/HW-decode graphs declare `format=p010` for 10-bit (and `nv12`
-// for 8-bit), so a p010 token anywhere in the args means the encoder is fed
-// 10-bit and needs the main10 profile.
+// tenBitOutput reports whether the HW filter chain targets 10-bit. Both
+// backends declare `format=p010` for 10-bit (scale_vaapi and scale_cuda) and
+// `nv12` for 8-bit, so a p010 token anywhere in the args means the encoder is
+// fed 10-bit and needs the main10 profile.
 func tenBitOutput(args []string) bool {
 	for _, a := range args {
 		if strings.Contains(a, "p010") {
