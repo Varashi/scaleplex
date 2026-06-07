@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.14.0](https://github.com/Varashi/scaleplex/compare/v1.13.0...v1.14.0) (2026-06-07)
+
+
+### Features
+
+* **clientfix:** SNI-aware TLS front — fix PMS remote-access flapping ([0e6edae](https://github.com/Varashi/scaleplex/commit/0e6edae223b318853b5f04c4a14cb7ea3405f000))
+* **clientfix:** SNI-aware TLS front (passthrough plex.direct, terminate own domain) ([6717750](https://github.com/Varashi/scaleplex/commit/6717750b34e619814ead173fe997aede27f2d5c8))
+* **dockermod:** thread clientfix TLS-SNI env into the in-pod longrun ([b46ded0](https://github.com/Varashi/scaleplex/commit/b46ded0fcc9bb8356f83fb40e485769372442b1e))
+
 ## [1.13.0](https://github.com/Varashi/scaleplex/compare/v1.12.0...v1.13.0) (2026-06-06)
 
 
