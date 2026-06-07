@@ -7,9 +7,9 @@ See also: [`TEST_MATRIX.md`](TEST_MATRIX.md) for cells flagged
 `[KNOWN: <slug>]` — those cross-reference back here so a known-broken
 shape isn't re-validated each release.
 
-## Plex for Apple TV 8.45 · transcoded HEVC crashed (HEVC Rext) — RESOLVED in worker v1.13.0
+## Plex for Apple TV 8.45 · cannot play TRANSCODED HEVC (any container) — h264 workaround
 
-**Resolved (worker v1.13.0, #189):** the worker was emitting HEVC **Rext** on 10-bit HW encodes (no `-profile` → VAAPI default); `ensureHEVCMain10` now forces `-profile main10` (all HW backends), which Apple VideoToolbox decodes. The history below is the diagnosis.
+**Status (2026-06-07):** ATV-8.45 **cannot play a transcoded HEVC stream at all** — real-device tested mkv / mp4 / fMP4 / mpegts × Rext × **Main10** × 4K × 1080p (Dennis, Tim), every one fails; only **h264** plays. A hard client limit. (The HEVC **Rext** encoder bug found en route was real + is fixed in worker v1.13.0, #189 — correct + helps non-ATV hevc clients — but it does NOT unlock ATV.) Worked around: clientfix `strip` → h264 1080p. The narrative below is the diagnosis trail.
 
 Pre-v1.13.0, ATV 8.45 (tvOS 26.5/26.6) could not play a **transcoded HEVC** stream. Its
 "Enhanced Player" forces HLS transcodes into `container=mkv` (via an
@@ -38,17 +38,22 @@ HEVC attempt:
 The worker emits **HEVC Range-Extensions (Rext) with unspecified pixel format**
 plus a **malformed fMP4 `hvcC`/`stsd` (size 0)**. A 4:2:0 10-bit source must be
 **Main10**; Apple VideoToolbox decodes only Main/Main10, so the Rext stream is
-undecodable → mpv hwdec crashes. ATV 8.45 **can** play HEVC Main10. **Fixed in
-worker v1.13.0 (#189):** `ensureHEVCMain10` forces `-profile main10` on 10-bit
-HW HEVC encodes (hevc_vaapi Intel+AMD, hevc_nvenc) — validated plex-test
-(ffprobe `Main 10`) + qa_matrix 60/60 + live Android 4K HEVC. qa_matrix now
-guards it (#193/#195).
+undecodable → mpv hwdec crashes. The Rext encoder bug is FIXED in worker
+v1.13.0 (#189): `ensureHEVCMain10` forces `-profile main10` on 10-bit HW HEVC
+(hevc_vaapi Intel+AMD, hevc_nvenc) — validated plex-test (ffprobe `Main 10`) +
+qa_matrix 60/60 + live Android 4K HEVC; guarded by qa_matrix (#193/#195).
 
-**Interim workaround (now superseded by v1.13.0):** [`clientfix`](CLIENTFIX.md)
-`CLIENTFIX_DECISION_MODE=strip` forced **h264 1080p** to dodge the crash. With
-v1.13.0 shipped, clientfix is **bypassed** in prod (ATV gets native HEVC Main10);
-pending a real-ATV confirm → full teardown. (Worker SW→HW av1 decode, #185, is a
-separate fleet-load item.)
+**But that did NOT unlock ATV (real-device, 2026-06-07):** with Main10 served,
+Dennis (mkv-Main10, 01:00) and Tim (mp4/fMP4-Main10, 13:0x) both still failed.
+So ATV-8.45 cannot play a transcoded HEVC stream in ANY container/profile — a
+hard client limit, separate from the (now-fixed) Rext bug.
+
+**Workaround (shipped, permanent for this client):** [`clientfix`](CLIENTFIX.md)
+`CLIENTFIX_DECISION_MODE=strip` drops the profile-extra → PMS base tvOS profile
+→ **h264 1080p** (5.1 audio copy) — the only working transcode codec on ATV-8.45.
+clientfix is live in strip mode and **NOT retirable** (the Main10 worker fix
+doesn't unlock ATV). 4K on ATV only via copy/Direct-Play of a device-decodable
+(non-av1) source. (Worker SW→HW av1 decode, #185, is a separate fleet-load item.)
 
 ## Burned PGS cue stayed on screen until next cue — RESOLVED in v1.6.1
 
