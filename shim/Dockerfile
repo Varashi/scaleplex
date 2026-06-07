@@ -109,9 +109,19 @@ RUN echo longrun > /mod/etc/s6-overlay/s6-rc.d/scaleplex-relay/type && \
 # targets it. Env-overridable (CLIENTFIX_LISTEN_ADDR / CLIENTFIX_PMS_UPSTREAM).
 RUN cat > /mod/etc/s6-overlay/s6-rc.d/scaleplex-clientfix/run <<'EOF'
 #!/command/with-contenv bash
+# CLIENTFIX_TLS_CERT/KEY (empty default = off) enable the SNI-aware TLS
+# front: terminate our own *.boeye.net cert for the decision rewrite over
+# HTTPS, and pass plex.direct TLS straight through to PMS so its
+# reachability probe + plex.direct clients ride PMS's real cert (no
+# "remote access" flapping). Passthrough target defaults to loopback PMS.
 exec s6-setuidgid abc env \
   CLIENTFIX_LISTEN_ADDR="${CLIENTFIX_LISTEN_ADDR:-:32401}" \
   CLIENTFIX_PMS_UPSTREAM="${CLIENTFIX_PMS_UPSTREAM:-http://127.0.0.1:32400}" \
+  CLIENTFIX_DECISION_MODE="${CLIENTFIX_DECISION_MODE:-strip}" \
+  CLIENTFIX_TLS_CERT="${CLIENTFIX_TLS_CERT:-}" \
+  CLIENTFIX_TLS_KEY="${CLIENTFIX_TLS_KEY:-}" \
+  CLIENTFIX_TLS_SNI_SUFFIX="${CLIENTFIX_TLS_SNI_SUFFIX:-.boeye.net}" \
+  CLIENTFIX_PMS_PASSTHROUGH_ADDR="${CLIENTFIX_PMS_PASSTHROUGH_ADDR:-127.0.0.1:32400}" \
   /usr/local/bin/scaleplex-clientfix
 EOF
 RUN echo longrun > /mod/etc/s6-overlay/s6-rc.d/scaleplex-clientfix/type && \
