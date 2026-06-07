@@ -7,6 +7,27 @@ See also: [`TEST_MATRIX.md`](TEST_MATRIX.md) for cells flagged
 `[KNOWN: <slug>]` — those cross-reference back here so a known-broken
 shape isn't re-validated each release.
 
+## PMS "remote access down/up" flapping with clientfix on the LB — RESOLVED
+
+**Status (2026-06-07):** RESOLVED via the [clientfix TLS-SNI front](CLIENTFIX.md#tls-sni-front-the-lb-path).
+
+When clientfix fronts the LB/port-forward, it sits on the path that carries
+**raw TLS** — `plex.direct` is HTTPS, and so is Plex's remote-access
+**reachability probe**. clientfix was plaintext-HTTP only, so the HTTPS probe
+hit an HTTP listener and failed → PMS cycled `Mapped - Not Published (Not
+Reachable)` and emitted "remote access down/up" (every ~2/day, more on pod
+rolls). Playback still worked because media clients fall back to HTTP under
+`secureConnections=Preferred`; only the always-HTTPS probe failed. Confirmed
+by test: `curl https://<lb>:8080/identity` → `000`, `http` → `200`, and
+`https` straight to the PMS pod → `200`.
+
+**Fix:** clientfix peeks the TLS `ClientHello` and routes by SNI —
+`*.plex.direct` (and the probe) pass **straight through** to PMS so it answers
+on its own real cert (reachable, no flap); our custom domain (`*.boeye.net`)
+is **terminated with our own cert-manager wildcard** so the decision rewrite
+still works over HTTPS. No Plex-cert extraction; Remote Access stays on.
+Enabled with `CLIENTFIX_TLS_CERT`/`KEY` (see CLIENTFIX.md).
+
 ## Plex for Apple TV 8.45 · cannot play TRANSCODED HEVC (any container) — h264 workaround
 
 **Status (2026-06-07):** ATV-8.45 **cannot play a transcoded HEVC stream at all** — real-device tested mkv / mp4 / fMP4 / mpegts × Rext × **Main10** × 4K × 1080p (Dennis, Tim), every one fails; only **h264** plays. A hard client limit. (The HEVC **Rext** encoder bug found en route was real + is fixed in worker v1.13.0, #189 — correct + helps non-ATV hevc clients — but it does NOT unlock ATV.) Worked around: clientfix `strip` → h264 1080p. The narrative below is the diagnosis trail.

@@ -264,7 +264,9 @@ Three things added to the cluster:
    a headless Service and routes each task to the least-loaded one.
 3. **PMS DOCKER_MOD** — on your existing PMS container, point
    `DOCKER_MODS` at `scaleplex_pms_dockermod`. The mod lays down the
-   shim as `Plex Transcoder` and runs the relay sidecar:
+   shim as `Plex Transcoder`, runs the relay sidecar, and bundles the
+   optional [clientfix](docs/CLIENTFIX.md) longrun (idle unless you
+   target it — see [clientfix below](#clientfix--optional-network-dependent)):
 
    ```yaml
    env:
@@ -314,6 +316,38 @@ shape, headless discovery Service, PERFMON cap) is the planned
 distribution artifact; a dedicated first-party chart is a possible
 follow-up if the reference proves clumsy. The `charts/scaleplex/`
 directory is a placeholder.
+
+### clientfix — optional, network-dependent
+
+[`clientfix`](docs/CLIENTFIX.md) is a **fourth, optional** component. It fixes
+bugs in a *client's* HTTP capability negotiation (today only Plex for Apple TV
+8.45) by reshaping the PMS transcode **decision** — the worker can't, since PMS
+builds the playlist before any worker is involved. **If you don't have an
+affected client, don't deploy it** — it changes nothing for the transcode path.
+
+It ships **two ways** (both inert by default):
+
+- **In-pod (bundled in the dockermod)** — already in `scaleplex_pms_dockermod`
+  as an s6 longrun, **idle unless** you point the PMS Service/LB at its port
+  (`CLIENTFIX_LISTEN_ADDR`, default `:32401`). PMS then sees loopback →
+  honours `X-Forwarded-For`.
+- **Standalone Deployment** — `scaleplex_clientfix` fronting the LoadBalancer
+  (`LB → clientfix → PMS`). Bumping it never rolls the PMS pod.
+
+**Whether you need the TLS-SNI front depends on your ingress topology.**
+clientfix is plaintext HTTP:
+
+- **Behind a TLS-terminating gateway/reverse-proxy** (Envoy/Caddy/Traefik →
+  plaintext to clientfix): nothing extra — leave `CLIENTFIX_TLS_*` unset.
+- **Directly on a raw-TLS ingress** (the LB / `plex.direct` port-forward, which
+  also carries Plex's HTTPS **reachability probe**): set
+  `CLIENTFIX_TLS_CERT`/`KEY` to your own cert for a domain you control. clientfix
+  then passes `plex.direct` TLS straight through to PMS (probe stays reachable —
+  otherwise PMS flaps "remote access down") and terminates your custom domain
+  for the decision rewrite. See [`docs/CLIENTFIX.md`](docs/CLIENTFIX.md#tls-sni-front-the-lb-path).
+
+**Rollback** — point the Service/LB back at PMS (`:32400`) / drop the standalone
+Deployment. No PMS change.
 
 ### Deploy — Docker / docker-compose
 

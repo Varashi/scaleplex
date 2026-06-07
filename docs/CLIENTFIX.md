@@ -15,9 +15,12 @@ clientfix must front **every** ingress path a client can reach PMS by, because
 which one a given client picks is not under our control:
 
 - **LoadBalancer** (`plex-plex-lb` → clientfix → PMS): catches `plex.direct`
-  remote clients (WAN port-forward → LB) and LAN clients.
-- **Gateway** (`HTTPRoute /video/:/transcode/universal/decision` → clientfix):
-  catches clients on the custom access URL (`plex.boeye.net`).
+  remote clients (WAN port-forward → LB) and LAN clients. This path carries
+  **raw TLS** (plex.direct is HTTPS, as is Plex's reachability probe) — see
+  [TLS-SNI front](#tls-sni-front-the-lb-path) for how clientfix handles it.
+- **Gateway** (`HTTPRoute … → clientfix`): catches clients on the custom access
+  URL (`plex.boeye.net`). Here **Envoy terminates TLS** and forwards plaintext
+  HTTP to clientfix, so the SNI front below is not involved on this path.
 
 A gateway `RequestHeaderModifier` is **not** sufficient on its own: Plex sends
 the profile-extra in the URL **query** as well as the header, and a gateway
@@ -52,6 +55,44 @@ PMS caches the (re-issued) decision under the session GUID; the later
 | `CLIENTFIX_PMS_UPSTREAM` | — (required) | `http://plex.plex.svc:32400` |
 | `CLIENTFIX_DECISION_MODE` | `strip` | `strip` \| container name (`mp4`,`mpegts`) |
 | `CLIENTFIX_UPSTREAM_TIMEOUT` | `30s` | two-pass client timeout |
+| `CLIENTFIX_TLS_CERT` / `CLIENTFIX_TLS_KEY` | — (off) | enable the SNI front; PEM cert+key for our custom domain (e.g. cert-manager `*.boeye.net`) |
+| `CLIENTFIX_TLS_SNI_SUFFIX` | `.boeye.net` | SNI suffix to terminate; any other TLS SNI is passed through |
+| `CLIENTFIX_PMS_PASSTHROUGH_ADDR` | `CLIENTFIX_PMS_UPSTREAM` host | TCP target PMS serves TLS on (passthrough dial) |
+| `CLIENTFIX_TLS_RELOAD` | `1h` | cert hot-reload interval (picks up cert-manager renewals) |
+
+## TLS-SNI front (the LB path)
+
+clientfix is a plaintext-HTTP server, but on the LB / port-forward it sits on
+the path that carries **raw TLS**: `plex.direct` remote clients connect over
+HTTPS, and Plex's **remote-access reachability probe** is HTTPS too. A plain
+HTTP listener can't answer that TLS, so the probe fails and PMS flaps
+"remote access down/up" — even while playback works (clients fall back to HTTP
+under `secureConnections=Preferred`).
+
+We can't terminate `plex.direct`'s own cert (it's Plex's, rotating, on the
+RWO `/config`). Instead, when `CLIENTFIX_TLS_CERT`/`KEY` are set, clientfix
+peeks the TLS `ClientHello` and routes by **SNI**:
+
+| SNI | action |
+|---|---|
+| ends with `CLIENTFIX_TLS_SNI_SUFFIX` (our custom domain, e.g. `plex-svc.boeye.net`) | **terminate** with our own cert → run the HTTP handler (decision rewrite over HTTPS) |
+| `*.plex.direct` / no SNI / anything else | **raw TCP passthrough** to PMS (`CLIENTFIX_PMS_PASSTHROUGH_ADDR`); PMS answers with its own real `plex.direct` cert |
+| not TLS (plaintext) | HTTP handler, as before (e.g. behind the gateway) |
+
+So the **reachability probe + plex.direct clients ride PMS's real cert** (no
+flapping, no Plex-cert extraction, Remote Access stays on), while clients that
+reach us on **our** custom domain get the decision rewrite over HTTPS. The cert
+is hot-reloaded (`CLIENTFIX_TLS_RELOAD`) so cert-manager renewals need no
+restart. Terminated TLS forces HTTP/1.1 (ALPN `http/1.1`); passthrough is
+transparent so plex.direct h2 is unaffected. Unset `CLIENTFIX_TLS_CERT` →
+original plain-HTTP listener (the gateway/Envoy path, where Envoy already
+terminates TLS).
+
+> The matched-client decision rewrite only applies on the **terminated** path
+> (our domain) and the plaintext/gateway path. A client that connects via
+> `plex.direct` is passed straight through to PMS (native decision) — the rewrite
+> targets such clients via the custom URL. For ATV-8.45 that's acceptable: it's
+> a hard client limit regardless (see the case study).
 
 ## Case study: Plex for Apple TV 8.45 (the only rule today)
 
