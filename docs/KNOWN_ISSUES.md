@@ -7,9 +7,11 @@ See also: [`TEST_MATRIX.md`](TEST_MATRIX.md) for cells flagged
 `[KNOWN: <slug>]` — those cross-reference back here so a known-broken
 shape isn't re-validated each release.
 
-## Plex for Apple TV 8.45 · transcoded HEVC crashes the app — client bug, worked around
+## Plex for Apple TV 8.45 · transcoded HEVC crashed (HEVC Rext) — RESOLVED in worker v1.13.0
 
-ATV 8.45 (tvOS 26.5/26.6) cannot play a **transcoded HEVC** stream. Its
+**Resolved (worker v1.13.0, #189):** the worker was emitting HEVC **Rext** on 10-bit HW encodes (no `-profile` → VAAPI default); `ensureHEVCMain10` now forces `-profile main10` (all HW backends), which Apple VideoToolbox decodes. The history below is the diagnosis.
+
+Pre-v1.13.0, ATV 8.45 (tvOS 26.5/26.6) could not play a **transcoded HEVC** stream. Its
 "Enhanced Player" forces HLS transcodes into `container=mkv` (via an
 `add-transcode-target(... replace=true)` in `X-Plex-Client-Profile-Extra`),
 and the tvOS demuxer rejects a *re-encoded* mkv-in-HLS (copy plays fine — see
@@ -36,16 +38,17 @@ HEVC attempt:
 The worker emits **HEVC Range-Extensions (Rext) with unspecified pixel format**
 plus a **malformed fMP4 `hvcC`/`stsd` (size 0)**. A 4:2:0 10-bit source must be
 **Main10**; Apple VideoToolbox decodes only Main/Main10, so the Rext stream is
-undecodable → mpv hwdec crashes. ATV 8.45 **can** play HEVC Main10 — so 4K is
-achievable once the encode/mux is fixed (force `hevc_vaapi -profile:v main10`
-+ a complete `hvcC`). Tracked in **#189**.
+undecodable → mpv hwdec crashes. ATV 8.45 **can** play HEVC Main10. **Fixed in
+worker v1.13.0 (#189):** `ensureHEVCMain10` forces `-profile main10` on 10-bit
+HW HEVC encodes (hevc_vaapi Intel+AMD, hevc_nvenc) — validated plex-test
+(ffprobe `Main 10`) + qa_matrix 60/60 + live Android 4K HEVC. qa_matrix now
+guards it (#193/#195).
 
-**Interim workaround (shipped):** [`clientfix`](CLIENTFIX.md)
-`CLIENTFIX_DECISION_MODE=strip` removes the profile-extra on the 8.45 transcode
-decision → PMS falls back to the stock tvOS profile → **h264 1080p** (5.1 audio
-copy, 20 Mbps). Once #189 lands, a custom tvOS hevc-4K-fMP4 profile + strip
-restores full 4K and this workaround can be retired. (Worker SW→HW av1 decode,
-#185, is a separate fleet-load item.)
+**Interim workaround (now superseded by v1.13.0):** [`clientfix`](CLIENTFIX.md)
+`CLIENTFIX_DECISION_MODE=strip` forced **h264 1080p** to dodge the crash. With
+v1.13.0 shipped, clientfix is **bypassed** in prod (ATV gets native HEVC Main10);
+pending a real-ATV confirm → full teardown. (Worker SW→HW av1 decode, #185, is a
+separate fleet-load item.)
 
 ## Burned PGS cue stayed on screen until next cue — RESOLVED in v1.6.1
 
