@@ -101,12 +101,30 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/", p.handle)
 
+	log.Printf("scaleplex-clientfix fronting PMS %s, listening on %s (decision mode=%s)", upstream, listen, mode)
+
+	// TLS-SNI front (opt-in via CLIENTFIX_TLS_CERT/KEY): terminate our own
+	// custom-domain (*.boeye.net) TLS so the decision rewrite works over
+	// HTTPS, and pass plex.direct TLS straight to PMS so its reachability
+	// probe + plex.direct clients keep working on PMS's own cert. See sni.go.
+	// Unset → original plain-HTTP listener (e.g. behind the gateway/Envoy).
+	if certFile, keyFile := os.Getenv("CLIENTFIX_TLS_CERT"), os.Getenv("CLIENTFIX_TLS_KEY"); certFile != "" && keyFile != "" {
+		cr := &certReloader{certFile: certFile, keyFile: keyFile}
+		if err := cr.load(); err != nil {
+			log.Fatalf("load TLS cert (%s,%s): %v", certFile, keyFile, err)
+		}
+		go cr.watch(envDur("CLIENTFIX_TLS_RELOAD", time.Hour))
+		passAddr := envOr("CLIENTFIX_PMS_PASSTHROUGH_ADDR", upstream.Host)
+		termSuffix := envOr("CLIENTFIX_TLS_SNI_SUFFIX", ".boeye.net")
+		log.Printf("scaleplex-clientfix SNI front: terminate *%s, passthrough other TLS → %s", termSuffix, passAddr)
+		log.Fatal(serveSNI(listen, passAddr, termSuffix, cr.get, mux))
+	}
+
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("scaleplex-clientfix fronting PMS %s, listening on %s (decision mode=%s)", upstream, listen, mode)
 	log.Fatal(srv.ListenAndServe())
 }
 
