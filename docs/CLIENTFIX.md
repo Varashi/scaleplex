@@ -72,18 +72,19 @@ container or the extra. Full matrix on real devices (tvOS 26.5/26.6, Plex
 | hevc 4K — fMP4 via a clean custom `tvOS.xml` (extra fully stripped) | ❌ crashes the app |
 | h264 1080p — mpegts (`strip` → stock `tvOS.xml`) | ✅ plays |
 
-**Root cause (#189 — FIXED in worker v1.13.0):** not a client limit. The client's mpv/ffmpeg player logs
-`hevc (Rext), ... unspecified pixel format` + a malformed fMP4 `stsd` — the
-worker emits HEVC **Range-Extensions** instead of **Main10**, which Apple
-VideoToolbox can't decode → crash. ATV 8.45 *can* play HEVC Main10. Fixed by
-`ensureHEVCMain10` (force `-profile main10` on 10-bit HW HEVC, all backends) —
-worker **v1.13.0**, live in prod; qa_matrix guards it (#193/#195).
+**Two layers (final, 2026-06-07):** (1) the worker emitted HEVC **Rext** on
+10-bit HW encodes — a real encoder bug, FIXED in worker v1.13.0 (#189,
+`ensureHEVCMain10` → `-profile main10`, all backends; correct + helps non-ATV
+hevc clients; qa_matrix guards it #193/#195). (2) But ATV-8.45 **still can't
+play transcoded HEVC even as Main10** (real-device: Dennis mkv-Main10, Tim
+mp4-Main10 — both failed) → a hard client limit, any container. So h264 is the
+only working transcode codec on this client.
 
-**Superseded by v1.13.0:** the `CLIENTFIX_DECISION_MODE=strip` → h264-1080p
-workaround is no longer needed now the worker emits HEVC Main10. clientfix is
-**bypassed** in prod (idle, pending a real-ATV confirm → teardown). With no
-remaining rules, clientfix is on track to be retired entirely — see
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+**Permanent for ATV-8.45:** `CLIENTFIX_DECISION_MODE=strip` → h264 1080p is the
+only thing that plays a transcoded ATV-8.45 session (every HEVC variant fails,
+even Main10). clientfix is **live in prod in strip mode** and **NOT retirable**
+for this client — the worker Main10 fix doesn't unlock ATV. 4K on ATV only via
+copy/Direct-Play — see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
 
 ### Custom PMS profiles (for the record)
 
