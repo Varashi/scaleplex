@@ -1453,17 +1453,57 @@ func ensureHEVCMain10(args, changes []string) ([]string, []string) {
 	return args, changes
 }
 
-// tenBitOutput reports whether the HW filter chain targets 10-bit. Both
-// backends declare `format=p010` for 10-bit (scale_vaapi and scale_cuda) and
-// `nv12` for 8-bit, so a p010 token anywhere in the args means the encoder is
-// fed 10-bit and needs the main10 profile.
+// tenBitOutput reports whether the HW filter chain feeds the encoder a 10-bit
+// surface. The pixfmt entering the encoder is the LAST `format=<pixfmt>`
+// declaration in the video filter graph: Plex's HDR-tonemap shape declares
+// `scale_vaapi=…format=p010` upstream and then `tonemap_opencl=…format=nv12`
+// + `hwdownload,format=nv12` downstream, so a naked `p010` substring scan
+// would mis-tag an 8-bit hand-off as 10-bit (scaleplex#200). The encoder
+// ultimately receives whatever the LAST `format=` token says — track that.
 func tenBitOutput(args []string) bool {
-	for _, a := range args {
-		if strings.Contains(a, "p010") {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] != "-filter_complex" {
+			continue
+		}
+		graph := args[i+1]
+		lastP010 := lastFormatToken(graph, "p010")
+		lastNV12 := lastFormatToken(graph, "nv12")
+		if lastP010 < 0 && lastNV12 < 0 {
+			continue // not a pixfmt-bearing graph (audio chain etc.)
+		}
+		if lastP010 > lastNV12 {
 			return true
 		}
+		return false
 	}
 	return false
+}
+
+// lastFormatToken returns the byte offset of the last `format=<pixfmt>` token
+// in graph whose pixfmt identifier matches `pixfmt` exactly (no partial
+// matches like `nv12` inside `nv12_something`), or -1 if none.
+func lastFormatToken(graph, pixfmt string) int {
+	needle := "format=" + pixfmt
+	off, last := 0, -1
+	for {
+		pos := strings.Index(graph[off:], needle)
+		if pos < 0 {
+			break
+		}
+		pos += off
+		end := pos + len(needle)
+		if end < len(graph) {
+			c := graph[end]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '_' {
+				off = end
+				continue // identifier continues — partial match, skip
+			}
+		}
+		last = pos
+		off = end
+	}
+	return last
 }
 
 // stripInlineassDecodeSink removes Plex's subtitle decode-sink output —
