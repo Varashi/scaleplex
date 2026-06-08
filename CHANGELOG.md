@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.1](https://github.com/Varashi/scaleplex/compare/v1.14.0...v1.14.1) (2026-06-08)
+
+
+### Fixes
+
+* **worker/agent:** tenBitOutput tracks last format= token, not bare p010 ([#200](https://github.com/Varashi/scaleplex/issues/200)) ([#201](https://github.com/Varashi/scaleplex/issues/201)) ([5d4a712](https://github.com/Varashi/scaleplex/commit/5d4a71291449f953495eb0326568e916e69892bc))
+
 ## [1.14.0](https://github.com/Varashi/scaleplex/compare/v1.13.0...v1.14.0) (2026-06-07)
 
 
