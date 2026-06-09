@@ -675,6 +675,15 @@ type burnSpec struct {
 	w, h       string // target resolution
 	hdr        bool   // HDR source → insert the tonemap stage (p010→nv12)
 	algo       string // tonemap algo to honor (HDR only; "" = cfg default)
+	// tenBit: encoder needs a 10-bit input (HEVC Main10 over HDR-passthrough).
+	// Distinct from hdr — hdr means "Plex sent a tonemap node and we render
+	// to 8-bit", tenBit means "no tonemap and we keep the 10-bit chain so the
+	// encoder gets a p010 surface for Main10". Ignored when hdr is true (the
+	// tonemap path is the encoder's bit-depth gate). Caller sets when the
+	// source carries an HDR transfer (smpte2084 / arib-std-b67) AND Plex's
+	// graph carries no tonemap node AND the encoder is HEVC — i.e. an
+	// HDR-passthrough sub-burn. scaleplex#204.
+	tenBit bool
 	// burnSub + subParams: when burnSub, append an inlineass stage. subParams
 	// is the leading inlineass params (Plex's params for text, "" for bitmap);
 	// composeBurn appends render_height (the fork's libass/replay_bitmap band
@@ -743,10 +752,17 @@ func (tm tonemapConfig) composeBurn(s burnSpec) (filter, newLabel string) {
 		src = "[" + u + "]"
 	}
 	scaled := next()
-	if s.hdr {
+	switch {
+	case s.hdr:
 		fmt.Fprintf(&b, "%s%s,%s[%s]",
 			src, d.scaleFilter(s.w, s.h, "p010"), tm.stage(s.algo), scaled)
-	} else {
+	case s.tenBit:
+		// HDR-passthrough: preserve 10-bit through the chain. No tonemap
+		// stage (Plex's argv didn't carry one — the encoder will emit HDR
+		// HEVC Main10). scaleplex#204.
+		fmt.Fprintf(&b, "%s%s[%s]",
+			src, d.scaleFilter(s.w, s.h, "p010"), scaled)
+	default:
 		fmt.Fprintf(&b, "%s%s[%s]",
 			src, d.scaleFilter(s.w, s.h, "nv12"), scaled)
 	}
@@ -2983,12 +2999,18 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						vfIdx = indexOfArg(args, "-filter_complex", 0) + 1
 					}
 					animated := subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile)
+					// HDR-passthrough sub-burn: Plex carried no tonemap node
+					// (facts.hdr=false) but the source is HDR (sourceIsHDR) and
+					// the HEVC encoder will run Main10 — keep the chain 10-bit
+					// so the encoder gets a p010 surface (scaleplex#204).
+					tenBit := sourceIsHDR && !facts.hdr && hwEncoderCodec[args[encCodecIdx+1]] == "hevc"
 					newFilter, newLabel := tm.composeBurn(burnSpec{
 						vaResident:       true,
 						w:                facts.w,
 						h:                facts.h,
 						hdr:              facts.hdr,
 						algo:             facts.algo,
+						tenBit:           tenBit,
 						burnSub:          true,
 						subParams:        facts.subParams,
 						animatedTierDown: animated,
@@ -3046,8 +3068,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// VA-resident only when Plex's argv actually HW-decodes; otherwise
 				// composeBurn prepends the hwupload itself.
 				vaResident := streamSpecIndex(args, "-hwaccel", 0, 0) >= 0
+				// HDR-passthrough bitmap burn (scaleplex#204) — mirrors the
+				// text branch: keep the chain 10-bit when source is HDR and
+				// Plex didn't tonemap so the HEVC encoder gets p010 for Main10.
+				tenBit := sourceIsHDR && !hdr && hwEncoderCodec[args[encCodecIdx+1]] == "hevc"
 				newFilter, newLabel := tm.composeBurn(burnSpec{
 					vaResident: vaResident, w: w, h: h, hdr: hdr, algo: algo,
+					tenBit:  tenBit,
 					burnSub: true,
 				})
 				args[i+1] = newFilter
