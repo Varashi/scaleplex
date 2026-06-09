@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.2](https://github.com/Varashi/scaleplex/compare/v1.14.1...v1.14.2) (2026-06-09)
+
+
+### Fixes
+
+* **rewriter:** preserve 10-bit through composeBurn on HDR-passthrough sub-burn ([#204](https://github.com/Varashi/scaleplex/issues/204)) ([#203](https://github.com/Varashi/scaleplex/issues/203)) ([2b9e195](https://github.com/Varashi/scaleplex/commit/2b9e19554fc8003424ee0d2791b9afc6cc148c89))
+
 ## [1.14.1](https://github.com/Varashi/scaleplex/compare/v1.14.0...v1.14.1) (2026-06-08)
 
 
