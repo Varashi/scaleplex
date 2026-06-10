@@ -46,7 +46,7 @@ COPY clientfix/ /clientfix/
 RUN cd /clientfix && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
       -o /out/scaleplex-clientfix ./cmd/clientfix
 
-FROM alpine:3.23 AS layout
+FROM alpine:3.24 AS layout
 RUN mkdir -p /mod/usr/lib/plexmediaserver \
              /mod/usr/local/bin \
              /mod/custom-cont-init.d \
