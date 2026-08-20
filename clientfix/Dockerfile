@@ -6,7 +6,7 @@
 #
 # Deployed as a small Service the gateway routes the matched client's
 # decision request to; everything else bypasses it straight to PMS.
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY clientfix/go.mod ./
 RUN go mod download
