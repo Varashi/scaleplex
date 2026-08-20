@@ -31,7 +31,7 @@
 # (the /etc/cont-init.d and /etc/services.d v2 paths are wiped by the
 # mod loader before extraction.)
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY shim/go.mod ./
 RUN go mod download

@@ -2,7 +2,7 @@
 # Static Go binary on distroless. No ffmpeg, no NFS, no GPU here — the
 # orchestrator just routes task envelopes to workers.
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY orchestrator/go.mod ./
 RUN go mod download
