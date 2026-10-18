@@ -30,10 +30,13 @@ func TestEngineSampler_SingleEngine(t *testing.T) {
 	if got := s.sample(); got != 0 {
 		t.Fatalf("baseline sample %v want 0", got)
 	}
+	t0 := time.Now()
 
-	// Simulate 100ms wall clock with the engine busy 100% of the time.
+	// Engine busy for the whole real elapsed interval (not a fixed
+	// 100ms: on a loaded CI runner the sleep overshoots and a fixed
+	// busy delta under-reports).
 	time.Sleep(100 * time.Millisecond)
-	writeBusy(t, dir, "vcs0.busy", 100*1e6) // 100ms in ns
+	writeBusy(t, dir, "vcs0.busy", uint64(time.Since(t0).Nanoseconds()))
 	got := s.sample()
 	if got < 0.5 || got > 1.05 {
 		t.Fatalf("100%% busy: got %v want ~1.0", got)
@@ -50,10 +53,11 @@ func TestEngineSampler_TwoEnginesMeanBusy(t *testing.T) {
 
 	s := newEngineSampler()
 	s.sample()
+	t0 := time.Now()
 
 	time.Sleep(100 * time.Millisecond)
-	writeBusy(t, dir, "vcs0.busy", 100*1e6) // engine 0 busy 100ms
-	writeBusy(t, dir, "vcs1.busy", 0)       // engine 1 idle
+	writeBusy(t, dir, "vcs0.busy", uint64(time.Since(t0).Nanoseconds())) // engine 0 busy whole interval
+	writeBusy(t, dir, "vcs1.busy", 0)                                    // engine 1 idle
 	got := s.sample()
 	if got < 0.3 || got > 0.7 {
 		t.Fatalf("1 of 2 engines busy: got %v want ~0.5", got)
