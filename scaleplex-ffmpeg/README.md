@@ -187,8 +187,10 @@ can be cached. `lib/split-docker-build.sh` rewrites jellyfin's
    Locally, `REPLAY_NO_FFMPEG=1 go test -tags=replay -run TestReplayCorpus`
    validates the rewriter half without ffmpeg.
 6. Commit the new `VERSION` + any patch fixups. Rebuild the worker
-   image (`build-worker` GHA picks up the new ffmpeg deb artifact
-   via cross-workflow download).
+   image: `build-ffmpeg` publishes the deb as
+   `ghcr.io/varashi/scaleplex-ffmpeg-deb:<key>` (`<key>` from
+   `deb-key.sh`, a hash of the build inputs) and its completion triggers
+   `build-worker`, which pulls the deb by that tag.
 
 The 14 patches (`0094`–`0107`) are small and touch a handful of files
 only — rebasing should remain a sub-hour exercise per jellyfin bump,
