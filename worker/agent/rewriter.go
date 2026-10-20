@@ -1481,18 +1481,41 @@ func tenBitOutput(args []string) bool {
 		if args[i] != "-filter_complex" {
 			continue
 		}
-		graph := args[i+1]
-		lastP010 := lastFormatToken(graph, "p010")
-		lastNV12 := lastFormatToken(graph, "nv12")
-		if lastP010 < 0 && lastNV12 < 0 {
+		tenBit, pixfmtBearing := graphFeedsTenBit(args[i+1])
+		if !pixfmtBearing {
 			continue // not a pixfmt-bearing graph (audio chain etc.)
 		}
-		if lastP010 > lastNV12 {
-			return true
-		}
-		return false
+		return tenBit
 	}
 	return false
+}
+
+// graphFeedsTenBit reports whether a single filtergraph hands its consumer a
+// 10-bit surface (its LAST p010/nv12 `format=` token is p010), and whether the
+// graph declares any such pixfmt at all. Shared by tenBitOutput (final-argv
+// Main10 gate) and the burn recomposers, which read Plex's ORIGINAL graph to
+// decide whether the rebuilt chain must stay 10-bit — a 10-bit SDR source has
+// no HDR transfer, so the HDR probe alone misses it (scaleplex#214).
+func graphFeedsTenBit(graph string) (tenBit, pixfmtBearing bool) {
+	lastP010 := lastFormatToken(graph, "p010")
+	lastNV12 := lastFormatToken(graph, "nv12")
+	if lastP010 < 0 && lastNV12 < 0 {
+		return false, false
+	}
+	return lastP010 > lastNV12, true
+}
+
+// encoderIsHEVC reports whether the output video encoder (the first `-codec`
+// after the first `-i`) is a HW HEVC encoder. Looked up fresh from args on
+// every call so a caller can't read through an index left stale by an earlier
+// splice (scaleplex#214 trigger 3).
+func encoderIsHEVC(args []string) bool {
+	in := indexOfArg(args, "-i", 0)
+	if in < 0 {
+		return false
+	}
+	e := streamSpecIndex(args, "-codec", 0, in+1)
+	return e >= 0 && e+1 < len(args) && hwEncoderCodec[args[e+1]] == "hevc"
 }
 
 // lastFormatToken returns the byte offset of the last `format=<pixfmt>` token
@@ -2881,7 +2904,7 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			}
 			args[encCodecIdx+1] = hwEncoder
 			changes = append(changes, TagPrefixEncode+swEncoder+"->"+hwEncoder)
-			args, changes = ensureHEVCMain10(args, changes)
+			// Main10 pin runs once after all graph reshaping (step 5c).
 		} else if honorHybrid {
 			// HW decode + SW encode (per-axis honor, docs/HW_PROFILE.md). PMS
 			// emitted `-hwaccel:0 vaapi` decode + a libx264/libx265 encode (its
@@ -2912,7 +2935,9 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				return bail(TagPrefixBailUnexpectedEncoder + swEncoder)
 			}
 			changes = append(changes, TagPrefixEncodeHWPassthrough+swEncoder)
-			args, changes = ensureHEVCMain10(args, changes)
+			// Main10 pin runs once after all graph reshaping (step 5c): pinning
+			// here, on Plex's ORIGINAL graph, contradicted the recomposed burn
+			// graph whenever the two disagreed on bit depth (scaleplex#214).
 
 			// HDR-source already detected + emitted at the session level
 			// (hoisted above the branch split); `sourceIsHDR` flows through
@@ -2984,6 +3009,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 					if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
 						oldLabel = "[" + m[1] + "]"
 					}
+					// Bit-depth facts read from Plex's ORIGINAL graph + encoder,
+					// BEFORE the -hwaccel_output_format splice below shifts args
+					// (reading args[encCodecIdx+1] after it hit the wrong token —
+					// scaleplex#214 trigger 3).
+					plexTenBit, _ := graphFeedsTenBit(args[vfIdx])
+					hevcOut := encoderIsHEVC(args)
 					// vaResident=true: Plex's argv carries the HW decode flags
 					// (`-hwaccel:0 <vaapi|nvdec> -hwaccel_output_format:0
 					// <vaapi|cuda>`), so [0:0] is already a backend surface —
@@ -2999,11 +3030,13 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 						vfIdx = indexOfArg(args, "-filter_complex", 0) + 1
 					}
 					animated := subtitleIsAnimated(subSrc.Codec, subSrc.FilePath, os.ReadFile)
-					// HDR-passthrough sub-burn: Plex carried no tonemap node
-					// (facts.hdr=false) but the source is HDR (sourceIsHDR) and
-					// the HEVC encoder will run Main10 — keep the chain 10-bit
-					// so the encoder gets a p010 surface (scaleplex#204).
-					tenBit := sourceIsHDR && !facts.hdr && hwEncoderCodec[args[encCodecIdx+1]] == "hevc"
+					// Keep the chain 10-bit when Plex carried no tonemap node
+					// (facts.hdr=false), the encoder is HEVC, and EITHER the
+					// source is HDR (HDR-passthrough, scaleplex#204) OR Plex's
+					// own graph fed the encoder p010 (10-bit SDR source,
+					// scaleplex#214) — the encoder then gets a p010 surface and
+					// the step-5c Main10 pin matches it.
+					tenBit := (sourceIsHDR || plexTenBit) && !facts.hdr && hevcOut
 					newFilter, newLabel := tm.composeBurn(burnSpec{
 						vaResident:       true,
 						w:                facts.w,
@@ -3068,10 +3101,12 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 				// VA-resident only when Plex's argv actually HW-decodes; otherwise
 				// composeBurn prepends the hwupload itself.
 				vaResident := streamSpecIndex(args, "-hwaccel", 0, 0) >= 0
-				// HDR-passthrough bitmap burn (scaleplex#204) — mirrors the
-				// text branch: keep the chain 10-bit when source is HDR and
-				// Plex didn't tonemap so the HEVC encoder gets p010 for Main10.
-				tenBit := sourceIsHDR && !hdr && hwEncoderCodec[args[encCodecIdx+1]] == "hevc"
+				// 10-bit bitmap burn — mirrors the text branch: keep the chain
+				// 10-bit when Plex didn't tonemap, the encoder is HEVC, and the
+				// source is HDR (scaleplex#204) or Plex's graph fed p010
+				// (10-bit SDR, scaleplex#214).
+				plexTenBit, _ := graphFeedsTenBit(args[i+1])
+				tenBit := (sourceIsHDR || plexTenBit) && !hdr && encoderIsHEVC(args)
 				newFilter, newLabel := tm.composeBurn(burnSpec{
 					vaResident: vaResident, w: w, h: h, hdr: hdr, algo: algo,
 					tenBit:  tenBit,
@@ -3118,6 +3153,15 @@ func Rewrite(inputArgs []string, inputEnv map[string]string, opts *RewriteOpts) 
 			newInputIdx = indexOfArg(args, "-i", 0)
 			encCodecIdx = streamSpecIndex(args, "-codec", 0, newInputIdx+1)
 		}
+
+		// 5c. HEVC Main10 pin — exactly once, on the FINAL graph. Every reshape
+		// above (SW→HW filter rewrite, burn recompose, OpenCL tonemap fix-up)
+		// can change the pixfmt handed to the encoder, so the pin must read the
+		// graph the encoder will actually receive: `-profile main10` with an
+		// nv12 hand-off is rejected by vaapi_encode ("No usable encoding profile
+		// found", exit 218). Invariant: main10 ⇒ final graph ends in p010.
+		// scaleplex#189 / #200 / #204 / #214.
+		args, changes = ensureHEVCMain10(args, changes)
 
 		// 6. -crf:0 is left untouched. The scaleplex-ffmpeg fork's VAAPI
 		// encoder accepts libx264-style `-crf:N` directly and maps it to

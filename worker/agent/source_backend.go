@@ -262,12 +262,18 @@ func reshapeForeignHWArgv(args []string, tm tonemapConfig) ([]string, []string) 
 			if m := reGraphTrailingLabel.FindStringSubmatch(args[vfIdx]); m != nil {
 				oldLabel = "[" + m[1] + "]"
 			}
+			// Keep a 10-bit source chain 10-bit across the backend swap: when
+			// the foreign graph fed its HEVC encoder p010 with no tonemap, the
+			// recomposed graph must too, or the Main10 pin / 10-bit output is
+			// lost (scaleplex#214 case B).
+			plexTenBit, _ := graphFeedsTenBit(args[vfIdx])
 			newFilter, newLabel := tm.composeBurn(burnSpec{
 				vaResident: true,
 				w:          facts.w,
 				h:          facts.h,
 				hdr:        facts.hdr,
 				algo:       facts.algo,
+				tenBit:     plexTenBit && !facts.hdr && encoderIsHEVC(args),
 				burnSub:    facts.subKind == "text",
 				subParams:  facts.subParams,
 			})
