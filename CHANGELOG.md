@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.4](https://github.com/Varashi/scaleplex/compare/v1.14.3...v1.14.4) (2026-10-20)
+
+
+### Fixes
+
+* **orchestrator,worker:** fail over dead workers and drain on shutdown ([#219](https://github.com/Varashi/scaleplex/issues/219), [#242](https://github.com/Varashi/scaleplex/issues/242)) ([#243](https://github.com/Varashi/scaleplex/issues/243)) ([bedf0e8](https://github.com/Varashi/scaleplex/commit/bedf0e81689243ace9261d81cae714f32247d03f))
+
 ## [1.14.3](https://github.com/Varashi/scaleplex/compare/v1.14.2...v1.14.3) (2026-10-20)
 
 **Images shipped:**
