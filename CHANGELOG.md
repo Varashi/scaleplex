@@ -2,6 +2,16 @@
 
 ## [1.14.3](https://github.com/Varashi/scaleplex/compare/v1.14.2...v1.14.3) (2026-10-20)
 
+**Images shipped:**
+
+| Image | Tag | Notes |
+|---|---|---|
+| `ghcr.io/varashi/scaleplex_worker` | `v1.13.3` (`sha-4a73169`) | **bumped** — HEVC Main10 pin moved to the final filter graph; 10-bit SDR sub-burn keeps p010 (#214) |
+| `ghcr.io/varashi/scaleplex_orchestrator` | `v1.4.1` | unchanged |
+| `ghcr.io/varashi/scaleplex_pms_dockermod` | `sha-0e6edae` | unchanged |
+
+A 10-bit SDR source with a burned text subtitle and a HW HEVC encoder failed to start (`No usable encoding profile found`, exit 218): the Main10 pin ran on Plex's original 10-bit graph, then the burn recomposer rebuilt it 8-bit because it only kept 10-bit for HDR sources. The pin now runs once on the final graph, and the recomposers (HW text, HW bitmap, cross-backend) keep 10-bit whenever Plex's own graph fed the encoder p010. Validated live on plex-test (Arc A310): the failing prod title now starts first try on the HW path.
+
 
 ### Fixes
 
