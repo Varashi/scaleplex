@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.3](https://github.com/Varashi/scaleplex/compare/v1.14.2...v1.14.3) (2026-10-20)
+
+
+### Fixes
+
+* **rewriter:** pin HEVC Main10 on the final graph, keep 10-bit SDR burns 10-bit ([#214](https://github.com/Varashi/scaleplex/issues/214)) ([#240](https://github.com/Varashi/scaleplex/issues/240)) ([4a73169](https://github.com/Varashi/scaleplex/commit/4a731691bac98dbe828646c59dc185602b5af049))
+
 ## [1.14.2](https://github.com/Varashi/scaleplex/compare/v1.14.1...v1.14.2) (2026-06-09)
 
 
