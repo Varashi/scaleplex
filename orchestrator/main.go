@@ -32,7 +32,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -71,6 +70,12 @@ type capabilityResponse struct {
 	GPULoad        float64 `json:"gpu_load"`    // 0..1 mean across video engines
 	GPUEngines     int     `json:"gpu_engines"` // vcs/vecs engine count
 	Backend        string  `json:"backend"`     // "vaapi" | "nvenc" | "sw" (#77 PR4)
+	// Ready mirrors the worker's /readyz (pre-warm done, not draining). A
+	// pointer so a worker image that predates the field (nil) still counts as
+	// ready during a rolling upgrade (#242).
+	Ready *bool `json:"ready,omitempty"`
+	// Draining is true once the worker got SIGTERM and refuses new sessions.
+	Draining bool `json:"draining,omitempty"`
 }
 
 // sourceBits is a bit-set of the discovery sources currently vouching
@@ -108,7 +113,14 @@ type worker struct {
 	mu             sync.Mutex
 	healthy        bool
 	activeSessions int   // last reported by /capability poll (5s stale)
-	inFlight       int32 // dispatched-here-but-not-yet-finished count
+	pending        int32 // dispatches sent here, worker hasn't answered yet (atomic)
+	// accepted holds sessions the worker accepted, keyed by ticket, valued by
+	// accept time. One counts toward load only until a /capability probe that
+	// STARTED after its accept succeeds — from then on the worker's own
+	// activeSessions includes it, so counting it again would double it (#219).
+	accepted       map[*dispatchTicket]time.Time
+	lastProbeStart time.Time // start time of the last successful probe
+	downAt         time.Time // when the last dispatch/probe failure marked it down
 	maxSessions    int
 	gpuLoad        float64 // 0..1 mean across video engines (last reported)
 	gpuEngines     int
@@ -140,7 +152,7 @@ func (w *worker) load() float64 {
 	if !healthy {
 		return float64(1 << 30)
 	}
-	combined := float64(active) + float64(atomic.LoadInt32(&w.inFlight))
+	combined := float64(active) + float64(w.inFlight())
 	var sessLoad float64
 	if max > 0 {
 		sessLoad = combined / float64(max)
@@ -153,8 +165,43 @@ func (w *worker) load() float64 {
 	return sessLoad
 }
 
-func (w *worker) dispatchBegin() { atomic.AddInt32(&w.inFlight, 1) }
-func (w *worker) dispatchEnd()   { atomic.AddInt32(&w.inFlight, -1) }
+// dispatchBegin/dispatchEnd bracket a request the worker hasn't answered yet.
+func (w *worker) dispatchBegin() { atomic.AddInt32(&w.pending, 1) }
+func (w *worker) dispatchEnd()   { atomic.AddInt32(&w.pending, -1) }
+
+// inFlight is the load the last probe can't see yet: unanswered dispatches,
+// plus accepted sessions newer than the start of the last successful probe.
+func (w *worker) inFlight() int {
+	n := int(atomic.LoadInt32(&w.pending))
+	w.mu.Lock()
+	for _, at := range w.accepted {
+		if !at.Before(w.lastProbeStart) {
+			n++
+		}
+	}
+	w.mu.Unlock()
+	return n
+}
+
+// markDown takes the worker out of rotation immediately — used when a dispatch
+// can't even connect, so it stops attracting sessions before the next probe
+// (#219). The next successful probe restores it.
+func (w *worker) markDown(reason string) {
+	w.mu.Lock()
+	w.healthy = false
+	w.lastErr = reason
+	w.downAt = time.Now()
+	w.mu.Unlock()
+}
+
+// healthySince reports whether a successful probe that started after t has
+// marked the worker healthy again — lets recovery reuse a worker that failed
+// earlier in the same session only once it has demonstrably come back.
+func (w *worker) healthySince(t time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.healthy && w.lastProbeStart.After(t)
+}
 
 // isHW reports whether this worker has a hardware backend (vaapi/nvenc). A
 // worker that hasn't reported a backend yet ("" — e.g. a pre-PR4 image during a
@@ -173,7 +220,7 @@ func (w *worker) sessions() int {
 	w.mu.Lock()
 	a := w.activeSessions
 	w.mu.Unlock()
-	return a + int(atomic.LoadInt32(&w.inFlight))
+	return a + w.inFlight()
 }
 
 func (w *worker) backendStr() string {
@@ -195,6 +242,19 @@ type pool struct {
 	strategy lbStrategy
 	flatPool bool   // SCALEPLEX_PREFER_HW=0 → one flat pool (no HW/SW tier split)
 	rrCursor uint64 // round-robin dispatch cursor (atomic)
+
+	// DNS discovery config, kept so recovery can re-resolve on demand instead
+	// of waiting for the next refresh tick (#242). dns == "" disables it.
+	dns  string
+	port int
+}
+
+// rediscover re-resolves DNS (when configured) and probes every worker now.
+func (p *pool) rediscover() {
+	if p.dns != "" {
+		p.refresh(p.dns, p.port)
+	}
+	p.probeAllSync(probeClient)
 }
 
 // hostPort is the parsed form of a single WORKERS_LIST entry.
@@ -204,7 +264,12 @@ type hostPort struct {
 }
 
 func (hp hostPort) url() string {
-	return fmt.Sprintf("http://%s:%d", hp.host, hp.port)
+	return workerURL(hp.host, hp.port)
+}
+
+// workerURL builds http://host:port, bracketing IPv6 literals (#219).
+func workerURL(host string, port int) string {
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // parseWorkerList parses the WORKERS_LIST env: comma-separated host[:port]
@@ -274,9 +339,11 @@ func (p *pool) refresh(dns string, port int) {
 		return
 	}
 	seen := make(map[string]struct{}, len(ips))
+	hostOf := make(map[string]string, len(ips))
 	for _, ip := range ips {
-		url := fmt.Sprintf("http://%s:%d", ip, port)
+		url := workerURL(ip, port)
 		seen[url] = struct{}{}
+		hostOf[url] = ip
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -288,13 +355,7 @@ func (p *pool) refresh(dns string, port int) {
 			}
 			continue
 		}
-		// Extract host from "http://<host>:<port>" for the worker's
-		// host field (used for logging + future capability reporting).
-		host := strings.TrimPrefix(url, "http://")
-		if i := strings.LastIndex(host, ":"); i >= 0 {
-			host = host[:i]
-		}
-		p.workers[url] = &worker{host: host, url: url, sources: srcDNS}
+		p.workers[url] = &worker{host: hostOf[url], url: url, sources: srcDNS}
 		log.Printf("dns: added worker %s", url)
 	}
 	for url, w := range p.workers {
@@ -340,7 +401,7 @@ func (p *pool) loadList(entries []hostPort) {
 // created the worker (newly seen), false if it just refreshed an
 // existing one.
 func (p *pool) register(host string, port int, now time.Time) bool {
-	url := fmt.Sprintf("http://%s:%d", host, port)
+	url := workerURL(host, port)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if w, ok := p.workers[url]; ok {
@@ -395,6 +456,7 @@ func (p *pool) probeAll(client *http.Client) {
 }
 
 func probeWorker(client *http.Client, w *worker) {
+	start := time.Now()
 	req, err := http.NewRequest(http.MethodGet, w.url+"/capability", nil)
 	if err != nil {
 		w.mu.Lock()
@@ -423,15 +485,37 @@ func probeWorker(client *http.Client, w *worker) {
 		return
 	}
 	w.mu.Lock()
-	w.healthy = c.FFmpegOK
+	// Healthy = can run ffmpeg AND is ready (pre-warm done) AND not draining
+	// for shutdown (#242). An older worker that doesn't report ready counts
+	// as ready.
+	w.healthy = c.FFmpegOK && !c.Draining && (c.Ready == nil || *c.Ready)
+	w.lastProbeStart = start
 	w.activeSessions = c.ActiveSessions
 	w.maxSessions = c.MaxSessions
 	w.gpuLoad = c.GPULoad
 	w.gpuEngines = c.GPUEngines
 	w.backend = c.Backend
-	w.lastErr = ""
+	switch {
+	case c.Draining:
+		w.lastErr = "draining"
+	case c.Ready != nil && !*c.Ready:
+		w.lastErr = "warming"
+	default:
+		w.lastErr = ""
+	}
 	w.lastUpdated = time.Now()
 	w.mu.Unlock()
+}
+
+// probeAllSync probes every worker and waits for all probes to finish — used
+// by mid-stream recovery, which can't wait for the next probe tick.
+func (p *pool) probeAllSync(client *http.Client) {
+	var wg sync.WaitGroup
+	for _, w := range p.list() {
+		wg.Add(1)
+		go func(w *worker) { defer wg.Done(); probeWorker(client, w) }(w)
+	}
+	wg.Wait()
 }
 
 // lbStrategy is the within-tier worker-ordering policy (SCALEPLEX_LB_STRATEGY).
@@ -599,6 +683,8 @@ func main() {
 	pl.flatPool = os.Getenv("SCALEPLEX_PREFER_HW") == "0"
 	log.Printf("scheduler: strategy=%s prefer-hw=%t", pl.strategy, !pl.flatPool)
 
+	pl.dns, pl.port = workersDNS, workerPort
+	recoveryWait = time.Duration(envSecondsOr("SCALEPLEX_RECOVERY_WAIT_SECONDS", int(defaultRecoveryWait/time.Second))) * time.Second
 	go discoveryLoop(workersDNS, workerPort, refresh, probe)
 	go pushReaperLoop(time.Duration(pushReap)*time.Second, time.Duration(pushTimeout)*time.Second)
 
@@ -744,7 +830,7 @@ func handleWorkers(w http.ResponseWriter, r *http.Request) {
 			Sources:        wk.sources.String(),
 			Healthy:        wk.healthy,
 			ActiveSessions: wk.activeSessions,
-			InFlight:       atomic.LoadInt32(&wk.inFlight),
+			InFlight:       int32(wk.pendingAndAcceptedLocked()),
 			MaxSessions:    wk.maxSessions,
 			GPULoad:        wk.gpuLoad,
 			GPUEngines:     wk.gpuEngines,
@@ -770,9 +856,14 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	// Bounded read (#219): a task envelope is argv + env, a few KB in practice.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxTaskBody+1))
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxTaskBody {
+		http.Error(w, "task body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	var req taskRequest
@@ -800,203 +891,7 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 		metricDispatchTotal.WithLabelValues("resumed").Inc()
 	}
 
-	// Compute the candidate order ONCE per dispatch (round-robin needs a
-	// stable rotation). The in-flight count is folded into load()/sessions()
-	// so concurrent dispatches still spread; on a 503 we fall through to the
-	// next candidate in this order.
-	order := pl.schedule()
-	if len(order) == 0 {
-		metricDispatchTotal.WithLabelValues("no_workers").Inc()
-		http.Error(w, "all workers at capacity", http.StatusServiceUnavailable)
-		return
-	}
-	for i, wk := range order {
-		log.Printf("session %s: try worker %s (load=%.3f, backend=%s, attempt=%d/%d)",
-			req.SessionID, wk.url, wk.load(), wk.backendStr(), i+1, len(order))
-		wk.dispatchBegin()
-		// Start a checkpoint poller scoped to this PMS-facing request
-		// — it shuts down when the request context is cancelled.
-		pollCtx, cancelPoll := context.WithCancel(r.Context())
-		go pollCheckpoint(pollCtx, wk.url, req.SessionID, req.Args)
-		ok := proxyToWorker(w, r, wk.url, body, req.SessionID)
-		cancelPoll()
-		wk.dispatchEnd()
-		if ok {
-			metricDispatchAttempts.Observe(float64(i + 1))
-			metricDispatchTotal.WithLabelValues("success").Inc()
-			return
-		}
-		metricDispatchTotal.WithLabelValues("fallthrough_503").Inc()
-	}
-	metricDispatchTotal.WithLabelValues("all_at_cap").Inc()
-	metricDispatchAttempts.Observe(float64(len(order)))
-	http.Error(w, "all workers at capacity", http.StatusServiceUnavailable)
-}
-
-// proxyToWorker forwards the PMS-facing POST to a worker and streams
-// the worker's chunked response back. Returns true on success / fatal
-// PMS-side write error / non-503 worker error (meaning "don't try
-// another worker"); false on 503 ("try the next candidate").
-//
-// Phase 4d: if the worker stream errors mid-flight (pod death, network
-// drop) AFTER we've already started streaming bytes back to PMS, we
-// transparently swap to a healthy alternative worker — using the
-// checkpoint cache to inject resume flags so the new ffmpeg picks up
-// where the old one stopped. The PMS-facing connection stays open;
-// the shim sees a brief stall (1-3s for the new worker to spin up)
-// then segments resume.
-func proxyToWorker(w http.ResponseWriter, r *http.Request, workerURL string, body []byte, sessionID string) bool {
-	currentURL := workerURL
-	currentBody := body
-	headersWritten := false
-	tried := map[string]bool{currentURL: true}
-
-	for attempt := 0; attempt < 3; attempt++ {
-		ok, status, didHeader, midStream := streamFromUpstream(
-			w, r, currentURL, currentBody, sessionID, headersWritten,
-		)
-		if status == http.StatusServiceUnavailable && !headersWritten {
-			// 503 from initial connect — caller should pick the next candidate.
-			return false
-		}
-		if didHeader {
-			headersWritten = true
-		}
-		if ok {
-			// Upstream finished cleanly OR PMS-side write failed
-			// (client gone). Either way we're done.
-			return true
-		}
-		if !midStream {
-			// Initial-connect failure with no bytes flowed and not 503;
-			// surface as 502 for caller telemetry. http.Error already
-			// fired in streamFromUpstream → done.
-			return true
-		}
-		// Mid-stream failure with PMS still listening. Try recovery.
-		next := pickRecoveryWorker(tried)
-		if next == nil {
-			log.Printf("session %s: mid-stream failure on %s, no alt worker available", sessionID, currentURL)
-			return true
-		}
-		log.Printf("session %s: mid-stream failure on %s, recovering to %s (attempt=%d)", sessionID, currentURL, next.url, attempt+1)
-		metricDispatchTotal.WithLabelValues("recovered").Inc()
-		// Inject resume flags from checkpoint cache into the body
-		// (idempotent — replaces values if already injected).
-		var req taskRequest
-		if err := json.Unmarshal(currentBody, &req); err == nil {
-			if newArgs, resumed := resumeIfApplicable(req.Args); resumed {
-				req.Args = newArgs
-				if nb, err := json.Marshal(req); err == nil {
-					currentBody = nb
-				}
-			}
-		}
-		currentURL = next.url
-		tried[currentURL] = true
-	}
-	log.Printf("session %s: recovery exhausted attempts", sessionID)
-	return true
-}
-
-// streamFromUpstream opens one connection to the named worker and
-// pipes its body to w until either side errors. On the very first
-// successful response it writes the PMS-facing status+headers (gated
-// by `headersWritten`).
-//
-// Returns:
-//   - ok        : true if upstream completed cleanly OR pms-side write failed
-//   - status    : HTTP status from upstream (0 if dial failed)
-//   - didHeader : true if we wrote PMS-facing headers this call
-//   - midStream : true if the failure happened AFTER any bytes flowed
-//     (signals 4d crash-recovery should kick in)
-func streamFromUpstream(
-	w http.ResponseWriter,
-	r *http.Request,
-	workerURL string,
-	body []byte,
-	sessionID string,
-	headersWritten bool,
-) (ok bool, status int, didHeader bool, midStream bool) {
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	preq, err := http.NewRequestWithContext(ctx, http.MethodPost, workerURL+"/task", strings.NewReader(string(body)))
-	if err != nil {
-		if !headersWritten {
-			http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
-		}
-		return true, 0, false, false
-	}
-	preq.Header.Set("Content-Type", "application/json")
-	resp, err := proxyClient.Do(preq)
-	if err != nil {
-		log.Printf("session %s: worker %s error: %v", sessionID, workerURL, err)
-		if !headersWritten {
-			http.Error(w, "worker dial: "+err.Error(), http.StatusBadGateway)
-		}
-		return true, 0, false, false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		log.Printf("session %s: worker %s at capacity, falling through", sessionID, workerURL)
-		return false, http.StatusServiceUnavailable, false, false
-	}
-
-	sessions.set(sessionID, workerURL)
-	defer sessions.del(sessionID)
-
-	if !headersWritten {
-		for k, v := range resp.Header {
-			w.Header()[k] = v
-		}
-		w.WriteHeader(resp.StatusCode)
-		didHeader = true
-	}
-	flusher, _ := w.(http.Flusher)
-	if flusher != nil {
-		flusher.Flush()
-	}
-
-	bytesFlowed := false
-	buf := make([]byte, 4096)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			bytesFlowed = true
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				// PMS gone — give up entirely, no recovery.
-				return true, resp.StatusCode, didHeader, false
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				return true, resp.StatusCode, didHeader, false
-			}
-			// Mid-stream failure = recover. Initial failure = return cleanly
-			// (the caller's outer loop is responsible for picking another
-			// worker via pickOrder, just like a 503).
-			return false, resp.StatusCode, didHeader, bytesFlowed
-		}
-	}
-}
-
-// pickRecoveryWorker returns a healthy worker not in `tried`, ranked by
-// the same load score as fresh dispatch. Distinct from the outer
-// dispatch loop because we may need to swap to a previously-tried-and-
-// rejected (503) worker if it's the only healthy option left.
-func pickRecoveryWorker(tried map[string]bool) *worker {
-	for _, w := range pl.schedule() {
-		if !tried[w.url] {
-			return w
-		}
-	}
-	return nil
+	dispatchTask(w, r, body, req.SessionID)
 }
 
 func handleTaskByID(w http.ResponseWriter, r *http.Request) {

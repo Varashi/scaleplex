@@ -61,6 +61,12 @@ type capabilityResponse struct {
 	// lower values for the same session count, biasing routing toward
 	// them. 0 on CPU-only workers.
 	GPULoad float64 `json:"gpu_load"`
+	// Ready is true once pre-warm finished and the worker is not draining —
+	// the same signal as /readyz, so the orchestrator can skip warming or
+	// shutting-down workers without a second probe (scaleplex#242).
+	Ready bool `json:"ready"`
+	// Draining is true after SIGTERM: the worker refuses new sessions.
+	Draining bool `json:"draining"`
 	// GPUEngines counts the discovered video engines so the orchestrator
 	// (or a dashboard) can sanity-check the gpu_load reading.
 	GPUEngines int `json:"gpu_engines"`
@@ -196,9 +202,7 @@ func main() {
 		Addr:    listenAddr,
 		Handler: mux,
 	}
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server: %v", err)
-	}
+	serveWithDrain(srv)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -207,6 +211,11 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleReady(w http.ResponseWriter, r *http.Request) {
+	if isDraining() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, "draining\n")
+		return
+	}
 	if atomic.LoadInt32(&ready) == 1 {
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "ready\n")
@@ -308,6 +317,8 @@ func handleCapability(w http.ResponseWriter, r *http.Request) {
 		resp.GPUEngines = engineSamplerInst.numEngines()
 	}
 	resp.Backend = activeDialect.backendName()
+	resp.Draining = isDraining()
+	resp.Ready = atomic.LoadInt32(&ready) == 1 && !resp.Draining
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -407,6 +418,14 @@ func handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Args) == 0 {
 		http.Error(w, "args required", http.StatusBadRequest)
+		return
+	}
+
+	// Draining (SIGTERM received): refuse so the orchestrator falls through
+	// to another worker instead of starting a session we're about to kill.
+	if isDraining() {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "worker draining", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -1040,6 +1059,4 @@ func buildEnv(supplied map[string]string) []string {
 	return out
 }
 
-// graceful shutdown placeholder — wire up signal handling once the agent
-// has work it actually needs to drain. For phase 1 the kubelet's
-// pre-stop hook + 5s grace is enough.
+// Graceful shutdown: see drain.go (scaleplex#242).
