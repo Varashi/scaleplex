@@ -21,7 +21,7 @@ var (
 	metricDispatchTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "scaleplex_orch_dispatch_total",
 		Help: "Task dispatches by outcome.",
-	}, []string{"outcome"}) // success | fallthrough_503 | error | no_workers | all_at_cap
+	}, []string{"outcome"}) // success | fallthrough_503 | fallthrough_unreachable | no_workers | all_at_cap | recovered | recovery_failed | resumed
 
 	metricDispatchAttempts = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "scaleplex_orch_dispatch_attempts",
