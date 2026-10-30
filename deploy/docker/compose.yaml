@@ -81,6 +81,10 @@ services:
 
   worker:
     image: ghcr.io/varashi/scaleplex_worker:${IMAGE_TAG:-latest}
+    # On SIGTERM the worker drains: it refuses new sessions and waits up to
+    # SCALEPLEX_DRAIN_SECONDS (default 10) before exiting. Docker's default
+    # stop timeout is also 10 s, so give it headroom before SIGKILL.
+    stop_grace_period: 30s
     restart: unless-stopped
     # Worker port is reachable inside the compose network for
     # /capability + /task. Expose to the host only if you need to add

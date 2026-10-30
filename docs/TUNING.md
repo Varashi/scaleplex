@@ -44,6 +44,8 @@ workers or run a non-Intel worker.
 | `HW_VAAPI_DRIVER` | `iHD` | libva driver name. `iHD` for Intel Gen9+ / Arc. The VAAPI render node itself is the `/dev/dri/render*` device you mount/grant — there is no env knob for it; the rewriter derives `-init_hw_device` from Plex's argv. |
 | `HW_LIBVA_DRIVERS_PATH` | (libva auto-discovers) | Only needed to override the driver search path, e.g. when pointing at a bundled driver cache. |
 | `WORKER_MAX_SESSIONS` | `0` (unlimited) | Soft cap on concurrent sessions per worker. At the cap the worker refuses new dispatch so the orchestrator routes elsewhere. |
+| `SCALEPLEX_DRAIN_SECONDS` | `10` | **Worker.** On SIGTERM, how long to wait for active sessions before exiting (new sessions are refused immediately). `0` exits at once. Keep it below the pod's `terminationGracePeriodSeconds` / compose `stop_grace_period`. Sessions still running are recovered on another worker by the orchestrator. |
+| `SCALEPLEX_RECOVERY_WAIT_SECONDS` | `30` | **Orchestrator.** How long one mid-stream recovery waits for a healthy worker (re-resolving DNS and re-probing meanwhile) before giving up. Covers a worker rollout: replacement scheduled, pre-warmed, probed. Raise it if your workers take longer to become ready. |
 
 ## Diagnostics / development
 

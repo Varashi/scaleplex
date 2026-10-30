@@ -26,6 +26,15 @@ metadata:
   labels:
     app.kubernetes.io/name: scaleplex-worker
 spec:
+  # Rollout safety (#242): a worker is Ready ~100 ms after start (pre-warm is
+  # fast), so without minReadySeconds the whole fleet turns over in seconds —
+  # faster than the orchestrator's DNS refresh — and in-flight streams have no
+  # live worker to recover to. Replace one worker at a time, 30 s apart.
+  minReadySeconds: 30
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: scaleplex-worker
@@ -45,6 +54,8 @@ spec:
       #   pulls once, the rest hit Spegel.
       # - Liveness probe is /healthz (returns 200 immediately).
       # - Readiness probe is /readyz (flips after pre-warm finishes).
+      # Must exceed SCALEPLEX_DRAIN_SECONDS (default 10): on SIGTERM the worker
+      # refuses new sessions, waits for active ones, then exits on its own.
       terminationGracePeriodSeconds: 30
       nodeSelector:
         intel.feature.node.kubernetes.io/gpu: "true"
