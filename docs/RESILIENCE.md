@@ -159,9 +159,9 @@ that `watchAndRenumberChunks` bumps on each successful chunk rename.
 
 `orchestrator/checkpoint.go`:
 
-- A goroutine spawned alongside each dispatch polls
-  `/task/<id>/checkpoint` every 2 s while the PMS-facing request is
-  alive.
+- A goroutine spawned per upstream attempt polls the CURRENT worker's
+  `/task/<id>/checkpoint` every 2 s while that attempt is streaming
+  (after a recovery swap it follows the new worker, not the dead one).
 - Cache key = the Plex transcode-session UUID parsed from
   `-progressurl` (Plex keeps that UUID stable across ffmpeg restarts
   within a session; the per-spawn job UUID changes).
@@ -179,31 +179,65 @@ On every fresh `POST /task` whose argv carries a known UUID:
   any existing values). The worker resumes exactly where the previous
   one stopped.
 
-`orchestrator/main.go`'s `proxyToWorker` is split:
+Dispatch and recovery live in `orchestrator/failover.go`:
 
-- `streamFromUpstream` — opens one connection, writes PMS-facing
-  status+headers on the first call (gated by `headersWritten`), pipes
-  body bytes through, returns when either side errors.
-- `proxyToWorker` — outer loop. If `streamFromUpstream` reports a
-  failure AFTER any bytes flowed (mid-stream failure), pick a healthy
-  alternative worker via `pickRecoveryWorker`, inject resume flags
-  from the cache, reopen with headers already sent. PMS-facing
-  connection stays open across the swap. Up to 3 attempts.
+- `streamFrom` runs one upstream attempt. It writes the PMS-facing
+  status + headers once (first accepting worker), pipes bytes through,
+  and classifies the end: **done** (EOF), **refused** (worker never
+  accepted), **broken** (accepted, then failed), or **client gone**.
+- `dispatchTask` walks the candidate order, falling through refusals.
+- `recover` moves a broken session onto another worker with resume
+  flags injected; the PMS-facing connection stays open across the swap.
+  Up to 3 moves per session.
 
-### Recovery vs initial 503
+### Failure handling (#219, #242)
 
-- 503 from the first dial → caller falls through to next worker
-  (existing behaviour).
-- Mid-stream failure → recovery loop kicks in, picks alternative
-  worker, injects resume flags, reuses headers.
-- PMS write failure → terminal, no recovery (client already gone).
+- **503 (at capacity or draining)** before any response → fall through
+  to the next candidate.
+- **Connection refused/reset** before any response → fall through too,
+  and mark that worker down immediately so it stops attracting sessions
+  before the next `/capability` probe.
+- **Mid-stream failure** → recovery. If the chosen target is itself
+  unreachable, try another. When no healthy candidate is known, recovery
+  re-resolves DNS and re-probes the fleet, waiting up to
+  `SCALEPLEX_RECOVERY_WAIT_SECONDS` (default 30) — during a rolling
+  restart every cached worker address can be stale at once. A worker
+  whose stream broke is never reused for that session (a crashed ffmpeg
+  can still pass `/capability`); a worker that only refused may be
+  reused once a newer probe shows it healthy.
+- **PMS write failure / client disconnect** → terminal, no recovery,
+  not counted as `recovered`.
+- If the dead worker stopped mid-line, a newline is written before the
+  new worker's output so the fragments don't merge.
+
+### Worker drain + rollout safety (#242)
+
+On SIGTERM/SIGINT a worker drains: `/readyz` and `POST /task` return
+503, `/capability` reports `draining: true` / `ready: false`, and the
+agent waits up to `SCALEPLEX_DRAIN_SECONDS` (default 10) for active
+sessions before exiting. Sessions still running then die with the agent
+and are recovered elsewhere. Keep the drain shorter than the pod's
+`terminationGracePeriodSeconds` (or compose `stop_grace_period`).
+
+Workers turn Ready ~100 ms after start, so set DaemonSet
+`minReadySeconds` (30 s in the reference manifests). Without it a
+rollout replaces every worker within seconds and a recovering stream
+can find no live worker. Validated: a full worker rollout mid-transcode
+moved the stream once with no visible client hitch.
+
+**Known limit:** the orchestrator is a single replica on the data path —
+restarting it cuts every in-flight stream (#227).
 
 ### Metrics
 
 - `scaleplex_orch_dispatch_total{outcome="resumed"}` — request landed
   on a cached resume hint
-- `scaleplex_orch_dispatch_total{outcome="recovered"}` — mid-stream
-  swap fired
+- `scaleplex_orch_dispatch_total{outcome="recovered"}` — a mid-stream
+  move landed on a new worker
+- `scaleplex_orch_dispatch_total{outcome="recovery_failed"}` — no healthy
+  worker within the wait budget, or moves exhausted
+- `scaleplex_orch_dispatch_total{outcome="fallthrough_503"|"fallthrough_unreachable"}`
+  — a candidate refused (at capacity/draining) or was unreachable
 - `scaleplex_worker_throttle_*` (above) — orthogonal but observed in
   the same session graphs
 

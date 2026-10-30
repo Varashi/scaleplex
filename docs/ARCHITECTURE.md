@@ -73,7 +73,11 @@ Service in front of the worker DaemonSet), re-resolved every
 self-register path (workers `POST /register` + heartbeat) for non-k8s
 deployments. Each known worker is polled with `GET /capability` every
 `WORKERS_PROBE_SECONDS` to learn `(active_sessions, max_sessions,
-healthy, gpu_load, backend)`.
+gpu_load, backend, ready, draining)`. A worker is schedulable only when
+ffmpeg is present AND it is ready (pre-warm done) AND not draining; a
+worker image that predates the `ready` field counts as ready. A worker
+that refuses a connection is marked down at once, without waiting for
+the next probe.
 
 **Selection (`schedule()`).** Computed once per dispatch. With
 `SCALEPLEX_PREFER_HW=1` (default) the pool is split `[HW tier, SW tier]`
@@ -87,10 +91,11 @@ prior least-loaded ranking. A 503 falls through to the next candidate;
 the in-flight counter keeps concurrent arrivals from colliding.
 
 **Race protection.** The orchestrator combines its `/capability` cache
-with a local in-flight counter, so two concurrent task arrivals don't
-both pick the same worker just because the cache is 5s stale. The local
-counter increments on dispatch, decrements when the worker's response
-stream closes.
+with a local in-flight count, so two concurrent task arrivals don't
+both pick the same worker just because the cache is 5s stale. A dispatch
+counts as in-flight while the worker hasn't answered, and once accepted
+only until a probe that started after the accept succeeds — from then on
+the worker's own `active_sessions` includes it, so it isn't counted twice.
 
 No socket.io, no arg rewriting (worker-side), no LOCAL_RELAY logic. The
 clusterplex orchestrator's PMS-restart hook is gone too — workers no
@@ -103,9 +108,14 @@ longer hold per-PMS-UUID state (no EAE, see [LESSONS-FROM-CLUSTERPLEX.md](LESSON
 **Endpoints:**
 - `POST /task` — receive `{session_id, args[], env{}, cwd}`. Spawns ffmpeg.
   Streams stdout/stderr/exit code back as a chunked response.
-- `GET /capability` — return `{active_sessions, max_sessions, healthy, gpu_load, gpu_engines, backend}` (`backend` ∈ `vaapi`/`nvenc`/`sw`).
+- `GET /capability` — return `{ffmpeg_ok, active_sessions, max_sessions, gpu_load, gpu_engines, backend, ready, draining}` (`backend` ∈ `vaapi`/`nvenc`/`sw`).
 - `GET /healthz` — bound the moment HTTP listens.
-- `GET /readyz` — gated on pre-warm completion.
+- `GET /readyz` — gated on pre-warm completion; 503 again once draining.
+
+**Shutdown:** on SIGTERM the agent drains — refuses new `/task` with 503,
+waits up to `SCALEPLEX_DRAIN_SECONDS` for active sessions, then exits;
+the orchestrator recovers whatever was still running (see
+[RESILIENCE.md](RESILIENCE.md)).
 - `GET /metrics` — Prometheus.
 
 **Pre-warm at startup** (gated by `/readyz`):
