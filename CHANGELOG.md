@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.14.4](https://github.com/Varashi/scaleplex/compare/v1.14.3...v1.14.4) (2026-10-20)
+
+**Images shipped:**
+
+| Image | Tag | Notes |
+|---|---|---|
+| `ghcr.io/varashi/scaleplex_worker` | `v1.13.4` (`sha-bedf0e8`) | **bumped** — graceful drain on SIGTERM; `/capability` reports `ready` / `draining` (#242) |
+| `ghcr.io/varashi/scaleplex_orchestrator` | `v1.4.2` (`sha-bedf0e8`) | **bumped** — dead-worker fall-through, rollout-safe mid-stream recovery, per-upstream accounting (#219, #242) |
+| `ghcr.io/varashi/scaleplex_pms_dockermod` | `sha-0e6edae` | unchanged |
+
+A worker rollout dropped a live stream. Every worker was replaced in ~4 s, recovery picked a pod that was also gone, and on connection refused it gave up. The orchestrator now falls through on connect errors and marks the worker down. Recovery re-resolves DNS, re-probes, and waits up to `SCALEPLEX_RECOVERY_WAIT_SECONDS` (default 30) for a healthy worker, and never reuses one whose stream broke. Workers drain on SIGTERM for up to `SCALEPLEX_DRAIN_SECONDS` (default 10) and refuse new sessions. Pair with DaemonSet `minReadySeconds` (30 s in the reference deploy). Validated live on plex-test: a full worker rollout mid-transcode moved the stream once, with no visible client hitch.
+
+
+### Fixes
+
+* **orchestrator,worker:** fail over dead workers and drain on shutdown ([#219](https://github.com/Varashi/scaleplex/issues/219), [#242](https://github.com/Varashi/scaleplex/issues/242)) ([#243](https://github.com/Varashi/scaleplex/issues/243)) ([bedf0e8](https://github.com/Varashi/scaleplex/commit/bedf0e81689243ace9261d81cae714f32247d03f))
+
 ## [1.14.3](https://github.com/Varashi/scaleplex/compare/v1.14.2...v1.14.3) (2026-10-20)
 
 **Images shipped:**
